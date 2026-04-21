@@ -13,11 +13,11 @@ Distributed evaluation and deployment gating for Generative AI systems.
 
 ## Documentation
 
-Learn more about using [Agent Vigilo on the official site!](https://agent-vigilo.com)
+Learn more about using [Agent Vigilo on the official site!](https://agentvigilo.com)
 
-* **[Getting Started](https://agent-vigilo.com/docs/getting-started)**: Installation and basic setup.
-* **[Tutorial](https://agent-vigilo.com/docs/tutorial)**: A step-by-step guide to building your first project.
-* **[API Reference](https://agent-vigilo.com/docs/api)**: Detailed information about the available functions and classes.
+* **[Getting Started](https://agentvigilo.com/docs/getting-started)**: Installation and basic setup.
+* **[Tutorial](https://agentvigilo.com/docs/tutorial)**: A step-by-step guide to building your first project.
+* **[API Reference](https://agentvigilo.com/docs/api)**: Detailed information about the available functions and classes.
 
 ## License
 
