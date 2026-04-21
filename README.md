@@ -1,10 +1,10 @@
 [![Build](https://github.com/gregl83/agent-vigilo/actions/workflows/build.yml/badge.svg)](https://github.com/gregl83/agent-vigilo/actions/workflows/build.yml)
 [![Coverage Status](https://codecov.io/gh/gregl83/agent-vigilo/graph/badge.svg?token=CL93O7DW9C)](https://codecov.io/gh/gregl83/agent-vigilo)
 [![Crates.io](https://img.shields.io/crates/v/agent-vigilo.svg)](https://crates.io/crates/agent-vigilo)
-[![Documentation](https://img.shields.io/badge/docs-Docusaurus-blue.svg)](https://agent-vigilo.com)
+[![Documentation](https://img.shields.io/badge/docs-Docusaurus-blue.svg)](https://agentvigilo.com)
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/gregl83/agent-vigilo/blob/master/LICENSE)
 
-# agent-vigilo
+# Agent Vigilo
 
 Distributed evaluation and deployment gating for Generative AI systems.
 
