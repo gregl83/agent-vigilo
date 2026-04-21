@@ -16,10 +16,10 @@ CREATE TABLE runs (
     aggregation_policy_id TEXT NOT NULL,
     aggregation_policy_version TEXT NOT NULL,
 
-    -- model + prompt/config identity
-    model_provider TEXT NOT NULL,
-    model_name TEXT NOT NULL,
-    model_version TEXT,
+    -- agent + prompt/config identity
+    agent_provider TEXT NOT NULL,
+    agent_name TEXT NOT NULL,
+    agent_version TEXT,
     prompt_config_id TEXT NOT NULL,
     prompt_config_version TEXT NOT NULL,
 

@@ -47,3 +47,8 @@ CREATE INDEX idx_evaluator_results_dimension ON evaluator_results(dimension);
 CREATE INDEX idx_evaluator_results_status ON evaluator_results(status);
 CREATE INDEX idx_evaluator_results_failure_category ON evaluator_results(failure_category);
 CREATE INDEX idx_evaluator_results_evaluator_id ON evaluator_results(evaluator_id);
+
+COMMENT ON COLUMN evaluator_results.status IS
+'Result of the evaluator for this execution. Used as input to aggregation and policy decisions.';
+COMMENT ON COLUMN evaluator_results.severity IS
+'Severity level assigned by the evaluator to indicate the impact of a detected issue. Used in aggregation and policy decisions alongside evaluation_status.';

@@ -20,7 +20,7 @@ CREATE TABLE execution_attempts (
     response_artifact_uri TEXT,
 
     -- timing
-    model_latency_ms BIGINT CHECK (model_latency_ms IS NULL OR model_latency_ms >= 0),
+    agent_latency_ms BIGINT CHECK (agent_latency_ms IS NULL OR agent_latency_ms >= 0),
     evaluator_latency_ms BIGINT CHECK (evaluator_latency_ms IS NULL OR evaluator_latency_ms >= 0),
     total_latency_ms BIGINT CHECK (total_latency_ms IS NULL OR total_latency_ms >= 0),
 
@@ -46,3 +46,6 @@ CREATE INDEX idx_execution_attempts_status ON execution_attempts(status);
 CREATE INDEX idx_execution_attempts_lease ON execution_attempts(leased_until)
     WHERE status = 'running';
 CREATE INDEX idx_execution_attempts_run_status ON execution_attempts(run_id, status);
+
+COMMENT ON COLUMN execution_attempts.status IS
+'State of this specific attempt. Multiple attempts may exist for a single execution; only the most recent non-stale attempt is authoritative.';

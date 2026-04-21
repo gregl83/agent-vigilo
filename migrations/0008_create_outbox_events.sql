@@ -21,6 +21,8 @@ CREATE TABLE outbox_events (
 
 CREATE INDEX idx_outbox_events_status_available_at
     ON outbox_events(status, available_at);
-
 CREATE INDEX idx_outbox_events_aggregate
     ON outbox_events(aggregate_type, aggregate_id);
+
+COMMENT ON COLUMN outbox_events.status IS
+'Current publication state of the event. Used by the outbox publisher to track delivery progress and retries.';
