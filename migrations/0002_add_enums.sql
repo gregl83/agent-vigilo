@@ -6,16 +6,18 @@ CREATE TYPE run_status AS ENUM (
   'failed', -- Run failed due to a system-level issue (e.g., infrastructure error, unrecoverable failure), not just failing evaluations.
   'cancelled' -- Run was intentionally stopped before completion; some executions may be incomplete or abandoned.
 );
+
 COMMENT ON TYPE run_status IS
-'Lifecycle state of an evaluation run. Represents orchestration progress from creation through finalization.';
+    'Lifecycle state of an evaluation run. Represents orchestration progress from creation through finalization.';
 
 CREATE TYPE gate_status AS ENUM (
   'unknown', -- Gate result has not yet been determined. Run is still in progress or has not been evaluated.
   'pass', -- Run met all evaluation criteria and policy thresholds. Safe to proceed with downstream actions such as deployment.
   'fail' -- Run did not meet evaluation criteria or violated blocking conditions. Should prevent downstream actions such as deployment.
 );
+
 COMMENT ON TYPE gate_status IS
-'Final evaluation outcome of a run based on aggregation policy. Separate from run lifecycle (run_status).';
+    'Final evaluation outcome of a run based on aggregation policy. Separate from run lifecycle (run_status).';
 
 CREATE TYPE execution_status AS ENUM (
   'pending', -- Execution has been created but not yet claimed or started by a worker.
@@ -27,8 +29,9 @@ CREATE TYPE execution_status AS ENUM (
   'timed_out', -- Execution did not complete within allowed time bounds and was marked terminal.
   'cancelled' -- Execution was intentionally stopped before completion, typically due to run cancellation.
 );
+
 COMMENT ON TYPE execution_status IS
-'Lifecycle state of a single execution (one dataset case). Tracks progress from scheduling through agent execution, evaluation, and terminal outcome.';
+    'Lifecycle state of a single execution (one dataset case). Tracks progress from scheduling through agent execution, evaluation, and terminal outcome.';
 
 CREATE TYPE attempt_status AS ENUM (
   'pending', -- Attempt has been created but not yet claimed by a worker. No work has started.
@@ -40,8 +43,9 @@ CREATE TYPE attempt_status AS ENUM (
   'cancelled', -- Attempt was intentionally terminated before completion, typically due to run cancellation or manual intervention.
   'stale' -- Attempt is no longer authoritative due to lease expiration or reassignment. A newer attempt is expected to replace it.
 );
+
 COMMENT ON TYPE attempt_status IS
-'Lifecycle state of a single execution attempt. Represents one worker-owned attempt to process an execution, including leasing, execution, evaluation, and termination conditions.';
+    'Lifecycle state of a single execution attempt. Represents one worker-owned attempt to process an execution, including leasing, execution, evaluation, and termination conditions.';
 
 CREATE TYPE evaluation_status AS ENUM (
   'passed', -- Evaluator determined the output meets the expected criteria or constraints for this check.
@@ -49,8 +53,9 @@ CREATE TYPE evaluation_status AS ENUM (
   'error', -- Evaluator failed to produce a valid result due to an internal error, runtime failure, or invalid input. Does not necessarily indicate the output itself is incorrect.
   'skipped' -- Evaluator was not applied to this execution, typically due to conditional logic, unsupported input, or configuration rules.
 );
+
 COMMENT ON TYPE evaluation_status IS
-'Outcome of a single evaluator applied to an execution. Represents the evaluator’s judgment, independent of aggregation or overall execution result.';
+    'Outcome of a single evaluator applied to an execution. Represents the evaluator’s judgment, independent of aggregation or overall execution result.';
 
 CREATE TYPE severity AS ENUM (
   'none', -- No issue detected or not applicable. Used when the evaluator does not report any concern.
@@ -59,13 +64,15 @@ CREATE TYPE severity AS ENUM (
   'high', -- Serious issue with significant impact. Likely to contribute to execution failure or policy violations.
   'critical' -- Severe issue indicating unacceptable behavior (e.g., safety violations, major correctness failures). Typically should block deployment regardless of other scores.
 );
+
 COMMENT ON TYPE severity IS
-'Indicates the magnitude or impact of an evaluator finding. Used to qualify failures or issues beyond simple pass/fail outcomes.';
+    'Indicates the magnitude or impact of an evaluator finding. Used to qualify failures or issues beyond simple pass/fail outcomes.';
 
 CREATE TYPE outbox_status AS ENUM (
   'pending', -- Event has been created and is ready to be published, but has not yet been processed by the outbox publisher.
   'published', -- Event has been successfully delivered to the external system or message broker.
   'failed' -- Event publication attempt failed. The event may be retried depending on retry policy and error handling.
 );
+
 COMMENT ON TYPE outbox_status IS
-'Represents the delivery state of an outbox event. Used to ensure reliable, idempotent publication of events to external systems.';
+    'Represents the delivery state of an outbox event. Used to ensure reliable, idempotent publication of events to external systems.';

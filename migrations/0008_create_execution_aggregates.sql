@@ -19,4 +19,41 @@ CREATE TABLE execution_aggregates (
 );
 
 CREATE INDEX idx_execution_aggregates_run_id ON execution_aggregates(run_id);
+
 CREATE INDEX idx_execution_aggregates_overall_status ON execution_aggregates(overall_status);
+
+COMMENT ON TABLE execution_aggregates IS
+    'Stores the current authoritative aggregate result for an execution attempt. Derived from append-only evaluator results and used for execution- and run-level summaries, scoring, and gate decisions.';
+
+COMMENT ON COLUMN execution_aggregates.execution_id IS
+    'Reference to the execution this aggregate summarizes. One authoritative aggregate exists per execution.';
+
+COMMENT ON COLUMN execution_aggregates.run_id IS
+    'Reference to the run this execution aggregate belongs to. Included for query efficiency and run-level aggregation.';
+
+COMMENT ON COLUMN execution_aggregates.attempt_id IS
+    'Reference to the authoritative attempt whose evaluator results were used to produce this aggregate.';
+
+COMMENT ON COLUMN execution_aggregates.overall_status IS
+    'Final aggregated status for the execution, derived from evaluator results and aggregation policy.';
+
+COMMENT ON COLUMN execution_aggregates.aggregate_score IS
+    'Final normalized aggregate score for the execution, typically in the range 0.0 to 1.0.';
+
+COMMENT ON COLUMN execution_aggregates.evaluator_result_count IS
+    'Number of evaluator result records used to compute this aggregate.';
+
+COMMENT ON COLUMN execution_aggregates.dimension_scores IS
+    'Structured map of per-dimension aggregate scores (e.g., correctness, safety, quality) derived from evaluator results.';
+
+COMMENT ON COLUMN execution_aggregates.blocking_failures IS
+    'Structured list of blocking failures that affected the execution outcome, if any.';
+
+COMMENT ON COLUMN execution_aggregates.summary IS
+    'Compact execution-level summary including derived metrics, failure counts, and other aggregation outputs used for reporting and debugging.';
+
+COMMENT ON COLUMN execution_aggregates.created_at IS
+    'Timestamp when the aggregate record was first created.';
+
+COMMENT ON COLUMN execution_aggregates.updated_at IS
+    'Timestamp of the most recent update to the aggregate record.';
