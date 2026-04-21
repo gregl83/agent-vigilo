@@ -24,6 +24,8 @@ panic = "abort"
 strip = true
 
 [dependencies]
+sqlx = { version = "0.8.6", features = ["macros", "migrate", "postgres", "runtime-tokio-rustls"] }
+tokio = { version = "1.52.1", features = ["full"] }
 
 [features]
 default = []
