@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: agent_vigilo_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: agent_vigilo
+    ports:
+      - "5432:5432"
+    volumes:
+      - agent_vigilo_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d agent_vigilo"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  sqlx-runner:
+    container_name: agent_vigilo_migrate
+    build:
+      context: ../../
+      dockerfile: infra/dev/Dockerfile.sqlx
+    environment:
+      - DATABASE_URL=postgres://postgres:password@postgres:5432/agent_vigilo
+    volumes:
+      - ../../migrations:/app/migrations
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["migrate", "run"]
+
+volumes:
+  agent_vigilo_db_data:
