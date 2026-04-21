@@ -4,7 +4,7 @@ title: Execution Flow & State Model
 
 # Execution Flow & State Model
 
-This document describes how Agent Vigilo processes an evaluation run from invocation to completion, including execution lifecycle, retry behavior, and event publication.
+This document describes how Agent Vigilo processes an evaluation run from start to completion, including execution lifecycle, retry behavior, and event publication.
 
 ---
 
@@ -12,13 +12,13 @@ This document describes how Agent Vigilo processes an evaluation run from invoca
 
 At a high level, the system follows a fan-out / fan-in pattern:
 
-1. A **run** is created
-2. **executions** are generated from a dataset
-3. workers process executions via **attempts**
-4. evaluators produce append-only results
-5. execution aggregates are computed
-6. the run is finalized
-7. a completion event is published
+1. **Run** is created
+2. **Executions** are generated from a dataset cases
+3. Workers process executions via **attempts**
+4. Evaluators produce append-only results
+5. Execution aggregates are computed
+6. **Run** is finalized
+7. Completion event is published
 
 ---
 
