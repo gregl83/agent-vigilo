@@ -1,0 +1,29 @@
+[package]
+name = "agent-vigilo"
+version = "0.1.0"
+authors = ["Gregory Langlais <_@gregorylanglais.com>"]
+edition = "2024"
+description = "Distributed evaluation and deployment gating for Generative AI systems."
+license = "MIT"
+readme = "README.md"
+keywords = [
+    "generative",
+    "ai",
+    "models",
+    "evaluations",
+    "gating"
+]
+repository = "https://github.com/gregl83/agent-vigilo"
+homepage = "https://agentvigilo.com"
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dependencies]
+
+[features]
+default = []
