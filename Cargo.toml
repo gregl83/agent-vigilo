@@ -24,6 +24,9 @@ panic = "abort"
 strip = true
 
 [dependencies]
+anyhow = { version = "1.0.102" }
+async-trait = {  version = "0.1.89" }
+clap = { version = "4.6.1", features = ["cargo", "derive", "env"] }
 sqlx = { version = "0.8.6", features = ["macros", "migrate", "postgres", "runtime-tokio-rustls"] }
 tokio = { version = "1.52.1", features = ["full"] }
 
