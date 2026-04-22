@@ -103,6 +103,12 @@ COMMENT ON COLUMN runs.agent_name IS
 COMMENT ON COLUMN runs.agent_version IS
     'Version or deployment identifier of the evaluated target. Used to distinguish different releases of the same agent.';
 
+COMMENT ON COLUMN runs.prompt_config_id IS
+    'Identifier of the agent configuration used for this run, including prompts, system instructions, and runtime settings.';
+
+COMMENT ON COLUMN runs.prompt_config_version IS
+    'Version of the agent configuration used for this run. Ensures reproducibility across prompt and configuration changes.';
+
 COMMENT ON COLUMN runs.config_snapshot IS
     'Frozen configuration snapshot capturing all relevant run inputs (dataset, profile, agent configuration) to ensure reproducibility and auditability.';
 

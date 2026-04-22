@@ -52,6 +52,9 @@ CREATE INDEX idx_evaluators_interface
 COMMENT ON TABLE evaluators IS
     'Registry of versioned evaluator artifacts. Stores WASM binaries and associated metadata used by workers to load and execute evaluators at runtime.';
 
+COMMENT ON COLUMN evaluators.id IS
+    'Unique identifier for the evaluator.';
+
 COMMENT ON COLUMN evaluators.namespace IS
     'Logical ownership boundary for evaluators, typically a project, team, or organization namespace.';
 
@@ -96,3 +99,9 @@ COMMENT ON COLUMN evaluators.metadata IS
 
 COMMENT ON COLUMN evaluators.is_active IS
     'Whether the evaluator artifact is active and eligible for use. Inactive evaluators remain stored for auditability and reproducibility.';
+
+COMMENT ON COLUMN evaluators.created_at IS
+    'Timestamp when the evaluator was created.';
+
+COMMENT ON COLUMN evaluators.updated_at IS
+    'Timestamp of the last update to the evaluator.';
