@@ -10,12 +10,13 @@ use clap::{
 
 mod args;
 mod commands;
-pub use commands::Command;
+use super::context::Context;
+use commands::Command;
 
 
 #[async_trait]
-pub trait Executable {
-    async fn exec(self) -> anyhow::Result<()>;
+pub(super) trait Executable {
+    async fn exec(self, context: Context) -> anyhow::Result<()>;
 }
 
 #[derive(Debug, Parser)]
@@ -25,7 +26,7 @@ pub trait Executable {
     about = crate_description!(),
     long_about = None
 )]
-pub struct App {
+pub(crate) struct App {
     /// Path to config file
     #[arg(global = true, long)]
     pub config: Option<PathBuf>,
@@ -52,7 +53,7 @@ pub struct App {
 
 #[async_trait]
 impl Executable for App {
-    async fn exec(self) -> anyhow::Result<()> {
-        self.command.exec().await
+    async fn exec(self, context: Context) -> anyhow::Result<()> {
+        self.command.exec(context).await
     }
 }

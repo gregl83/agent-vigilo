@@ -1,14 +1,15 @@
 use async_trait::async_trait;
 use clap::Subcommand;
+use crate::context::Context;
 
-pub mod placeholder;
-pub mod setup;
+pub(super) mod placeholder;
+pub(super) mod setup;
 
 use super::args;
 use super::Executable;
 
 #[derive(Debug, Subcommand)]
-pub enum Command {
+pub(crate) enum Command {
     /// Placeholder and bootstrap operations
     Placeholder(placeholder::Command),
 
@@ -18,10 +19,10 @@ pub enum Command {
 
 #[async_trait]
 impl Executable for Command {
-    async fn exec(self) -> anyhow::Result<()> {
+    async fn exec(self, context: Context) -> anyhow::Result<()> {
         match self {
-            Command::Placeholder(cmd) => cmd.exec().await,
-            Command::Setup(cmd) => cmd.exec().await,
+            Command::Placeholder(cmd) => cmd.exec(context).await,
+            Command::Setup(cmd) => cmd.exec(context).await,
         }
     }
 }

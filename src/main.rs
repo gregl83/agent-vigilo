@@ -10,6 +10,8 @@ use cli::{
     App,
     Executable,
 };
+mod context;
+use crate::context::Context;
 use tracing::{
     error,
     Level,
@@ -52,14 +54,21 @@ async fn main() -> ExitCode {
     match app_parse_result {
         Ok(app) => {
             init_logger(app.quiet, app.verbose);
-            if let Err(e) = app.exec().await {
+
+            let context = Context::new(
+                app.database_uri.clone(),
+            );
+
+            if let Err(e) = app.exec(context).await {
                 error!(error = %e, "command execution failed");
                 return ExitCode::FAILURE;
             }
+
             ExitCode::SUCCESS
         }
         Err(e) => {
             init_logger(false, 0);
+
             if !e.use_stderr() {
                 _ = e.print();
                 return ExitCode::SUCCESS;
@@ -69,6 +78,7 @@ async fn main() -> ExitCode {
                 .next()
                 .unwrap_or("unexpected error message");
             error!(error = error_msg);
+
             ExitCode::from(e.exit_code() as u8)
         }
     }
