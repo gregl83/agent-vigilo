@@ -18,21 +18,19 @@ pub(crate) struct Command {
     pub migrations_dir: PathBuf,
 }
 
-fn db_migrate() {
-    migrate!("./migrations");
-}
-
 #[async_trait]
 impl Executable for Command {
     async fn exec(self, context: Context) -> anyhow::Result<()> {
-        // todo - sqlx migration call
-
         info!(
             "Setting up Agent Vigilo migrations_dir={}",
             self.migrations_dir.display()
         );
 
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let db = context.db().await?;
+
+        migrate!("./migrations")
+            .run(db)
+            .await?;
 
         info!("Command complete");
 
