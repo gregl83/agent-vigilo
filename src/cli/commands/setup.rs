@@ -6,18 +6,9 @@ use tracing::{
     info
 };
 
+use super::args::parsers::parse_dir;
 use super::Executable;
 
-
-// Helper function for validation
-fn parse_dir(s: &str) -> Result<PathBuf, String> {
-    let p = PathBuf::from(s);
-    if p.is_dir() {
-        Ok(p)
-    } else {
-        Err(format!("'{}' is not a valid directory", s))
-    }
-}
 
 #[derive(Debug, Args)]
 pub struct Command {

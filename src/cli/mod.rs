@@ -8,6 +8,7 @@ use clap::{
     Parser,
 };
 
+mod args;
 mod commands;
 pub use commands::Command;
 
