@@ -1,4 +1,7 @@
-use std::io::stderr;
+use std::{
+    io::stderr,
+    process::ExitCode,
+};
 
 use clap::Parser;
 
@@ -29,7 +32,7 @@ fn init_logger(quiet: bool, verbose: u8) {
         }
     };
 
-    tracing_subscriber::registry()
+    _ = tracing_subscriber::registry()
         .with(
             fmt::layer()
                 .with_writer(stderr)
@@ -39,19 +42,34 @@ fn init_logger(quiet: bool, verbose: u8) {
             EnvFilter::from_default_env()
                 .add_directive(level.into())
         )
-        .init();
+        .try_init();
 }
 
 #[tokio::main]
-async fn main() {
-    let cli = App::parse();
+async fn main() -> ExitCode {
+    let app_parse_result = App::try_parse();
 
-    init_logger(cli.quiet, cli.verbose);
-
-    match cli.exec().await {
-        Ok(_) => (),
+    match app_parse_result {
+        Ok(app) => {
+            init_logger(app.quiet, app.verbose);
+            if let Err(e) = app.exec().await {
+                error!(error = %e, "command execution failed");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
         Err(e) => {
-            error!("{}", e);
-        },
+            init_logger(false, 0);
+            if !e.use_stderr() {
+                _ = e.print();
+                return ExitCode::SUCCESS;
+            }
+            let multi_line_error_msg = e.render().to_string();
+            let error_msg = multi_line_error_msg.lines()
+                .next()
+                .unwrap_or("unexpected error message");
+            error!(error = error_msg);
+            ExitCode::from(e.exit_code() as u8)
+        }
     }
 }
