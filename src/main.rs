@@ -2,18 +2,7 @@ use std::{
     io::stderr,
     process::ExitCode,
 };
-
 use clap::Parser;
-
-mod cli;
-use cli::{
-    App,
-    Executable,
-};
-
-mod adapters;
-mod context;
-use context::Context;
 use tracing::{
     error,
     Level,
@@ -24,6 +13,16 @@ use tracing_subscriber::{
     prelude::*,
     Registry,
 };
+
+mod adapters;
+mod cli;
+use cli::{
+    App,
+    Executable,
+};
+mod context;
+use context::Context;
+mod evaluators;
 
 
 fn init_logger(quiet: bool, verbose: u8) {
@@ -64,12 +63,15 @@ async fn main() -> ExitCode {
                 app.database_uri.clone(),
             );
 
-            if let Err(e) = app.exec(context).await {
-                error!(error = %e, "command execution failed");
-                return ExitCode::FAILURE;
+            match app.exec(context).await {
+                Err(e) => {
+                    error!(error = %e, "command execution failed");
+                    ExitCode::FAILURE
+                }
+                Ok(()) => {
+                    ExitCode::SUCCESS
+                }
             }
-
-            ExitCode::SUCCESS
         }
         Err(e) => {
             init_logger(false, 0);
@@ -78,11 +80,14 @@ async fn main() -> ExitCode {
                 _ = e.print();
                 return ExitCode::SUCCESS;
             }
-            let multi_line_error_msg = e.render().to_string();
-            let error_msg = multi_line_error_msg.lines()
-                .next()
-                .unwrap_or("unexpected error message");
-            error!(error = error_msg);
+
+            for (kind, value) in e.context() {
+                if let Some(kind) = kind.as_str() {
+                    if !kind.is_empty() {
+                        error!("command failed: {}: {}", kind, value);
+                    }
+                }
+            }
 
             ExitCode::from(e.exit_code() as u8)
         }

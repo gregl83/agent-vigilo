@@ -8,7 +8,6 @@ use super::args::parsers::parse_filepath;
 use super::Executable;
 
 
-
 #[derive(Debug, Subcommand)]
 pub(crate) enum SubCommand {
     /// Add evaluator to system
@@ -16,6 +15,30 @@ pub(crate) enum SubCommand {
         /// Path to evaluator
         #[arg(value_parser = parse_filepath)]
         evaluator_path: PathBuf,
+    },
+    /// Show system evaluator
+    Show {
+        /// Evaluator name
+        #[arg()]
+        evaluator_name: String,
+    },
+    /// Deactivate system evaluator
+    Deactivate {
+        /// Evaluator name
+        #[arg()]
+        evaluator_name: String,
+    },
+    /// Activate system evaluator
+    Activate {
+        /// Evaluator name
+        #[arg()]
+        evaluator_name: String,
+    },
+    /// Remove system evaluator
+    Remove {
+        /// Evaluator name
+        #[arg()]
+        evaluator_name: String,
     },
 }
 
@@ -25,6 +48,52 @@ impl Executable for SubCommand {
         match self {
             SubCommand::Add{ evaluator_path } => {
                 println!("executing run");
+
+                // todo
+
+                // Example async work
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                println!("run complete");
+                Ok(())
+            }
+            SubCommand::Show{ evaluator_name } => {
+                println!("executing run");
+
+                // todo
+
+                // Example async work
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                println!("run complete");
+                Ok(())
+            }
+            SubCommand::Deactivate{ evaluator_name } => {
+                println!("executing run");
+
+                // todo
+
+                // Example async work
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                println!("run complete");
+                Ok(())
+            }
+            SubCommand::Activate{ evaluator_name } => {
+                println!("executing run");
+
+                // todo
+
+                // Example async work
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                println!("run complete");
+                Ok(())
+            }
+            SubCommand::Remove{ evaluator_name } => {
+                println!("executing run");
+
+                // todo
 
                 // Example async work
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;

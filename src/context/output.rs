@@ -9,7 +9,10 @@ use std::{
 };
 
 use tokio::sync::OnceCell;
-use tracing::{debug, error};
+use tracing::{
+    debug,
+    error,
+};
 
 
 pub struct Buffer {
