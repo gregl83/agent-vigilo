@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
 mod database;
+mod output;
 
 struct ContextInner {
     pub db: database::Context,
+    pub out: output::Context,
 }
 
 #[derive(Clone)]
@@ -16,10 +18,17 @@ impl Context {
                 uri: db_uri,
                 cell: Default::default(),
             },
+            out: output::Context {
+                cell: Default::default(),
+            }
         }))
     }
 
     pub async fn db(&self) -> anyhow::Result<&sqlx::PgPool> {
         self.0.db.get().await
+    }
+
+    pub async fn out(&self) -> anyhow::Result<&output::Buffer> {
+        self.0.out.get().await
     }
 }
