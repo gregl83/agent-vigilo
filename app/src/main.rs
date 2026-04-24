@@ -22,7 +22,6 @@ use cli::{
 };
 mod context;
 use context::Context;
-mod evaluators;
 
 
 fn init_logger(quiet: bool, verbose: u8) {

@@ -2,10 +2,12 @@ use std::sync::Arc;
 
 mod database;
 mod output;
+mod registry;
 
 struct ContextInner {
     pub db: database::Context,
     pub out: output::Context,
+    pub reg: registry::Context,
 }
 
 #[derive(Clone)]
@@ -16,6 +18,9 @@ impl Context {
         Self(Arc::new(ContextInner {
             db: database::Context {
                 uri: db_uri,
+                cell: Default::default(),
+            },
+            reg: registry::Context{
                 cell: Default::default(),
             },
             out: output::Context {
@@ -30,5 +35,9 @@ impl Context {
 
     pub async fn out(&self) -> anyhow::Result<&output::Buffer> {
         self.0.out.get().await
+    }
+
+    pub async fn reg(&self) -> anyhow::Result<&moka::future::Cache<String, wasmtime::Module>> {
+        self.0.reg.get().await
     }
 }
