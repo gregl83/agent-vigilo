@@ -6,7 +6,7 @@ use tokio::sync::OnceCell;
 use tracing::debug;
 
 pub struct Context {
-    pub(crate) url: String,
+    pub(crate) uri: String,
     pub(crate) cell: OnceCell<PgPool>,
 }
 
@@ -17,7 +17,7 @@ impl Context {
 
             PgPoolOptions::new()
                 .max_connections(5)
-                .connect(&self.url)
+                .connect(&self.uri)
                 .await
                 .map_err(|e| anyhow::anyhow!("database connection failed: {}", e))
         }).await

@@ -13,15 +13,15 @@ pub(crate) enum SubCommand {
 
 #[async_trait]
 impl Executable for SubCommand {
-    async fn exec(self, context: Context) -> anyhow::Result<()> {
+    async fn exec(self, _context: Context) -> anyhow::Result<()> {
         match self {
             SubCommand::Do => {
-                println!("Executing run");
+                println!("executing run");
 
                 // Example async work
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-                println!("Run complete");
+                println!("run complete");
                 Ok(())
             }
         }

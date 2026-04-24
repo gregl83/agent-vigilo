@@ -10,10 +10,10 @@ struct ContextInner {
 pub(crate) struct Context(Arc<ContextInner>);
 
 impl Context {
-    pub fn new(db_url: String) -> Self {
+    pub fn new(db_uri: String) -> Self {
         Self(Arc::new(ContextInner {
             db: database::Context {
-                url: db_url,
+                uri: db_uri,
                 cell: Default::default(),
             },
         }))
