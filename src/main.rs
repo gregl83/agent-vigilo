@@ -20,6 +20,7 @@ use tracing_subscriber::{
     EnvFilter,
     fmt,
     prelude::*,
+    Registry,
 };
 
 
@@ -34,17 +35,19 @@ fn init_logger(quiet: bool, verbose: u8) {
         }
     };
 
-    _ = tracing_subscriber::registry()
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(""))
+        .add_directive(level.into());
+
+    let subscriber = Registry::default()
         .with(
             fmt::layer()
                 .with_writer(stderr)
                 .with_target(false)
         )
-        .with(
-            EnvFilter::from_default_env()
-                .add_directive(level.into())
-        )
-        .try_init();
+        .with(filter);
+
+    let _ = subscriber.try_init();
 }
 
 #[tokio::main]
