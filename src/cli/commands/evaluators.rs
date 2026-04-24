@@ -2,20 +2,28 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use clap::{Args, Subcommand};
+
 use crate::context::Context;
+use super::args::parsers::parse_filepath;
 use super::Executable;
+
 
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum SubCommand {
-    Do,
+    /// Add evaluator to system
+    Add {
+        /// Path to evaluator
+        #[arg(value_parser = parse_filepath)]
+        evaluator_path: PathBuf,
+    },
 }
 
 #[async_trait]
 impl Executable for SubCommand {
     async fn exec(self, _context: Context) -> anyhow::Result<()> {
         match self {
-            SubCommand::Do => {
+            SubCommand::Add{ evaluator_path } => {
                 println!("executing run");
 
                 // Example async work
@@ -30,10 +38,6 @@ impl Executable for SubCommand {
 
 #[derive(Debug, Args)]
 pub(crate) struct Command {
-    /// Path to migrations directory
-    #[arg(long, default_value = "migrations")]
-    pub migrations_dir: PathBuf,
-
     #[command(subcommand)]
     pub command: Option<SubCommand>,
 }
@@ -44,10 +48,6 @@ impl Executable for Command {
         match self.command {
             Some(subcommand) => subcommand.exec(context).await,
             None => {
-                println!(
-                    "Executing command directly with migrations_dir={}",
-                    self.migrations_dir.display()
-                );
 
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 

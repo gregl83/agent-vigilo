@@ -25,8 +25,8 @@ impl Executable for Command {
         info!("running database migrations");
         database::db_migrate(db, self.migrations_dir).await?;
 
-        info!("installing evaluations");
-        // todo - install evaluations
+        info!("adding evaluators");
+        // todo - add evaluators
 
         Ok(())
     }

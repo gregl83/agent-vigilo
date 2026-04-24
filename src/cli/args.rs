@@ -9,4 +9,13 @@ pub mod parsers {
             Err(format!("'{}' is not a valid directory", s))
         }
     }
+
+    pub(crate) fn parse_filepath(s: &str) -> Result<PathBuf, String> {
+        let p = PathBuf::from(s);
+        if p.is_file() {
+            Ok(p)
+        } else {
+            Err(format!("'{}' is not a valid filepath", s))
+        }
+    }
 }
