@@ -10,8 +10,10 @@ use cli::{
     App,
     Executable,
 };
+
+mod adapters;
 mod context;
-use crate::context::Context;
+use context::Context;
 use tracing::{
     error,
     Level,

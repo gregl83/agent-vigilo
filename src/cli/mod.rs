@@ -10,8 +10,8 @@ use clap::{
 
 mod args;
 mod commands;
-use super::context::Context;
 use commands::Command;
+use super::context::Context;
 
 
 #[async_trait]
