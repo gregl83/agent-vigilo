@@ -1,14 +1,14 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+use std::io::{self, Read};
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[no_mangle]
+pub extern "C" fn evaluate() -> i32 {
+    // Read input from stdin (WASI)
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input).unwrap();
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+    // Do work
+    let price: f64 = input.trim().parse().unwrap_or(0.0);
+    let adjusted = (price * 1.1) as i32;
+
+    adjusted
 }
