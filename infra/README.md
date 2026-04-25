@@ -1,3 +1,3 @@
 # Infrastructure
 
-Systems components for running Agent Vigilo.
+System components for running Agent Vigilo.
