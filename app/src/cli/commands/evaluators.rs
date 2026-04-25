@@ -59,12 +59,7 @@ impl Executable for SubCommand {
             SubCommand::Add{ evaluator_path } => {
                 println!("executing run");
 
-                info!(
-                    "adding evaluator: {}@{}:{}",
-                    crate_name!(),
-                    crate_version!(),
-                    evaluator_path.display(),
-                );
+                info!("adding evaluator: {}", evaluator_path.display());
 
                 let wasm_bytes = fs::read(evaluator_path)?;
 
