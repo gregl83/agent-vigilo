@@ -17,20 +17,5 @@ services:
       retries: 5
     restart: unless-stopped
 
-# optional migration runner
-#  sqlx-migrate:
-#    container_name: agent_vigilo_migrate
-#    build:
-#      context: ../../
-#      dockerfile: infra/dev/Dockerfile.sqlx
-#    environment:
-#      - DATABASE_URL=postgres://postgres:password@postgres:5432/agent_vigilo
-#    volumes:
-#      - ../../migrations:/app/migrations
-#    depends_on:
-#      postgres:
-#        condition: service_healthy
-#    command: ["migrate", "run"]
-
 volumes:
   agent_vigilo_db_data:
