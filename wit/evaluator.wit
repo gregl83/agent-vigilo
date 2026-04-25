@@ -1,27 +1,32 @@
 package app:evaluator;
 
-// types shared across everything
+// data types
 interface types {
+    record context {
+        db: string,
+    }
     record input {
-        price: f64,
-        currency: string,
-        context: string,
+        context: context,
     }
 
+    record data {
+        val: string,
+    }
     record output {
-        score: f64,
-        reason: string,
+        data: data,
     }
 }
 
-// host functions — declared ONCE here, available to all evaluators
-interface host {
-    get-exchange-rate: func(currency: string) -> f64;
-    log: func(msg: string);
-    get-config: func(key: string) -> option<string>;
+// executor functions exposed to evaluators
+interface executor {
+    // tracing
+    trace: func(msg: string);
+    debug: func(msg: string);
+    warn: func(msg: string);
+    error: func(msg: string);
 }
 
-// what every evaluator must implement
+// evaluator interface
 interface evaluator {
     use types.{input, output};
     evaluate: func(input: input) -> result<output, string>;
@@ -29,6 +34,6 @@ interface evaluator {
 
 world evaluator-world {
     import types;
-    import host;        // host provides this — evaluator just calls it
-    export evaluator;   // evaluator must implement this
+    import executor;
+    export evaluator;
 }

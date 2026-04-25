@@ -1,14 +1,31 @@
-use std::io::{self, Read};
+wit_bindgen::generate!({
+    path: "../../wit/evaluator.wit",
+    world: "evaluator-world",
+});
 
-#[no_mangle]
-pub extern "C" fn evaluate() -> i32 {
-    // Read input from stdin (WASI)
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input).unwrap();
+use exports::app::evaluator::evaluator::{
+    Guest,
+    Input,
+    Output,
+};
+use app::evaluator::types::Data;
+use app::evaluator::executor;
 
-    // Do work
-    let price: f64 = input.trim().parse().unwrap_or(0.0);
-    let adjusted = (price * 1.1) as i32;
+struct Evaluator;
 
-    adjusted
+impl Guest for Evaluator {
+    fn evaluate(input: Input) -> Result<Output, String> {
+        executor::trace("sentiment evaluator started");
+        executor::debug(&format!("db context: {}", input.context.db));
+
+        // evaluator logic here
+        let val = "sentiment-result".to_string();
+
+        Ok(Output {
+            data: Data { val },
+        })
+    }
 }
+
+export!(Evaluator);
+
