@@ -14,7 +14,6 @@ use tracing_subscriber::{
     Registry,
 };
 
-mod adapters;
 mod cli;
 use cli::{
     App,
@@ -22,6 +21,7 @@ use cli::{
 };
 mod context;
 use context::Context;
+mod db;
 
 
 fn init_logger(quiet: bool, verbose: u8) {

@@ -1,7 +1,17 @@
-use std::path::PathBuf;
+use std::{
+    fs,
+    path::PathBuf,
+    hash::{DefaultHasher, Hash, Hasher},
+};
 
 use async_trait::async_trait;
-use clap::{Args, Subcommand};
+use clap::{crate_name, crate_version, Args, Subcommand};
+use tracing::info;
+use wasmtime::{
+    Config,
+    component::Component,
+    Engine,
+};
 
 use crate::context::Context;
 use super::args::parsers::parse_filepath;
@@ -49,7 +59,37 @@ impl Executable for SubCommand {
             SubCommand::Add{ evaluator_path } => {
                 println!("executing run");
 
-                // todo
+                info!(
+                    "adding evaluator: {}@{}:{}",
+                    crate_name!(),
+                    crate_version!(),
+                    evaluator_path.display(),
+                );
+
+                let wasm_bytes = fs::read(evaluator_path)?;
+
+                let mut config = Config::new();
+                config.wasm_component_model(true);
+
+                let engine = Engine::new(&config)?;
+
+                let component = Component::new(
+                    &engine,
+                    &wasm_bytes
+                )?;
+
+                fn engine_fingerprint(engine: &Engine) -> String {
+                    let mut hasher = DefaultHasher::new();
+                    engine.precompile_compatibility_hash().hash(&mut hasher);
+                    format!("{:x}-{}", hasher.finish(), std::env::consts::ARCH)
+                }
+
+                let hash = blake3::hash(&wasm_bytes).to_hex().to_string();
+                let compiled = component.serialize()?;
+                let fingerprint = engine_fingerprint(&engine);
+                println!("{}", fingerprint);
+
+                // todo - move wasm code to module
 
                 // Example async work
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;

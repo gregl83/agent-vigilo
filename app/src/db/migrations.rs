@@ -16,7 +16,7 @@ use tracing::{
     info,
 };
 
-pub(crate) async fn db_migrate(db: &PgPool, migrations_dir: PathBuf) -> anyhow::Result<()> {
+pub(crate) async fn migrate(db: &PgPool, migrations_dir: PathBuf) -> anyhow::Result<()> {
     let migrator = Migrator::new(
         migrations_dir.as_path()
     ).await?;

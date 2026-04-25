@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use clap::Args;
 use tracing::info;
 
-use crate::adapters::database;
+use crate::db::migrations;
 use crate::context::Context;
 use super::args::parsers::parse_dir;
 use super::Executable;
@@ -23,7 +23,7 @@ impl Executable for Command {
         let db = context.db().await?;
 
         info!("running database migrations");
-        database::db_migrate(db, self.migrations_dir).await?;
+        migrations::migrate(db, self.migrations_dir).await?;
 
         info!("adding evaluators");
         // todo - add evaluators
