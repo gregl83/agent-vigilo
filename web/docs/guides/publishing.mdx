@@ -1,0 +1,251 @@
+---
+sidebar_label: Publishing Evaluators
+title: Publishing Evaluators
+description: End-to-end guide for building and publishing evaluators to the Agent Vigilo registry using the Vigilo CLI.
+---
+
+# Publishing Evaluators
+
+This guide walks through the end-to-end process of building and publishing an evaluator to the Agent Vigilo registry using the `vigilo` CLI.
+
+---
+
+## Prerequisites
+
+Install `vigilo` via Cargo:
+
+```bash
+cargo install vigilo
+```
+
+Verify the installation:
+
+```bash
+vigilo --version
+```
+
+You will also need the appropriate build toolchain for your evaluator's wasm component ecosystem:
+
+- **Rust:** [`cargo-component`](https://github.com/bytecodealliance/cargo-component)
+- **Python:** [`componentize-py`](https://github.com/bytecodealliance/componentize-py)
+
+---
+
+## Setup
+
+Each evaluator requires a [`vigilo.toml`](../configuration/vigilo-toml.md) file at the component root alongside the package manifest. At minimum:
+
+```toml
+# vigilo.toml
+manifest = "Cargo.toml"
+profile = "release"
+wasm = "target/wasm32-unknown-unknown/release/my_evaluator.wasm"
+```
+
+See the [`vigilo.toml` reference](../configuration/vigilo-toml.md) for all fields.
+
+---
+
+## Publishing a Rust Evaluator
+
+### 1. Build the evaluator component
+
+```bash
+cargo component build --release
+```
+
+### 2. Publish
+
+```bash
+vigilo publish ./my-evaluator
+```
+
+`vigilo` reads `name` and `version` from `Cargo.toml`, validates the build, and publishes to the registry.
+
+---
+
+## Publishing a Python Evaluator
+
+### 1. Build the evaluator component
+
+```bash
+componentize-py componentize \
+  --wit-path wit/ \
+  --world my-world \
+  app.py \
+  -o my_evaluator.wasm
+```
+
+### 2. Publish
+
+```bash
+vigilo publish ./my-evaluator
+```
+
+`vigilo` reads `name` and `version` from `pyproject.toml` and publishes to the registry.
+
+---
+
+## What Happens at Publish Time
+
+When you run `vigilo publish`, the following steps occur in order:
+
+1. `vigilo.toml` is located and parsed in the given directory
+2. `name` and `version` are read from the declared `manifest`
+3. The wasm file modification time is compared against the manifest modification time
+4. If the build appears stale, the publish is aborted with an error
+5. The evaluator wasm component is tagged with `name`, `version`, and `profile`
+6. The evaluator wasm component is submitted to the Agent Vigilo registry
+
+---
+
+## Stale Build Detection
+
+`vigilo` checks whether the wasm output is older than the package manifest before publishing. This catches the most common mistake — bumping the version without rebuilding.
+
+If a stale build is detected:
+
+```
+error: evaluator may be stale
+       Cargo.toml was modified after the wasm was built
+       rebuild before publishing:
+
+       cargo component build --release
+```
+
+Rebuild and publish again:
+
+```bash
+cargo component build --release
+vigilo publish ./my-evaluator
+```
+
+---
+
+## Validating Without Publishing
+
+Use `vigilo validate` to run all pre-publish checks without submitting to the registry:
+
+```bash
+vigilo validate ./my-evaluator
+```
+
+This is useful in CI to verify the evaluator is ready before a release step.
+
+---
+
+## Workspaces and Multiple Evaluators
+
+Each evaluator in a workspace has its own `vigilo.toml` and is published independently:
+
+```
+my-workspace/
+├── Cargo.toml
+└── evaluators/
+    ├── core/
+    │   ├── Cargo.toml
+    │   └── vigilo.toml
+    └── utils/
+        ├── Cargo.toml
+        └── vigilo.toml
+```
+
+Build and publish each:
+
+```bash
+cargo component build --release --manifest-path evaluators/core/Cargo.toml
+cargo component build --release --manifest-path evaluators/utils/Cargo.toml
+
+vigilo publish ./evaluators/core
+vigilo publish ./evaluators/utils
+```
+
+For CI, publish all evaluators in a workspace automatically:
+
+```bash
+for dir in evaluators/*/; do vigilo publish "$dir"; done
+```
+
+---
+
+## Registry Identity and Versioning
+
+Each published evaluator is uniquely identified by:
+
+```
+name + version + profile
+```
+
+Attempting to republish an existing combination is rejected by default. To overwrite:
+
+```bash
+vigilo publish ./my-evaluator --force
+```
+
+:::warning
+`--force` permanently overwrites the existing artifact in the registry. Avoid using it in production unless you have a specific reason to replace an already-published version.
+:::
+
+---
+
+## CI Integration
+
+A typical CI publish workflow:
+
+```yaml
+# .github/workflows/publish.yml
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-component
+        run: cargo install cargo-component
+
+      - name: Install vigilo
+        run: cargo install vigilo
+
+      - name: Build
+        run: cargo component build --release
+
+      - name: Validate
+        run: vigilo validate ./my-evaluator
+
+      - name: Publish
+        run: vigilo publish ./my-evaluator
+        env:
+          VIGILO_TOKEN: ${{ secrets.VIGILO_TOKEN }}
+```
+
+---
+
+## Reference
+
+### `vigilo publish`
+
+```
+vigilo publish <path> [--force]
+
+Arguments:
+  <path>     Path to the component directory containing vigilo.toml
+
+Options:
+  --force    Overwrite an existing registry entry with the same name, version, and profile
+```
+
+### `vigilo validate`
+
+```
+vigilo validate <path>
+
+Arguments:
+  <path>     Path to the evaluator directory containing vigilo.toml
+```

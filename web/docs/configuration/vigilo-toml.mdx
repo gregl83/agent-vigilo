@@ -1,0 +1,156 @@
+---
+sidebar_label: vigilo.toml
+title: vigilo.toml Configuration Reference
+description: Complete reference for the vigilo.toml manifest file used to configure wasm component publishing.
+---
+
+# `vigilo.toml` Reference
+
+`vigilo.toml` is the manifest file that tells `vigilo` how to publish a wasm component. It lives alongside the package manifest (`Cargo.toml` or `pyproject.toml`) at the component root.
+
+---
+
+## File Location
+
+Place `vigilo.toml` in the same directory as your package manifest:
+
+```
+my-evaluator/
+├── Cargo.toml
+├── vigilo.toml     ← here
+└── src/
+```
+
+For Python evaluators:
+
+```
+my-evaluator/
+├── pyproject.toml
+├── vigilo.toml     ← here
+└── app.py
+```
+
+---
+
+## Fields
+
+### `manifest`
+
+**Required.** Path to the package manifest file, relative to `vigilo.toml`.
+
+```toml
+manifest = "Cargo.toml"
+```
+
+`vigilo` reads `name` and `version` exclusively from this file. They are not declared in `vigilo.toml` itself — this ensures the registry identity stays in sync with the package source and cannot drift independently.
+
+Supported manifest files:
+
+| Value | Ecosystem | Identity fields read |
+|-------|-----------|----------------------|
+| `"Cargo.toml"` | Rust | `[package].name`, `[package].version` |
+| `"pyproject.toml"` | Python | `[project].name`, `[project].version` |
+
+The declared file must exist at publish time. If it is missing, `vigilo` will error immediately before reading any other fields.
+
+---
+
+### `profile`
+
+**Required.** The build profile used to produce the wasm output.
+
+```toml
+profile = "release"
+```
+
+Common values:
+
+| Value | Description |
+|-------|-------------|
+| `"release"` | Optimized build, recommended for publishing |
+| `"debug"` | Unoptimized build with debug symbols |
+| `"<custom>"` | Any custom profile defined in `Cargo.toml` |
+
+The profile is stored as part of the evaluator's registry identity alongside `name` and `version`. This means `my-evaluator@1.0.0/release` and `my-evaluator@1.0.0/debug` are distinct registry entries.
+
+:::caution
+Publishing a `debug` profile evaluator will produce a warning. Non-release builds should only be published intentionally to development or staging registries.
+:::
+
+---
+
+### `wasm`
+
+**Required.** Path to the compiled wasm evaluator output, relative to `vigilo.toml`.
+
+```toml
+wasm = "target/wasm32-unknown-unknown/release/my_evaluator.wasm"
+```
+
+Common output paths by build tool:
+
+| Build tool | Typical output path |
+|------------|---------------------|
+| `cargo component build --release` | `target/wasm32-unknown-unknown/release/<name>.wasm` |
+| `cargo component build` (debug) | `target/wasm32-unknown-unknown/debug/<name>.wasm` |
+| `componentize-py` | configurable, often `<name>.wasm` in project root |
+
+The file at this path must exist and must be a valid wasm component at publish time.
+
+---
+
+## Complete Example
+
+```toml
+# vigilo.toml
+manifest = "Cargo.toml"
+profile = "release"
+wasm = "target/wasm32-unknown-unknown/release/my_evaluator.wasm"
+```
+
+For a Python component:
+
+```toml
+# vigilo.toml
+manifest = "pyproject.toml"
+profile = "release"
+wasm = "my_evaluator.wasm"
+```
+
+---
+
+## Registry Identity
+
+A published evaluator is uniquely identified by three values derived at publish time:
+
+| Field | Source |
+|-------|--------|
+| `name` | Read from `manifest` |
+| `version` | Read from `manifest` |
+| `profile` | Declared in `vigilo.toml` |
+
+The combination of `name + version + profile` must be unique in the registry. Attempting to publish a duplicate will be rejected unless `--force` is passed explicitly.
+
+---
+
+## Stale Build Detection
+
+`vigilo` compares the modification time of the `wasm` file against the `manifest` file before publishing. If the manifest was modified more recently than the wasm, the publish is aborted with an error indicating a potential stale build.
+
+This check exists to catch the most common mistake: bumping the version in the package manifest without rebuilding the evaluator. See the [Publishing Guide](../guides/publishing.mdx) for details on the full publish flow.
+
+---
+
+## Gitignore Recommendations
+
+Wasm output directories should be listed in `.gitignore` to exclude build artifacts from source control:
+
+```gitignore
+# Rust wasm component output
+target/
+
+# Python wasm component output
+*.wasm
+```
+
+This is particularly important if you use source hashing tools alongside `vigilo`, as build output included in the hash will cause instability across clean builds.
