@@ -1,0 +1,8 @@
+[package]
+manifest = "Cargo.toml"
+
+[profile.dev]
+wasm = "target/wasm32-wasip1/debug/sentiment.wasm"
+
+[profile.release]
+wasm = "target/wasm32-wasip1/release/sentiment.wasm"

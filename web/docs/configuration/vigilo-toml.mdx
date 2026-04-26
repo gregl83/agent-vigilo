@@ -1,23 +1,23 @@
 ---
-sidebar_label: vigilo.toml
-title: vigilo.toml Configuration Reference
-description: Complete reference for the vigilo.toml manifest file used to configure wasm component publishing.
+sidebar_label: Vigilo.toml
+title: Vigilo.toml Configuration Reference
+description: Complete reference for the Vigilo.toml manifest file used to configure wasm component publishing.
 ---
 
-# `vigilo.toml` Reference
+# `Vigilo.toml` Reference
 
-`vigilo.toml` is the manifest file that tells `vigilo` how to publish a wasm component. It lives alongside the package manifest (`Cargo.toml` or `pyproject.toml`) at the component root.
+`Vigilo.toml` is the manifest file that tells `vigilo` how to publish a wasm component. It lives alongside the package manifest (`Cargo.toml` or `pyproject.toml`) at the component root.
 
 ---
 
 ## File Location
 
-Place `vigilo.toml` in the same directory as your package manifest:
+Place `Vigilo.toml` in the same directory as your package manifest:
 
 ```
 my-evaluator/
 ├── Cargo.toml
-├── vigilo.toml     ← here
+├── Vigilo.toml     ← here
 └── src/
 ```
 
@@ -26,7 +26,7 @@ For Python evaluators:
 ```
 my-evaluator/
 ├── pyproject.toml
-├── vigilo.toml     ← here
+├── Vigilo.toml     ← here
 └── app.py
 ```
 
@@ -36,13 +36,13 @@ my-evaluator/
 
 ### `manifest`
 
-**Required.** Path to the package manifest file, relative to `vigilo.toml`.
+**Required.** Path to the package manifest file, relative to `Vigilo.toml`.
 
 ```toml
 manifest = "Cargo.toml"
 ```
 
-`vigilo` reads `name` and `version` exclusively from this file. They are not declared in `vigilo.toml` itself — this ensures the registry identity stays in sync with the package source and cannot drift independently.
+`vigilo` reads `name` and `version` exclusively from this file. They are not declared in `Vigilo.toml` itself — this ensures the registry identity stays in sync with the package source and cannot drift independently.
 
 Supported manifest files:
 
@@ -81,7 +81,7 @@ Publishing a `debug` profile evaluator will produce a warning. Non-release build
 
 ### `wasm`
 
-**Required.** Path to the compiled wasm evaluator output, relative to `vigilo.toml`.
+**Required.** Path to the compiled wasm evaluator output, relative to `Vigilo.toml`.
 
 ```toml
 wasm = "target/wasm32-unknown-unknown/release/my_evaluator.wasm"
@@ -102,19 +102,29 @@ The file at this path must exist and must be a valid wasm component at publish t
 ## Complete Example
 
 ```toml
-# vigilo.toml
+# Vigilo.toml
+[package]
 manifest = "Cargo.toml"
-profile = "release"
-wasm = "target/wasm32-unknown-unknown/release/my_evaluator.wasm"
+
+[profile.dev]
+wasm = "target/wasm32-wasip1/debug/my_evaluator.wasm"
+
+[profile.release]
+wasm = "target/wasm32-wasip1/release/my_evaluator.wasm"
 ```
 
 For a Python component:
 
 ```toml
-# vigilo.toml
+# Vigilo.toml
+[package]
 manifest = "pyproject.toml"
-profile = "release"
-wasm = "my_evaluator.wasm"
+
+[profile.dev]
+wasm = "my_evaluator.dev.wasm"
+
+[profile.release]
+wasm = "my_evaluator.release.wasm"
 ```
 
 ---
@@ -127,7 +137,7 @@ A published evaluator is uniquely identified by three values derived at publish 
 |-------|--------|
 | `name` | Read from `manifest` |
 | `version` | Read from `manifest` |
-| `profile` | Declared in `vigilo.toml` |
+| `profile` | Declared in `Vigilo.toml` |
 
 The combination of `name + version + profile` must be unique in the registry. Attempting to publish a duplicate will be rejected unless `--force` is passed explicitly.
 

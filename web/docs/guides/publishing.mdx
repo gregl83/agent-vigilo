@@ -33,16 +33,21 @@ You will also need the appropriate build toolchain for your evaluator's wasm com
 
 ## Setup
 
-Each evaluator requires a [`vigilo.toml`](../configuration/vigilo-toml.md) file at the component root alongside the package manifest. At minimum:
+Each evaluator requires a [`Vigilo.toml`](../configuration/vigilo-toml.md) file at the component root alongside the package manifest. At minimum:
 
 ```toml
-# vigilo.toml
+# Vigilo.toml
+[package]
 manifest = "Cargo.toml"
-profile = "release"
-wasm = "target/wasm32-unknown-unknown/release/my_evaluator.wasm"
+
+[profile.dev]
+wasm = "target/wasm32-wasip1/debug/my_evaluator.wasm"
+
+[profile.release]
+wasm = "target/wasm32-wasip1/release/my_evaluator.wasm"
 ```
 
-See the [`vigilo.toml` reference](../configuration/vigilo-toml.md) for all fields.
+See the [`Vigilo.toml` reference](../configuration/vigilo-toml.md) for all fields.
 
 ---
 
@@ -90,7 +95,7 @@ vigilo publish ./my-evaluator
 
 When you run `vigilo publish`, the following steps occur in order:
 
-1. `vigilo.toml` is located and parsed in the given directory
+1. `Vigilo.toml` is located and parsed in the given directory
 2. `name` and `version` are read from the declared `manifest`
 3. The wasm file modification time is compared against the manifest modification time
 4. If the build appears stale, the publish is aborted with an error
@@ -136,7 +141,7 @@ This is useful in CI to verify the evaluator is ready before a release step.
 
 ## Workspaces and Multiple Evaluators
 
-Each evaluator in a workspace has its own `vigilo.toml` and is published independently:
+Each evaluator in a workspace has its own `Vigilo.toml` and is published independently:
 
 ```
 my-workspace/
@@ -144,10 +149,10 @@ my-workspace/
 └── evaluators/
     ├── core/
     │   ├── Cargo.toml
-    │   └── vigilo.toml
+    │   └── Vigilo.toml
     └── utils/
         ├── Cargo.toml
-        └── vigilo.toml
+        └── Vigilo.toml
 ```
 
 Build and publish each:
@@ -235,7 +240,7 @@ jobs:
 vigilo publish <path> [--force]
 
 Arguments:
-  <path>     Path to the component directory containing vigilo.toml
+  <path>     Path to the component directory containing Vigilo.toml
 
 Options:
   --force    Overwrite an existing registry entry with the same name, version, and profile
@@ -247,5 +252,5 @@ Options:
 vigilo validate <path>
 
 Arguments:
-  <path>     Path to the evaluator directory containing vigilo.toml
+  <path>     Path to the evaluator directory containing Vigilo.toml
 ```
