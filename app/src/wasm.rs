@@ -1,1 +1,0 @@
-// todo write wasm config and compile functions
