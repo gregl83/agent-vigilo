@@ -235,28 +235,61 @@
 //     ))
 // }
 
-
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::fs;
 use tokio::sync::OnceCell;
 use tracing::{debug, error};
-use wasmtime::{Config, Engine};
+use wasmtime::{Config, Engine, component};
+
+
+pub struct Component {
+    pub hash: String,
+    pub wasm_bytes: Vec<u8>,
+    pub serialized: Vec<u8>,
+    pub component: component::Component,
+}
 
 pub struct Wasm {
-    engine: Mutex<Engine>,
+    engine: Engine,
+    fingerprint: String,
 }
 
 impl Wasm {
-    pub fn new() -> Self {
-        Self {
-            engine: Mutex::new(
-                Engine::new(
-                    &Config::default(),
-                ).unwrap()
-            )
-        }
+    pub fn new() -> anyhow::Result<Self> {
+        let mut config = Config::new();
+    config.wasm_component_model(true);
+
+        let engine = Engine::new(&config)?;
+
+        let mut hasher = DefaultHasher::new();
+        engine.precompile_compatibility_hash().hash(&mut hasher);
+        let fingerprint = format!("{:x}-{}", hasher.finish(), std::env::consts::ARCH);
+
+        Ok(
+            Self {
+                engine,
+                fingerprint,
+            }
+        )
     }
 
-    // todo - wasm build functionality
+    pub fn build(&self, path: PathBuf) -> anyhow::Result<(Component)> {
+        let wasm_bytes = fs::read(path)?;
+
+        let wasm_hash = blake3::hash(&wasm_bytes).to_hex().to_string();
+
+        let component = component::Component::new(&self.engine, &wasm_bytes)?;
+
+        Ok(
+            Component{
+                hash: wasm_hash,
+                wasm_bytes,
+                serialized: component.serialize()?,
+                component,
+            }
+        )
+    }
 }
 
 pub struct Context {
@@ -267,7 +300,7 @@ impl Context {
     pub async fn get(&self) -> anyhow::Result<&Wasm> {
         self.cell.get_or_try_init(|| async {
             debug!("initializing wasm engine");
-            Ok(Wasm::new())
+            Ok(Wasm::new()?)
         }).await
     }
 }
