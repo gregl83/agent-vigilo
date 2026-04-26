@@ -1,20 +1,14 @@
-use std::{
-    fs,
-    path::PathBuf,
-    hash::{DefaultHasher, Hash, Hasher},
-};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
-use clap::{crate_name, crate_version, Args, Subcommand};
-use tracing::info;
-use wasmtime::{
-    Config,
-    component::Component,
-    Engine,
+use clap::{
+    Args,
+    Subcommand,
 };
+use tracing::info;
 
 use crate::context::Context;
-use super::args::parsers::parse_filepath;
+use super::args::parsers::parse_dir;
 use super::Executable;
 
 
@@ -22,8 +16,8 @@ use super::Executable;
 pub(crate) enum SubCommand {
     /// Add evaluator to system
     Add {
-        /// Path to evaluator
-        #[arg(value_parser = parse_filepath)]
+        /// Path to evaluator crate
+        #[arg(value_parser = parse_dir)]
         evaluator_path: PathBuf,
     },
     /// Show system evaluator
@@ -54,35 +48,18 @@ pub(crate) enum SubCommand {
 
 #[async_trait]
 impl Executable for SubCommand {
-    async fn exec(self, _context: Context) -> anyhow::Result<()> {
+    async fn exec(self, context: Context) -> anyhow::Result<()> {
         match self {
             SubCommand::Add{ evaluator_path } => {
                 println!("executing run");
 
                 info!("adding evaluator: {}", evaluator_path.display());
 
-                let wasm_bytes = fs::read(evaluator_path)?;
-
-                let mut config = Config::new();
-                config.wasm_component_model(true);
-
-                let engine = Engine::new(&config)?;
-
-                let component = Component::new(
-                    &engine,
-                    &wasm_bytes
+                let component = context.wasm().await?.build(
+                    evaluator_path
                 )?;
 
-                fn engine_fingerprint(engine: &Engine) -> String {
-                    let mut hasher = DefaultHasher::new();
-                    engine.precompile_compatibility_hash().hash(&mut hasher);
-                    format!("{:x}-{}", hasher.finish(), std::env::consts::ARCH)
-                }
-
-                let hash = blake3::hash(&wasm_bytes).to_hex().to_string();
-                let compiled = component.serialize()?;
-                let fingerprint = engine_fingerprint(&engine);
-                println!("{}", fingerprint);
+                println!("component wasm hash: {}", component.wasm_hash);
 
                 // todo - move wasm code to module
 

@@ -210,6 +210,8 @@ use std::{
     },
     path::PathBuf,
 };
+
+use cargo_toml::Manifest;
 use tokio::sync::OnceCell;
 use tracing::debug;
 use wasmtime::{
@@ -219,6 +221,19 @@ use wasmtime::{
 };
 
 
+fn get_crate_identity(crate_root: &PathBuf) -> anyhow::Result<(String, String)> {
+    let manifest_path = crate_root.join("Cargo.toml");
+    let manifest = Manifest::from_path(manifest_path)?;
+
+    let package = manifest.package.ok_or_else(|| {
+        anyhow::anyhow!("no [package] section found in Cargo.toml")
+    })?;
+
+    Ok(
+        (package.name, package.version.get()?.to_string())
+    )
+}
+
 fn get_engine_fingerprint(engine: &Engine) -> String {
     let mut hasher = DefaultHasher::new();
     engine.precompile_compatibility_hash().hash(&mut hasher);
@@ -226,10 +241,12 @@ fn get_engine_fingerprint(engine: &Engine) -> String {
 }
 
 pub struct Component {
-    pub hash: String,
+    pub name: String,
+    pub version: String,
+    pub component: component::Component,
+    pub wasm_hash: String,
     pub wasm_bytes: Vec<u8>,
     pub serialized: Vec<u8>,
-    pub component: component::Component,
 }
 
 #[derive(Clone)]
@@ -262,19 +279,26 @@ impl Wasm {
         )
     }
 
-    pub fn build(&self, path: PathBuf) -> anyhow::Result<Component> {
-        let wasm_bytes = fs::read(path)?;
+    pub fn build(&self, crate_path: PathBuf) -> anyhow::Result<Component> {
+        let (name, version) = get_crate_identity(&crate_path)?;
 
+        // todo - determine wasm path using build profile contexts
+        let wasm_path = crate_path.join("wasm32-wasi");
+
+        let wasm_bytes = fs::read(wasm_path)?;
         let wasm_hash = blake3::hash(&wasm_bytes).to_hex().to_string();
 
         let component = component::Component::new(&self.engine, &wasm_bytes)?;
+        let serialized = component.serialize()?;
 
         Ok(
             Component{
-                hash: wasm_hash,
-                wasm_bytes,
-                serialized: component.serialize()?,
+                name,
+                version,
                 component,
+                wasm_hash,
+                wasm_bytes,
+                serialized,
             }
         )
     }
@@ -295,3 +319,75 @@ impl Context {
         }).await
     }
 }
+
+/*
+use std::path::{Path, PathBuf};
+use cargo_metadata::MetadataCommand;
+
+impl Wasm {
+    pub fn find_wasm_artifact(crate_root: &Path, is_release: bool) -> anyhow::Result<PathBuf> {
+        // 1. Fetch metadata for the crate
+        let metadata = MetadataCommand::new()
+            .manifest_path(crate_root.join("Cargo.toml"))
+            .exec()?;
+
+        // 2. Get the target directory (absolute path)
+        let target_dir = metadata.target_directory.as_std_path();
+
+        // 3. Identify the package name
+        let root_package = metadata.root_package()
+            .ok_or_else(|| anyhow::anyhow!("Could not find root package"))?;
+
+        // 4. Transform name: Cargo replaces '-' with '_' for filenames
+        let file_name = format!("{}.wasm", root_package.name.replace("-", "_"));
+
+        // 5. Construct the final path
+        // Common target for components is wasm32-wasip1
+        let profile = if is_release { "release" } else { "debug" };
+
+        let wasm_path = target_dir
+            .join("wasm32-wasip1")
+            .join(profile)
+            .join(file_name);
+
+        if !wasm_path.exists() {
+            return Err(anyhow::anyhow!(
+                "WASM artifact not found at {:?}. Did you run 'cargo component build'?",
+                wasm_path
+            ));
+        }
+
+        Ok(wasm_path)
+    }
+}
+
+
+use clap::Parser;
+
+#[derive(Parser)]
+pub struct Cli {
+    /// Build artifacts in release mode, with optimizations
+    #[arg(short, long)]
+    pub release: bool,
+
+    /// Build artifacts with the specified Cargo profile
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+
+    // ... other args like path ...
+}
+
+impl Cli {
+    /// Resolve which folder name to look for in the target directory
+    pub fn resolve_profile(&self) -> &str {
+        if let Some(ref p) = self.profile {
+            p
+        } else if self.release {
+            "release"
+        } else {
+            "debug"
+        }
+    }
+}
+ */
+

@@ -1,5 +1,5 @@
 [package]
-name = "agent-vigilo"
+name = "vigilo"
 version = "0.1.0"
 authors = ["Gregory Langlais <_@gregorylanglais.com>"]
 edition = "2024"
@@ -11,7 +11,8 @@ keywords = [
     "ai",
     "models",
     "evaluations",
-    "gating"
+    "gating",
+    "vigilo",
 ]
 repository = "https://github.com/gregl83/agent-vigilo"
 homepage = "https://agentvigilo.com"
@@ -26,6 +27,8 @@ strip = true
 [dependencies]
 anyhow = { version = "1.0.102" }
 async-trait = {  version = "0.1.89" }
+cargo_metadata = { version = "0.23.1" }
+cargo_toml = { version = "0.22.3" }
 clap = { version = "4.6.1", features = ["cargo", "derive", "env"] }
 moka = { version = "0.12.15", features = ["future"] }
 sqlx = { version = "0.8.6", features = ["macros", "migrate", "postgres", "runtime-tokio-rustls"] }
