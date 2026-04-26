@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-mod database;
-mod output;
-mod registry;
-mod wasm;
+pub(crate) mod database;
+pub(crate) mod output;
+pub(crate) mod registry;
+pub(crate) mod wasm;
 
 struct ContextInner {
     pub db: database::Context,
@@ -16,7 +16,7 @@ struct ContextInner {
 pub(crate) struct Context(Arc<ContextInner>);
 
 impl Context {
-    pub fn new(db_uri: String) -> Self {
+    pub fn new(db_uri: String, wasm_config: wasm::Config) -> Self {
         Self(Arc::new(ContextInner {
             db: database::Context {
                 uri: db_uri,
@@ -30,6 +30,7 @@ impl Context {
             },
             wasm: wasm::Context{
                 cell: Default::default(),
+                config: wasm_config,
             },
         }))
     }

@@ -198,50 +198,32 @@
 //         Ok(())
 //     }
 // }
-//
-//
-// fn engine_fingerprint(engine: &Engine) -> String {
-//     let mut hasher = DefaultHasher::new();
-//     engine.precompile_compatibility_hash().hash(&mut hasher);
-//     format!("{:x}-{}", hasher.finish(), std::env::consts::ARCH)
-// }
-//
-// pub struct Wasm {
-//     engine: Engine,
-//     component: Component,
-//     fingerprint: String,
-//     hash: String, // store as string in postgres?  BYTEA
-//     serialized: Vec<u8>,
-// }
-//
-// fn build(path: &PathBuf) -> anyhow::Result<(String, String, Vec<u8>, Vec<u8>)> {
-//     let wasm_bytes = fs::read(path)?;
-//
-//     let mut config = Config::new();
-//     config.wasm_component_model(true);
-//
-//     let engine = Engine::new(&config)?;
-//
-//     let component = Component::new(
-//         &engine,
-//         &wasm_bytes
-//     )?;
-//
-//     Ok((
-//         engine_fingerprint(&engine),
-//         blake3::hash(&wasm_bytes).to_hex().to_string(),
-//         wasm_bytes,
-//         component.serialize()?
-//     ))
-// }
 
-use std::path::PathBuf;
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::fs;
+
+use std::{
+    env::consts::ARCH,
+    fs,
+    hash::{
+        DefaultHasher,
+        Hash,
+        Hasher,
+    },
+    path::PathBuf,
+};
 use tokio::sync::OnceCell;
-use tracing::{debug, error};
-use wasmtime::{Config, Engine, component};
+use tracing::debug;
+use wasmtime::{
+    component,
+    Config as EngineConfig,
+    Engine,
+};
 
+
+fn get_engine_fingerprint(engine: &Engine) -> String {
+    let mut hasher = DefaultHasher::new();
+    engine.precompile_compatibility_hash().hash(&mut hasher);
+    format!("{:x}-{}", hasher.finish(), ARCH)
+}
 
 pub struct Component {
     pub hash: String,
@@ -250,21 +232,27 @@ pub struct Component {
     pub component: component::Component,
 }
 
+#[derive(Clone)]
+pub struct Config {}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {}
+    }
+}
+
 pub struct Wasm {
     engine: Engine,
     fingerprint: String,
 }
 
 impl Wasm {
-    pub fn new() -> anyhow::Result<Self> {
-        let mut config = Config::new();
-    config.wasm_component_model(true);
+    pub fn new(_config: Config) -> anyhow::Result<Self> {
+        let mut engine_config = EngineConfig::new();
+        engine_config.wasm_component_model(true);
 
-        let engine = Engine::new(&config)?;
-
-        let mut hasher = DefaultHasher::new();
-        engine.precompile_compatibility_hash().hash(&mut hasher);
-        let fingerprint = format!("{:x}-{}", hasher.finish(), std::env::consts::ARCH);
+        let engine = Engine::new(&engine_config)?;
+        let fingerprint = get_engine_fingerprint(&engine);
 
         Ok(
             Self {
@@ -274,7 +262,7 @@ impl Wasm {
         )
     }
 
-    pub fn build(&self, path: PathBuf) -> anyhow::Result<(Component)> {
+    pub fn build(&self, path: PathBuf) -> anyhow::Result<Component> {
         let wasm_bytes = fs::read(path)?;
 
         let wasm_hash = blake3::hash(&wasm_bytes).to_hex().to_string();
@@ -292,15 +280,18 @@ impl Wasm {
     }
 }
 
-pub struct Context {
+pub(crate) struct Context {
     pub(crate) cell: OnceCell<Wasm>,
+    pub(crate) config: Config,
 }
 
 impl Context {
     pub async fn get(&self) -> anyhow::Result<&Wasm> {
         self.cell.get_or_try_init(|| async {
             debug!("initializing wasm engine");
-            Ok(Wasm::new()?)
+            Ok(
+                Wasm::new(self.config.clone())?
+            )
         }).await
     }
 }

@@ -20,7 +20,10 @@ use cli::{
     Executable,
 };
 mod context;
-use context::Context;
+use context::{
+    Context,
+    wasm,
+};
 mod db;
 
 
@@ -58,8 +61,10 @@ async fn main() -> ExitCode {
         Ok(app) => {
             init_logger(app.quiet, app.verbose);
 
+            let wasm_config = wasm::Config::default();
             let context = Context::new(
                 app.database_uri.clone(),
+                wasm_config,
             );
 
             match app.exec(context).await {
