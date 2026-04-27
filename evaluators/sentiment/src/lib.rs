@@ -3,13 +3,13 @@ wit_bindgen::generate!({
     world: "evaluator-world",
 });
 
-use exports::app::evaluator::evaluator::{
+use exports::vigilo::evaluator::evaluator::{
     Guest,
     Input,
     Output,
 };
-use app::evaluator::types::Data;
-use app::evaluator::executor;
+use vigilo::evaluator::types::Data;
+use vigilo::evaluator::executor;
 
 struct Evaluator;
 

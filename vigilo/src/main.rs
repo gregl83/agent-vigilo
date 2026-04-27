@@ -2,6 +2,7 @@ use std::{
     io::stderr,
     process::ExitCode,
 };
+
 use clap::Parser;
 use tracing::{
     error,
