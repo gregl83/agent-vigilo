@@ -211,6 +211,7 @@ use std::{
     path::PathBuf,
 };
 
+use cargo_metadata::MetadataCommand;
 use cargo_toml::Manifest;
 use tokio::sync::OnceCell;
 use tracing::debug;
@@ -220,18 +221,44 @@ use wasmtime::{
     Engine,
 };
 
+use super::super::manifest::read_manifest;
 
-fn get_crate_identity(crate_root: &PathBuf) -> anyhow::Result<(String, String)> {
-    let manifest_path = crate_root.join("Cargo.toml");
-    let manifest = Manifest::from_path(manifest_path)?;
 
-    let package = manifest.package.ok_or_else(|| {
-        anyhow::anyhow!("no [package] section found in Cargo.toml")
-    })?;
+struct PackageMetadata {
+    name: String,
+    version: String,
+    target_dir: PathBuf,
+}
 
-    Ok(
-        (package.name, package.version.get()?.to_string())
-    )
+fn get_package_metadata(package_path: &PathBuf, manifest_file: &String) -> anyhow::Result<PackageMetadata> {
+    match manifest_file.as_str() {
+        "Cargo.toml" => {
+            let manifest_path = package_path.join(manifest_file);
+
+            let metadata = MetadataCommand::new()
+                .manifest_path(&manifest_path)
+                .exec()?;
+
+            let target_dir = metadata.target_directory;
+
+            let manifest = Manifest::from_path(&manifest_path)?;
+
+            let package = manifest.package.ok_or_else(|| {
+                anyhow::anyhow!("no [package] section found in Cargo.toml")
+            })?;
+
+            Ok(
+                PackageMetadata {
+                    name: package.name,
+                    version: package.version.get()?.to_string(),
+                    target_dir: target_dir.into_std_path_buf(),
+                }
+            )
+        }
+        _ => {
+            Err(anyhow::anyhow!("Vigilo.toml [package] manifest {} is unsupported", manifest_file))
+        }
+    }
 }
 
 fn get_engine_fingerprint(engine: &Engine) -> String {
@@ -279,22 +306,31 @@ impl Wasm {
         )
     }
 
-    pub fn build(&self, crate_path: PathBuf) -> anyhow::Result<Component> {
-        let (name, version) = get_crate_identity(&crate_path)?;
+    pub fn build(&self, package_path: PathBuf, profile: String) -> anyhow::Result<Component> {
+        let manifest = read_manifest(&package_path)?;
+        let manifest_profile = manifest.get_profile(profile)?;
 
-        // todo - determine wasm path using build profile contexts
-        let wasm_path = crate_path.join("wasm32-wasi");
+        let package_metadata = get_package_metadata(
+            &package_path,
+            &manifest.package.manifest,
+        )?;
 
+        let wasm_path = package_metadata.target_dir.join(&manifest_profile.wasm);
         let wasm_bytes = fs::read(wasm_path)?;
         let wasm_hash = blake3::hash(&wasm_bytes).to_hex().to_string();
 
-        let component = component::Component::new(&self.engine, &wasm_bytes)?;
+        // todo - compare component to package metadata age for stale wasm check
+
+        let component = component::Component::new(
+            &self.engine,
+            &wasm_bytes,
+        )?;
         let serialized = component.serialize()?;
 
         Ok(
             Component{
-                name,
-                version,
+                name: package_metadata.name,
+                version: package_metadata.version,
                 component,
                 wasm_hash,
                 wasm_bytes,

@@ -2,7 +2,7 @@
 manifest = "Cargo.toml"
 
 [profile.dev]
-wasm = "target/wasm32-wasip1/debug/sentiment.wasm"
+wasm = "wasm32-wasip2/debug/sentiment.wasm"
 
 [profile.release]
-wasm = "target/wasm32-wasip1/release/sentiment.wasm"
+wasm = "wasm32-wasip2/release/sentiment.wasm"

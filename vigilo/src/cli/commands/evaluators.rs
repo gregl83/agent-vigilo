@@ -12,6 +12,13 @@ use super::args::parsers::parse_dir;
 use super::Executable;
 
 
+fn get_manifest_profile(release: bool, profile: Option<String>) -> String {
+    match release {
+        true => "release".to_string(),
+        false => profile.unwrap_or_else(|| "dev".to_string())
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum SubCommand {
     /// Add evaluator to system
@@ -19,6 +26,14 @@ pub(crate) enum SubCommand {
         /// Path to evaluator crate
         #[arg(value_parser = parse_dir)]
         evaluator_path: PathBuf,
+
+        /// Add evaluator built in release mode, with optimizations
+        #[arg(short, long)]
+        release: bool,
+
+        /// Add evaluator built with the specified profile
+        #[arg(long, value_name = "PROFILE", conflicts_with = "release")]
+        profile: Option<String>,
     },
     /// Show system evaluator
     Show {
@@ -50,18 +65,18 @@ pub(crate) enum SubCommand {
 impl Executable for SubCommand {
     async fn exec(self, context: Context) -> anyhow::Result<()> {
         match self {
-            SubCommand::Add{ evaluator_path } => {
+            SubCommand::Add{ evaluator_path, release, profile } => {
                 println!("executing run");
 
                 info!("adding evaluator: {}", evaluator_path.display());
 
+                let profile = get_manifest_profile(release, profile);
                 let component = context.wasm().await?.build(
-                    evaluator_path
+                    evaluator_path,
+                    profile,
                 )?;
 
-                println!("component wasm hash: {}", component.wasm_hash);
-
-                // todo - move wasm code to module
+                // todo - persist component in database
 
                 // Example async work
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
