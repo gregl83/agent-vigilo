@@ -1,4 +1,4 @@
-package vigilo:evaluator;
+package vigilo:evaluator@0.1.0;
 
 // data types
 interface types {
