@@ -26,6 +26,7 @@ use context::{
     wasm,
 };
 mod db;
+mod manifest;
 
 
 fn init_logger(quiet: bool, verbose: u8) {
