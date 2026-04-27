@@ -210,7 +210,7 @@ use std::{
     },
     path::PathBuf,
 };
-
+use std::time::SystemTime;
 use cargo_metadata::MetadataCommand;
 use cargo_toml::Manifest;
 use tokio::sync::OnceCell;
@@ -228,12 +228,15 @@ struct PackageMetadata {
     name: String,
     version: String,
     target_dir: PathBuf,
+    modified: SystemTime,
 }
 
 fn get_package_metadata(package_path: &PathBuf, manifest_file: &String) -> anyhow::Result<PackageMetadata> {
     match manifest_file.as_str() {
         "Cargo.toml" => {
             let manifest_path = package_path.join(manifest_file);
+
+            let fs_metadata = fs::metadata(&manifest_path)?;
 
             let metadata = MetadataCommand::new()
                 .manifest_path(&manifest_path)
@@ -252,6 +255,7 @@ fn get_package_metadata(package_path: &PathBuf, manifest_file: &String) -> anyho
                     name: package.name,
                     version: package.version.get()?.to_string(),
                     target_dir: target_dir.into_std_path_buf(),
+                    modified: fs_metadata.modified()?,
                 }
             )
         }
@@ -316,10 +320,14 @@ impl Wasm {
         )?;
 
         let wasm_path = package_metadata.target_dir.join(&manifest_profile.wasm);
+
+        let fs_wasm_metadata = fs::metadata(&wasm_path)?;
+        let wasm_modified = fs_wasm_metadata.modified()?;
+        if package_metadata.modified > wasm_modified {
+            return Err(anyhow::anyhow!("evaluation manifest was modified after wasm build"));
+        }
         let wasm_bytes = fs::read(wasm_path)?;
         let wasm_hash = blake3::hash(&wasm_bytes).to_hex().to_string();
-
-        // todo - compare component to package metadata age for stale wasm check
 
         let component = component::Component::new(
             &self.engine,
