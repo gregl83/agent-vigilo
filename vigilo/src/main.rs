@@ -27,6 +27,7 @@ use context::{
 };
 mod db;
 mod manifest;
+mod models;
 
 
 fn init_logger(quiet: bool, verbose: u8) {
