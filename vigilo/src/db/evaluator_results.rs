@@ -1,4 +1,5 @@
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::models::evaluator_result::{
     EvaluatorResult,
@@ -6,63 +7,21 @@ use crate::models::evaluator_result::{
     EvaluatorResultPatch,
 };
 
-const SELECT_COLUMNS: &str = r#"
-    id::text AS id,
-    run_id::text AS run_id,
-    execution_id::text AS execution_id,
-    attempt_id::text AS attempt_id,
-    evaluator_id,
-    evaluator_version,
-    evaluator_profile_id,
-    evaluator_profile_version,
-    evaluator_interface_version,
-    evaluator_runtime_version,
-    dimension,
-    status::text AS status,
-    blocking,
-    score_kind,
-    raw_score,
-    raw_score_min,
-    raw_score_max,
-    normalized_score,
-    weight,
-    severity::text AS severity,
-    failure_category,
-    reason,
-    evidence,
-    raw_evaluator_output,
-    created_at::text AS created_at
-"#;
-
-
 pub(crate) async fn insert_evaluator_result(
     db: &PgPool,
     draft: &EvaluatorResultDraft,
 ) -> anyhow::Result<EvaluatorResult> {
-    let result = sqlx::query_as::<_, EvaluatorResult>(&format!(
+    let result = sqlx::query_as::<_, EvaluatorResult>(
         r#"
         INSERT INTO evaluator_results (
-            run_id,
-            execution_id,
-            attempt_id,
-            evaluator_id,
-            evaluator_version,
-            evaluator_profile_id,
-            evaluator_profile_version,
-            evaluator_interface_version,
-            evaluator_runtime_version,
-            dimension,
-            status,
-            blocking,
-            score_kind,
-            raw_score,
-            raw_score_min,
-            raw_score_max,
-            normalized_score,
-            weight,
-            severity,
-            failure_category,
-            reason
+            run_id, execution_id, attempt_id,
+            evaluator_id, evaluator_version,
+            evaluator_profile_id, evaluator_profile_version,
+            evaluator_interface_version, evaluator_runtime_version,
+            dimension, status, blocking, score_kind,
+            raw_score, raw_score_min, raw_score_max,
+            normalized_score, weight, severity,
+            failure_category, reason
         )
         VALUES (
             $1::uuid,
@@ -87,14 +46,38 @@ pub(crate) async fn insert_evaluator_result(
             $20,
             $21
         )
-        RETURNING {}
+        RETURNING
+            id,
+            run_id,
+            execution_id,
+            attempt_id,
+            evaluator_id::uuid as evaluator_id,
+            evaluator_version,
+            evaluator_profile_id,
+            evaluator_profile_version,
+            evaluator_interface_version,
+            evaluator_runtime_version,
+            dimension,
+            status::text as status,
+            blocking,
+            score_kind,
+            raw_score,
+            raw_score_min,
+            raw_score_max,
+            normalized_score,
+            weight,
+            severity::text as severity,
+            failure_category,
+            reason,
+            evidence,
+            raw_evaluator_output,
+            created_at
         "#,
-        SELECT_COLUMNS
-    ))
-    .bind(&draft.run_id)
-    .bind(&draft.execution_id)
-    .bind(&draft.attempt_id)
-    .bind(&draft.evaluator_id)
+    )
+    .bind(draft.run_id)
+    .bind(draft.execution_id)
+    .bind(draft.attempt_id)
+    .bind(draft.evaluator_id.to_string())
     .bind(&draft.evaluator_version)
     .bind(&draft.evaluator_profile_id)
     .bind(&draft.evaluator_profile_version)
@@ -120,16 +103,40 @@ pub(crate) async fn insert_evaluator_result(
 
 pub(crate) async fn select_evaluator_result_by_id(
     db: &PgPool,
-    id: &str,
+    id: Uuid,
 ) -> anyhow::Result<Option<EvaluatorResult>> {
-    let result = sqlx::query_as::<_, EvaluatorResult>(&format!(
+    let result = sqlx::query_as::<_, EvaluatorResult>(
         r#"
-        SELECT {}
+        SELECT
+            id,
+            run_id,
+            execution_id,
+            attempt_id,
+            evaluator_id::uuid as evaluator_id,
+            evaluator_version,
+            evaluator_profile_id,
+            evaluator_profile_version,
+            evaluator_interface_version,
+            evaluator_runtime_version,
+            dimension,
+            status::text as status,
+            blocking,
+            score_kind,
+            raw_score,
+            raw_score_min,
+            raw_score_max,
+            normalized_score,
+            weight,
+            severity::text as severity,
+            failure_category,
+            reason,
+            evidence,
+            raw_evaluator_output,
+            created_at
         FROM evaluator_results
         WHERE id = $1::uuid
         "#,
-        SELECT_COLUMNS
-    ))
+    )
     .bind(id)
     .fetch_optional(db)
     .await?;
@@ -139,17 +146,41 @@ pub(crate) async fn select_evaluator_result_by_id(
 
 pub(crate) async fn list_evaluator_results_by_attempt_id(
     db: &PgPool,
-    attempt_id: &str,
+    attempt_id: Uuid,
 ) -> anyhow::Result<Vec<EvaluatorResult>> {
-    let results = sqlx::query_as::<_, EvaluatorResult>(&format!(
+    let results = sqlx::query_as::<_, EvaluatorResult>(
         r#"
-        SELECT {}
+        SELECT
+            id,
+            run_id,
+            execution_id,
+            attempt_id,
+            evaluator_id::uuid as evaluator_id,
+            evaluator_version,
+            evaluator_profile_id,
+            evaluator_profile_version,
+            evaluator_interface_version,
+            evaluator_runtime_version,
+            dimension,
+            status::text as status,
+            blocking,
+            score_kind,
+            raw_score,
+            raw_score_min,
+            raw_score_max,
+            normalized_score,
+            weight,
+            severity::text as severity,
+            failure_category,
+            reason,
+            evidence,
+            raw_evaluator_output,
+            created_at
         FROM evaluator_results
         WHERE attempt_id = $1::uuid
         ORDER BY created_at ASC
         "#,
-        SELECT_COLUMNS
-    ))
+    )
     .bind(attempt_id)
     .fetch_all(db)
     .await?;
@@ -159,19 +190,43 @@ pub(crate) async fn list_evaluator_results_by_attempt_id(
 
 pub(crate) async fn update_evaluator_result_reason(
     db: &PgPool,
-    id: &str,
+    id: Uuid,
     patch: &EvaluatorResultPatch,
 ) -> anyhow::Result<Option<EvaluatorResult>> {
-    let result = sqlx::query_as::<_, EvaluatorResult>(&format!(
+    let result = sqlx::query_as::<_, EvaluatorResult>(
         r#"
         UPDATE evaluator_results
         SET reason = $2,
             failure_category = $3
         WHERE id = $1::uuid
-        RETURNING {}
+        RETURNING
+            id,
+            run_id,
+            execution_id,
+            attempt_id,
+            evaluator_id::uuid as evaluator_id,
+            evaluator_version,
+            evaluator_profile_id,
+            evaluator_profile_version,
+            evaluator_interface_version,
+            evaluator_runtime_version,
+            dimension,
+            status::text as status,
+            blocking,
+            score_kind,
+            raw_score,
+            raw_score_min,
+            raw_score_max,
+            normalized_score,
+            weight,
+            severity::text as severity,
+            failure_category,
+            reason,
+            evidence,
+            raw_evaluator_output,
+            created_at
         "#,
-        SELECT_COLUMNS
-    ))
+    )
     .bind(id)
     .bind(&patch.reason)
     .bind(&patch.failure_category)
@@ -181,7 +236,7 @@ pub(crate) async fn update_evaluator_result_reason(
     Ok(result)
 }
 
-pub(crate) async fn delete_evaluator_result_by_id(db: &PgPool, id: &str) -> anyhow::Result<u64> {
+pub(crate) async fn delete_evaluator_result_by_id(db: &PgPool, id: Uuid) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
         DELETE FROM evaluator_results
@@ -194,4 +249,3 @@ pub(crate) async fn delete_evaluator_result_by_id(db: &PgPool, id: &str) -> anyh
 
     Ok(result.rows_affected())
 }
-

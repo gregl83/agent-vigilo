@@ -1,4 +1,5 @@
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::models::execution_aggregate::{
     ExecutionAggregate,
@@ -6,43 +7,34 @@ use crate::models::execution_aggregate::{
     ExecutionAggregatePatch,
 };
 
-const SELECT_COLUMNS: &str = r#"
-    execution_id::text AS execution_id,
-    run_id::text AS run_id,
-    attempt_id::text AS attempt_id,
-    overall_status::text AS overall_status,
-    aggregate_score,
-    evaluator_result_count,
-    dimension_scores,
-    blocking_failures,
-    summary,
-    created_at::text AS created_at,
-    updated_at::text AS updated_at
-"#;
-
-
 pub(crate) async fn insert_execution_aggregate(
     db: &PgPool,
     draft: &ExecutionAggregateDraft,
 ) -> anyhow::Result<ExecutionAggregate> {
-    let aggregate = sqlx::query_as::<_, ExecutionAggregate>(&format!(
+    let aggregate = sqlx::query_as::<_, ExecutionAggregate>(
         r#"
         INSERT INTO execution_aggregates (
+            execution_id, run_id, attempt_id,
+            overall_status, aggregate_score, evaluator_result_count
+        )
+        VALUES ($1::uuid, $2::uuid, $3::uuid, $4::evaluation_status, $5, $6)
+        RETURNING
             execution_id,
             run_id,
             attempt_id,
-            overall_status,
+            overall_status::text as overall_status,
             aggregate_score,
-            evaluator_result_count
-        )
-        VALUES ($1::uuid, $2::uuid, $3::uuid, $4::evaluation_status, $5, $6)
-        RETURNING {}
+            evaluator_result_count,
+            dimension_scores,
+            blocking_failures,
+            summary,
+            created_at,
+            updated_at
         "#,
-        SELECT_COLUMNS
-    ))
-    .bind(&draft.execution_id)
-    .bind(&draft.run_id)
-    .bind(&draft.attempt_id)
+    )
+    .bind(draft.execution_id)
+    .bind(draft.run_id)
+    .bind(draft.attempt_id)
     .bind(&draft.overall_status)
     .bind(draft.aggregate_score)
     .bind(draft.evaluator_result_count)
@@ -54,16 +46,26 @@ pub(crate) async fn insert_execution_aggregate(
 
 pub(crate) async fn select_execution_aggregate_by_execution_id(
     db: &PgPool,
-    execution_id: &str,
+    execution_id: Uuid,
 ) -> anyhow::Result<Option<ExecutionAggregate>> {
-    let aggregate = sqlx::query_as::<_, ExecutionAggregate>(&format!(
+    let aggregate = sqlx::query_as::<_, ExecutionAggregate>(
         r#"
-        SELECT {}
+        SELECT
+            execution_id,
+            run_id,
+            attempt_id,
+            overall_status::text as overall_status,
+            aggregate_score,
+            evaluator_result_count,
+            dimension_scores,
+            blocking_failures,
+            summary,
+            created_at,
+            updated_at
         FROM execution_aggregates
         WHERE execution_id = $1::uuid
         "#,
-        SELECT_COLUMNS
-    ))
+    )
     .bind(execution_id)
     .fetch_optional(db)
     .await?;
@@ -73,17 +75,27 @@ pub(crate) async fn select_execution_aggregate_by_execution_id(
 
 pub(crate) async fn list_execution_aggregates_by_run_id(
     db: &PgPool,
-    run_id: &str,
+    run_id: Uuid,
 ) -> anyhow::Result<Vec<ExecutionAggregate>> {
-    let aggregates = sqlx::query_as::<_, ExecutionAggregate>(&format!(
+    let aggregates = sqlx::query_as::<_, ExecutionAggregate>(
         r#"
-        SELECT {}
+        SELECT
+            execution_id,
+            run_id,
+            attempt_id,
+            overall_status::text as overall_status,
+            aggregate_score,
+            evaluator_result_count,
+            dimension_scores,
+            blocking_failures,
+            summary,
+            created_at,
+            updated_at
         FROM execution_aggregates
         WHERE run_id = $1::uuid
         ORDER BY updated_at DESC
         "#,
-        SELECT_COLUMNS
-    ))
+    )
     .bind(run_id)
     .fetch_all(db)
     .await?;
@@ -93,10 +105,10 @@ pub(crate) async fn list_execution_aggregates_by_run_id(
 
 pub(crate) async fn update_execution_aggregate(
     db: &PgPool,
-    execution_id: &str,
+    execution_id: Uuid,
     patch: &ExecutionAggregatePatch,
 ) -> anyhow::Result<Option<ExecutionAggregate>> {
-    let aggregate = sqlx::query_as::<_, ExecutionAggregate>(&format!(
+    let aggregate = sqlx::query_as::<_, ExecutionAggregate>(
         r#"
         UPDATE execution_aggregates
         SET overall_status = $2::evaluation_status,
@@ -104,10 +116,20 @@ pub(crate) async fn update_execution_aggregate(
             evaluator_result_count = $4,
             updated_at = now()
         WHERE execution_id = $1::uuid
-        RETURNING {}
+        RETURNING
+            execution_id,
+            run_id,
+            attempt_id,
+            overall_status::text as overall_status,
+            aggregate_score,
+            evaluator_result_count,
+            dimension_scores,
+            blocking_failures,
+            summary,
+            created_at,
+            updated_at
         "#,
-        SELECT_COLUMNS
-    ))
+    )
     .bind(execution_id)
     .bind(&patch.overall_status)
     .bind(patch.aggregate_score)
@@ -120,7 +142,7 @@ pub(crate) async fn update_execution_aggregate(
 
 pub(crate) async fn delete_execution_aggregate_by_execution_id(
     db: &PgPool,
-    execution_id: &str,
+    execution_id: Uuid,
 ) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
@@ -134,4 +156,3 @@ pub(crate) async fn delete_execution_aggregate_by_execution_id(
 
     Ok(result.rows_affected())
 }
-

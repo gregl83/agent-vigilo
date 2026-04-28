@@ -1,4 +1,5 @@
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::models::execution::{
     Execution,
@@ -6,48 +7,40 @@ use crate::models::execution::{
     ExecutionPatch,
 };
 
-const SELECT_COLUMNS: &str = r#"
-    id::text AS id,
-    run_id::text AS run_id,
-    case_id,
-    task_type,
-    tags,
-    input_payload,
-    expected_output,
-    case_metadata,
-    evaluation_profile_id,
-    evaluation_profile_version,
-    evaluator_manifest,
-    expected_evaluator_count,
-    status::text AS status,
-    current_attempt_no,
-    current_attempt_id::text AS current_attempt_id,
-    last_error_message,
-    created_at::text AS created_at,
-    started_at::text AS started_at,
-    completed_at::text AS completed_at,
-    updated_at::text AS updated_at
-"#;
-
-
 pub(crate) async fn insert_execution(db: &PgPool, draft: &ExecutionDraft) -> anyhow::Result<Execution> {
-    let execution = sqlx::query_as::<_, Execution>(&format!(
+    let execution = sqlx::query_as::<_, Execution>(
         r#"
         INSERT INTO executions (
-            run_id,
-            case_id,
-            task_type,
-            evaluation_profile_id,
-            evaluation_profile_version,
+            run_id, case_id, task_type,
+            evaluation_profile_id, evaluation_profile_version,
             expected_evaluator_count
         )
-        VALUES ($1::uuid, $2, $3, $4, $5, $6)
-        RETURNING {}
+        VALUES ($1::uuid, $2::text, $3, $4, $5, $6)
+        RETURNING
+            id,
+            run_id,
+            case_id::uuid as case_id,
+            task_type,
+            tags,
+            input_payload,
+            expected_output,
+            case_metadata,
+            evaluation_profile_id,
+            evaluation_profile_version,
+            evaluator_manifest,
+            expected_evaluator_count,
+            status::text as status,
+            current_attempt_no,
+            current_attempt_id,
+            last_error_message,
+            created_at,
+            started_at,
+            completed_at,
+            updated_at
         "#,
-        SELECT_COLUMNS
-    ))
-    .bind(&draft.run_id)
-    .bind(&draft.case_id)
+    )
+    .bind(draft.run_id)
+    .bind(draft.case_id.to_string())
     .bind(&draft.task_type)
     .bind(&draft.evaluation_profile_id)
     .bind(&draft.evaluation_profile_version)
@@ -58,15 +51,37 @@ pub(crate) async fn insert_execution(db: &PgPool, draft: &ExecutionDraft) -> any
     Ok(execution)
 }
 
-pub(crate) async fn select_execution_by_id(db: &PgPool, id: &str) -> anyhow::Result<Option<Execution>> {
-    let execution = sqlx::query_as::<_, Execution>(&format!(
+pub(crate) async fn select_execution_by_id(
+    db: &PgPool,
+    id: Uuid,
+) -> anyhow::Result<Option<Execution>> {
+    let execution = sqlx::query_as::<_, Execution>(
         r#"
-        SELECT {}
+        SELECT
+            id,
+            run_id,
+            case_id::uuid as case_id,
+            task_type,
+            tags,
+            input_payload,
+            expected_output,
+            case_metadata,
+            evaluation_profile_id,
+            evaluation_profile_version,
+            evaluator_manifest,
+            expected_evaluator_count,
+            status::text as status,
+            current_attempt_no,
+            current_attempt_id,
+            last_error_message,
+            created_at,
+            started_at,
+            completed_at,
+            updated_at
         FROM executions
         WHERE id = $1::uuid
         "#,
-        SELECT_COLUMNS
-    ))
+    )
     .bind(id)
     .fetch_optional(db)
     .await?;
@@ -74,16 +89,38 @@ pub(crate) async fn select_execution_by_id(db: &PgPool, id: &str) -> anyhow::Res
     Ok(execution)
 }
 
-pub(crate) async fn list_executions_by_run_id(db: &PgPool, run_id: &str) -> anyhow::Result<Vec<Execution>> {
-    let executions = sqlx::query_as::<_, Execution>(&format!(
+pub(crate) async fn list_executions_by_run_id(
+    db: &PgPool,
+    run_id: Uuid,
+) -> anyhow::Result<Vec<Execution>> {
+    let executions = sqlx::query_as::<_, Execution>(
         r#"
-        SELECT {}
+        SELECT
+            id,
+            run_id,
+            case_id::uuid as case_id,
+            task_type,
+            tags,
+            input_payload,
+            expected_output,
+            case_metadata,
+            evaluation_profile_id,
+            evaluation_profile_version,
+            evaluator_manifest,
+            expected_evaluator_count,
+            status::text as status,
+            current_attempt_no,
+            current_attempt_id,
+            last_error_message,
+            created_at,
+            started_at,
+            completed_at,
+            updated_at
         FROM executions
         WHERE run_id = $1::uuid
         ORDER BY created_at ASC
         "#,
-        SELECT_COLUMNS
-    ))
+    )
     .bind(run_id)
     .fetch_all(db)
     .await?;
@@ -93,10 +130,10 @@ pub(crate) async fn list_executions_by_run_id(db: &PgPool, run_id: &str) -> anyh
 
 pub(crate) async fn update_execution_status(
     db: &PgPool,
-    id: &str,
+    id: Uuid,
     patch: &ExecutionPatch,
 ) -> anyhow::Result<Option<Execution>> {
-    let execution = sqlx::query_as::<_, Execution>(&format!(
+    let execution = sqlx::query_as::<_, Execution>(
         r#"
         UPDATE executions
         SET status = $2::execution_status,
@@ -105,13 +142,32 @@ pub(crate) async fn update_execution_status(
             last_error_message = $5,
             updated_at = now()
         WHERE id = $1::uuid
-        RETURNING {}
+        RETURNING
+            id,
+            run_id,
+            case_id::uuid as case_id,
+            task_type,
+            tags,
+            input_payload,
+            expected_output,
+            case_metadata,
+            evaluation_profile_id,
+            evaluation_profile_version,
+            evaluator_manifest,
+            expected_evaluator_count,
+            status::text as status,
+            current_attempt_no,
+            current_attempt_id,
+            last_error_message,
+            created_at,
+            started_at,
+            completed_at,
+            updated_at
         "#,
-        SELECT_COLUMNS
-    ))
+    )
     .bind(id)
     .bind(&patch.status)
-    .bind(patch.current_attempt_no)
+    .bind(&patch.current_attempt_no)
     .bind(&patch.current_attempt_id)
     .bind(&patch.error_message)
     .fetch_optional(db)
@@ -120,7 +176,7 @@ pub(crate) async fn update_execution_status(
     Ok(execution)
 }
 
-pub(crate) async fn delete_execution_by_id(db: &PgPool, id: &str) -> anyhow::Result<u64> {
+pub(crate) async fn delete_execution_by_id(db: &PgPool, id: Uuid) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
         DELETE FROM executions
@@ -133,4 +189,3 @@ pub(crate) async fn delete_execution_by_id(db: &PgPool, id: &str) -> anyhow::Res
 
     Ok(result.rows_affected())
 }
-

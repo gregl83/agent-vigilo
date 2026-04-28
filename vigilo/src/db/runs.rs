@@ -1,4 +1,5 @@
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::models::run::{
     Run,
@@ -6,68 +7,45 @@ use crate::models::run::{
     RunPatch,
 };
 
-const SELECT_COLUMNS: &str = r#"
-    id::text AS id,
-    run_key,
-    name,
-    description,
-    dataset_id,
-    dataset_version,
-    evaluation_profile_id,
-    evaluation_profile_version,
-    aggregation_policy_id,
-    aggregation_policy_version,
-    agent_provider,
-    agent_name,
-    agent_version,
-    prompt_config_id,
-    prompt_config_version,
-    config_snapshot,
-    status::text AS status,
-    gate_status::text AS gate_status,
-    coordinator_id,
-    coordinator_leased_until::text AS coordinator_leased_until,
-    coordinator_heartbeat_at::text AS coordinator_heartbeat_at,
-    expected_execution_count,
-    terminal_execution_count,
-    passed_execution_count,
-    failed_execution_count,
-    errored_execution_count,
-    summary,
-    error_message,
-    created_at::text AS created_at,
-    started_at::text AS started_at,
-    dispatched_at::text AS dispatched_at,
-    finalized_at::text AS finalized_at,
-    completed_at::text AS completed_at,
-    updated_at::text AS updated_at
-"#;
-
-
 pub(crate) async fn insert_run(db: &PgPool, draft: &RunDraft) -> anyhow::Result<Run> {
-    let run = sqlx::query_as::<_, Run>(&format!(
+    let run = sqlx::query_as::<_, Run>(
         r#"
         INSERT INTO runs (
-            run_key,
-            name,
-            description,
-            dataset_id,
-            dataset_version,
-            evaluation_profile_id,
-            evaluation_profile_version,
-            aggregation_policy_id,
-            aggregation_policy_version,
-            agent_provider,
-            agent_name,
-            agent_version,
-            prompt_config_id,
-            prompt_config_version
+            run_key, name, description, dataset_id, dataset_version,
+            evaluation_profile_id, evaluation_profile_version,
+            aggregation_policy_id, aggregation_policy_version,
+            agent_provider, agent_name, agent_version,
+            prompt_config_id, prompt_config_version
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-        RETURNING {}
+        RETURNING
+            id, run_key, name, description,
+            dataset_id::uuid as dataset_id, dataset_version,
+            evaluation_profile_id, evaluation_profile_version,
+            aggregation_policy_id, aggregation_policy_version,
+            agent_provider, agent_name, agent_version,
+            prompt_config_id, prompt_config_version,
+            config_snapshot,
+            status::text as status,
+            gate_status::text as gate_status,
+            coordinator_id::uuid as coordinator_id,
+            coordinator_leased_until,
+            coordinator_heartbeat_at,
+            expected_execution_count,
+            terminal_execution_count,
+            passed_execution_count,
+            failed_execution_count,
+            errored_execution_count,
+            summary,
+            error_message,
+            created_at,
+            started_at,
+            dispatched_at,
+            finalized_at,
+            completed_at,
+            updated_at
         "#,
-        SELECT_COLUMNS
-    ))
+    )
     .bind(&draft.run_key)
     .bind(&draft.name)
     .bind(&draft.description)
@@ -88,15 +66,39 @@ pub(crate) async fn insert_run(db: &PgPool, draft: &RunDraft) -> anyhow::Result<
     Ok(run)
 }
 
-pub(crate) async fn select_run_by_id(db: &PgPool, id: &str) -> anyhow::Result<Option<Run>> {
-    let run = sqlx::query_as::<_, Run>(&format!(
+pub(crate) async fn select_run_by_id(db: &PgPool, id: Uuid) -> anyhow::Result<Option<Run>> {
+    let run = sqlx::query_as::<_, Run>(
         r#"
-        SELECT {}
+        SELECT
+            id, run_key, name, description,
+            dataset_id::uuid as dataset_id, dataset_version,
+            evaluation_profile_id, evaluation_profile_version,
+            aggregation_policy_id, aggregation_policy_version,
+            agent_provider, agent_name, agent_version,
+            prompt_config_id, prompt_config_version,
+            config_snapshot,
+            status::text as status,
+            gate_status::text as gate_status,
+            coordinator_id::uuid as coordinator_id,
+            coordinator_leased_until,
+            coordinator_heartbeat_at,
+            expected_execution_count,
+            terminal_execution_count,
+            passed_execution_count,
+            failed_execution_count,
+            errored_execution_count,
+            summary,
+            error_message,
+            created_at,
+            started_at,
+            dispatched_at,
+            finalized_at,
+            completed_at,
+            updated_at
         FROM runs
         WHERE id = $1::uuid
         "#,
-        SELECT_COLUMNS
-    ))
+    )
     .bind(id)
     .fetch_optional(db)
     .await?;
@@ -105,14 +107,38 @@ pub(crate) async fn select_run_by_id(db: &PgPool, id: &str) -> anyhow::Result<Op
 }
 
 pub(crate) async fn select_run_by_key(db: &PgPool, run_key: &str) -> anyhow::Result<Option<Run>> {
-    let run = sqlx::query_as::<_, Run>(&format!(
+    let run = sqlx::query_as::<_, Run>(
         r#"
-        SELECT {}
+        SELECT
+            id, run_key, name, description,
+            dataset_id::uuid as dataset_id, dataset_version,
+            evaluation_profile_id, evaluation_profile_version,
+            aggregation_policy_id, aggregation_policy_version,
+            agent_provider, agent_name, agent_version,
+            prompt_config_id, prompt_config_version,
+            config_snapshot,
+            status::text as status,
+            gate_status::text as gate_status,
+            coordinator_id::uuid as coordinator_id,
+            coordinator_leased_until,
+            coordinator_heartbeat_at,
+            expected_execution_count,
+            terminal_execution_count,
+            passed_execution_count,
+            failed_execution_count,
+            errored_execution_count,
+            summary,
+            error_message,
+            created_at,
+            started_at,
+            dispatched_at,
+            finalized_at,
+            completed_at,
+            updated_at
         FROM runs
         WHERE run_key = $1
         "#,
-        SELECT_COLUMNS
-    ))
+    )
     .bind(run_key)
     .fetch_optional(db)
     .await?;
@@ -121,15 +147,39 @@ pub(crate) async fn select_run_by_key(db: &PgPool, run_key: &str) -> anyhow::Res
 }
 
 pub(crate) async fn list_runs(db: &PgPool, limit: i64, offset: i64) -> anyhow::Result<Vec<Run>> {
-    let runs = sqlx::query_as::<_, Run>(&format!(
+    let runs = sqlx::query_as::<_, Run>(
         r#"
-        SELECT {}
+        SELECT
+            id, run_key, name, description,
+            dataset_id::uuid as dataset_id, dataset_version,
+            evaluation_profile_id, evaluation_profile_version,
+            aggregation_policy_id, aggregation_policy_version,
+            agent_provider, agent_name, agent_version,
+            prompt_config_id, prompt_config_version,
+            config_snapshot,
+            status::text as status,
+            gate_status::text as gate_status,
+            coordinator_id::uuid as coordinator_id,
+            coordinator_leased_until,
+            coordinator_heartbeat_at,
+            expected_execution_count,
+            terminal_execution_count,
+            passed_execution_count,
+            failed_execution_count,
+            errored_execution_count,
+            summary,
+            error_message,
+            created_at,
+            started_at,
+            dispatched_at,
+            finalized_at,
+            completed_at,
+            updated_at
         FROM runs
         ORDER BY created_at DESC
         LIMIT $1 OFFSET $2
         "#,
-        SELECT_COLUMNS
-    ))
+    )
     .bind(limit)
     .bind(offset)
     .fetch_all(db)
@@ -140,10 +190,10 @@ pub(crate) async fn list_runs(db: &PgPool, limit: i64, offset: i64) -> anyhow::R
 
 pub(crate) async fn update_run_status(
     db: &PgPool,
-    id: &str,
+    id: Uuid,
     patch: &RunPatch,
 ) -> anyhow::Result<Option<Run>> {
-    let run = sqlx::query_as::<_, Run>(&format!(
+    let run = sqlx::query_as::<_, Run>(
         r#"
         UPDATE runs
         SET status = $2::run_status,
@@ -151,10 +201,34 @@ pub(crate) async fn update_run_status(
             error_message = $4,
             updated_at = now()
         WHERE id = $1::uuid
-        RETURNING {}
+        RETURNING
+            id, run_key, name, description,
+            dataset_id::uuid as dataset_id, dataset_version,
+            evaluation_profile_id, evaluation_profile_version,
+            aggregation_policy_id, aggregation_policy_version,
+            agent_provider, agent_name, agent_version,
+            prompt_config_id, prompt_config_version,
+            config_snapshot,
+            status::text as status,
+            gate_status::text as gate_status,
+            coordinator_id::uuid as coordinator_id,
+            coordinator_leased_until,
+            coordinator_heartbeat_at,
+            expected_execution_count,
+            terminal_execution_count,
+            passed_execution_count,
+            failed_execution_count,
+            errored_execution_count,
+            summary,
+            error_message,
+            created_at,
+            started_at,
+            dispatched_at,
+            finalized_at,
+            completed_at,
+            updated_at
         "#,
-        SELECT_COLUMNS
-    ))
+    )
     .bind(id)
     .bind(&patch.status)
     .bind(&patch.gate_status)
@@ -165,7 +239,7 @@ pub(crate) async fn update_run_status(
     Ok(run)
 }
 
-pub(crate) async fn delete_run_by_id(db: &PgPool, id: &str) -> anyhow::Result<u64> {
+pub(crate) async fn delete_run_by_id(db: &PgPool, id: Uuid) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
         DELETE FROM runs
@@ -178,4 +252,3 @@ pub(crate) async fn delete_run_by_id(db: &PgPool, id: &str) -> anyhow::Result<u6
 
     Ok(result.rows_affected())
 }
-
