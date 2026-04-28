@@ -1,9 +1,9 @@
 use sqlx::PgPool;
 
 use crate::models::evaluator_result::{
+    EvaluatorResult,
     EvaluatorResultDraft,
     EvaluatorResultPatch,
-    EvaluatorResult,
 };
 
 const SELECT_COLUMNS: &str = r#"

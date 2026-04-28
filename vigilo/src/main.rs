@@ -66,7 +66,7 @@ async fn main() -> ExitCode {
 
             let wasm_config = wasm::Config::default();
             let context = Context::new(
-                app.database_uri.clone(),
+                app.database_url.clone(),
                 wasm_config,
             );
 

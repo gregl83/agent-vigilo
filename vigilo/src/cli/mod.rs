@@ -32,8 +32,8 @@ pub(crate) struct App {
     pub config: Option<PathBuf>,
 
     /// Database URI (connection string)
-    #[arg(long, env = "DATABASE_URI")]
-    pub database_uri: String,
+    #[arg(long, env = "DATABASE_URL")]
+    pub database_url: String,
 
     /// Output as JSON when supported
     #[arg(global = true, long, action = ArgAction::SetTrue)]

@@ -1,11 +1,19 @@
-use sqlx::types::JsonValue;
+use chrono::{
+    DateTime,
+    Utc,
+};
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use uuid::Uuid;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct EvaluatorResultDraft {
-    pub(crate) run_id: String,
-    pub(crate) execution_id: String,
-    pub(crate) attempt_id: String,
-    pub(crate) evaluator_id: String,
+    pub(crate) run_id: Uuid,
+    pub(crate) execution_id: Uuid,
+    pub(crate) attempt_id: Uuid,
+    pub(crate) evaluator_id: Uuid,
     pub(crate) evaluator_version: String,
     pub(crate) evaluator_profile_id: String,
     pub(crate) evaluator_profile_version: String,
@@ -25,19 +33,19 @@ pub(crate) struct EvaluatorResultDraft {
     pub(crate) reason: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct EvaluatorResultPatch {
     pub(crate) reason: Option<String>,
     pub(crate) failure_category: Option<String>,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub(crate) struct EvaluatorResult {
-    pub(crate) id: String,
-    pub(crate) run_id: String,
-    pub(crate) execution_id: String,
-    pub(crate) attempt_id: String,
-    pub(crate) evaluator_id: String,
+    pub(crate) id: Uuid,
+    pub(crate) run_id: Uuid,
+    pub(crate) execution_id: Uuid,
+    pub(crate) attempt_id: Uuid,
+    pub(crate) evaluator_id: Uuid,
     pub(crate) evaluator_version: String,
     pub(crate) evaluator_profile_id: String,
     pub(crate) evaluator_profile_version: String,
@@ -55,7 +63,7 @@ pub(crate) struct EvaluatorResult {
     pub(crate) severity: String,
     pub(crate) failure_category: Option<String>,
     pub(crate) reason: Option<String>,
-    pub(crate) evidence: JsonValue,
-    pub(crate) raw_evaluator_output: JsonValue,
-    pub(crate) created_at: String,
+    pub(crate) evidence: serde_json::Value,
+    pub(crate) raw_evaluator_output: serde_json::Value,
+    pub(crate) created_at: DateTime<Utc>,
 }

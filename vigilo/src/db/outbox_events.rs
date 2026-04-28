@@ -1,9 +1,9 @@
 use sqlx::PgPool;
 
 use crate::models::outbox_event::{
+    OutboxEvent,
     OutboxEventDraft,
     OutboxEventPatch,
-    OutboxEvent,
 };
 
 const SELECT_COLUMNS: &str = r#"

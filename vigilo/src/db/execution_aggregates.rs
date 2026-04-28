@@ -1,9 +1,9 @@
 use sqlx::PgPool;
 
 use crate::models::execution_aggregate::{
+    ExecutionAggregate,
     ExecutionAggregateDraft,
     ExecutionAggregatePatch,
-    ExecutionAggregate,
 };
 
 const SELECT_COLUMNS: &str = r#"
