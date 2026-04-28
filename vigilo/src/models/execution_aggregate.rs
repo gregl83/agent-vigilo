@@ -31,4 +31,3 @@ pub(crate) struct ExecutionAggregate {
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
 }
-

@@ -59,4 +59,3 @@ pub(crate) struct EvaluatorResult {
     pub(crate) raw_evaluator_output: JsonValue,
     pub(crate) created_at: String,
 }
-

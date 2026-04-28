@@ -41,5 +41,3 @@ pub(crate) struct Execution {
     pub(crate) completed_at: Option<String>,
     pub(crate) updated_at: String,
 }
-
-

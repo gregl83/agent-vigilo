@@ -29,5 +29,3 @@ pub(crate) struct OutboxEvent {
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
 }
-
-

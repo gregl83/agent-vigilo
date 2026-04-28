@@ -41,4 +41,3 @@ pub(crate) struct Evaluator {
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
 }
-
