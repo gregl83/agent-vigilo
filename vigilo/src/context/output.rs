@@ -29,7 +29,7 @@ impl Buffer {
     /// Write line to buffer
     pub fn write_line(&self, msg: impl AsRef<str>) -> anyhow::Result<()> {
         let mut guard = self.buffer.lock()
-            .map_err(|_| anyhow::anyhow!("failed to acquire buffer lock"))?;;
+            .map_err(|_| anyhow::anyhow!("failed to acquire buffer lock"))?;
         writeln!(guard, "{}", msg.as_ref())?;
         Ok(())
     }
