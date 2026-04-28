@@ -1,8 +1,9 @@
 use sqlx::PgPool;
 
 use crate::models::evaluator::{
+    EvaluatorDraft,
+    EvaluatorPatch,
     Evaluator,
-    NewEvaluator,
 };
 
 const SELECT_COLUMNS: &str = r#"
@@ -27,8 +28,8 @@ const SELECT_COLUMNS: &str = r#"
 "#;
 
 
-pub(crate) async fn insert_evaluator(db: &PgPool, new: &NewEvaluator) -> anyhow::Result<Evaluator> {
-    let wasm_size_bytes = i64::try_from(new.wasm_bytes.len())?;
+pub(crate) async fn insert_evaluator(db: &PgPool, draft: &EvaluatorDraft) -> anyhow::Result<Evaluator> {
+    let wasm_size_bytes = i64::try_from(draft.wasm_bytes.len())?;
 
     let evaluator = sqlx::query_as::<_, Evaluator>(&format!(
         r#"
@@ -51,18 +52,18 @@ pub(crate) async fn insert_evaluator(db: &PgPool, new: &NewEvaluator) -> anyhow:
         "#,
         SELECT_COLUMNS
     ))
-    .bind(&new.namespace)
-    .bind(&new.name)
-    .bind(&new.version)
-    .bind(&new.content_hash)
-    .bind(&new.wasm_bytes)
+    .bind(&draft.namespace)
+    .bind(&draft.name)
+    .bind(&draft.version)
+    .bind(&draft.content_hash)
+    .bind(&draft.wasm_bytes)
     .bind(wasm_size_bytes)
-    .bind(&new.interface_name)
-    .bind(&new.interface_version)
-    .bind(&new.wit_world)
-    .bind(&new.runtime)
-    .bind(&new.runtime_version)
-    .bind(&new.description)
+    .bind(&draft.interface_name)
+    .bind(&draft.interface_version)
+    .bind(&draft.wit_world)
+    .bind(&draft.runtime)
+    .bind(&draft.runtime_version)
+    .bind(&draft.description)
     .fetch_one(db)
     .await?;
 
@@ -129,7 +130,7 @@ pub(crate) async fn update_evaluator_active_by_name(
     db: &PgPool,
     namespace: &str,
     name: &str,
-    is_active: bool,
+    patch: &EvaluatorPatch,
 ) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
@@ -141,7 +142,7 @@ pub(crate) async fn update_evaluator_active_by_name(
     )
     .bind(namespace)
     .bind(name)
-    .bind(is_active)
+    .bind(patch.is_active)
     .execute(db)
     .await?;
 

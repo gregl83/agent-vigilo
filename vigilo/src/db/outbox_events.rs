@@ -1,7 +1,8 @@
 use sqlx::PgPool;
 
 use crate::models::outbox_event::{
-    NewOutboxEvent,
+    OutboxEventDraft,
+    OutboxEventPatch,
     OutboxEvent,
 };
 
@@ -21,7 +22,7 @@ const SELECT_COLUMNS: &str = r#"
 "#;
 
 
-pub(crate) async fn insert_outbox_event(db: &PgPool, new: &NewOutboxEvent) -> anyhow::Result<OutboxEvent> {
+pub(crate) async fn insert_outbox_event(db: &PgPool, draft: &OutboxEventDraft) -> anyhow::Result<OutboxEvent> {
     let event = sqlx::query_as::<_, OutboxEvent>(&format!(
         r#"
         INSERT INTO outbox_events (
@@ -35,10 +36,10 @@ pub(crate) async fn insert_outbox_event(db: &PgPool, new: &NewOutboxEvent) -> an
         "#,
         SELECT_COLUMNS
     ))
-    .bind(&new.event_type)
-    .bind(&new.aggregate_type)
-    .bind(&new.aggregate_id)
-    .bind(&new.dedupe_key)
+    .bind(&draft.event_type)
+    .bind(&draft.aggregate_type)
+    .bind(&draft.aggregate_id)
+    .bind(&draft.dedupe_key)
     .fetch_one(db)
     .await?;
 
@@ -87,8 +88,7 @@ pub(crate) async fn list_outbox_events_by_status(
 pub(crate) async fn update_outbox_event_status(
     db: &PgPool,
     id: &str,
-    status: &str,
-    error_message: Option<&str>,
+    patch: &OutboxEventPatch,
 ) -> anyhow::Result<Option<OutboxEvent>> {
     let event = sqlx::query_as::<_, OutboxEvent>(&format!(
         r#"
@@ -103,8 +103,8 @@ pub(crate) async fn update_outbox_event_status(
         SELECT_COLUMNS
     ))
     .bind(id)
-    .bind(status)
-    .bind(error_message)
+    .bind(&patch.status)
+    .bind(&patch.error_message)
     .fetch_optional(db)
     .await?;
 

@@ -1,8 +1,9 @@
 use sqlx::PgPool;
 
 use crate::models::evaluator_result::{
+    EvaluatorResultDraft,
+    EvaluatorResultPatch,
     EvaluatorResult,
-    NewEvaluatorResult,
 };
 
 const SELECT_COLUMNS: &str = r#"
@@ -36,7 +37,7 @@ const SELECT_COLUMNS: &str = r#"
 
 pub(crate) async fn insert_evaluator_result(
     db: &PgPool,
-    new: &NewEvaluatorResult,
+    draft: &EvaluatorResultDraft,
 ) -> anyhow::Result<EvaluatorResult> {
     let result = sqlx::query_as::<_, EvaluatorResult>(&format!(
         r#"
@@ -90,27 +91,27 @@ pub(crate) async fn insert_evaluator_result(
         "#,
         SELECT_COLUMNS
     ))
-    .bind(&new.run_id)
-    .bind(&new.execution_id)
-    .bind(&new.attempt_id)
-    .bind(&new.evaluator_id)
-    .bind(&new.evaluator_version)
-    .bind(&new.evaluator_profile_id)
-    .bind(&new.evaluator_profile_version)
-    .bind(&new.evaluator_interface_version)
-    .bind(&new.evaluator_runtime_version)
-    .bind(&new.dimension)
-    .bind(&new.status)
-    .bind(new.blocking)
-    .bind(&new.score_kind)
-    .bind(new.raw_score)
-    .bind(new.raw_score_min)
-    .bind(new.raw_score_max)
-    .bind(new.normalized_score)
-    .bind(new.weight)
-    .bind(&new.severity)
-    .bind(&new.failure_category)
-    .bind(&new.reason)
+    .bind(&draft.run_id)
+    .bind(&draft.execution_id)
+    .bind(&draft.attempt_id)
+    .bind(&draft.evaluator_id)
+    .bind(&draft.evaluator_version)
+    .bind(&draft.evaluator_profile_id)
+    .bind(&draft.evaluator_profile_version)
+    .bind(&draft.evaluator_interface_version)
+    .bind(&draft.evaluator_runtime_version)
+    .bind(&draft.dimension)
+    .bind(&draft.status)
+    .bind(draft.blocking)
+    .bind(&draft.score_kind)
+    .bind(draft.raw_score)
+    .bind(draft.raw_score_min)
+    .bind(draft.raw_score_max)
+    .bind(draft.normalized_score)
+    .bind(draft.weight)
+    .bind(&draft.severity)
+    .bind(&draft.failure_category)
+    .bind(&draft.reason)
     .fetch_one(db)
     .await?;
 
@@ -159,8 +160,7 @@ pub(crate) async fn list_evaluator_results_by_attempt_id(
 pub(crate) async fn update_evaluator_result_reason(
     db: &PgPool,
     id: &str,
-    reason: Option<&str>,
-    failure_category: Option<&str>,
+    patch: &EvaluatorResultPatch,
 ) -> anyhow::Result<Option<EvaluatorResult>> {
     let result = sqlx::query_as::<_, EvaluatorResult>(&format!(
         r#"
@@ -173,8 +173,8 @@ pub(crate) async fn update_evaluator_result_reason(
         SELECT_COLUMNS
     ))
     .bind(id)
-    .bind(reason)
-    .bind(failure_category)
+    .bind(&patch.reason)
+    .bind(&patch.failure_category)
     .fetch_optional(db)
     .await?;
 

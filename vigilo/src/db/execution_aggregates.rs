@@ -1,8 +1,9 @@
 use sqlx::PgPool;
 
 use crate::models::execution_aggregate::{
+    ExecutionAggregateDraft,
+    ExecutionAggregatePatch,
     ExecutionAggregate,
-    NewExecutionAggregate,
 };
 
 const SELECT_COLUMNS: &str = r#"
@@ -22,7 +23,7 @@ const SELECT_COLUMNS: &str = r#"
 
 pub(crate) async fn insert_execution_aggregate(
     db: &PgPool,
-    new: &NewExecutionAggregate,
+    draft: &ExecutionAggregateDraft,
 ) -> anyhow::Result<ExecutionAggregate> {
     let aggregate = sqlx::query_as::<_, ExecutionAggregate>(&format!(
         r#"
@@ -39,12 +40,12 @@ pub(crate) async fn insert_execution_aggregate(
         "#,
         SELECT_COLUMNS
     ))
-    .bind(&new.execution_id)
-    .bind(&new.run_id)
-    .bind(&new.attempt_id)
-    .bind(&new.overall_status)
-    .bind(new.aggregate_score)
-    .bind(new.evaluator_result_count)
+    .bind(&draft.execution_id)
+    .bind(&draft.run_id)
+    .bind(&draft.attempt_id)
+    .bind(&draft.overall_status)
+    .bind(draft.aggregate_score)
+    .bind(draft.evaluator_result_count)
     .fetch_one(db)
     .await?;
 
@@ -93,9 +94,7 @@ pub(crate) async fn list_execution_aggregates_by_run_id(
 pub(crate) async fn update_execution_aggregate(
     db: &PgPool,
     execution_id: &str,
-    overall_status: &str,
-    aggregate_score: Option<f64>,
-    evaluator_result_count: i32,
+    patch: &ExecutionAggregatePatch,
 ) -> anyhow::Result<Option<ExecutionAggregate>> {
     let aggregate = sqlx::query_as::<_, ExecutionAggregate>(&format!(
         r#"
@@ -110,9 +109,9 @@ pub(crate) async fn update_execution_aggregate(
         SELECT_COLUMNS
     ))
     .bind(execution_id)
-    .bind(overall_status)
-    .bind(aggregate_score)
-    .bind(evaluator_result_count)
+    .bind(&patch.overall_status)
+    .bind(patch.aggregate_score)
+    .bind(patch.evaluator_result_count)
     .fetch_optional(db)
     .await?;
 

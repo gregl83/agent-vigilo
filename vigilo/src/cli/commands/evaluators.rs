@@ -9,7 +9,10 @@ use tracing::info;
 
 use crate::context::Context;
 use crate::db::evaluators;
-use crate::models::evaluator::NewEvaluator;
+use crate::models::evaluator::{
+    EvaluatorDraft,
+    EvaluatorPatch,
+};
 use super::args::parsers::parse_dir;
 use super::Executable;
 
@@ -81,7 +84,7 @@ impl Executable for SubCommand {
                 let db = context.db().await?;
                 let evaluator = evaluators::insert_evaluator(
                     db,
-                    &NewEvaluator {
+                    &EvaluatorDraft {
                         namespace: DEFAULT_NAMESPACE.to_string(),
                         name: component.name,
                         version: component.version,
@@ -138,7 +141,7 @@ impl Executable for SubCommand {
                     db,
                     DEFAULT_NAMESPACE,
                     &evaluator_name,
-                    false,
+                    &EvaluatorPatch { is_active: false },
                 ).await?;
 
                 println!("deactivated {} row(s)", affected);
@@ -151,7 +154,7 @@ impl Executable for SubCommand {
                     db,
                     DEFAULT_NAMESPACE,
                     &evaluator_name,
-                    true,
+                    &EvaluatorPatch { is_active: true },
                 ).await?;
 
                 println!("activated {} row(s)", affected);

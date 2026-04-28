@@ -1,5 +1,30 @@
 use sqlx::types::JsonValue;
 
+#[derive(Debug, Clone)]
+pub(crate) struct RunDraft {
+    pub(crate) run_key: String,
+    pub(crate) name: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) dataset_id: String,
+    pub(crate) dataset_version: String,
+    pub(crate) evaluation_profile_id: String,
+    pub(crate) evaluation_profile_version: String,
+    pub(crate) aggregation_policy_id: String,
+    pub(crate) aggregation_policy_version: String,
+    pub(crate) agent_provider: String,
+    pub(crate) agent_name: String,
+    pub(crate) agent_version: Option<String>,
+    pub(crate) prompt_config_id: String,
+    pub(crate) prompt_config_version: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RunPatch {
+    pub(crate) status: String,
+    pub(crate) gate_status: String,
+    pub(crate) error_message: Option<String>,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct Run {
     pub(crate) id: String,
@@ -38,21 +63,4 @@ pub(crate) struct Run {
     pub(crate) updated_at: String,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct NewRun {
-    pub(crate) run_key: String,
-    pub(crate) name: Option<String>,
-    pub(crate) description: Option<String>,
-    pub(crate) dataset_id: String,
-    pub(crate) dataset_version: String,
-    pub(crate) evaluation_profile_id: String,
-    pub(crate) evaluation_profile_version: String,
-    pub(crate) aggregation_policy_id: String,
-    pub(crate) aggregation_policy_version: String,
-    pub(crate) agent_provider: String,
-    pub(crate) agent_name: String,
-    pub(crate) agent_version: Option<String>,
-    pub(crate) prompt_config_id: String,
-    pub(crate) prompt_config_version: String,
-}
 

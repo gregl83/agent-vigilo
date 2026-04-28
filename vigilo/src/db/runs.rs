@@ -1,7 +1,8 @@
 use sqlx::PgPool;
 
 use crate::models::run::{
-    NewRun,
+    RunDraft,
+    RunPatch,
     Run,
 };
 
@@ -43,7 +44,7 @@ const SELECT_COLUMNS: &str = r#"
 "#;
 
 
-pub(crate) async fn insert_run(db: &PgPool, new: &NewRun) -> anyhow::Result<Run> {
+pub(crate) async fn insert_run(db: &PgPool, draft: &RunDraft) -> anyhow::Result<Run> {
     let run = sqlx::query_as::<_, Run>(&format!(
         r#"
         INSERT INTO runs (
@@ -67,20 +68,20 @@ pub(crate) async fn insert_run(db: &PgPool, new: &NewRun) -> anyhow::Result<Run>
         "#,
         SELECT_COLUMNS
     ))
-    .bind(&new.run_key)
-    .bind(&new.name)
-    .bind(&new.description)
-    .bind(&new.dataset_id)
-    .bind(&new.dataset_version)
-    .bind(&new.evaluation_profile_id)
-    .bind(&new.evaluation_profile_version)
-    .bind(&new.aggregation_policy_id)
-    .bind(&new.aggregation_policy_version)
-    .bind(&new.agent_provider)
-    .bind(&new.agent_name)
-    .bind(&new.agent_version)
-    .bind(&new.prompt_config_id)
-    .bind(&new.prompt_config_version)
+    .bind(&draft.run_key)
+    .bind(&draft.name)
+    .bind(&draft.description)
+    .bind(&draft.dataset_id)
+    .bind(&draft.dataset_version)
+    .bind(&draft.evaluation_profile_id)
+    .bind(&draft.evaluation_profile_version)
+    .bind(&draft.aggregation_policy_id)
+    .bind(&draft.aggregation_policy_version)
+    .bind(&draft.agent_provider)
+    .bind(&draft.agent_name)
+    .bind(&draft.agent_version)
+    .bind(&draft.prompt_config_id)
+    .bind(&draft.prompt_config_version)
     .fetch_one(db)
     .await?;
 
@@ -140,9 +141,7 @@ pub(crate) async fn list_runs(db: &PgPool, limit: i64, offset: i64) -> anyhow::R
 pub(crate) async fn update_run_status(
     db: &PgPool,
     id: &str,
-    status: &str,
-    gate_status: &str,
-    error_message: Option<&str>,
+    patch: &RunPatch,
 ) -> anyhow::Result<Option<Run>> {
     let run = sqlx::query_as::<_, Run>(&format!(
         r#"
@@ -157,9 +156,9 @@ pub(crate) async fn update_run_status(
         SELECT_COLUMNS
     ))
     .bind(id)
-    .bind(status)
-    .bind(gate_status)
-    .bind(error_message)
+    .bind(&patch.status)
+    .bind(&patch.gate_status)
+    .bind(&patch.error_message)
     .fetch_optional(db)
     .await?;
 

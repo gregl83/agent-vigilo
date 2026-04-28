@@ -1,8 +1,9 @@
 use sqlx::PgPool;
 
 use crate::models::execution_attempt::{
+    ExecutionAttemptDraft,
+    ExecutionAttemptPatch,
     ExecutionAttempt,
-    NewExecutionAttempt,
 };
 
 const SELECT_COLUMNS: &str = r#"
@@ -33,7 +34,7 @@ const SELECT_COLUMNS: &str = r#"
 
 pub(crate) async fn insert_execution_attempt(
     db: &PgPool,
-    new: &NewExecutionAttempt,
+    draft: &ExecutionAttemptDraft,
 ) -> anyhow::Result<ExecutionAttempt> {
     let attempt = sqlx::query_as::<_, ExecutionAttempt>(&format!(
         r#"
@@ -50,12 +51,12 @@ pub(crate) async fn insert_execution_attempt(
         "#,
         SELECT_COLUMNS
     ))
-    .bind(&new.execution_id)
-    .bind(&new.run_id)
-    .bind(new.attempt_no)
-    .bind(&new.worker_id)
-    .bind(&new.worker_host)
-    .bind(&new.queue_message_id)
+    .bind(&draft.execution_id)
+    .bind(&draft.run_id)
+    .bind(draft.attempt_no)
+    .bind(&draft.worker_id)
+    .bind(&draft.worker_host)
+    .bind(&draft.queue_message_id)
     .fetch_one(db)
     .await?;
 
@@ -104,8 +105,7 @@ pub(crate) async fn list_execution_attempts_by_execution_id(
 pub(crate) async fn update_execution_attempt_status(
     db: &PgPool,
     id: &str,
-    status: &str,
-    error_message: Option<&str>,
+    patch: &ExecutionAttemptPatch,
 ) -> anyhow::Result<Option<ExecutionAttempt>> {
     let attempt = sqlx::query_as::<_, ExecutionAttempt>(&format!(
         r#"
@@ -119,8 +119,8 @@ pub(crate) async fn update_execution_attempt_status(
         SELECT_COLUMNS
     ))
     .bind(id)
-    .bind(status)
-    .bind(error_message)
+    .bind(&patch.status)
+    .bind(&patch.error_message)
     .fetch_optional(db)
     .await?;
 

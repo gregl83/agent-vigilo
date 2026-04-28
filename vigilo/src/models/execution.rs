@@ -1,5 +1,23 @@
 use sqlx::types::JsonValue;
 
+#[derive(Debug, Clone)]
+pub(crate) struct ExecutionDraft {
+    pub(crate) run_id: String,
+    pub(crate) case_id: String,
+    pub(crate) task_type: String,
+    pub(crate) evaluation_profile_id: String,
+    pub(crate) evaluation_profile_version: String,
+    pub(crate) expected_evaluator_count: i32,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExecutionPatch {
+    pub(crate) status: String,
+    pub(crate) current_attempt_no: i32,
+    pub(crate) current_attempt_id: Option<String>,
+    pub(crate) error_message: Option<String>,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct Execution {
     pub(crate) id: String,
@@ -24,13 +42,4 @@ pub(crate) struct Execution {
     pub(crate) updated_at: String,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct NewExecution {
-    pub(crate) run_id: String,
-    pub(crate) case_id: String,
-    pub(crate) task_type: String,
-    pub(crate) evaluation_profile_id: String,
-    pub(crate) evaluation_profile_version: String,
-    pub(crate) expected_evaluator_count: i32,
-}
 

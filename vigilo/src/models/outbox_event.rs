@@ -1,5 +1,19 @@
 use sqlx::types::JsonValue;
 
+#[derive(Debug, Clone)]
+pub(crate) struct OutboxEventDraft {
+    pub(crate) event_type: String,
+    pub(crate) aggregate_type: String,
+    pub(crate) aggregate_id: String,
+    pub(crate) dedupe_key: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OutboxEventPatch {
+    pub(crate) status: String,
+    pub(crate) error_message: Option<String>,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct OutboxEvent {
     pub(crate) id: String,
@@ -16,11 +30,4 @@ pub(crate) struct OutboxEvent {
     pub(crate) updated_at: String,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct NewOutboxEvent {
-    pub(crate) event_type: String,
-    pub(crate) aggregate_type: String,
-    pub(crate) aggregate_id: String,
-    pub(crate) dedupe_key: String,
-}
 

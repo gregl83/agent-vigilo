@@ -1,8 +1,9 @@
 use sqlx::PgPool;
 
 use crate::models::execution::{
+    ExecutionDraft,
+    ExecutionPatch,
     Execution,
-    NewExecution,
 };
 
 const SELECT_COLUMNS: &str = r#"
@@ -29,7 +30,7 @@ const SELECT_COLUMNS: &str = r#"
 "#;
 
 
-pub(crate) async fn insert_execution(db: &PgPool, new: &NewExecution) -> anyhow::Result<Execution> {
+pub(crate) async fn insert_execution(db: &PgPool, draft: &ExecutionDraft) -> anyhow::Result<Execution> {
     let execution = sqlx::query_as::<_, Execution>(&format!(
         r#"
         INSERT INTO executions (
@@ -45,12 +46,12 @@ pub(crate) async fn insert_execution(db: &PgPool, new: &NewExecution) -> anyhow:
         "#,
         SELECT_COLUMNS
     ))
-    .bind(&new.run_id)
-    .bind(&new.case_id)
-    .bind(&new.task_type)
-    .bind(&new.evaluation_profile_id)
-    .bind(&new.evaluation_profile_version)
-    .bind(new.expected_evaluator_count)
+    .bind(&draft.run_id)
+    .bind(&draft.case_id)
+    .bind(&draft.task_type)
+    .bind(&draft.evaluation_profile_id)
+    .bind(&draft.evaluation_profile_version)
+    .bind(draft.expected_evaluator_count)
     .fetch_one(db)
     .await?;
 
@@ -93,10 +94,7 @@ pub(crate) async fn list_executions_by_run_id(db: &PgPool, run_id: &str) -> anyh
 pub(crate) async fn update_execution_status(
     db: &PgPool,
     id: &str,
-    status: &str,
-    current_attempt_no: i32,
-    current_attempt_id: Option<&str>,
-    error_message: Option<&str>,
+    patch: &ExecutionPatch,
 ) -> anyhow::Result<Option<Execution>> {
     let execution = sqlx::query_as::<_, Execution>(&format!(
         r#"
@@ -112,10 +110,10 @@ pub(crate) async fn update_execution_status(
         SELECT_COLUMNS
     ))
     .bind(id)
-    .bind(status)
-    .bind(current_attempt_no)
-    .bind(current_attempt_id)
-    .bind(error_message)
+    .bind(&patch.status)
+    .bind(patch.current_attempt_no)
+    .bind(&patch.current_attempt_id)
+    .bind(&patch.error_message)
     .fetch_optional(db)
     .await?;
 
