@@ -8,8 +8,12 @@ use clap::{
 use tracing::info;
 
 use crate::context::Context;
+use crate::db::evaluators;
+use crate::models::evaluator::NewEvaluator;
 use super::args::parsers::parse_dir;
 use super::Executable;
+
+const DEFAULT_NAMESPACE: &str = "default";
 
 
 fn get_manifest_profile(release: bool, profile: Option<String>) -> String {
@@ -66,8 +70,6 @@ impl Executable for SubCommand {
     async fn exec(self, context: Context) -> anyhow::Result<()> {
         match self {
             SubCommand::Add{ evaluator_path, release, profile } => {
-                println!("executing run");
-
                 info!("adding evaluator: {}", evaluator_path.display());
 
                 let profile = get_manifest_profile(release, profile);
@@ -76,56 +78,95 @@ impl Executable for SubCommand {
                     profile,
                 )?;
 
-                // todo - persist component in database
+                let db = context.db().await?;
+                let evaluator = evaluators::insert_evaluator(
+                    db,
+                    &NewEvaluator {
+                        namespace: DEFAULT_NAMESPACE.to_string(),
+                        name: component.name,
+                        version: component.version,
+                        content_hash: component.wasm_hash,
+                        wasm_bytes: component.wasm_bytes,
+                        interface_name: None,
+                        interface_version: None,
+                        wit_world: None,
+                        runtime: Some("wasmtime".to_string()),
+                        runtime_version: None,
+                        description: None,
+                    },
+                ).await?;
 
-                // Example async work
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-                println!("run complete");
+                println!(
+                    "added evaluator {}:{}:{}",
+                    evaluator.namespace,
+                    evaluator.name,
+                    evaluator.version,
+                );
                 Ok(())
             }
             SubCommand::Show{ evaluator_name } => {
-                println!("executing run");
+                let db = context.db().await?;
 
-                // todo
+                let evaluator = evaluators::select_latest_evaluator_by_name(
+                    db,
+                    DEFAULT_NAMESPACE,
+                    &evaluator_name,
+                ).await?;
 
-                // Example async work
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                match evaluator {
+                    Some(e) => {
+                        println!(
+                            "{}:{}:{} active={} hash={}",
+                            e.namespace,
+                            e.name,
+                            e.version,
+                            e.is_active,
+                            e.content_hash,
+                        );
+                    }
+                    None => {
+                        println!("evaluator not found: {}", evaluator_name);
+                    }
+                }
 
-                println!("run complete");
                 Ok(())
             }
             SubCommand::Deactivate{ evaluator_name } => {
-                println!("executing run");
+                let db = context.db().await?;
 
-                // todo
+                let affected = evaluators::update_evaluator_active_by_name(
+                    db,
+                    DEFAULT_NAMESPACE,
+                    &evaluator_name,
+                    false,
+                ).await?;
 
-                // Example async work
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-                println!("run complete");
+                println!("deactivated {} row(s)", affected);
                 Ok(())
             }
             SubCommand::Activate{ evaluator_name } => {
-                println!("executing run");
+                let db = context.db().await?;
 
-                // todo
+                let affected = evaluators::update_evaluator_active_by_name(
+                    db,
+                    DEFAULT_NAMESPACE,
+                    &evaluator_name,
+                    true,
+                ).await?;
 
-                // Example async work
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-                println!("run complete");
+                println!("activated {} row(s)", affected);
                 Ok(())
             }
             SubCommand::Remove{ evaluator_name } => {
-                println!("executing run");
+                let db = context.db().await?;
 
-                // todo
+                let affected = evaluators::delete_evaluator_by_name(
+                    db,
+                    DEFAULT_NAMESPACE,
+                    &evaluator_name,
+                ).await?;
 
-                // Example async work
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-                println!("run complete");
+                println!("removed {} row(s)", affected);
                 Ok(())
             }
         }
@@ -144,10 +185,23 @@ impl Executable for Command {
         match self.command {
             Some(subcommand) => subcommand.exec(context).await,
             None => {
+                let db = context.db().await?;
+                let evaluators = evaluators::list_evaluators(db, DEFAULT_NAMESPACE).await?;
 
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if evaluators.is_empty() {
+                    println!("no evaluators found");
+                } else {
+                    for evaluator in evaluators {
+                        println!(
+                            "{}:{}:{} active={}",
+                            evaluator.namespace,
+                            evaluator.name,
+                            evaluator.version,
+                            evaluator.is_active,
+                        );
+                    }
+                }
 
-                println!("Command complete");
                 Ok(())
             }
         }

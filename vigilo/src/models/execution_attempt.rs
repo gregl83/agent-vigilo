@@ -26,3 +26,13 @@ pub(crate) struct ExecutionAttempt {
     pub(crate) updated_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct NewExecutionAttempt {
+    pub(crate) execution_id: String,
+    pub(crate) run_id: String,
+    pub(crate) attempt_no: i32,
+    pub(crate) worker_id: Option<String>,
+    pub(crate) worker_host: Option<String>,
+    pub(crate) queue_message_id: Option<String>,
+}
+

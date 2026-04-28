@@ -24,3 +24,13 @@ pub(crate) struct Execution {
     pub(crate) updated_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct NewExecution {
+    pub(crate) run_id: String,
+    pub(crate) case_id: String,
+    pub(crate) task_type: String,
+    pub(crate) evaluation_profile_id: String,
+    pub(crate) evaluation_profile_version: String,
+    pub(crate) expected_evaluator_count: i32,
+}
+
