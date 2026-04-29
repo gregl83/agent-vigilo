@@ -16,7 +16,7 @@ use crate::models::evaluator::{
 use super::args::parsers::parse_dir;
 use super::Executable;
 
-const DEFAULT_NAMESPACE: &str = "default";
+const DEFAULT_NAMESPACE: &str = "vigilo";
 
 
 fn get_manifest_profile(release: bool, profile: Option<String>) -> String {
