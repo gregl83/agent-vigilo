@@ -31,7 +31,7 @@ pub(crate) struct EvaluatorDraft {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct EvaluatorPatch {
-    pub(crate) is_active: bool,
+    pub(crate) is_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -52,7 +52,7 @@ pub(crate) struct Evaluator {
     pub(crate) description: Option<String>,
     pub(crate) tags: serde_json::Value,
     pub(crate) metadata: serde_json::Value,
-    pub(crate) is_active: bool,
+    pub(crate) is_enabled: bool,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) updated_at: DateTime<Utc>,
 }
@@ -73,7 +73,7 @@ pub(crate) struct EvaluatorSummary {
     pub(crate) description: Option<String>,
     pub(crate) tags: serde_json::Value,
     pub(crate) metadata: serde_json::Value,
-    pub(crate) is_active: bool,
+    pub(crate) is_enabled: bool,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) updated_at: DateTime<Utc>,
 }

@@ -24,7 +24,7 @@ pub(crate) async fn insert_evaluator(db: &PgPool, draft: &EvaluatorDraft) -> any
             id, namespace, name, version, content_hash, wasm_bytes,
             wasm_size_bytes, interface_name, interface_version,
             wit_world, runtime, runtime_version, runtime_fingerprint,
-            description, tags, metadata, is_active, created_at, updated_at
+            description, tags, metadata, is_enabled, created_at, updated_at
         "#,
     )
     .bind(&draft.namespace)
@@ -55,7 +55,7 @@ pub(crate) async fn select_evaluator_by_id(db: &PgPool, id: Uuid) -> anyhow::Res
             id, namespace, name, version, content_hash, wasm_bytes,
             wasm_size_bytes, interface_name, interface_version,
             wit_world, runtime, runtime_version, runtime_fingerprint,
-            description, tags, metadata, is_active, created_at, updated_at
+            description, tags, metadata, is_enabled, created_at, updated_at
         FROM evaluators
         WHERE id = $1
         "#,
@@ -78,7 +78,7 @@ pub(crate) async fn select_latest_evaluator_by_name(
             id, namespace, name, version, content_hash, wasm_bytes,
             wasm_size_bytes, interface_name, interface_version,
             wit_world, runtime, runtime_version, runtime_fingerprint,
-            description, tags, metadata, is_active, created_at, updated_at
+            description, tags, metadata, is_enabled, created_at, updated_at
         FROM evaluators
         WHERE namespace = $1 AND name = $2
         ORDER BY created_at DESC
@@ -100,7 +100,7 @@ pub(crate) async fn list_evaluators(db: &PgPool, namespace: &str) -> anyhow::Res
             id, namespace, name, version, content_hash, wasm_bytes,
             wasm_size_bytes, interface_name, interface_version,
             wit_world, runtime, runtime_version, runtime_fingerprint,
-            description, tags, metadata, is_active, created_at, updated_at
+            description, tags, metadata, is_enabled, created_at, updated_at
         FROM evaluators
         WHERE namespace = $1
         ORDER BY name ASC, version DESC
@@ -132,7 +132,7 @@ pub(crate) async fn search_evaluator_summaries(
             id, namespace, name, version, content_hash,
             interface_name, interface_version, wit_world,
             runtime, runtime_version, runtime_fingerprint,
-            description, tags, metadata, is_active, created_at, updated_at
+            description, tags, metadata, is_enabled, created_at, updated_at
         FROM evaluators
         WHERE namespace = $1
           AND (
@@ -155,7 +155,7 @@ pub(crate) async fn search_evaluator_summaries(
     Ok(evaluators)
 }
 
-pub(crate) async fn update_evaluator_active_by_name(
+pub(crate) async fn update_evaluator_enabled_by_name(
     db: &PgPool,
     namespace: &str,
     name: &str,
@@ -164,14 +164,14 @@ pub(crate) async fn update_evaluator_active_by_name(
     let result = sqlx::query(
         r#"
         UPDATE evaluators
-        SET is_active = $3,
+        SET is_enabled = $3,
             updated_at = now()
         WHERE namespace = $1 AND name = $2
         "#,
     )
     .bind(namespace)
     .bind(name)
-    .bind(patch.is_active)
+    .bind(patch.is_enabled)
     .execute(db)
     .await?;
 

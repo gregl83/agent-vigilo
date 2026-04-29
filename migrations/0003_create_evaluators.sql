@@ -27,7 +27,7 @@ CREATE TABLE evaluators (
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
 
     -- lifecycle
-    is_active BOOLEAN NOT NULL DEFAULT true,
+    is_enabled BOOLEAN NOT NULL DEFAULT true,
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -44,8 +44,8 @@ CREATE TABLE evaluators (
 CREATE INDEX idx_evaluators_namespace_name
     ON evaluators(namespace, name);
 
-CREATE INDEX idx_evaluators_namespace_active
-    ON evaluators(namespace, is_active);
+CREATE INDEX idx_evaluators_namespace_enabled
+    ON evaluators(namespace, is_enabled);
 
 CREATE INDEX idx_evaluators_interface
     ON evaluators(interface_name, interface_version);
@@ -101,8 +101,8 @@ COMMENT ON COLUMN evaluators.tags IS
 COMMENT ON COLUMN evaluators.metadata IS
     'Extensible JSON metadata for evaluator-specific annotations, capabilities, or publishing information.';
 
-COMMENT ON COLUMN evaluators.is_active IS
-    'Whether the evaluator artifact is active and eligible for use. Inactive evaluators remain stored for auditability and reproducibility.';
+COMMENT ON COLUMN evaluators.is_enabled IS
+    'Whether the evaluator artifact is enabled and eligible for use. Disabled evaluators remain stored for auditability and reproducibility.';
 
 COMMENT ON COLUMN evaluators.created_at IS
     'Timestamp when the evaluator was created.';

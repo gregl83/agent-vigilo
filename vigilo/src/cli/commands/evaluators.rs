@@ -65,14 +65,14 @@ pub(crate) enum SubCommand {
         #[arg()]
         query: Option<String>,
     },
-    /// Deactivate system evaluator
-    Deactivate {
+    /// Disable system evaluator
+    Disable {
         /// Evaluator name
         #[arg()]
         evaluator_name: String,
     },
-    /// Activate system evaluator
-    Activate {
+    /// Enable system evaluator
+    Enable {
         /// Evaluator name
         #[arg()]
         evaluator_name: String,
@@ -141,11 +141,11 @@ impl Executable for SubCommand {
                 match evaluator {
                     Some(e) => {
                         out.write_line(format!(
-                            "{}:{}:{} active={} hash={}",
+                            "{}:{}:{} enabled={} hash={}",
                             e.namespace,
                             e.name,
                             e.version,
-                            e.is_active,
+                            e.is_enabled,
                             e.content_hash,
                         ))?;
                     }
@@ -177,32 +177,32 @@ impl Executable for SubCommand {
                 out.write_line(serde_json::to_string_pretty(&payload)?)?;
                 Ok(())
             }
-            SubCommand::Deactivate{ evaluator_name } => {
+            SubCommand::Disable{ evaluator_name } => {
                 let db = context.db().await?;
                 let out = context.out().await?;
 
-                let affected = evaluators::update_evaluator_active_by_name(
+                let affected = evaluators::update_evaluator_enabled_by_name(
                     db,
                     DEFAULT_NAMESPACE,
                     &evaluator_name,
-                    &EvaluatorPatch { is_active: false },
+                    &EvaluatorPatch { is_enabled: false },
                 ).await?;
 
-                out.write_line(format!("deactivated {} row(s)", affected))?;
+                out.write_line(format!("disabled {} row(s)", affected))?;
                 Ok(())
             }
-            SubCommand::Activate{ evaluator_name } => {
+            SubCommand::Enable{ evaluator_name } => {
                 let db = context.db().await?;
                 let out = context.out().await?;
 
-                let affected = evaluators::update_evaluator_active_by_name(
+                let affected = evaluators::update_evaluator_enabled_by_name(
                     db,
                     DEFAULT_NAMESPACE,
                     &evaluator_name,
-                    &EvaluatorPatch { is_active: true },
+                    &EvaluatorPatch { is_enabled: true },
                 ).await?;
 
-                out.write_line(format!("activated {} row(s)", affected))?;
+                out.write_line(format!("enabled {} row(s)", affected))?;
                 Ok(())
             }
             SubCommand::Remove{ evaluator_name } => {
@@ -242,11 +242,11 @@ impl Executable for Command {
                 } else {
                     for evaluator in evaluators {
                         info!(
-                            "{}:{}:{} active={}",
+                            "{}:{}:{} enabled={}",
                             evaluator.namespace,
                             evaluator.name,
                             evaluator.version,
-                            evaluator.is_active,
+                            evaluator.is_enabled,
                         );
                     }
                 }
