@@ -21,6 +21,43 @@ const DEFAULT_NAMESPACE: &str = "vigilo";
 const DEFAULT_SEARCH_LIMIT: i64 = 10;
 const MAX_SEARCH_LIMIT: i64 = 20;
 
+struct EvaluatorIdentity {
+    namespace: String,
+    name: String,
+    version: String,
+}
+
+fn parse_fully_qualified_evaluator(input: &str) -> anyhow::Result<EvaluatorIdentity> {
+    let (identity, version) = input
+        .split_once('@')
+        .map(|(l, r)| (l.trim(), r.trim()))
+        .ok_or_else(|| anyhow::anyhow!(
+            "ambiguous evaluator reference '{}'; use fully qualified '<namespace>:<name>@<version>'",
+            input
+        ))?;
+
+    let (namespace, name) = identity
+        .split_once(':')
+        .map(|(l, r)| (l.trim(), r.trim()))
+        .ok_or_else(|| anyhow::anyhow!(
+            "ambiguous evaluator reference '{}'; use fully qualified '<namespace>:<name>@<version>'",
+            input
+        ))?;
+
+    if namespace.is_empty() || name.is_empty() || version.is_empty() {
+        anyhow::bail!(
+            "ambiguous evaluator reference '{}'; use fully qualified '<namespace>:<name>@<version>'",
+            input
+        );
+    }
+
+    Ok(EvaluatorIdentity {
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        version: version.to_string(),
+    })
+}
+
 
 fn get_manifest_profile(release: bool, profile: Option<String>) -> String {
     match release {
@@ -47,9 +84,9 @@ pub(crate) enum SubCommand {
     },
     /// Show system evaluator
     Show {
-        /// Evaluator name
+        /// Fully qualified evaluator reference (<namespace>:<name>@<version>)
         #[arg()]
-        evaluator_name: String,
+        evaluator: String,
     },
     /// Search evaluators and return JSON payload
     Search {
@@ -67,21 +104,21 @@ pub(crate) enum SubCommand {
     },
     /// Disable system evaluator
     Disable {
-        /// Evaluator name
+        /// Fully qualified evaluator reference (<namespace>:<name>@<version>)
         #[arg()]
-        evaluator_name: String,
+        evaluator: String,
     },
     /// Enable system evaluator
     Enable {
-        /// Evaluator name
+        /// Fully qualified evaluator reference (<namespace>:<name>@<version>)
         #[arg()]
-        evaluator_name: String,
+        evaluator: String,
     },
     /// Remove system evaluator
     Remove {
-        /// Evaluator name
+        /// Fully qualified evaluator reference (<namespace>:<name>@<version>)
         #[arg()]
-        evaluator_name: String,
+        evaluator: String,
     },
 }
 
@@ -120,7 +157,7 @@ impl Executable for SubCommand {
                 ).await?;
 
                 info!(
-                    "successfully added evaluator: {}:{}:{}",
+                    "successfully added evaluator: {}:{}@{}",
                     evaluator.namespace,
                     evaluator.name,
                     evaluator.version,
@@ -128,31 +165,51 @@ impl Executable for SubCommand {
 
                 Ok(())
             }
-            SubCommand::Show{ evaluator_name } => {
+            SubCommand::Show{ evaluator } => {
                 let db = context.db().await?;
                 let out = context.out().await?;
+                let evaluator = parse_fully_qualified_evaluator(&evaluator)?;
 
-                let evaluator = evaluators::select_latest_evaluator_by_name(
+                let evaluator_record = evaluators::select_evaluator(
                     db,
-                    DEFAULT_NAMESPACE,
-                    &evaluator_name,
+                    &evaluator.namespace,
+                    &evaluator.name,
+                    &evaluator.version,
                 ).await?;
 
-                match evaluator {
-                    Some(e) => {
-                        out.write_line(format!(
-                            "{}:{}:{} enabled={} hash={}",
-                            e.namespace,
-                            e.name,
-                            e.version,
-                            e.is_enabled,
-                            e.content_hash,
-                        ))?;
-                    }
-                    None => {
-                        out.write_line(format!("evaluator not found: {}", evaluator_name))?;
-                    }
-                }
+                let payload = match evaluator_record {
+                    Some(e) => json!({
+                        "id": e.id,
+                        "namespace": e.namespace,
+                        "name": e.name,
+                        "version": e.version,
+                        "content_hash": e.content_hash,
+                        "wasm_size_bytes": e.wasm_size_bytes,
+                        "interface_name": e.interface_name,
+                        "interface_version": e.interface_version,
+                        "wit_world": e.wit_world,
+                        "runtime": e.runtime,
+                        "runtime_version": e.runtime_version,
+                        "runtime_fingerprint": e.runtime_fingerprint,
+                        "description": e.description,
+                        "tags": e.tags,
+                        "metadata": e.metadata,
+                        "is_enabled": e.is_enabled,
+                        "created_at": e.created_at,
+                        "updated_at": e.updated_at,
+                    }),
+                    None => json!({
+                        "evaluator": serde_json::Value::Null,
+                        "error": format!(
+                            "evaluator not found: {}:{}@{}",
+                            evaluator.namespace,
+                            evaluator.name,
+                            evaluator.version,
+                        ),
+                    }),
+                };
+
+                out.write_line(serde_json::to_string_pretty(&payload)?)?;
 
                 Ok(())
             }
@@ -177,42 +234,48 @@ impl Executable for SubCommand {
                 out.write_line(serde_json::to_string_pretty(&payload)?)?;
                 Ok(())
             }
-            SubCommand::Disable{ evaluator_name } => {
+            SubCommand::Disable{ evaluator } => {
                 let db = context.db().await?;
                 let out = context.out().await?;
+                let evaluator = parse_fully_qualified_evaluator(&evaluator)?;
 
-                let affected = evaluators::update_evaluator_enabled_by_name(
+                let affected = evaluators::update_evaluator_enabled(
                     db,
-                    DEFAULT_NAMESPACE,
-                    &evaluator_name,
+                    &evaluator.namespace,
+                    &evaluator.name,
+                    &evaluator.version,
                     &EvaluatorPatch { is_enabled: false },
                 ).await?;
 
                 out.write_line(format!("disabled {} row(s)", affected))?;
                 Ok(())
             }
-            SubCommand::Enable{ evaluator_name } => {
+            SubCommand::Enable{ evaluator } => {
                 let db = context.db().await?;
                 let out = context.out().await?;
+                let evaluator = parse_fully_qualified_evaluator(&evaluator)?;
 
-                let affected = evaluators::update_evaluator_enabled_by_name(
+                let affected = evaluators::update_evaluator_enabled(
                     db,
-                    DEFAULT_NAMESPACE,
-                    &evaluator_name,
+                    &evaluator.namespace,
+                    &evaluator.name,
+                    &evaluator.version,
                     &EvaluatorPatch { is_enabled: true },
                 ).await?;
 
                 out.write_line(format!("enabled {} row(s)", affected))?;
                 Ok(())
             }
-            SubCommand::Remove{ evaluator_name } => {
+            SubCommand::Remove{ evaluator } => {
                 let db = context.db().await?;
                 let out = context.out().await?;
+                let evaluator = parse_fully_qualified_evaluator(&evaluator)?;
 
-                let affected = evaluators::delete_evaluator_by_name(
+                let affected = evaluators::delete_evaluator(
                     db,
-                    DEFAULT_NAMESPACE,
-                    &evaluator_name,
+                    &evaluator.namespace,
+                    &evaluator.name,
+                    &evaluator.version,
                 ).await?;
 
                 out.write_line(format!("removed {} row(s)", affected))?;
@@ -242,7 +305,7 @@ impl Executable for Command {
                 } else {
                     for evaluator in evaluators {
                         info!(
-                            "{}:{}:{} enabled={}",
+                            "{}:{}@{} enabled={}",
                             evaluator.namespace,
                             evaluator.name,
                             evaluator.version,

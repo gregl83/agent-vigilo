@@ -93,6 +93,33 @@ pub(crate) async fn select_latest_evaluator_by_name(
     Ok(evaluator)
 }
 
+pub(crate) async fn select_evaluator(
+    db: &PgPool,
+    namespace: &str,
+    name: &str,
+    version: &str,
+) -> anyhow::Result<Option<Evaluator>> {
+    let evaluator = sqlx::query_as::<_, Evaluator>(
+        r#"
+        SELECT
+            id, namespace, name, version, content_hash, wasm_bytes,
+            wasm_size_bytes, interface_name, interface_version,
+            wit_world, runtime, runtime_version, runtime_fingerprint,
+            description, tags, metadata, is_enabled, created_at, updated_at
+        FROM evaluators
+        WHERE namespace = $1 AND name = $2 AND version = $3
+        LIMIT 1
+        "#,
+    )
+    .bind(namespace)
+    .bind(name)
+    .bind(version)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(evaluator)
+}
+
 pub(crate) async fn list_evaluators(db: &PgPool, namespace: &str) -> anyhow::Result<Vec<Evaluator>> {
     let evaluators = sqlx::query_as::<_, Evaluator>(
         r#"
@@ -129,10 +156,7 @@ pub(crate) async fn search_evaluator_summaries(
     let evaluators = sqlx::query_as::<_, EvaluatorSummary>(
         r#"
         SELECT
-            id, namespace, name, version, content_hash,
-            interface_name, interface_version, wit_world,
-            runtime, runtime_version, runtime_fingerprint,
-            description, tags, metadata, is_enabled, created_at, updated_at
+            namespace, name, version, description, tags, metadata
         FROM evaluators
         WHERE namespace = $1
           AND (
@@ -155,10 +179,11 @@ pub(crate) async fn search_evaluator_summaries(
     Ok(evaluators)
 }
 
-pub(crate) async fn update_evaluator_enabled_by_name(
+pub(crate) async fn update_evaluator_enabled(
     db: &PgPool,
     namespace: &str,
     name: &str,
+    version: &str,
     patch: &EvaluatorPatch,
 ) -> anyhow::Result<u64> {
     let result = sqlx::query(
@@ -166,31 +191,34 @@ pub(crate) async fn update_evaluator_enabled_by_name(
         UPDATE evaluators
         SET is_enabled = $3,
             updated_at = now()
-        WHERE namespace = $1 AND name = $2
+        WHERE namespace = $1 AND name = $2 AND version = $4
         "#,
     )
     .bind(namespace)
     .bind(name)
     .bind(patch.is_enabled)
+    .bind(version)
     .execute(db)
     .await?;
 
     Ok(result.rows_affected())
 }
 
-pub(crate) async fn delete_evaluator_by_name(
+pub(crate) async fn delete_evaluator(
     db: &PgPool,
     namespace: &str,
     name: &str,
+    version: &str,
 ) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
         DELETE FROM evaluators
-        WHERE namespace = $1 AND name = $2
+        WHERE namespace = $1 AND name = $2 AND version = $3
         "#,
     )
     .bind(namespace)
     .bind(name)
+    .bind(version)
     .execute(db)
     .await?;
 
