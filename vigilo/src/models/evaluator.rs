@@ -25,6 +25,8 @@ pub(crate) struct EvaluatorDraft {
     pub(crate) runtime_version: String,
     pub(crate) runtime_fingerprint: String,
     pub(crate) description: Option<String>,
+    pub(crate) tags: serde_json::Value,
+    pub(crate) metadata: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

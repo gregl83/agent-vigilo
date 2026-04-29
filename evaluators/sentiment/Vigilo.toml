@@ -1,5 +1,11 @@
 [package]
 manifest = "Cargo.toml"
+description = "Lexicon-based sentiment evaluator"
+tags = ["sentiment", "classification", "example"]
+
+[package.metadata]
+owner = "evaluators-team"
+tier = "example"
 
 [wit]
 path = "../../wit/evaluator.wit"

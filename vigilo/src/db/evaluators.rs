@@ -16,9 +16,9 @@ pub(crate) async fn insert_evaluator(db: &PgPool, draft: &EvaluatorDraft) -> any
             namespace, name, version, content_hash, wasm_bytes,
             wasm_size_bytes, interface_name, interface_version,
             wit_world, runtime, runtime_version, runtime_fingerprint,
-            description
+            description, tags, metadata
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         RETURNING
             id, namespace, name, version, content_hash, wasm_bytes,
             wasm_size_bytes, interface_name, interface_version,
@@ -39,6 +39,8 @@ pub(crate) async fn insert_evaluator(db: &PgPool, draft: &EvaluatorDraft) -> any
     .bind(&draft.runtime_version)
     .bind(&draft.runtime_fingerprint)
     .bind(&draft.description)
+    .bind(&draft.tags)
+    .bind(&draft.metadata)
     .fetch_one(db)
     .await?;
 

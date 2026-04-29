@@ -217,6 +217,7 @@ use serde::{
     Deserialize,
     Serialize,
 };
+use serde_json::Value;
 use tokio::sync::OnceCell;
 use tracing::{
     debug,
@@ -243,6 +244,15 @@ struct PackageMetadata {
     version: String,
     target_dir: PathBuf,
     modified: SystemTime,
+    description: Option<String>,
+    tags: Vec<String>,
+    metadata: Option<Value>,
+}
+
+struct EvaluatorMetadata {
+    description: Option<String>,
+    tags: Value,
+    metadata: Value,
 }
 
 struct WitWorld {
@@ -534,10 +544,44 @@ fn resolve_wit_metadata(
     })
 }
 
+fn value_from_toml(value: &toml::Value) -> anyhow::Result<Value> {
+    serde_json::to_value(value)
+        .map_err(|err| anyhow::anyhow!("failed to encode TOML value to JSON: {}", err))
+}
+
+fn resolve_evaluator_metadata(
+    package: &super::super::manifest::Package,
+    cargo: &PackageMetadata,
+) -> anyhow::Result<EvaluatorMetadata> {
+    let description = package
+        .description
+        .clone()
+        .or_else(|| cargo.description.clone());
+
+    let tags = if package.tags.is_empty() {
+        cargo.tags.clone()
+    } else {
+        package.tags.clone()
+    };
+
+    let metadata = match &package.metadata {
+        Some(value) => value_from_toml(value)?,
+        None => cargo.metadata.clone().unwrap_or_else(|| Value::Object(Default::default())),
+    };
+
+    Ok(EvaluatorMetadata {
+        description,
+        tags: Value::Array(tags.into_iter().map(Value::String).collect()),
+        metadata,
+    })
+}
+
 fn get_package_metadata(package_path: &PathBuf, manifest_file: &String) -> anyhow::Result<PackageMetadata> {
     match manifest_file.as_str() {
         "Cargo.toml" => {
             let manifest_path = package_path.join(manifest_file);
+            let manifest_content = fs::read_to_string(&manifest_path)?;
+            let manifest_value: toml::Value = toml::from_str(&manifest_content)?;
 
             let fs_metadata = fs::metadata(&manifest_path)?;
 
@@ -553,12 +597,42 @@ fn get_package_metadata(package_path: &PathBuf, manifest_file: &String) -> anyho
                 anyhow::anyhow!("no [package] section found in Cargo.toml")
             })?;
 
+            let package_table = manifest_value
+                .get("package")
+                .and_then(|value| value.as_table());
+
+            let description = package_table
+                .and_then(|pkg| pkg.get("description"))
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string());
+
+            let tags = package_table
+                .and_then(|pkg| pkg.get("keywords"))
+                .and_then(|value| value.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.as_str())
+                        .map(|item| item.to_string())
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default();
+
+            let metadata = package_table
+                .and_then(|pkg| pkg.get("metadata"))
+                .and_then(|value| value.as_table())
+                .and_then(|metadata| metadata.get("vigilo"))
+                .map(value_from_toml)
+                .transpose()?;
+
             Ok(
                 PackageMetadata {
                     name: package.name,
                     version: package.version.get()?.to_string(),
                     target_dir: target_dir.into_std_path_buf(),
                     modified: fs_metadata.modified()?,
+                    description,
+                    tags,
+                    metadata,
                 }
             )
         }
@@ -589,6 +663,9 @@ fn resolve_runtime_version() -> anyhow::Result<String> {
 pub struct Component {
     pub name: String,
     pub version: String,
+    pub description: Option<String>,
+    pub tags: Value,
+    pub metadata: Value,
     pub interface_name: Option<String>,
     pub interface_version: Option<String>,
     pub wit_world: Option<String>,
@@ -640,6 +717,7 @@ impl Wasm {
             &package_path,
             &manifest.package.manifest,
         )?;
+        let evaluator_metadata = resolve_evaluator_metadata(&manifest.package, &package_metadata)?;
 
         let wasm_path = package_metadata.target_dir.join(&manifest_profile.wasm);
 
@@ -668,6 +746,9 @@ impl Wasm {
             Component{
                 name: package_metadata.name,
                 version: package_metadata.version,
+                description: evaluator_metadata.description,
+                tags: evaluator_metadata.tags,
+                metadata: evaluator_metadata.metadata,
                 interface_name: wit_metadata.interface_name,
                 interface_version: wit_metadata.interface_version,
                 wit_world: wit_metadata.wit_world,

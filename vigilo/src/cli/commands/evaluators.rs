@@ -96,7 +96,9 @@ impl Executable for SubCommand {
                         runtime: component.runtime,
                         runtime_version: component.runtime_version,
                         runtime_fingerprint: component.runtime_fingerprint,
-                        description: None,
+                        description: component.description,
+                        tags: component.tags,
+                        metadata: component.metadata,
                     },
                 ).await?;
 

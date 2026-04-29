@@ -10,6 +10,10 @@ use serde::Deserialize;
 #[derive(Deserialize)]
 pub(crate) struct Package {
     pub manifest: String,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub metadata: Option<toml::Value>,
 }
 
 #[derive(Deserialize)]
