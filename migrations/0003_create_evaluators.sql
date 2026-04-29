@@ -17,8 +17,9 @@ CREATE TABLE evaluators (
     interface_name TEXT,
     interface_version TEXT,
     wit_world TEXT,
-    runtime TEXT,
-    runtime_version TEXT,
+    runtime TEXT NOT NULL,
+    runtime_version TEXT NOT NULL,
+    runtime_fingerprint TEXT NOT NULL,
 
     -- optional descriptive metadata
     description TEXT,
@@ -87,6 +88,9 @@ COMMENT ON COLUMN evaluators.runtime IS
 
 COMMENT ON COLUMN evaluators.runtime_version IS
     'Expected runtime version or compatibility band for the evaluator artifact.';
+
+COMMENT ON COLUMN evaluators.runtime_fingerprint IS
+    'Exact runtime compatibility fingerprint used to ensure the evaluator artifact is executed by a compatible host runtime.';
 
 COMMENT ON COLUMN evaluators.description IS
     'Optional human-readable description of the evaluator.';

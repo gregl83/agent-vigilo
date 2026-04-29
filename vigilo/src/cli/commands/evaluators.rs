@@ -93,8 +93,9 @@ impl Executable for SubCommand {
                         interface_name: component.interface_name,
                         interface_version: component.interface_version,
                         wit_world: component.wit_world,
-                        runtime: Some("wasmtime".to_string()),
-                        runtime_version: None,
+                        runtime: component.runtime,
+                        runtime_version: component.runtime_version,
+                        runtime_fingerprint: component.runtime_fingerprint,
                         description: None,
                     },
                 ).await?;

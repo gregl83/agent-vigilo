@@ -263,6 +263,18 @@ struct WitMetadata {
 }
 
 const PACKAGE_METADATA_SECTION: &str = "vigilo.package";
+const WASM_RUNTIME_NAME: &str = "wasmtime";
+
+#[derive(Deserialize)]
+struct CargoLockDocument {
+    package: Vec<CargoLockPackage>,
+}
+
+#[derive(Deserialize)]
+struct CargoLockPackage {
+    name: String,
+    version: String,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct EmbeddedPackageMetadata {
@@ -562,12 +574,27 @@ fn get_engine_fingerprint(engine: &Engine) -> String {
     format!("{:x}-{}", hasher.finish(), ARCH)
 }
 
+fn resolve_runtime_version() -> anyhow::Result<String> {
+    let lock_content = include_str!("../../../Cargo.lock");
+    let lock = toml::from_str::<CargoLockDocument>(lock_content)
+        .map_err(|err| anyhow::anyhow!("failed to parse embedded Cargo.lock: {}", err))?;
+
+    lock.package
+        .into_iter()
+        .find(|pkg| pkg.name == WASM_RUNTIME_NAME)
+        .map(|pkg| pkg.version)
+        .ok_or_else(|| anyhow::anyhow!("{} dependency was not found in embedded Cargo.lock", WASM_RUNTIME_NAME))
+}
+
 pub struct Component {
     pub name: String,
     pub version: String,
     pub interface_name: Option<String>,
     pub interface_version: Option<String>,
     pub wit_world: Option<String>,
+    pub runtime: String,
+    pub runtime_version: String,
+    pub runtime_fingerprint: String,
     pub component: component::Component,
     pub wasm_hash: String,
     pub wasm_bytes: Vec<u8>,
@@ -635,6 +662,8 @@ impl Wasm {
         )?;
         let serialized = component.serialize()?;
 
+        let runtime_version = resolve_runtime_version()?;
+
         Ok(
             Component{
                 name: package_metadata.name,
@@ -642,6 +671,9 @@ impl Wasm {
                 interface_name: wit_metadata.interface_name,
                 interface_version: wit_metadata.interface_version,
                 wit_world: wit_metadata.wit_world,
+                runtime: WASM_RUNTIME_NAME.to_string(),
+                runtime_version,
+                runtime_fingerprint: self.fingerprint.clone(),
                 component,
                 wasm_hash,
                 wasm_bytes,

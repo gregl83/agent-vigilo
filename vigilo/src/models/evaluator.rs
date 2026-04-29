@@ -21,8 +21,9 @@ pub(crate) struct EvaluatorDraft {
     pub(crate) interface_name: Option<String>,
     pub(crate) interface_version: Option<String>,
     pub(crate) wit_world: Option<String>,
-    pub(crate) runtime: Option<String>,
-    pub(crate) runtime_version: Option<String>,
+    pub(crate) runtime: String,
+    pub(crate) runtime_version: String,
+    pub(crate) runtime_fingerprint: String,
     pub(crate) description: Option<String>,
 }
 
@@ -43,8 +44,9 @@ pub(crate) struct Evaluator {
     pub(crate) interface_name: Option<String>,
     pub(crate) interface_version: Option<String>,
     pub(crate) wit_world: Option<String>,
-    pub(crate) runtime: Option<String>,
-    pub(crate) runtime_version: Option<String>,
+    pub(crate) runtime: String,
+    pub(crate) runtime_version: String,
+    pub(crate) runtime_fingerprint: String,
     pub(crate) description: Option<String>,
     pub(crate) tags: serde_json::Value,
     pub(crate) metadata: serde_json::Value,
