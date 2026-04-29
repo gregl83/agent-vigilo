@@ -5,6 +5,7 @@ use crate::models::evaluator::{
     Evaluator,
     EvaluatorDraft,
     EvaluatorPatch,
+    EvaluatorSummary,
 };
 
 pub(crate) async fn insert_evaluator(db: &PgPool, draft: &EvaluatorDraft) -> anyhow::Result<Evaluator> {
@@ -106,6 +107,48 @@ pub(crate) async fn list_evaluators(db: &PgPool, namespace: &str) -> anyhow::Res
         "#,
     )
     .bind(namespace)
+    .fetch_all(db)
+    .await?;
+
+    Ok(evaluators)
+}
+
+pub(crate) async fn search_evaluator_summaries(
+    db: &PgPool,
+    namespace: &str,
+    query: Option<&str>,
+    limit: i64,
+) -> anyhow::Result<Vec<EvaluatorSummary>> {
+    let limit = limit.clamp(1, 20);
+
+    let pattern = query
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("%{}%", value));
+
+    let evaluators = sqlx::query_as::<_, EvaluatorSummary>(
+        r#"
+        SELECT
+            id, namespace, name, version, content_hash,
+            interface_name, interface_version, wit_world,
+            runtime, runtime_version, runtime_fingerprint,
+            description, tags, metadata, is_active, created_at, updated_at
+        FROM evaluators
+        WHERE namespace = $1
+          AND (
+              $2::text IS NULL
+              OR name ILIKE $2
+              OR COALESCE(description, '') ILIKE $2
+              OR tags::text ILIKE $2
+              OR metadata::text ILIKE $2
+          )
+        ORDER BY name ASC, version DESC
+        LIMIT $3
+        "#,
+    )
+    .bind(namespace)
+    .bind(pattern)
+    .bind(limit)
     .fetch_all(db)
     .await?;
 

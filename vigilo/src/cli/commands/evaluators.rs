@@ -5,6 +5,7 @@ use clap::{
     Args,
     Subcommand,
 };
+use serde_json::json;
 use tracing::{info, warn};
 
 use crate::context::Context;
@@ -17,6 +18,8 @@ use super::args::parsers::parse_dir;
 use super::Executable;
 
 const DEFAULT_NAMESPACE: &str = "vigilo";
+const DEFAULT_SEARCH_LIMIT: i64 = 10;
+const MAX_SEARCH_LIMIT: i64 = 20;
 
 
 fn get_manifest_profile(release: bool, profile: Option<String>) -> String {
@@ -47,6 +50,20 @@ pub(crate) enum SubCommand {
         /// Evaluator name
         #[arg()]
         evaluator_name: String,
+    },
+    /// Search evaluators and return JSON payload
+    Search {
+        /// Evaluator namespace
+        #[arg(long, value_name = "NAMESPACE", default_value = DEFAULT_NAMESPACE)]
+        namespace: String,
+
+        /// Max results to return
+        #[arg(long, value_name = "LIMIT", default_value_t = DEFAULT_SEARCH_LIMIT, value_parser = clap::value_parser!(i64).range(1..=MAX_SEARCH_LIMIT as i64))]
+        limit: i64,
+
+        /// Optional text query (matches name, description, tags, metadata)
+        #[arg()]
+        query: Option<String>,
     },
     /// Deactivate system evaluator
     Deactivate {
@@ -113,6 +130,7 @@ impl Executable for SubCommand {
             }
             SubCommand::Show{ evaluator_name } => {
                 let db = context.db().await?;
+                let out = context.out().await?;
 
                 let evaluator = evaluators::select_latest_evaluator_by_name(
                     db,
@@ -122,24 +140,46 @@ impl Executable for SubCommand {
 
                 match evaluator {
                     Some(e) => {
-                        println!(
+                        out.write_line(format!(
                             "{}:{}:{} active={} hash={}",
                             e.namespace,
                             e.name,
                             e.version,
                             e.is_active,
                             e.content_hash,
-                        );
+                        ))?;
                     }
                     None => {
-                        println!("evaluator not found: {}", evaluator_name);
+                        out.write_line(format!("evaluator not found: {}", evaluator_name))?;
                     }
                 }
 
                 Ok(())
             }
+            SubCommand::Search { namespace, limit, query } => {
+                let db = context.db().await?;
+                let out = context.out().await?;
+                let evaluators = evaluators::search_evaluator_summaries(
+                    db,
+                    &namespace,
+                    query.as_deref(),
+                    limit,
+                ).await?;
+
+                let payload = json!({
+                    "namespace": namespace,
+                    "query": query,
+                    "limit": limit,
+                    "count": evaluators.len(),
+                    "items": evaluators,
+                });
+
+                out.write_line(serde_json::to_string_pretty(&payload)?)?;
+                Ok(())
+            }
             SubCommand::Deactivate{ evaluator_name } => {
                 let db = context.db().await?;
+                let out = context.out().await?;
 
                 let affected = evaluators::update_evaluator_active_by_name(
                     db,
@@ -148,11 +188,12 @@ impl Executable for SubCommand {
                     &EvaluatorPatch { is_active: false },
                 ).await?;
 
-                println!("deactivated {} row(s)", affected);
+                out.write_line(format!("deactivated {} row(s)", affected))?;
                 Ok(())
             }
             SubCommand::Activate{ evaluator_name } => {
                 let db = context.db().await?;
+                let out = context.out().await?;
 
                 let affected = evaluators::update_evaluator_active_by_name(
                     db,
@@ -161,11 +202,12 @@ impl Executable for SubCommand {
                     &EvaluatorPatch { is_active: true },
                 ).await?;
 
-                println!("activated {} row(s)", affected);
+                out.write_line(format!("activated {} row(s)", affected))?;
                 Ok(())
             }
             SubCommand::Remove{ evaluator_name } => {
                 let db = context.db().await?;
+                let out = context.out().await?;
 
                 let affected = evaluators::delete_evaluator_by_name(
                     db,
@@ -173,7 +215,7 @@ impl Executable for SubCommand {
                     &evaluator_name,
                 ).await?;
 
-                println!("removed {} row(s)", affected);
+                out.write_line(format!("removed {} row(s)", affected))?;
                 Ok(())
             }
         }
