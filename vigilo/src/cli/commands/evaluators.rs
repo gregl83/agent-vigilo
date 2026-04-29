@@ -76,7 +76,7 @@ impl Executable for SubCommand {
                 info!("adding evaluator: {}", evaluator_path.display());
 
                 let profile = get_manifest_profile(release, profile);
-                let component = context.wasm().await?.build(
+                let component = context.wasm().await?.prepare_component(
                     evaluator_path,
                     profile,
                 )?;

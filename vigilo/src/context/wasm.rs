@@ -604,7 +604,7 @@ impl Wasm {
         )
     }
 
-    pub fn build(&self, package_path: PathBuf, profile: String) -> anyhow::Result<Component> {
+    pub fn prepare_component(&self, package_path: PathBuf, profile: String) -> anyhow::Result<Component> {
         let manifest = read_manifest(&package_path)?;
         let manifest_profile = manifest.get_profile(profile)?;
         let wit_metadata = resolve_wit_metadata(&package_path, manifest.wit.as_ref())?;
