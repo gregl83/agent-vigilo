@@ -5,7 +5,7 @@ use clap::{
     Args,
     Subcommand,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::context::Context;
 use crate::db::evaluators;
@@ -99,12 +99,13 @@ impl Executable for SubCommand {
                     },
                 ).await?;
 
-                println!(
-                    "added evaluator {}:{}:{}",
+                info!(
+                    "successfully added evaluator: {}:{}:{}",
                     evaluator.namespace,
                     evaluator.name,
                     evaluator.version,
                 );
+
                 Ok(())
             }
             SubCommand::Show{ evaluator_name } => {
@@ -192,10 +193,10 @@ impl Executable for Command {
                 let evaluators = evaluators::list_evaluators(db, DEFAULT_NAMESPACE).await?;
 
                 if evaluators.is_empty() {
-                    println!("no evaluators found");
+                    warn!("no evaluators found");
                 } else {
                     for evaluator in evaluators {
-                        println!(
+                        info!(
                             "{}:{}:{} active={}",
                             evaluator.namespace,
                             evaluator.name,
