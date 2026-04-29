@@ -213,8 +213,16 @@ use std::{
 use std::time::SystemTime;
 use cargo_metadata::MetadataCommand;
 use cargo_toml::Manifest;
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use tokio::sync::OnceCell;
 use tracing::debug;
+use wasmparser::{
+    Parser,
+    Payload,
+};
 use wasmtime::{
     component,
     Config as EngineConfig,
@@ -229,6 +237,113 @@ struct PackageMetadata {
     version: String,
     target_dir: PathBuf,
     modified: SystemTime,
+}
+
+const PACKAGE_METADATA_SECTION: &str = "vigilo.package";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct EmbeddedPackageMetadata {
+    name: String,
+    version: String,
+}
+
+fn read_embedded_package_metadata(wasm_bytes: &[u8]) -> anyhow::Result<Option<EmbeddedPackageMetadata>> {
+    for payload in Parser::new(0).parse_all(wasm_bytes) {
+        if let Payload::CustomSection(section) = payload? {
+            if section.name() == PACKAGE_METADATA_SECTION {
+                let metadata = serde_json::from_slice::<EmbeddedPackageMetadata>(section.data())
+                    .map_err(|err| anyhow::anyhow!("failed to decode {} metadata: {}", PACKAGE_METADATA_SECTION, err))?;
+                return Ok(Some(metadata));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn push_u32_leb128(buf: &mut Vec<u8>, mut value: u32) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+
+        if value != 0 {
+            byte |= 0x80;
+        }
+
+        buf.push(byte);
+
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+fn append_custom_section(wasm_bytes: &[u8], section_name: &str, section_data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    let section_name_len = u32::try_from(section_name.len())
+        .map_err(|_| anyhow::anyhow!("custom section name too long"))?;
+    push_u32_leb128(&mut payload, section_name_len);
+    payload.extend_from_slice(section_name.as_bytes());
+    payload.extend_from_slice(section_data);
+
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| anyhow::anyhow!("custom section payload too long"))?;
+
+    let mut out = Vec::with_capacity(wasm_bytes.len() + payload.len() + 8);
+    out.extend_from_slice(wasm_bytes);
+    out.push(0);
+    push_u32_leb128(&mut out, payload_len);
+    out.extend_from_slice(&payload);
+
+    Ok(out)
+}
+
+fn ensure_embedded_package_metadata(
+    wasm_bytes: Vec<u8>,
+    package_name: &str,
+    package_version: &str,
+) -> anyhow::Result<Vec<u8>> {
+    match read_embedded_package_metadata(&wasm_bytes)? {
+        Some(existing) => {
+            if existing.name != package_name || existing.version != package_version {
+                anyhow::bail!(
+                    "embedded {} mismatch (found {}@{}, expected {}@{})",
+                    PACKAGE_METADATA_SECTION,
+                    existing.name,
+                    existing.version,
+                    package_name,
+                    package_version,
+                );
+            }
+
+            Ok(wasm_bytes)
+        }
+        None => {
+            let metadata = EmbeddedPackageMetadata {
+                name: package_name.to_string(),
+                version: package_version.to_string(),
+            };
+            let encoded = serde_json::to_vec(&metadata)?;
+            let out = append_custom_section(&wasm_bytes, PACKAGE_METADATA_SECTION, &encoded)?;
+
+            // verify append/read-back so we fail fast on malformed custom section writes.
+            let embedded = read_embedded_package_metadata(&out)?
+                .ok_or_else(|| anyhow::anyhow!("failed to read back embedded {} metadata", PACKAGE_METADATA_SECTION))?;
+
+            if embedded.name != package_name || embedded.version != package_version {
+                anyhow::bail!(
+                    "embedded {} mismatch after write (found {}@{}, expected {}@{})",
+                    PACKAGE_METADATA_SECTION,
+                    embedded.name,
+                    embedded.version,
+                    package_name,
+                    package_version,
+                );
+            }
+
+            Ok(out)
+        }
+    }
 }
 
 fn get_package_metadata(package_path: &PathBuf, manifest_file: &String) -> anyhow::Result<PackageMetadata> {
@@ -327,6 +442,11 @@ impl Wasm {
             return Err(anyhow::anyhow!("evaluation manifest was modified after wasm build"));
         }
         let wasm_bytes = fs::read(wasm_path)?;
+        let wasm_bytes = ensure_embedded_package_metadata(
+            wasm_bytes,
+            &package_metadata.name,
+            &package_metadata.version,
+        )?;
         let wasm_hash = blake3::hash(&wasm_bytes).to_hex().to_string();
 
         let component = component::Component::new(

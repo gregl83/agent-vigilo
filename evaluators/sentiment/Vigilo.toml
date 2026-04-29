@@ -1,6 +1,14 @@
 [package]
 manifest = "Cargo.toml"
 
+[wit]
+path = "../../wit/evaluator.wit"
+world = "evaluator-world"
+package = "vigilo:evaluator"
+version = "0.1.0"
+interface = "evaluator"
+strict = true
+
 [profile.dev]
 wasm = "wasm32-wasip2/debug/sentiment.wasm"
 

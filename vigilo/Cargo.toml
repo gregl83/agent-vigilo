@@ -50,6 +50,8 @@ tracing = { version = "0.1.44" }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.8", features = ["v7", "serde"] }
 wasmtime = { version = "44.0.0" }
+wasmparser = { version = "0.248.0" }
+wit-parser = { version = "0.248.0" }
 serde_json = "1.0.149"
 
 [features]
