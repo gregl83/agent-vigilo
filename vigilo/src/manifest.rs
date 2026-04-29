@@ -17,9 +17,25 @@ pub(crate) struct Profile {
     pub wasm: String,
 }
 
+fn default_false() -> bool {
+    false
+}
+
+#[derive(Deserialize)]
+pub(crate) struct Wit {
+    pub path: String,
+    pub world: String,
+    pub package: String,
+    pub version: String,
+    pub interface: String,
+    #[serde(default = "default_false")]
+    pub strict: bool,
+}
+
 #[derive(Deserialize)]
 pub(crate) struct Manifest {
     pub package: Package,
+    pub wit: Option<Wit>,
     profile: HashMap<String, Profile>,
 }
 

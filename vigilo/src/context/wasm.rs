@@ -218,7 +218,10 @@ use serde::{
     Serialize,
 };
 use tokio::sync::OnceCell;
-use tracing::debug;
+use tracing::{
+    debug,
+    warn,
+};
 use wasmparser::{
     Parser,
     Payload,
@@ -229,7 +232,10 @@ use wasmtime::{
     Engine,
 };
 
-use super::super::manifest::read_manifest;
+use super::super::manifest::{
+    Wit,
+    read_manifest,
+};
 
 
 struct PackageMetadata {
@@ -237,6 +243,23 @@ struct PackageMetadata {
     version: String,
     target_dir: PathBuf,
     modified: SystemTime,
+}
+
+struct WitWorld {
+    name: String,
+    exports: Vec<String>,
+}
+
+struct WitDocument {
+    package: String,
+    version: Option<String>,
+    worlds: Vec<WitWorld>,
+}
+
+struct WitMetadata {
+    interface_name: Option<String>,
+    interface_version: Option<String>,
+    wit_world: Option<String>,
 }
 
 const PACKAGE_METADATA_SECTION: &str = "vigilo.package";
@@ -346,6 +369,159 @@ fn ensure_embedded_package_metadata(
     }
 }
 
+fn parse_wit_file(path: &PathBuf) -> anyhow::Result<WitDocument> {
+    let content = fs::read_to_string(path)?;
+
+    let mut package: Option<String> = None;
+    let mut version: Option<String> = None;
+    let mut worlds: Vec<WitWorld> = Vec::new();
+
+    let mut current_world: Option<WitWorld> = None;
+    let mut world_depth: i32 = 0;
+
+    for raw in content.lines() {
+        let line = raw.split("//").next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if package.is_none() && line.starts_with("package ") && line.ends_with(';') {
+            let body = line
+                .trim_start_matches("package ")
+                .trim_end_matches(';')
+                .trim();
+
+            if let Some((pkg, ver)) = body.split_once('@') {
+                package = Some(pkg.trim().to_string());
+                version = Some(ver.trim().to_string());
+            } else {
+                package = Some(body.to_string());
+            }
+            continue;
+        }
+
+        if current_world.is_none() && line.starts_with("world ") && line.contains('{') {
+            let name_part = line
+                .trim_start_matches("world ")
+                .split('{')
+                .next()
+                .unwrap_or("")
+                .trim();
+
+            if !name_part.is_empty() {
+                current_world = Some(WitWorld {
+                    name: name_part.to_string(),
+                    exports: Vec::new(),
+                });
+                world_depth = 1;
+                continue;
+            }
+        }
+
+        if let Some(world) = current_world.as_mut() {
+            if line.starts_with("export ") && line.ends_with(';') {
+                let export_name = line
+                    .trim_start_matches("export ")
+                    .trim_end_matches(';')
+                    .trim();
+                if !export_name.is_empty() {
+                    world.exports.push(export_name.to_string());
+                }
+            }
+
+            let opens = line.chars().filter(|c| *c == '{').count() as i32;
+            let closes = line.chars().filter(|c| *c == '}').count() as i32;
+            world_depth += opens - closes;
+
+            if world_depth <= 0 {
+                let finished = current_world.take().expect("world exists");
+                worlds.push(finished);
+                world_depth = 0;
+            }
+        }
+    }
+
+    let package = package.ok_or_else(|| anyhow::anyhow!("missing package declaration in WIT file {}", path.display()))?;
+
+    Ok(WitDocument {
+        package,
+        version,
+        worlds,
+    })
+}
+
+fn resolve_wit_metadata(
+    package_path: &PathBuf,
+    manifest_wit: Option<&Wit>,
+) -> anyhow::Result<WitMetadata> {
+    let Some(wit) = manifest_wit else {
+        return Ok(WitMetadata {
+            interface_name: None,
+            interface_version: None,
+            wit_world: None,
+        });
+    };
+
+    let wit_path = package_path.join(&wit.path);
+    let parsed = parse_wit_file(&wit_path)?;
+
+    let world = parsed
+        .worlds
+        .iter()
+        .find(|w| w.name == wit.world);
+
+    let has_interface_export = world
+        .map(|w| w.exports.iter().any(|e| e == &wit.interface))
+        .unwrap_or(false);
+
+    let package_matches = parsed.package == wit.package;
+    let version_matches = parsed.version.as_deref() == Some(wit.version.as_str());
+    let world_matches = world.is_some();
+    let interface_matches = has_interface_export;
+
+    if wit.strict {
+        if !package_matches {
+            return Err(anyhow::anyhow!(
+                "WIT package mismatch (config={}, file={})",
+                wit.package,
+                parsed.package,
+            ));
+        }
+        if !version_matches {
+            return Err(anyhow::anyhow!(
+                "WIT version mismatch (config={}, file={})",
+                wit.version,
+                parsed.version.unwrap_or_else(|| "<missing>".to_string()),
+            ));
+        }
+        if !world_matches {
+            return Err(anyhow::anyhow!(
+                "WIT world '{}' not found in {}",
+                wit.world,
+                wit_path.display(),
+            ));
+        }
+        if !interface_matches {
+            return Err(anyhow::anyhow!(
+                "WIT interface '{}' is not exported by world '{}'",
+                wit.interface,
+                wit.world,
+            ));
+        }
+    } else if !package_matches || !version_matches || !world_matches || !interface_matches {
+        warn!(
+            "WIT config does not fully match {} (strict=false), continuing with configured values",
+            wit_path.display()
+        );
+    }
+
+    Ok(WitMetadata {
+        interface_name: Some(format!("{}/{}", wit.package, wit.interface)),
+        interface_version: Some(wit.version.clone()),
+        wit_world: Some(wit.world.clone()),
+    })
+}
+
 fn get_package_metadata(package_path: &PathBuf, manifest_file: &String) -> anyhow::Result<PackageMetadata> {
     match manifest_file.as_str() {
         "Cargo.toml" => {
@@ -389,6 +565,9 @@ fn get_engine_fingerprint(engine: &Engine) -> String {
 pub struct Component {
     pub name: String,
     pub version: String,
+    pub interface_name: Option<String>,
+    pub interface_version: Option<String>,
+    pub wit_world: Option<String>,
     pub component: component::Component,
     pub wasm_hash: String,
     pub wasm_bytes: Vec<u8>,
@@ -428,6 +607,7 @@ impl Wasm {
     pub fn build(&self, package_path: PathBuf, profile: String) -> anyhow::Result<Component> {
         let manifest = read_manifest(&package_path)?;
         let manifest_profile = manifest.get_profile(profile)?;
+        let wit_metadata = resolve_wit_metadata(&package_path, manifest.wit.as_ref())?;
 
         let package_metadata = get_package_metadata(
             &package_path,
@@ -459,6 +639,9 @@ impl Wasm {
             Component{
                 name: package_metadata.name,
                 version: package_metadata.version,
+                interface_name: wit_metadata.interface_name,
+                interface_version: wit_metadata.interface_version,
+                wit_world: wit_metadata.wit_world,
                 component,
                 wasm_hash,
                 wasm_bytes,
