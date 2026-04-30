@@ -9,7 +9,33 @@ use serde::{
 use uuid::Uuid;
 
 
-// todo - consider sqlx::types::Json<EvaluatorMetadata> 
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, Eq, clap::ValueEnum)]
+#[sqlx(type_name = "evaluator_state", rename_all = "lowercase")]
+pub(crate) enum EvaluatorState {
+    Active,
+    Yanked,
+    Deprecated,
+    Disabled,
+    Removed,
+}
+
+impl std::str::FromStr for EvaluatorState {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "active" => Ok(Self::Active),
+            "yanked" => Ok(Self::Yanked),
+            "deprecated" => Ok(Self::Deprecated),
+            "disabled" => Ok(Self::Disabled),
+            "removed" => Ok(Self::Removed),
+            _ => anyhow::bail!("invalid evaluator state '{}'; expected one of: active, yanked, deprecated, disabled, removed", s),
+        }
+    }
+}
+
+
+// todo - consider sqlx::types::Json<EvaluatorMetadata>
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct EvaluatorDraft {
@@ -31,7 +57,8 @@ pub(crate) struct EvaluatorDraft {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct EvaluatorPatch {
-    pub(crate) is_enabled: bool,
+    pub(crate) state: EvaluatorState,
+    pub(crate) state_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -52,7 +79,8 @@ pub(crate) struct Evaluator {
     pub(crate) description: Option<String>,
     pub(crate) tags: serde_json::Value,
     pub(crate) metadata: serde_json::Value,
-    pub(crate) is_enabled: bool,
+    pub(crate) state: EvaluatorState,
+    pub(crate) state_reason: Option<String>,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) updated_at: DateTime<Utc>,
 }
@@ -65,5 +93,7 @@ pub(crate) struct EvaluatorSummary {
     pub(crate) description: Option<String>,
     pub(crate) tags: serde_json::Value,
     pub(crate) metadata: serde_json::Value,
+    pub(crate) state: EvaluatorState,
+    pub(crate) state_reason: Option<String>,
 }
 

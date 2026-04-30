@@ -35,10 +35,6 @@ pub(crate) struct App {
     #[arg(long, env = "DATABASE_URL")]
     pub database_url: String,
 
-    /// Output as JSON when supported
-    #[arg(global = true, long, action = ArgAction::SetTrue)]
-    pub json: bool,
-
     /// Suppress all diagnostic output and progress messages
     #[arg(global = true, short, long, default_value_t = false)]
     pub quiet: bool,

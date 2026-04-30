@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use anyhow::anyhow;
 use async_trait::async_trait;
 use clap::{
     Args,
@@ -13,6 +12,7 @@ use crate::db::evaluators;
 use crate::models::evaluator::{
     EvaluatorDraft,
     EvaluatorPatch,
+    EvaluatorState,
 };
 use super::args::parsers::parse_dir;
 use super::Executable;
@@ -68,27 +68,27 @@ fn get_manifest_profile(release: bool, profile: Option<String>) -> String {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum SubCommand {
-    /// Add evaluator to system
-    Add {
+    /// Publish evaluator version
+    Publish {
         /// Path to evaluator crate
         #[arg(value_parser = parse_dir)]
         evaluator_path: PathBuf,
 
-        /// Add evaluator built in release mode, with optimizations
+        /// Publish evaluator built in release mode, with optimizations
         #[arg(short, long)]
         release: bool,
 
-        /// Add evaluator built with the specified profile
+        /// Publish evaluator built with the specified profile
         #[arg(long, value_name = "PROFILE", conflicts_with = "release")]
         profile: Option<String>,
     },
-    /// Show system evaluator
+    /// Show evaluator details
     Show {
         /// Fully qualified evaluator reference (<namespace>:<name>@<version>)
         #[arg()]
         evaluator: String,
     },
-    /// Search evaluators and return JSON payload
+    /// Search evaluators
     Search {
         /// Evaluator namespace
         #[arg(long, value_name = "NAMESPACE", default_value = DEFAULT_NAMESPACE)]
@@ -102,23 +102,19 @@ pub(crate) enum SubCommand {
         #[arg()]
         query: Option<String>,
     },
-    /// Disable system evaluator
-    Disable {
+    /// Set evaluator state
+    SetState {
         /// Fully qualified evaluator reference (<namespace>:<name>@<version>)
         #[arg()]
         evaluator: String,
-    },
-    /// Enable system evaluator
-    Enable {
-        /// Fully qualified evaluator reference (<namespace>:<name>@<version>)
-        #[arg()]
-        evaluator: String,
-    },
-    /// Remove system evaluator
-    Remove {
-        /// Fully qualified evaluator reference (<namespace>:<name>@<version>)
-        #[arg()]
-        evaluator: String,
+
+        /// Evaluator state
+        #[arg(value_name = "STATE", value_enum)]
+        state: EvaluatorState,
+
+        /// Optional reason for setting this state
+        #[arg(long, value_name = "TEXT")]
+        state_reason: Option<String>,
     },
 }
 
@@ -126,8 +122,8 @@ pub(crate) enum SubCommand {
 impl Executable for SubCommand {
     async fn exec(self, context: Context) -> anyhow::Result<()> {
         match self {
-            SubCommand::Add{ evaluator_path, release, profile } => {
-                info!("adding evaluator: {}", evaluator_path.display());
+            SubCommand::Publish{ evaluator_path, release, profile } => {
+                info!("publishing evaluator: {}", evaluator_path.display());
 
                 let profile = get_manifest_profile(release, profile);
                 let component = context.wasm().await?.prepare_component(
@@ -157,7 +153,7 @@ impl Executable for SubCommand {
                 ).await?;
 
                 info!(
-                    "successfully added evaluator: {}:{}@{}",
+                    "successfully published evaluator: {}:{}@{}",
                     evaluator.namespace,
                     evaluator.name,
                     evaluator.version,
@@ -197,7 +193,8 @@ impl Executable for SubCommand {
                             "description": e.description,
                             "tags": e.tags,
                             "metadata": e.metadata,
-                            "is_enabled": e.is_enabled,
+                            "state": e.state,
+                            "state_reason": e.state_reason,
                             "created_at": e.created_at,
                             "updated_at": e.updated_at,
                         }
@@ -246,99 +243,38 @@ impl Executable for SubCommand {
 
                 Ok(())
             }
-            SubCommand::Disable{ evaluator } => {
-                info!("disabling evaluator {}", evaluator);
+            SubCommand::SetState{ evaluator, state, state_reason } => {
+                info!("setting evaluator state {} -> {:?}", evaluator, state);
 
                 let db = context.db().await?;
                 let evaluator = parse_fully_qualified_evaluator(&evaluator)?;
 
-                let affected = evaluators::update_evaluator_enabled(
+                let affected = evaluators::update_evaluator_state(
                     db,
                     &evaluator.namespace,
                     &evaluator.name,
                     &evaluator.version,
-                    &EvaluatorPatch { is_enabled: false },
+                    &EvaluatorPatch { state: state.clone(), state_reason },
                 ).await?;
 
                 if affected == 0 {
                     anyhow::bail!(
-                        "failed to diaable evaluator {}:{}@{}",
+                        "failed to set evaluator state {}:{}@{} -> {:?}",
                         evaluator.namespace,
                         evaluator.name,
                         evaluator.version,
+                        state,
                     );
                 } else {
                     info!(
-                        "disabled evaluator {}:{}@{}",
+                        "set evaluator state {}:{}@{} -> {:?}",
                         evaluator.namespace,
                         evaluator.name,
                         evaluator.version,
+                        state,
                     );
                 }
 
-                Ok(())
-            }
-            SubCommand::Enable{ evaluator } => {
-                info!("enabling evaluator {}", evaluator);
-
-                let db = context.db().await?;
-                let out = context.out().await?;
-                let evaluator = parse_fully_qualified_evaluator(&evaluator)?;
-
-                let affected = evaluators::update_evaluator_enabled(
-                    db,
-                    &evaluator.namespace,
-                    &evaluator.name,
-                    &evaluator.version,
-                    &EvaluatorPatch { is_enabled: true },
-                ).await?;
-
-                if affected == 0 {
-                    anyhow::bail!(
-                        "failed to enable evaluator {}:{}@{}",
-                        evaluator.namespace,
-                        evaluator.name,
-                        evaluator.version,
-                    );
-                } else {
-                    info!(
-                        "enabled evaluator {}:{}@{}",
-                        evaluator.namespace,
-                        evaluator.name,
-                        evaluator.version,
-                    );
-                }
-
-                Ok(())
-            }
-            SubCommand::Remove{ evaluator } => {
-                info!("removing evaluator {}", evaluator);
-
-                let db = context.db().await?;
-                let evaluator = parse_fully_qualified_evaluator(&evaluator)?;
-
-                let affected = evaluators::delete_evaluator(
-                    db,
-                    &evaluator.namespace,
-                    &evaluator.name,
-                    &evaluator.version,
-                ).await?;
-
-                if affected == 0 {
-                    anyhow::bail!(
-                        "failed to remove evaluator {}:{}@{}",
-                        evaluator.namespace,
-                        evaluator.name,
-                        evaluator.version,
-                    );
-                } else {
-                    info!(
-                        "removed evaluator {}:{}@{}",
-                        evaluator.namespace,
-                        evaluator.name,
-                        evaluator.version,
-                    );
-                }
 
                 Ok(())
             }
@@ -366,11 +302,11 @@ impl Executable for Command {
                 } else {
                     for evaluator in evaluators {
                         info!(
-                            "{}:{}@{} enabled={}",
+                            "{}:{}@{} state={:?}",
                             evaluator.namespace,
                             evaluator.name,
                             evaluator.version,
-                            evaluator.is_enabled,
+                            evaluator.state,
                         );
                     }
                 }

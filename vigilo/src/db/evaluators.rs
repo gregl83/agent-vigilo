@@ -24,7 +24,7 @@ pub(crate) async fn insert_evaluator(db: &PgPool, draft: &EvaluatorDraft) -> any
             id, namespace, name, version, content_hash, wasm_bytes,
             wasm_size_bytes, interface_name, interface_version,
             wit_world, runtime, runtime_version, runtime_fingerprint,
-            description, tags, metadata, is_enabled, created_at, updated_at
+            description, tags, metadata, state, state_reason, created_at, updated_at
         "#,
     )
     .bind(&draft.namespace)
@@ -55,7 +55,7 @@ pub(crate) async fn select_evaluator_by_id(db: &PgPool, id: Uuid) -> anyhow::Res
             id, namespace, name, version, content_hash, wasm_bytes,
             wasm_size_bytes, interface_name, interface_version,
             wit_world, runtime, runtime_version, runtime_fingerprint,
-            description, tags, metadata, is_enabled, created_at, updated_at
+            description, tags, metadata, state, state_reason, created_at, updated_at
         FROM evaluators
         WHERE id = $1
         "#,
@@ -78,7 +78,7 @@ pub(crate) async fn select_latest_evaluator_by_name(
             id, namespace, name, version, content_hash, wasm_bytes,
             wasm_size_bytes, interface_name, interface_version,
             wit_world, runtime, runtime_version, runtime_fingerprint,
-            description, tags, metadata, is_enabled, created_at, updated_at
+            description, tags, metadata, state, state_reason, created_at, updated_at
         FROM evaluators
         WHERE namespace = $1 AND name = $2
         ORDER BY created_at DESC
@@ -105,7 +105,7 @@ pub(crate) async fn select_evaluator(
             id, namespace, name, version, content_hash, wasm_bytes,
             wasm_size_bytes, interface_name, interface_version,
             wit_world, runtime, runtime_version, runtime_fingerprint,
-            description, tags, metadata, is_enabled, created_at, updated_at
+            description, tags, metadata, state, state_reason, created_at, updated_at
         FROM evaluators
         WHERE namespace = $1 AND name = $2 AND version = $3
         LIMIT 1
@@ -127,7 +127,7 @@ pub(crate) async fn list_evaluators(db: &PgPool, namespace: &str) -> anyhow::Res
             id, namespace, name, version, content_hash, wasm_bytes,
             wasm_size_bytes, interface_name, interface_version,
             wit_world, runtime, runtime_version, runtime_fingerprint,
-            description, tags, metadata, is_enabled, created_at, updated_at
+            description, tags, metadata, state, state_reason, created_at, updated_at
         FROM evaluators
         WHERE namespace = $1
         ORDER BY name ASC, version DESC
@@ -156,13 +156,14 @@ pub(crate) async fn search_evaluator_summaries(
     let evaluators = sqlx::query_as::<_, EvaluatorSummary>(
         r#"
         SELECT
-            namespace, name, version, description, tags, metadata
+            namespace, name, version, description, tags, metadata, state, state_reason
         FROM evaluators
         WHERE namespace = $1
           AND (
               $2::text IS NULL
               OR name ILIKE $2
               OR COALESCE(description, '') ILIKE $2
+              OR COALESCE(state_reason, '') ILIKE $2
               OR tags::text ILIKE $2
               OR metadata::text ILIKE $2
           )
@@ -179,7 +180,7 @@ pub(crate) async fn search_evaluator_summaries(
     Ok(evaluators)
 }
 
-pub(crate) async fn update_evaluator_enabled(
+pub(crate) async fn update_evaluator_state(
     db: &PgPool,
     namespace: &str,
     name: &str,
@@ -189,14 +190,16 @@ pub(crate) async fn update_evaluator_enabled(
     let result = sqlx::query(
         r#"
         UPDATE evaluators
-        SET is_enabled = $3,
+        SET state = $3,
+            state_reason = $4,
             updated_at = now()
-        WHERE namespace = $1 AND name = $2 AND version = $4
+        WHERE namespace = $1 AND name = $2 AND version = $5
         "#,
     )
     .bind(namespace)
     .bind(name)
-    .bind(patch.is_enabled)
+    .bind(&patch.state)
+    .bind(&patch.state_reason)
     .bind(version)
     .execute(db)
     .await?;
