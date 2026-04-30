@@ -1,25 +1,15 @@
-use std::path::PathBuf;
-use std::fs;
 use async_trait::async_trait;
-use clap::{
-    Args,
-    Subcommand,
-};
+use clap::{Args, Subcommand};
 use serde_json::json;
+use std::fs;
+use std::path::PathBuf;
 use tracing::{info, warn};
 
+use super::Executable;
+use super::args::parsers::{parse_dir, parse_filepath};
 use crate::context::Context;
 use crate::db::evaluators;
-use crate::models::evaluator::{
-    EvaluatorDraft,
-    EvaluatorPatch,
-    EvaluatorState,
-};
-use super::args::parsers::{
-    parse_dir,
-    parse_filepath,
-};
-use super::Executable;
+use crate::models::evaluator::{EvaluatorDraft, EvaluatorPatch, EvaluatorState};
 
 const DEFAULT_NAMESPACE: &str = "vigilo";
 const DEFAULT_SEARCH_LIMIT: i64 = 10;
@@ -72,11 +62,10 @@ fn parse_fully_qualified_evaluator(input: &str) -> anyhow::Result<EvaluatorIdent
     })
 }
 
-
 fn get_manifest_profile(release: bool, profile: Option<String>) -> String {
     match release {
         true => "release".to_string(),
-        false => profile.unwrap_or_else(|| "dev".to_string())
+        false => profile.unwrap_or_else(|| "dev".to_string()),
     }
 }
 
@@ -123,7 +112,12 @@ pub(crate) enum SubCommand {
         evaluator: String,
 
         /// Input JSON string
-        #[arg(long, value_name = "JSON", conflicts_with = "input_file", required_unless_present = "input_file")]
+        #[arg(
+            long,
+            value_name = "JSON",
+            conflicts_with = "input_file",
+            required_unless_present = "input_file"
+        )]
         input: Option<String>,
 
         /// Path to input JSON file
@@ -150,14 +144,18 @@ pub(crate) enum SubCommand {
 impl Executable for SubCommand {
     async fn exec(self, context: Context) -> anyhow::Result<()> {
         match self {
-            SubCommand::Publish{ evaluator_path, release, profile } => {
+            SubCommand::Publish {
+                evaluator_path,
+                release,
+                profile,
+            } => {
                 info!("publishing evaluator: {}", evaluator_path.display());
 
                 let profile = get_manifest_profile(release, profile);
-                let component = context.wasm().await?.prepare_evaluator(
-                    evaluator_path,
-                    profile,
-                )?;
+                let component = context
+                    .wasm()
+                    .await?
+                    .prepare_evaluator(evaluator_path, profile)?;
 
                 let db = context.db().await?;
                 let evaluator = evaluators::insert_evaluator(
@@ -178,18 +176,17 @@ impl Executable for SubCommand {
                         tags: component.tags,
                         metadata: component.metadata,
                     },
-                ).await?;
+                )
+                .await?;
 
                 info!(
                     "successfully published evaluator: {}:{}@{}",
-                    evaluator.namespace,
-                    evaluator.name,
-                    evaluator.version,
+                    evaluator.namespace, evaluator.name, evaluator.version,
                 );
 
                 Ok(())
             }
-            SubCommand::Show{ evaluator } => {
+            SubCommand::Show { evaluator } => {
                 info!("fetching evaluator {}", evaluator);
 
                 let db = context.db().await?;
@@ -201,7 +198,8 @@ impl Executable for SubCommand {
                     &evaluator.namespace,
                     &evaluator.name,
                     &evaluator.version,
-                ).await?;
+                )
+                .await?;
 
                 let payload = match evaluator_record {
                     Some(e) => json!({
@@ -234,14 +232,18 @@ impl Executable for SubCommand {
                             evaluator.name,
                             evaluator.version,
                         );
-                    },
+                    }
                 };
 
                 out.write_line(serde_json::to_string_pretty(&payload)?)?;
 
                 Ok(())
             }
-            SubCommand::Search { namespace, limit, query } => {
+            SubCommand::Search {
+                namespace,
+                limit,
+                query,
+            } => {
                 info!(
                     "searching evaluators namespace `{}` for term `{}`",
                     namespace,
@@ -250,12 +252,9 @@ impl Executable for SubCommand {
 
                 let db = context.db().await?;
                 let out = context.out().await?;
-                let evaluators = evaluators::search_evaluator_summaries(
-                    db,
-                    &namespace,
-                    query.as_deref(),
-                    limit,
-                ).await?;
+                let evaluators =
+                    evaluators::search_evaluator_summaries(db, &namespace, query.as_deref(), limit)
+                        .await?;
 
                 let payload = json!({
                     "data": evaluators,
@@ -271,7 +270,11 @@ impl Executable for SubCommand {
 
                 Ok(())
             }
-            SubCommand::Test { evaluator, input, input_file } => {
+            SubCommand::Test {
+                evaluator,
+                input,
+                input_file,
+            } => {
                 info!("testing evaluator {}", evaluator);
 
                 let db = context.db().await?;
@@ -284,13 +287,16 @@ impl Executable for SubCommand {
                     &evaluator.namespace,
                     &evaluator.name,
                     &evaluator.version,
-                ).await?
-                .ok_or_else(|| anyhow::anyhow!(
-                    "evaluator not found: {}:{}@{}",
-                    evaluator.namespace,
-                    evaluator.name,
-                    evaluator.version,
-                ))?;
+                )
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "evaluator not found: {}:{}@{}",
+                        evaluator.namespace,
+                        evaluator.name,
+                        evaluator.version,
+                    )
+                })?;
 
                 match evaluator_record.state {
                     EvaluatorState::Disabled | EvaluatorState::Removed => {
@@ -314,10 +320,10 @@ impl Executable for SubCommand {
                 let parsed: EvaluatorTestInput = serde_json::from_str(&input_raw)
                     .map_err(|err| anyhow::anyhow!("invalid evaluator test input json: {}", err))?;
 
-                let evaluation_output = wasm.test_evaluator(
-                    &evaluator_record.wasm_bytes,
-                    parsed.context.db,
-                )?;
+                let evaluation_result =
+                    wasm.test_evaluator(&evaluator_record.wasm_bytes, parsed.context.db)?;
+
+                let normalized_results = evaluation_result.clone().normalize();
 
                 let payload = json!({
                     "data": {
@@ -325,11 +331,8 @@ impl Executable for SubCommand {
                         "name": evaluator_record.name,
                         "version": evaluator_record.version,
                         "state": evaluator_record.state,
-                        "output": {
-                            "data": {
-                                "val": evaluation_output,
-                            }
-                        }
+                        "result": evaluation_result,
+                        "normalized_results": normalized_results,
                     }
                 });
 
@@ -337,7 +340,11 @@ impl Executable for SubCommand {
 
                 Ok(())
             }
-            SubCommand::SetState{ evaluator, state, state_reason } => {
+            SubCommand::SetState {
+                evaluator,
+                state,
+                state_reason,
+            } => {
                 info!("setting evaluator state {} -> {:?}", evaluator, state);
 
                 let db = context.db().await?;
@@ -349,8 +356,12 @@ impl Executable for SubCommand {
                     &evaluator.namespace,
                     &evaluator.name,
                     &evaluator.version,
-                    &EvaluatorPatch { state: state.clone(), state_reason },
-                ).await?;
+                    &EvaluatorPatch {
+                        state: state.clone(),
+                        state_reason,
+                    },
+                )
+                .await?;
 
                 if affected == 0 {
                     anyhow::bail!(
@@ -363,13 +374,9 @@ impl Executable for SubCommand {
                 } else {
                     info!(
                         "set evaluator state {}:{}@{} -> {:?}",
-                        evaluator.namespace,
-                        evaluator.name,
-                        evaluator.version,
-                        state,
+                        evaluator.namespace, evaluator.name, evaluator.version, state,
                     );
                 }
-
 
                 Ok(())
             }
@@ -398,10 +405,7 @@ impl Executable for Command {
                     for evaluator in evaluators {
                         info!(
                             "{}:{}@{} state={:?}",
-                            evaluator.namespace,
-                            evaluator.name,
-                            evaluator.version,
-                            evaluator.state,
+                            evaluator.namespace, evaluator.name, evaluator.version, evaluator.state,
                         );
                     }
                 }

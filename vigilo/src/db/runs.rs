@@ -1,11 +1,7 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::models::run::{
-    Run,
-    RunDraft,
-    RunPatch,
-};
+use crate::models::run::{Run, RunDraft, RunPatch};
 
 pub(crate) async fn insert_run(db: &PgPool, draft: &RunDraft) -> anyhow::Result<Run> {
     let run = sqlx::query_as::<_, Run>(

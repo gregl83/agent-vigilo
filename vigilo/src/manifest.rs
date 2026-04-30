@@ -1,11 +1,6 @@
-use std::{
-    collections::HashMap,
-    fs,
-    path::PathBuf,
-};
 use anyhow::anyhow;
 use serde::Deserialize;
-
+use std::{collections::HashMap, fs, path::PathBuf};
 
 #[derive(Deserialize)]
 pub(crate) struct Package {
@@ -45,16 +40,14 @@ pub(crate) struct Manifest {
 
 impl Manifest {
     pub fn get_profile(&self, profile_name: String) -> anyhow::Result<&Profile> {
-        self.profile.get(&profile_name).ok_or(
-            anyhow!("manifest profile {} not supported", profile_name)
-        )
+        self.profile
+            .get(&profile_name)
+            .ok_or(anyhow!("manifest profile {} not supported", profile_name))
     }
 }
 
 pub(crate) fn read_manifest(crate_path: &PathBuf) -> anyhow::Result<Manifest> {
-    let content = fs::read_to_string(
-        crate_path.join("Vigilo.toml")
-    )?;
+    let content = fs::read_to_string(crate_path.join("Vigilo.toml"))?;
     let manifest: Manifest = toml::from_str(&content)?;
     Ok(manifest)
 }

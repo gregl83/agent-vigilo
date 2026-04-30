@@ -9,11 +9,71 @@ interface types {
         context: context,
     }
 
-    record data {
-        val: string,
+    record evaluator-identity {
+        namespace: string,
+        name: string,
+        version: string,
+        content-hash: option<string>,
+        interface-version: option<string>,
     }
+
+    variant evaluation-dimension {
+        correctness,
+        format,
+        safety,
+        quality,
+        latency,
+        tool-use,
+        calibration,
+        other(string),
+    }
+
+    enum evaluation-status {
+        passed,
+        failed,
+        error,
+        skipped,
+    }
+
+    enum severity {
+        none,
+        low,
+        medium,
+        high,
+        critical,
+    }
+
+    enum preference-outcome {
+        preferred,
+        tie,
+        not-preferred,
+    }
+
+    variant score {
+        binary(bool),
+        range(tuple<f64, f64, f64>),
+        normalized(f64),
+        severity-mapped(severity),
+        preference(preference-outcome),
+        informational,
+    }
+
+    record evaluator-finding {
+        dimension: evaluation-dimension,
+        status: evaluation-status,
+        score: score,
+        blocking: bool,
+        severity: severity,
+        failure-category: option<string>,
+        reason: option<string>,
+        evidence-json: string,
+        tags: list<string>,
+    }
+
     record output {
-        data: data,
+        evaluator: evaluator-identity,
+        results: list<evaluator-finding>,
+        metadata-json: string,
     }
 }
 

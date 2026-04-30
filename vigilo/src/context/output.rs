@@ -1,19 +1,10 @@
 use std::{
-    io::{
-        BufWriter,
-        stdout,
-        Stdout,
-        Write,
-    },
-    sync::Mutex
+    io::{BufWriter, Stdout, Write, stdout},
+    sync::Mutex,
 };
 
 use tokio::sync::OnceCell;
-use tracing::{
-    debug,
-    error,
-};
-
+use tracing::{debug, error};
 
 pub struct Buffer {
     buffer: Mutex<BufWriter<Stdout>>,
@@ -22,13 +13,15 @@ pub struct Buffer {
 impl Buffer {
     pub fn new() -> Self {
         Self {
-            buffer: Mutex::new(BufWriter::new(stdout()))
+            buffer: Mutex::new(BufWriter::new(stdout())),
         }
     }
 
     /// Write line to buffer
     pub fn write_line(&self, msg: impl AsRef<str>) -> anyhow::Result<()> {
-        let mut guard = self.buffer.lock()
+        let mut guard = self
+            .buffer
+            .lock()
             .map_err(|_| anyhow::anyhow!("failed to acquire buffer lock"))?;
         writeln!(guard, "{}", msg.as_ref())?;
         Ok(())
@@ -36,7 +29,9 @@ impl Buffer {
 
     /// Flush buffer to stdout
     pub fn flush(&self) -> anyhow::Result<()> {
-        let mut guard = self.buffer.lock()
+        let mut guard = self
+            .buffer
+            .lock()
             .map_err(|_| anyhow::anyhow!("failed to acquire buffer lock"))?;
         guard.flush()?;
         Ok(())
@@ -59,9 +54,11 @@ pub struct Context {
 
 impl Context {
     pub async fn get(&self) -> anyhow::Result<&Buffer> {
-        self.cell.get_or_try_init(|| async {
-            debug!("initializing out write buffer");
-            Ok(Buffer::new())
-        }).await
+        self.cell
+            .get_or_try_init(|| async {
+                debug!("initializing out write buffer");
+                Ok(Buffer::new())
+            })
+            .await
     }
 }

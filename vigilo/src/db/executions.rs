@@ -1,13 +1,12 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::models::execution::{
-    Execution,
-    ExecutionDraft,
-    ExecutionPatch,
-};
+use crate::models::execution::{Execution, ExecutionDraft, ExecutionPatch};
 
-pub(crate) async fn insert_execution(db: &PgPool, draft: &ExecutionDraft) -> anyhow::Result<Execution> {
+pub(crate) async fn insert_execution(
+    db: &PgPool,
+    draft: &ExecutionDraft,
+) -> anyhow::Result<Execution> {
     let execution = sqlx::query_as::<_, Execution>(
         r#"
         INSERT INTO executions (

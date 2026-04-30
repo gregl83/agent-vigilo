@@ -5,7 +5,6 @@ pub(crate) mod output;
 pub(crate) mod registry;
 pub(crate) mod wasm;
 
-
 struct ContextInner {
     pub db: database::Context,
     pub out: output::Context,
@@ -26,10 +25,10 @@ impl Context {
             out: output::Context {
                 cell: Default::default(),
             },
-            reg: registry::Context{
+            reg: registry::Context {
                 cell: Default::default(),
             },
-            wasm: wasm::Context{
+            wasm: wasm::Context {
                 cell: Default::default(),
                 config: wasm_config,
             },
@@ -44,7 +43,9 @@ impl Context {
         self.0.out.get().await
     }
 
-    pub async fn reg(&self) -> anyhow::Result<&moka::future::Cache<String, wasmtime::component::Component>> {
+    pub async fn reg(
+        &self,
+    ) -> anyhow::Result<&moka::future::Cache<String, wasmtime::component::Component>> {
         self.0.reg.get().await
     }
 

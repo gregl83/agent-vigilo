@@ -1,49 +1,27 @@
 use std::{
     env::consts::ARCH,
     fs,
-    hash::{
-        DefaultHasher,
-        Hash,
-        Hasher,
-    },
+    hash::{DefaultHasher, Hash, Hasher},
     path::PathBuf,
     time::SystemTime,
 };
 
 use cargo_metadata::MetadataCommand;
 use cargo_toml::Manifest;
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::OnceCell;
-use tracing::{
-    debug,
-    warn,
-};
-use wasmparser::{
-    Parser,
-    Payload,
-};
-use wasmtime::{
-    component,
-    component::ResourceTable,
-    Config as EngineConfig,
-    Engine,
-    Store,
-};
-use wasmtime_wasi::{
-    WasiCtx,
-    WasiCtxBuilder,
-    WasiCtxView,
-    WasiView,
+use tracing::{debug, warn};
+use wasmparser::{Parser, Payload};
+use wasmtime::{Config as EngineConfig, Engine, Store, component, component::ResourceTable};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+
+use crate::contracts::evaluator::{
+    EvaluationDimension, EvaluationStatus, EvaluatorFinding, EvaluatorIdentity, EvaluatorResponse,
+    PreferenceOutcome, Score, Severity,
 };
 
-use super::super::manifest::{
-    Wit,
-    read_manifest,
-};
+use super::super::manifest::{Wit, read_manifest};
 
 mod evaluator_test_bindings {
     wasmtime::component::bindgen!({
@@ -89,6 +67,121 @@ impl evaluator_test_bindings::vigilo::evaluator::executor::Host for EvaluatorTes
     ) -> Result<evaluator_test_bindings::vigilo::evaluator::executor::HttpResponse, String> {
         Err("send_http_request is not enabled yet; outbound HTTP policy enforcement is not configured".to_string())
     }
+}
+
+fn parse_json_payload(field_name: &str, raw: &str) -> anyhow::Result<Value> {
+    if raw.trim().is_empty() {
+        return Ok(Value::Object(Default::default()));
+    }
+
+    serde_json::from_str(raw).map_err(|err| anyhow::anyhow!("invalid {} JSON: {}", field_name, err))
+}
+
+fn map_dimension(
+    dimension: evaluator_test_bindings::vigilo::evaluator::types::EvaluationDimension,
+) -> EvaluationDimension {
+    use evaluator_test_bindings::vigilo::evaluator::types::EvaluationDimension as BindingDimension;
+
+    match dimension {
+        BindingDimension::Correctness => EvaluationDimension::Correctness,
+        BindingDimension::Format => EvaluationDimension::Format,
+        BindingDimension::Safety => EvaluationDimension::Safety,
+        BindingDimension::Quality => EvaluationDimension::Quality,
+        BindingDimension::Latency => EvaluationDimension::Latency,
+        BindingDimension::ToolUse => EvaluationDimension::ToolUse,
+        BindingDimension::Calibration => EvaluationDimension::Calibration,
+        BindingDimension::Other(value) => EvaluationDimension::Other(value),
+    }
+}
+
+fn map_status(
+    status: evaluator_test_bindings::vigilo::evaluator::types::EvaluationStatus,
+) -> EvaluationStatus {
+    use evaluator_test_bindings::vigilo::evaluator::types::EvaluationStatus as BindingStatus;
+
+    match status {
+        BindingStatus::Passed => EvaluationStatus::Passed,
+        BindingStatus::Failed => EvaluationStatus::Failed,
+        BindingStatus::Error => EvaluationStatus::Error,
+        BindingStatus::Skipped => EvaluationStatus::Skipped,
+    }
+}
+
+fn map_severity(severity: evaluator_test_bindings::vigilo::evaluator::types::Severity) -> Severity {
+    use evaluator_test_bindings::vigilo::evaluator::types::Severity as BindingSeverity;
+
+    match severity {
+        BindingSeverity::None => Severity::None,
+        BindingSeverity::Low => Severity::Low,
+        BindingSeverity::Medium => Severity::Medium,
+        BindingSeverity::High => Severity::High,
+        BindingSeverity::Critical => Severity::Critical,
+    }
+}
+
+fn map_preference_outcome(
+    outcome: evaluator_test_bindings::vigilo::evaluator::types::PreferenceOutcome,
+) -> PreferenceOutcome {
+    use evaluator_test_bindings::vigilo::evaluator::types::PreferenceOutcome as BindingPreferenceOutcome;
+
+    match outcome {
+        BindingPreferenceOutcome::Preferred => PreferenceOutcome::Preferred,
+        BindingPreferenceOutcome::Tie => PreferenceOutcome::Tie,
+        BindingPreferenceOutcome::NotPreferred => PreferenceOutcome::NotPreferred,
+    }
+}
+
+fn map_score(score: evaluator_test_bindings::vigilo::evaluator::types::Score) -> Score {
+    use evaluator_test_bindings::vigilo::evaluator::types::Score as BindingScore;
+
+    match score {
+        BindingScore::Binary(passed) => Score::Binary { passed },
+        BindingScore::Range((value, min, max)) => Score::Range { value, min, max },
+        BindingScore::Normalized(value) => Score::Normalized { value },
+        BindingScore::SeverityMapped(severity) => Score::SeverityMapped {
+            severity: map_severity(severity),
+        },
+        BindingScore::Preference(outcome) => Score::Preference {
+            outcome: map_preference_outcome(outcome),
+        },
+        BindingScore::Informational => Score::Informational,
+    }
+}
+
+fn map_output_to_response(
+    output: evaluator_test_bindings::vigilo::evaluator::types::Output,
+) -> anyhow::Result<EvaluatorResponse> {
+    let metadata = parse_json_payload("metadata-json", &output.metadata_json)?;
+
+    let results = output
+        .results
+        .into_iter()
+        .map(|finding| {
+            Ok(EvaluatorFinding {
+                dimension: map_dimension(finding.dimension),
+                status: map_status(finding.status),
+                score: map_score(finding.score),
+                blocking: finding.blocking,
+                severity: map_severity(finding.severity),
+                failure_category: finding.failure_category,
+                reason: finding.reason,
+                evidence: parse_json_payload("evidence-json", &finding.evidence_json)?,
+                tags: finding.tags,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    Ok(EvaluatorResponse {
+        evaluator: EvaluatorIdentity {
+            namespace: output.evaluator.namespace,
+            name: output.evaluator.name,
+            version: output.evaluator.version,
+            content_hash: output.evaluator.content_hash,
+            interface_version: output.evaluator.interface_version,
+        },
+        results,
+        metadata,
+    })
 }
 
 struct PackageMetadata {
@@ -144,12 +237,20 @@ struct EmbeddedPackageMetadata {
     version: String,
 }
 
-fn read_embedded_package_metadata(wasm_bytes: &[u8]) -> anyhow::Result<Option<EmbeddedPackageMetadata>> {
+fn read_embedded_package_metadata(
+    wasm_bytes: &[u8],
+) -> anyhow::Result<Option<EmbeddedPackageMetadata>> {
     for payload in Parser::new(0).parse_all(wasm_bytes) {
         if let Payload::CustomSection(section) = payload? {
             if section.name() == PACKAGE_METADATA_SECTION {
                 let metadata = serde_json::from_slice::<EmbeddedPackageMetadata>(section.data())
-                    .map_err(|err| anyhow::anyhow!("failed to decode {} metadata: {}", PACKAGE_METADATA_SECTION, err))?;
+                    .map_err(|err| {
+                        anyhow::anyhow!(
+                            "failed to decode {} metadata: {}",
+                            PACKAGE_METADATA_SECTION,
+                            err
+                        )
+                    })?;
                 return Ok(Some(metadata));
             }
         }
@@ -175,7 +276,11 @@ fn push_u32_leb128(buf: &mut Vec<u8>, mut value: u32) {
     }
 }
 
-fn append_custom_section(wasm_bytes: &[u8], section_name: &str, section_data: &[u8]) -> anyhow::Result<Vec<u8>> {
+fn append_custom_section(
+    wasm_bytes: &[u8],
+    section_name: &str,
+    section_data: &[u8],
+) -> anyhow::Result<Vec<u8>> {
     let mut payload = Vec::new();
     let section_name_len = u32::try_from(section_name.len())
         .map_err(|_| anyhow::anyhow!("custom section name too long"))?;
@@ -224,8 +329,12 @@ fn ensure_embedded_package_metadata(
             let out = append_custom_section(&wasm_bytes, PACKAGE_METADATA_SECTION, &encoded)?;
 
             // verify append/read-back so we fail fast on malformed custom section writes.
-            let embedded = read_embedded_package_metadata(&out)?
-                .ok_or_else(|| anyhow::anyhow!("failed to read back embedded {} metadata", PACKAGE_METADATA_SECTION))?;
+            let embedded = read_embedded_package_metadata(&out)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "failed to read back embedded {} metadata",
+                    PACKAGE_METADATA_SECTION
+                )
+            })?;
 
             if embedded.name != package_name || embedded.version != package_version {
                 anyhow::bail!(
@@ -315,7 +424,9 @@ fn parse_wit_file(path: &PathBuf) -> anyhow::Result<WitDocument> {
         }
     }
 
-    let package = package.ok_or_else(|| anyhow::anyhow!("missing package declaration in WIT file {}", path.display()))?;
+    let package = package.ok_or_else(|| {
+        anyhow::anyhow!("missing package declaration in WIT file {}", path.display())
+    })?;
 
     Ok(WitDocument {
         package,
@@ -339,10 +450,7 @@ fn resolve_wit_metadata(
     let wit_path = package_path.join(&wit.path);
     let parsed = parse_wit_file(&wit_path)?;
 
-    let world = parsed
-        .worlds
-        .iter()
-        .find(|w| w.name == wit.world);
+    let world = parsed.worlds.iter().find(|w| w.name == wit.world);
 
     let has_interface_export = world
         .map(|w| w.exports.iter().any(|e| e == &wit.interface))
@@ -418,7 +526,10 @@ fn resolve_evaluator_metadata(
 
     let metadata = match &package.metadata {
         Some(value) => value_from_toml(value)?,
-        None => cargo.metadata.clone().unwrap_or_else(|| Value::Object(Default::default())),
+        None => cargo
+            .metadata
+            .clone()
+            .unwrap_or_else(|| Value::Object(Default::default())),
     };
 
     Ok(EvaluatorMetadata {
@@ -428,7 +539,10 @@ fn resolve_evaluator_metadata(
     })
 }
 
-fn get_package_metadata(package_path: &PathBuf, manifest_file: &String) -> anyhow::Result<PackageMetadata> {
+fn get_package_metadata(
+    package_path: &PathBuf,
+    manifest_file: &String,
+) -> anyhow::Result<PackageMetadata> {
     match manifest_file.as_str() {
         "Cargo.toml" => {
             let manifest_path = package_path.join(manifest_file);
@@ -445,9 +559,9 @@ fn get_package_metadata(package_path: &PathBuf, manifest_file: &String) -> anyho
 
             let manifest = Manifest::from_path(&manifest_path)?;
 
-            let package = manifest.package.ok_or_else(|| {
-                anyhow::anyhow!("no [package] section found in Cargo.toml")
-            })?;
+            let package = manifest
+                .package
+                .ok_or_else(|| anyhow::anyhow!("no [package] section found in Cargo.toml"))?;
 
             let package_table = manifest_value
                 .get("package")
@@ -476,21 +590,20 @@ fn get_package_metadata(package_path: &PathBuf, manifest_file: &String) -> anyho
                 .map(value_from_toml)
                 .transpose()?;
 
-            Ok(
-                PackageMetadata {
-                    name: package.name,
-                    version: package.version.get()?.to_string(),
-                    target_dir: target_dir.into_std_path_buf(),
-                    modified: fs_metadata.modified()?,
-                    description,
-                    tags,
-                    metadata,
-                }
-            )
+            Ok(PackageMetadata {
+                name: package.name,
+                version: package.version.get()?.to_string(),
+                target_dir: target_dir.into_std_path_buf(),
+                modified: fs_metadata.modified()?,
+                description,
+                tags,
+                metadata,
+            })
         }
-        _ => {
-            Err(anyhow::anyhow!("Vigilo.toml [package] manifest {} is unsupported", manifest_file))
-        }
+        _ => Err(anyhow::anyhow!(
+            "Vigilo.toml [package] manifest {} is unsupported",
+            manifest_file
+        )),
     }
 }
 
@@ -509,7 +622,12 @@ fn resolve_runtime_version() -> anyhow::Result<String> {
         .into_iter()
         .find(|pkg| pkg.name == WASM_RUNTIME_NAME)
         .map(|pkg| pkg.version)
-        .ok_or_else(|| anyhow::anyhow!("{} dependency was not found in embedded Cargo.lock", WASM_RUNTIME_NAME))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} dependency was not found in embedded Cargo.lock",
+                WASM_RUNTIME_NAME
+            )
+        })
 }
 
 pub struct Component {
@@ -552,23 +670,22 @@ impl Wasm {
         let engine = Engine::new(&engine_config)?;
         let fingerprint = get_engine_fingerprint(&engine);
 
-        Ok(
-            Self {
-                engine,
-                fingerprint,
-            }
-        )
+        Ok(Self {
+            engine,
+            fingerprint,
+        })
     }
 
-    pub fn prepare_evaluator(&self, package_path: PathBuf, profile: String) -> anyhow::Result<Component> {
+    pub fn prepare_evaluator(
+        &self,
+        package_path: PathBuf,
+        profile: String,
+    ) -> anyhow::Result<Component> {
         let manifest = read_manifest(&package_path)?;
         let manifest_profile = manifest.get_profile(profile)?;
         let wit_metadata = resolve_wit_metadata(&package_path, manifest.wit.as_ref())?;
 
-        let package_metadata = get_package_metadata(
-            &package_path,
-            &manifest.package.manifest,
-        )?;
+        let package_metadata = get_package_metadata(&package_path, &manifest.package.manifest)?;
         let evaluator_metadata = resolve_evaluator_metadata(&manifest.package, &package_metadata)?;
 
         let wasm_path = package_metadata.target_dir.join(&manifest_profile.wasm);
@@ -576,7 +693,9 @@ impl Wasm {
         let fs_wasm_metadata = fs::metadata(&wasm_path)?;
         let wasm_modified = fs_wasm_metadata.modified()?;
         if package_metadata.modified > wasm_modified {
-            return Err(anyhow::anyhow!("evaluation manifest was modified after wasm build"));
+            return Err(anyhow::anyhow!(
+                "evaluation manifest was modified after wasm build"
+            ));
         }
         let wasm_bytes = fs::read(wasm_path)?;
         let wasm_bytes = ensure_embedded_package_metadata(
@@ -586,45 +705,44 @@ impl Wasm {
         )?;
         let wasm_hash = blake3::hash(&wasm_bytes).to_hex().to_string();
 
-        let component = component::Component::new(
-            &self.engine,
-            &wasm_bytes,
-        )?;
+        let component = component::Component::new(&self.engine, &wasm_bytes)?;
         let serialized = component.serialize()?;
 
         let runtime_version = resolve_runtime_version()?;
 
-        Ok(
-            Component{
-                name: package_metadata.name,
-                version: package_metadata.version,
-                description: evaluator_metadata.description,
-                tags: evaluator_metadata.tags,
-                metadata: evaluator_metadata.metadata,
-                interface_name: wit_metadata.interface_name,
-                interface_version: wit_metadata.interface_version,
-                wit_world: wit_metadata.wit_world,
-                runtime: WASM_RUNTIME_NAME.to_string(),
-                runtime_version,
-                runtime_fingerprint: self.fingerprint.clone(),
-                component,
-                wasm_hash,
-                wasm_bytes,
-                serialized,
-            }
-        )
+        Ok(Component {
+            name: package_metadata.name,
+            version: package_metadata.version,
+            description: evaluator_metadata.description,
+            tags: evaluator_metadata.tags,
+            metadata: evaluator_metadata.metadata,
+            interface_name: wit_metadata.interface_name,
+            interface_version: wit_metadata.interface_version,
+            wit_world: wit_metadata.wit_world,
+            runtime: WASM_RUNTIME_NAME.to_string(),
+            runtime_version,
+            runtime_fingerprint: self.fingerprint.clone(),
+            component,
+            wasm_hash,
+            wasm_bytes,
+            serialized,
+        })
     }
 
-    pub fn test_evaluator(&self, wasm_bytes: &[u8], db_context: String) -> anyhow::Result<String> {
+    pub fn test_evaluator(
+        &self,
+        wasm_bytes: &[u8],
+        db_context: String,
+    ) -> anyhow::Result<EvaluatorResponse> {
         let component = component::Component::new(&self.engine, wasm_bytes)?;
         let mut linker = component::Linker::new(&self.engine);
 
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
 
-        evaluator_test_bindings::vigilo::evaluator::executor::add_to_linker::<_, wasmtime::component::HasSelf<EvaluatorTestHost>>(
-            &mut linker,
-            |host: &mut EvaluatorTestHost| host,
-        )?;
+        evaluator_test_bindings::vigilo::evaluator::executor::add_to_linker::<
+            _,
+            wasmtime::component::HasSelf<EvaluatorTestHost>,
+        >(&mut linker, |host: &mut EvaluatorTestHost| host)?;
 
         let mut store = Store::new(
             &self.engine,
@@ -633,16 +751,11 @@ impl Wasm {
                 ctx: WasiCtxBuilder::new().build(),
             },
         );
-        let bindings = evaluator_test_bindings::EvaluatorWorld::instantiate(
-            &mut store,
-            &component,
-            &linker,
-        )?;
+        let bindings =
+            evaluator_test_bindings::EvaluatorWorld::instantiate(&mut store, &component, &linker)?;
 
         let input = evaluator_test_bindings::vigilo::evaluator::types::Input {
-            context: evaluator_test_bindings::vigilo::evaluator::types::Context {
-                db: db_context,
-            },
+            context: evaluator_test_bindings::vigilo::evaluator::types::Context { db: db_context },
         };
 
         let output = bindings
@@ -650,7 +763,7 @@ impl Wasm {
             .call_evaluate(&mut store, &input)?
             .map_err(|err| anyhow::anyhow!("evaluator returned error: {}", err))?;
 
-        Ok(output.data.val)
+        map_output_to_response(output)
     }
 }
 
@@ -661,11 +774,11 @@ pub(crate) struct Context {
 
 impl Context {
     pub async fn get(&self) -> anyhow::Result<&Wasm> {
-        self.cell.get_or_try_init(|| async {
-            debug!("initializing wasm engine");
-            Ok(
-                Wasm::new(self.config.clone())?
-            )
-        }).await
+        self.cell
+            .get_or_try_init(|| async {
+                debug!("initializing wasm engine");
+                Ok(Wasm::new(self.config.clone())?)
+            })
+            .await
     }
 }

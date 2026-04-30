@@ -2,9 +2,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::models::execution_attempt::{
-    ExecutionAttempt,
-    ExecutionAttemptDraft,
-    ExecutionAttemptPatch,
+    ExecutionAttempt, ExecutionAttemptDraft, ExecutionAttemptPatch,
 };
 
 pub(crate) async fn insert_execution_attempt(

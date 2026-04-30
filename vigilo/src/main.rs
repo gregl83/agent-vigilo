@@ -1,34 +1,17 @@
-use std::{
-    io::stderr,
-    process::ExitCode,
-};
+use std::{io::stderr, process::ExitCode};
 
 use clap::Parser;
-use tracing::{
-    error,
-    Level,
-};
-use tracing_subscriber::{
-    EnvFilter,
-    fmt,
-    prelude::*,
-    Registry,
-};
+use tracing::{Level, error};
+use tracing_subscriber::{EnvFilter, Registry, fmt, prelude::*};
 
 mod cli;
-use cli::{
-    App,
-    Executable,
-};
+use cli::{App, Executable};
 mod context;
-use context::{
-    Context,
-    wasm,
-};
+use context::{Context, wasm};
+mod contracts;
 mod db;
 mod manifest;
 mod models;
-
 
 fn init_logger(quiet: bool, verbose: u8) {
     let level = if quiet {
@@ -46,11 +29,7 @@ fn init_logger(quiet: bool, verbose: u8) {
         .add_directive(level.into());
 
     let subscriber = Registry::default()
-        .with(
-            fmt::layer()
-                .with_writer(stderr)
-                .with_target(false)
-        )
+        .with(fmt::layer().with_writer(stderr).with_target(false))
         .with(filter);
 
     let _ = subscriber.try_init();
@@ -65,19 +44,14 @@ async fn main() -> ExitCode {
             init_logger(app.quiet, app.verbose);
 
             let wasm_config = wasm::Config::default();
-            let context = Context::new(
-                app.database_url.clone(),
-                wasm_config,
-            );
+            let context = Context::new(app.database_url.clone(), wasm_config);
 
             match app.exec(context).await {
                 Err(e) => {
                     error!(error = %e, "command execution failed");
                     ExitCode::FAILURE
                 }
-                Ok(()) => {
-                    ExitCode::SUCCESS
-                }
+                Ok(()) => ExitCode::SUCCESS,
             }
         }
         Err(e) => {

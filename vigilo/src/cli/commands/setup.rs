@@ -4,11 +4,10 @@ use async_trait::async_trait;
 use clap::Args;
 use tracing::info;
 
-use crate::db::migrations;
-use crate::context::Context;
-use super::args::parsers::parse_dir;
 use super::Executable;
-
+use super::args::parsers::parse_dir;
+use crate::context::Context;
+use crate::db::migrations;
 
 #[derive(Debug, Args)]
 pub(crate) struct Command {

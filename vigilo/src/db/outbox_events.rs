@@ -1,13 +1,12 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::models::outbox_event::{
-    OutboxEvent,
-    OutboxEventDraft,
-    OutboxEventPatch,
-};
+use crate::models::outbox_event::{OutboxEvent, OutboxEventDraft, OutboxEventPatch};
 
-pub(crate) async fn insert_outbox_event(db: &PgPool, draft: &OutboxEventDraft) -> anyhow::Result<OutboxEvent> {
+pub(crate) async fn insert_outbox_event(
+    db: &PgPool,
+    draft: &OutboxEventDraft,
+) -> anyhow::Result<OutboxEvent> {
     let event = sqlx::query_as::<_, OutboxEvent>(
         r#"
         INSERT INTO outbox_events (

@@ -2,9 +2,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::models::evaluator_result::{
-    EvaluatorResult,
-    EvaluatorResultDraft,
-    EvaluatorResultPatch,
+    EvaluatorResult, EvaluatorResultDraft, EvaluatorResultPatch,
 };
 
 pub(crate) async fn insert_evaluator_result(

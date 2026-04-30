@@ -1,13 +1,6 @@
-use chrono::{
-    DateTime,
-    Utc,
-};
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -30,11 +23,13 @@ impl std::str::FromStr for EvaluatorState {
             "deprecated" => Ok(Self::Deprecated),
             "disabled" => Ok(Self::Disabled),
             "removed" => Ok(Self::Removed),
-            _ => anyhow::bail!("invalid evaluator state '{}'; expected one of: active, yanked, deprecated, disabled, removed", s),
+            _ => anyhow::bail!(
+                "invalid evaluator state '{}'; expected one of: active, yanked, deprecated, disabled, removed",
+                s
+            ),
         }
     }
 }
-
 
 // todo - consider sqlx::types::Json<EvaluatorMetadata>
 

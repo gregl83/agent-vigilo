@@ -1,14 +1,12 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::models::evaluator::{
-    Evaluator,
-    EvaluatorDraft,
-    EvaluatorPatch,
-    EvaluatorSummary,
-};
+use crate::models::evaluator::{Evaluator, EvaluatorDraft, EvaluatorPatch, EvaluatorSummary};
 
-pub(crate) async fn insert_evaluator(db: &PgPool, draft: &EvaluatorDraft) -> anyhow::Result<Evaluator> {
+pub(crate) async fn insert_evaluator(
+    db: &PgPool,
+    draft: &EvaluatorDraft,
+) -> anyhow::Result<Evaluator> {
     let wasm_size_bytes = draft.wasm_bytes.len() as i64;
 
     let evaluator = sqlx::query_as::<_, Evaluator>(
@@ -48,7 +46,10 @@ pub(crate) async fn insert_evaluator(db: &PgPool, draft: &EvaluatorDraft) -> any
     Ok(evaluator)
 }
 
-pub(crate) async fn select_evaluator_by_id(db: &PgPool, id: Uuid) -> anyhow::Result<Option<Evaluator>> {
+pub(crate) async fn select_evaluator_by_id(
+    db: &PgPool,
+    id: Uuid,
+) -> anyhow::Result<Option<Evaluator>> {
     let evaluator = sqlx::query_as::<_, Evaluator>(
         r#"
         SELECT
@@ -120,7 +121,10 @@ pub(crate) async fn select_evaluator(
     Ok(evaluator)
 }
 
-pub(crate) async fn list_evaluators(db: &PgPool, namespace: &str) -> anyhow::Result<Vec<Evaluator>> {
+pub(crate) async fn list_evaluators(
+    db: &PgPool,
+    namespace: &str,
+) -> anyhow::Result<Vec<Evaluator>> {
     let evaluators = sqlx::query_as::<_, Evaluator>(
         r#"
         SELECT

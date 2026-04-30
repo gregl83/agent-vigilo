@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "vigilo",
     "evaluators/sentiment",
+    "vigilo",
 ]
 resolver = "2"
