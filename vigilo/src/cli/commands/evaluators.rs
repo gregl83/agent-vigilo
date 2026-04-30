@@ -32,7 +32,7 @@ fn parse_fully_qualified_evaluator(input: &str) -> anyhow::Result<EvaluatorIdent
         .split_once('@')
         .map(|(l, r)| (l.trim(), r.trim()))
         .ok_or_else(|| anyhow::anyhow!(
-            "ambiguous evaluator reference '{}'; use fully qualified '<namespace>:<name>@<version>'",
+            "ambiguous evaluator identifier '{}'; use fully qualified '<namespace>:<name>@<version>'",
             input
         ))?;
 
@@ -40,13 +40,13 @@ fn parse_fully_qualified_evaluator(input: &str) -> anyhow::Result<EvaluatorIdent
         .split_once(':')
         .map(|(l, r)| (l.trim(), r.trim()))
         .ok_or_else(|| anyhow::anyhow!(
-            "ambiguous evaluator reference '{}'; use fully qualified '<namespace>:<name>@<version>'",
+            "ambiguous evaluator identifier '{}'; use fully qualified '<namespace>:<name>@<version>'",
             input
         ))?;
 
     if namespace.is_empty() || name.is_empty() || version.is_empty() {
         anyhow::bail!(
-            "ambiguous evaluator reference '{}'; use fully qualified '<namespace>:<name>@<version>'",
+            "ambiguous evaluator identifier '{}'; use fully qualified '<namespace>:<name>@<version>'",
             input
         );
     }
@@ -84,7 +84,7 @@ pub(crate) enum SubCommand {
     },
     /// Show evaluator details
     Show {
-        /// Fully qualified evaluator reference (<namespace>:<name>@<version>)
+        /// Fully qualified evaluator identifier (<namespace>:<name>@<version>)
         #[arg()]
         evaluator: String,
     },
@@ -104,7 +104,7 @@ pub(crate) enum SubCommand {
     },
     /// Set evaluator state
     SetState {
-        /// Fully qualified evaluator reference (<namespace>:<name>@<version>)
+        /// Fully qualified evaluator identifier (<namespace>:<name>@<version>)
         #[arg()]
         evaluator: String,
 

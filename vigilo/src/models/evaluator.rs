@@ -97,4 +97,3 @@ pub(crate) struct EvaluatorSummary {
     pub(crate) state: EvaluatorState,
     pub(crate) state_reason: Option<String>,
 }
-
