@@ -231,12 +231,40 @@ use wasmtime::{
     component,
     Config as EngineConfig,
     Engine,
+    Store,
 };
 
 use super::super::manifest::{
     Wit,
     read_manifest,
 };
+
+mod evaluator_test_bindings {
+    wasmtime::component::bindgen!({
+        path: "../wit/evaluator.wit",
+        world: "evaluator-world",
+    });
+}
+
+struct EvaluatorTestHost;
+
+impl evaluator_test_bindings::vigilo::evaluator::executor::Host for EvaluatorTestHost {
+    fn trace(&mut self, msg: String) {
+        debug!("evaluator.trace: {}", msg);
+    }
+
+    fn debug(&mut self, msg: String) {
+        debug!("evaluator.debug: {}", msg);
+    }
+
+    fn warn(&mut self, msg: String) {
+        warn!("evaluator.warn: {}", msg);
+    }
+
+    fn error(&mut self, msg: String) {
+        warn!("evaluator.error: {}", msg);
+    }
+}
 
 
 struct PackageMetadata {
@@ -708,7 +736,7 @@ impl Wasm {
         )
     }
 
-    pub fn prepare_component(&self, package_path: PathBuf, profile: String) -> anyhow::Result<Component> {
+    pub fn prepare_evaluator(&self, package_path: PathBuf, profile: String) -> anyhow::Result<Component> {
         let manifest = read_manifest(&package_path)?;
         let manifest_profile = manifest.get_profile(profile)?;
         let wit_metadata = resolve_wit_metadata(&package_path, manifest.wit.as_ref())?;
@@ -761,6 +789,36 @@ impl Wasm {
                 serialized,
             }
         )
+    }
+
+    pub fn test_evaluator(&self, wasm_bytes: &[u8], db_context: String) -> anyhow::Result<String> {
+        let component = component::Component::new(&self.engine, wasm_bytes)?;
+        let mut linker = component::Linker::new(&self.engine);
+
+        evaluator_test_bindings::vigilo::evaluator::executor::add_to_linker::<_, wasmtime::component::HasSelf<EvaluatorTestHost>>(
+            &mut linker,
+            |host: &mut EvaluatorTestHost| host,
+        )?;
+
+        let mut store = Store::new(&self.engine, EvaluatorTestHost);
+        let bindings = evaluator_test_bindings::EvaluatorWorld::instantiate(
+            &mut store,
+            &component,
+            &linker,
+        )?;
+
+        let input = evaluator_test_bindings::vigilo::evaluator::types::Input {
+            context: evaluator_test_bindings::vigilo::evaluator::types::Context {
+                db: db_context,
+            },
+        };
+
+        let output = bindings
+            .vigilo_evaluator_evaluator()
+            .call_evaluate(&mut store, &input)?
+            .map_err(|err| anyhow::anyhow!("evaluator returned error: {}", err))?;
+
+        Ok(output.data.val)
     }
 }
 
