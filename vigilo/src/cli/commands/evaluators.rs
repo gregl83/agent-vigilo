@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-
+use anyhow::anyhow;
 use async_trait::async_trait;
 use clap::{
     Args,
@@ -166,6 +166,8 @@ impl Executable for SubCommand {
                 Ok(())
             }
             SubCommand::Show{ evaluator } => {
+                info!("fetching evaluator {}", evaluator);
+
                 let db = context.db().await?;
                 let out = context.out().await?;
                 let evaluator = parse_fully_qualified_evaluator(&evaluator)?;
@@ -179,34 +181,35 @@ impl Executable for SubCommand {
 
                 let payload = match evaluator_record {
                     Some(e) => json!({
-                        "id": e.id,
-                        "namespace": e.namespace,
-                        "name": e.name,
-                        "version": e.version,
-                        "content_hash": e.content_hash,
-                        "wasm_size_bytes": e.wasm_size_bytes,
-                        "interface_name": e.interface_name,
-                        "interface_version": e.interface_version,
-                        "wit_world": e.wit_world,
-                        "runtime": e.runtime,
-                        "runtime_version": e.runtime_version,
-                        "runtime_fingerprint": e.runtime_fingerprint,
-                        "description": e.description,
-                        "tags": e.tags,
-                        "metadata": e.metadata,
-                        "is_enabled": e.is_enabled,
-                        "created_at": e.created_at,
-                        "updated_at": e.updated_at,
+                        "data": {
+                            "id": e.id,
+                            "namespace": e.namespace,
+                            "name": e.name,
+                            "version": e.version,
+                            "content_hash": e.content_hash,
+                            "wasm_size_bytes": e.wasm_size_bytes,
+                            "interface_name": e.interface_name,
+                            "interface_version": e.interface_version,
+                            "wit_world": e.wit_world,
+                            "runtime": e.runtime,
+                            "runtime_version": e.runtime_version,
+                            "runtime_fingerprint": e.runtime_fingerprint,
+                            "description": e.description,
+                            "tags": e.tags,
+                            "metadata": e.metadata,
+                            "is_enabled": e.is_enabled,
+                            "created_at": e.created_at,
+                            "updated_at": e.updated_at,
+                        }
                     }),
-                    None => json!({
-                        "evaluator": serde_json::Value::Null,
-                        "error": format!(
+                    None => {
+                        anyhow::bail!(
                             "evaluator not found: {}:{}@{}",
                             evaluator.namespace,
                             evaluator.name,
                             evaluator.version,
-                        ),
-                    }),
+                        );
+                    },
                 };
 
                 out.write_line(serde_json::to_string_pretty(&payload)?)?;
@@ -214,6 +217,12 @@ impl Executable for SubCommand {
                 Ok(())
             }
             SubCommand::Search { namespace, limit, query } => {
+                info!(
+                    "searching evaluators namespace `{}` for term `{}`",
+                    namespace,
+                    query.clone().unwrap_or_default(),
+                );
+
                 let db = context.db().await?;
                 let out = context.out().await?;
                 let evaluators = evaluators::search_evaluator_summaries(
@@ -224,19 +233,23 @@ impl Executable for SubCommand {
                 ).await?;
 
                 let payload = json!({
-                    "namespace": namespace,
-                    "query": query,
-                    "limit": limit,
-                    "count": evaluators.len(),
-                    "items": evaluators,
+                    "data": evaluators,
+                    "meta": {
+                        "namespace": namespace,
+                        "query": query,
+                        "limit": limit,
+                        "count": evaluators.len(),
+                    },
                 });
 
                 out.write_line(serde_json::to_string_pretty(&payload)?)?;
+
                 Ok(())
             }
             SubCommand::Disable{ evaluator } => {
+                info!("disabling evaluator {}", evaluator);
+
                 let db = context.db().await?;
-                let out = context.out().await?;
                 let evaluator = parse_fully_qualified_evaluator(&evaluator)?;
 
                 let affected = evaluators::update_evaluator_enabled(
@@ -247,10 +260,27 @@ impl Executable for SubCommand {
                     &EvaluatorPatch { is_enabled: false },
                 ).await?;
 
-                out.write_line(format!("disabled {} row(s)", affected))?;
+                if affected == 0 {
+                    anyhow::bail!(
+                        "failed to diaable evaluator {}:{}@{}",
+                        evaluator.namespace,
+                        evaluator.name,
+                        evaluator.version,
+                    );
+                } else {
+                    info!(
+                        "disabled evaluator {}:{}@{}",
+                        evaluator.namespace,
+                        evaluator.name,
+                        evaluator.version,
+                    );
+                }
+
                 Ok(())
             }
             SubCommand::Enable{ evaluator } => {
+                info!("enabling evaluator {}", evaluator);
+
                 let db = context.db().await?;
                 let out = context.out().await?;
                 let evaluator = parse_fully_qualified_evaluator(&evaluator)?;
@@ -263,12 +293,28 @@ impl Executable for SubCommand {
                     &EvaluatorPatch { is_enabled: true },
                 ).await?;
 
-                out.write_line(format!("enabled {} row(s)", affected))?;
+                if affected == 0 {
+                    anyhow::bail!(
+                        "failed to enable evaluator {}:{}@{}",
+                        evaluator.namespace,
+                        evaluator.name,
+                        evaluator.version,
+                    );
+                } else {
+                    info!(
+                        "enabled evaluator {}:{}@{}",
+                        evaluator.namespace,
+                        evaluator.name,
+                        evaluator.version,
+                    );
+                }
+
                 Ok(())
             }
             SubCommand::Remove{ evaluator } => {
+                info!("removing evaluator {}", evaluator);
+
                 let db = context.db().await?;
-                let out = context.out().await?;
                 let evaluator = parse_fully_qualified_evaluator(&evaluator)?;
 
                 let affected = evaluators::delete_evaluator(
@@ -278,7 +324,22 @@ impl Executable for SubCommand {
                     &evaluator.version,
                 ).await?;
 
-                out.write_line(format!("removed {} row(s)", affected))?;
+                if affected == 0 {
+                    anyhow::bail!(
+                        "failed to remove evaluator {}:{}@{}",
+                        evaluator.namespace,
+                        evaluator.name,
+                        evaluator.version,
+                    );
+                } else {
+                    info!(
+                        "removed evaluator {}:{}@{}",
+                        evaluator.namespace,
+                        evaluator.name,
+                        evaluator.version,
+                    );
+                }
+
                 Ok(())
             }
         }
