@@ -24,6 +24,26 @@ interface executor {
     debug: func(msg: string);
     warn: func(msg: string);
     error: func(msg: string);
+
+    // http requests
+    record http-header {
+        name: string,
+        value: string,
+    }
+    record http-request {
+        method: string,
+        uri: string,
+        headers: list<http-header>,
+        body: option<list<u8>>,
+        timeout-ms: option<u32>,
+    }
+    record http-response {
+        status: u16,
+        headers: list<http-header>,
+        body: list<u8>,
+    }
+    // outbound HTTP (host-mediated, policy-controlled)
+    send-http-request: func(req: http-request) -> result<http-response, string>;
 }
 
 // evaluator interface

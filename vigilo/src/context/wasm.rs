@@ -82,6 +82,13 @@ impl evaluator_test_bindings::vigilo::evaluator::executor::Host for EvaluatorTes
     fn error(&mut self, msg: String) {
         warn!("evaluator.error: {}", msg);
     }
+
+    fn send_http_request(
+        &mut self,
+        _req: evaluator_test_bindings::vigilo::evaluator::executor::HttpRequest,
+    ) -> Result<evaluator_test_bindings::vigilo::evaluator::executor::HttpResponse, String> {
+        Err("send_http_request is not enabled yet; outbound HTTP policy enforcement is not configured".to_string())
+    }
 }
 
 struct PackageMetadata {

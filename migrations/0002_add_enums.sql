@@ -4,10 +4,18 @@ CREATE TYPE evaluator_state AS ENUM (
     'deprecated', -- Still usable, but discouraged.
     'disabled', -- Unavailable for execution, but still present in record.
     'removed' -- Tombstone-only state for admin/legal workflows; not normal deletion.
-    );
+);
 
 COMMENT ON TYPE evaluator_state IS
     'Lifecycle state of an evaluator artifact aligned to package-management semantics.';
+
+CREATE TYPE evaluator_http_policy_action AS ENUM (
+  'allow',
+  'deny'
+);
+
+COMMENT ON TYPE evaluator_http_policy_action IS
+    'URI policy action for evaluator outbound HTTP requests; allow=whitelist, deny=blacklist.';
 
 CREATE TYPE run_status AS ENUM (
   'pending', -- Run has been created but no executions have been dispatched yet.
