@@ -249,6 +249,7 @@ impl Executable for SubCommand {
                 let db = context.db().await?;
                 let evaluator = parse_fully_qualified_evaluator(&evaluator)?;
 
+                // todo - handle failure reason (e.g. removed -> active failure)
                 let affected = evaluators::update_evaluator_state(
                     db,
                     &evaluator.namespace,

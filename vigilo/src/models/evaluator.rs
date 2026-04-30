@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
 #[sqlx(type_name = "evaluator_state", rename_all = "lowercase")]
 pub(crate) enum EvaluatorState {
     Active,

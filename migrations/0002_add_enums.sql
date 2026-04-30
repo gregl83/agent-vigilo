@@ -1,3 +1,14 @@
+CREATE TYPE evaluator_state AS ENUM (
+    'active', -- Selectable and usable by default.
+    'yanked', -- Not selected for new use, but existing/pinned users can still use it.
+    'deprecated', -- Still usable, but discouraged.
+    'disabled', -- Unavailable for execution, but still present in record.
+    'removed' -- Tombstone-only state for admin/legal workflows; not normal deletion.
+    );
+
+COMMENT ON TYPE evaluator_state IS
+    'Lifecycle state of an evaluator artifact aligned to package-management semantics.';
+
 CREATE TYPE run_status AS ENUM (
   'pending', -- Run has been created but no executions have been dispatched yet.
   'running', -- Executions have been dispatched and are actively being processed by workers.
@@ -76,15 +87,3 @@ CREATE TYPE outbox_status AS ENUM (
 
 COMMENT ON TYPE outbox_status IS
     'Represents the delivery state of an outbox event. Used to ensure reliable, idempotent publication of events to external systems.';
-
-CREATE TYPE evaluator_state AS ENUM (
-  'active', -- Selectable and usable by default.
-  'yanked', -- Not selected for new use, but existing/pinned users can still use it.
-  'deprecated', -- Still usable, but discouraged.
-  'disabled', -- Unavailable for execution, but still present in record.
-  'removed' -- Tombstone-only state for admin/legal workflows; not normal deletion.
-);
-
-COMMENT ON TYPE evaluator_state IS
-    'Lifecycle state of an evaluator artifact aligned to package-management semantics.';
-

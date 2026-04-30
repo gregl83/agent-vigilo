@@ -194,33 +194,13 @@ pub(crate) async fn update_evaluator_state(
             state_reason = $4,
             updated_at = now()
         WHERE namespace = $1 AND name = $2 AND version = $5
+          AND state <> 'removed'::evaluator_state
         "#,
     )
     .bind(namespace)
     .bind(name)
     .bind(&patch.state)
     .bind(&patch.state_reason)
-    .bind(version)
-    .execute(db)
-    .await?;
-
-    Ok(result.rows_affected())
-}
-
-pub(crate) async fn delete_evaluator(
-    db: &PgPool,
-    namespace: &str,
-    name: &str,
-    version: &str,
-) -> anyhow::Result<u64> {
-    let result = sqlx::query(
-        r#"
-        DELETE FROM evaluators
-        WHERE namespace = $1 AND name = $2 AND version = $3
-        "#,
-    )
-    .bind(namespace)
-    .bind(name)
     .bind(version)
     .execute(db)
     .await?;
