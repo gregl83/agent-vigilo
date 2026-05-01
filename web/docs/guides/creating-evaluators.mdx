@@ -18,7 +18,7 @@ A minimal evaluator crate should:
 - accept the canonical evaluator `input`
 - return the canonical evaluator `output`
 
-Use `evaluators/sentiment` as the concrete reference implementation.
+Use `evaluators/sentiment-basic-en` as the concrete reference implementation.
 
 ## Recommended Project Shape
 
@@ -62,7 +62,7 @@ cargo build --manifest-path evaluators/my-evaluator/Cargo.toml --target wasm32-w
 Run a focused evaluator test using the sample input:
 
 ```bash
-vigilo evaluators test 'vigilo:my-evaluator@0.1.0' --input-file evaluators/my-evaluator/example-input.json
+vigilo evaluators test 'vigilo/my-evaluator:0.1.0' --input-file evaluators/my-evaluator/example-input.json
 ```
 
 If you hit an interface conversion error, check that the published evaluator version matches the current WIT contract expected by the host.
@@ -85,7 +85,7 @@ Recommended prompt constraints:
 
 - "Create one Rust evaluator crate with one evaluator entrypoint."
 - "Follow `wit/evaluator.wit` input/output contract exactly."
-- "Use `evaluators/sentiment` as the style reference."
+- "Use `evaluators/sentiment-basic-en` as the style reference."
 - "Add `example-input.json` and include build/test commands."
 
 Recommended validation checklist:
@@ -99,6 +99,6 @@ Recommended validation checklist:
 
 - **`failed to convert function to given type`**: published evaluator ABI does not match current host WIT expectations.
 - **No evaluator trace/debug output**: run with appropriate log level filters so debug logs are visible.
-- **Evaluator not found**: use a fully qualified identifier: `<namespace>:<name>@<version>`.
+- **Evaluator not found**: use a fully qualified identifier: `<namespace>/<name>:<version>`.
 
 

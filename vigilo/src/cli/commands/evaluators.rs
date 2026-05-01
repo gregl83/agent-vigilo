@@ -16,6 +16,7 @@ const DEFAULT_NAMESPACE: &str = "vigilo";
 const DEFAULT_SEARCH_LIMIT: i64 = 10;
 const MAX_SEARCH_LIMIT: i64 = 20;
 
+#[derive(Debug)]
 struct EvaluatorIdentity {
     namespace: String,
     name: String,
@@ -24,24 +25,24 @@ struct EvaluatorIdentity {
 
 fn parse_fully_qualified_evaluator(input: &str) -> anyhow::Result<EvaluatorIdentity> {
     let (identity, version) = input
-        .split_once('@')
+        .rsplit_once(':')
         .map(|(l, r)| (l.trim(), r.trim()))
         .ok_or_else(|| anyhow::anyhow!(
-            "ambiguous evaluator identifier '{}'; use fully qualified '<namespace>:<name>@<version>'",
+            "ambiguous evaluator identifier '{}'; use fully qualified '<namespace>/<name>:<version>'",
             input
         ))?;
 
     let (namespace, name) = identity
-        .split_once(':')
+        .rsplit_once('/')
         .map(|(l, r)| (l.trim(), r.trim()))
         .ok_or_else(|| anyhow::anyhow!(
-            "ambiguous evaluator identifier '{}'; use fully qualified '<namespace>:<name>@<version>'",
+            "ambiguous evaluator identifier '{}'; use fully qualified '<namespace>/<name>:<version>'",
             input
         ))?;
 
     if namespace.is_empty() || name.is_empty() || version.is_empty() {
         anyhow::bail!(
-            "ambiguous evaluator identifier '{}'; use fully qualified '<namespace>:<name>@<version>'",
+            "ambiguous evaluator identifier '{}'; use fully qualified '<namespace>/<name>:<version>'",
             input
         );
     }
@@ -78,7 +79,7 @@ pub(crate) enum SubCommand {
     },
     /// Show evaluator details
     Show {
-        /// Fully qualified evaluator identifier (<namespace>:<name>@<version>)
+        /// Fully qualified evaluator identifier (<namespace>/<name>:<version>)
         #[arg()]
         evaluator: String,
     },
@@ -98,7 +99,7 @@ pub(crate) enum SubCommand {
     },
     /// Execute a single evaluator with canonical test input
     Test {
-        /// Fully qualified evaluator identifier (<namespace>:<name>@<version>)
+        /// Fully qualified evaluator identifier (<namespace>/<name>:<version>)
         #[arg()]
         evaluator: String,
 
@@ -125,7 +126,7 @@ pub(crate) enum SubCommand {
     },
     /// Set evaluator state
     SetState {
-        /// Fully qualified evaluator identifier (<namespace>:<name>@<version>)
+        /// Fully qualified evaluator identifier (<namespace>/<name>:<version>)
         #[arg()]
         evaluator: String,
 
@@ -179,7 +180,7 @@ impl Executable for SubCommand {
                 .await?;
 
                 info!(
-                    "successfully published evaluator: {}:{}@{}",
+                    "successfully published evaluator: {}/{}:{}",
                     evaluator.namespace, evaluator.name, evaluator.version,
                 );
 
@@ -226,7 +227,7 @@ impl Executable for SubCommand {
                     }),
                     None => {
                         anyhow::bail!(
-                            "evaluator not found: {}:{}@{}",
+                            "evaluator not found: {}/{}:{}",
                             evaluator.namespace,
                             evaluator.name,
                             evaluator.version,
@@ -290,7 +291,7 @@ impl Executable for SubCommand {
                 .await?
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "evaluator not found: {}:{}@{}",
+                        "evaluator not found: {}/{}:{}",
                         evaluator.namespace,
                         evaluator.name,
                         evaluator.version,
@@ -300,7 +301,7 @@ impl Executable for SubCommand {
                 match evaluator_record.state {
                     EvaluatorState::Disabled | EvaluatorState::Removed => {
                         anyhow::bail!(
-                            "evaluator {}:{}@{} cannot be tested while in state '{}'",
+                            "evaluator {}/{}:{} cannot be tested while in state '{}'",
                             evaluator_record.namespace,
                             evaluator_record.name,
                             evaluator_record.version,
@@ -364,7 +365,7 @@ impl Executable for SubCommand {
 
                 if affected == 0 {
                     anyhow::bail!(
-                        "failed to set evaluator state {}:{}@{} -> {:?}",
+                        "failed to set evaluator state {}/{}:{} -> {:?}",
                         evaluator.namespace,
                         evaluator.name,
                         evaluator.version,
@@ -372,7 +373,7 @@ impl Executable for SubCommand {
                     );
                 } else {
                     info!(
-                        "set evaluator state {}:{}@{} -> {:?}",
+                        "set evaluator state {}/{}:{} -> {:?}",
                         evaluator.namespace, evaluator.name, evaluator.version, state,
                     );
                 }
@@ -403,7 +404,7 @@ impl Executable for Command {
                 } else {
                     for evaluator in evaluators {
                         info!(
-                            "{}:{}@{} state={:?}",
+                            "{}/{}:{} state={:?}",
                             evaluator.namespace, evaluator.name, evaluator.version, evaluator.state,
                         );
                     }
@@ -414,3 +415,25 @@ impl Executable for Command {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_fully_qualified_evaluator;
+
+    #[test]
+    fn parse_fully_qualified_evaluator_accepts_new_format() {
+        let parsed = parse_fully_qualified_evaluator("vigilo/sentiment-basic-en:0.1.0").unwrap();
+
+        assert_eq!(parsed.namespace, "vigilo");
+        assert_eq!(parsed.name, "sentiment-basic-en");
+        assert_eq!(parsed.version, "0.1.0");
+    }
+
+    #[test]
+    fn parse_fully_qualified_evaluator_rejects_old_format() {
+        let err = parse_fully_qualified_evaluator("vigilo:sentiment-basic-en@0.1.0").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("<namespace>/<name>:<version>"));
+    }
+}
+

@@ -12,7 +12,7 @@ This repository supports AI-assisted development, but generated changes must fol
 - Keep evaluator interface vocabulary as `input` and `output`.
 - Treat `wit/evaluator.wit` as the source of truth for evaluator ABI.
 - Keep evaluator execution contracts in `vigilo/src/contracts/`, not persistence models.
-- Preserve strict evaluator identifier format: `<namespace>:<name>@<version>`.
+- Preserve strict evaluator identifier format: `<namespace>/<name>:<version>`.
 - Avoid broad refactors outside the requested scope.
 
 ## Documentation and Examples

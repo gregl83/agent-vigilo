@@ -275,7 +275,7 @@ pub(crate) enum Score {
 /// Host-side normalized result used for aggregation/storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct NormalizedEvaluatorResult {
-    /// Fully-qualified evaluator identity (`namespace:name@version`).
+    /// Fully-qualified evaluator identity (`namespace/name:version`).
     pub(crate) evaluator_identifier: String,
     /// Aggregation dimension this row contributes to.
     pub(crate) dimension: EvaluationDimension,
@@ -385,7 +385,7 @@ impl EvaluatorOutput {
     /// normalized score fields and a fully-qualified evaluator identifier.
     pub(crate) fn normalize(self) -> Vec<NormalizedEvaluatorResult> {
         let evaluator_identifier = format!(
-            "{}:{}@{}",
+            "{}/{}:{}",
             self.evaluator.namespace, self.evaluator.name, self.evaluator.version
         );
 
@@ -475,7 +475,7 @@ mod tests {
 
         let normalized = output.normalize();
         assert_eq!(normalized.len(), 1);
-        assert_eq!(normalized[0].evaluator_identifier, "vigilo:sentiment@0.1.0");
+        assert_eq!(normalized[0].evaluator_identifier, "vigilo/sentiment:0.1.0");
         assert_eq!(normalized[0].normalized_score, Some(0.8));
     }
 
