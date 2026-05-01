@@ -60,7 +60,9 @@ fn extract_text(raw: &str) -> Result<String, String> {
 
 fn extract_text_from_input(input: &Input) -> Result<String, String> {
     if let Some(text) = input.actual.text.as_deref() {
-        return extract_text(text);
+        if let Ok(parsed) = extract_text(text) {
+            return Ok(parsed);
+        }
     }
 
     let input_json: serde_json::Value = serde_json::from_str(&input.test_case.input_json)
@@ -156,7 +158,7 @@ impl Guest for Evaluator {
         Ok(Output {
             evaluator: EvaluatorIdentity {
                 namespace: "vigilo".to_string(),
-                name: "sentiment".to_string(),
+                name: "sentiment-basic-en".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 content_hash: None,
                 interface_version: Some("0.1.0".to_string()),
@@ -168,12 +170,26 @@ impl Guest for Evaluator {
                 blocking: false,
                 severity,
                 failure_category: None,
-                reason: Some(format!("sentiment label is {label}")),
+                reason: Some(format!(
+                    "basic English-only lexicon sentiment evaluator labeled input as {label}"
+                )),
                 evidence_json,
-                tags: vec!["sentiment".to_string(), label.to_string()],
+                tags: vec![
+                    "sentiment".to_string(),
+                    "basic".to_string(),
+                    "english-only".to_string(),
+                    label.to_string(),
+                ],
             }],
             metadata_json: json!({
-                "source": "lexicon",
+                "approach": "lexicon",
+                "language_scope": "en",
+                "language_scope_enforcement": "advisory",
+                "maturity": "basic",
+                "intended_use": "example_only",
+                "configuration": {
+                    "max_evidence_length": "not_configurable_yet"
+                }
             })
             .to_string(),
         })
@@ -260,5 +276,35 @@ mod tests {
         };
 
         assert_eq!(extract_text_from_input(&input).unwrap(), "great experience");
+    }
+
+    #[test]
+    fn extract_text_from_input_falls_back_when_actual_text_is_empty() {
+        let input = Input {
+            run_id: "run-1".to_string(),
+            execution_id: "exec-1".to_string(),
+            attempt_id: "attempt-1".to_string(),
+            test_case: TestCase {
+                id: "case-1".to_string(),
+                task_type: "classification".to_string(),
+                case_group: None,
+                input_json: r#"{"user_message":"fallback message"}"#.to_string(),
+                expected_json: None,
+                context_json: None,
+                tags: vec![],
+                metadata_json: "{}".to_string(),
+            },
+            actual: AgentOutput {
+                text: Some("   ".to_string()),
+                structured_json: None,
+                tool_calls: vec![],
+                trace: vec![],
+                raw_json: "{}".to_string(),
+                metadata_json: "{}".to_string(),
+            },
+            evaluator_config_json: "{}".to_string(),
+        };
+
+        assert_eq!(extract_text_from_input(&input).unwrap(), "fallback message");
     }
 }

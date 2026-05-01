@@ -31,4 +31,3 @@ This file applies to evaluator crates under `evaluators/`.
 - Example crate: `evaluators/sentiment`
 - Guide: `web/docs/guides/creating-evaluators.mdx`
 - Template details: `evaluators/sentiment/README.md`
-

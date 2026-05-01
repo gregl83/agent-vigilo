@@ -26,4 +26,3 @@ This repository supports AI-assisted development, but generated changes must fol
 - Make focused commits by concern (contracts, runtime, docs, examples).
 - Do not rename public CLI flags/terms unless explicitly requested.
 - When WIT shapes change, update host mappings, evaluator examples, and docs together.
-

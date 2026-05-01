@@ -1,11 +1,14 @@
 [package]
 manifest = "Cargo.toml"
-description = "Lexicon-based sentiment evaluator"
-tags = ["sentiment", "classification", "example"]
+description = "Basic English-only lexicon sentiment evaluator (example)"
+tags = ["sentiment", "classification", "example", "basic", "english-only"]
 
 [package.metadata]
 owner = "evaluators-team"
 tier = "example"
+language_scope = "en"
+maturity = "basic"
+intended_use = "example_only"
 
 [wit]
 path = "../../wit/evaluator.wit"
@@ -16,7 +19,7 @@ interface = "evaluator"
 strict = true
 
 [profile.dev]
-wasm = "wasm32-wasip2/debug/sentiment.wasm"
+wasm = "wasm32-wasip2/debug/sentiment_basic_en.wasm"
 
 [profile.release]
-wasm = "wasm32-wasip2/release/sentiment.wasm"
+wasm = "wasm32-wasip2/release/sentiment_basic_en.wasm"
