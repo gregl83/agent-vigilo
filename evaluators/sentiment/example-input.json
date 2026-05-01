@@ -1,0 +1,37 @@
+{
+  "run_id": "run_example_001",
+  "execution_id": "exec_example_001",
+  "attempt_id": "attempt_001",
+  "case": {
+    "id": "sentiment_001",
+    "task_type": "classification",
+    "case_group": "sentiment",
+    "input": {
+      "user_message": "I love this product. Great support and fast response."
+    },
+    "expected": {
+      "label": "positive"
+    },
+    "context": null,
+    "tags": ["smoke", "easy"],
+    "metadata": {
+      "difficulty": "easy",
+      "source": "synthetic"
+    }
+  },
+  "actual": {
+    "text": "I love this product. Great support and fast response.",
+    "structured": null,
+    "tool_calls": [],
+    "trace": [],
+    "raw": {
+      "provider": "example"
+    },
+    "metadata": {
+      "latency_ms": 42
+    }
+  },
+  "evaluator_config": {
+    "mode": "default"
+  }
+}
