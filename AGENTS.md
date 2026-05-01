@@ -18,7 +18,7 @@ This repository supports AI-assisted development, but generated changes must fol
 ## Documentation and Examples
 
 - Prefer linking to existing guides rather than duplicating long instructions.
-- Use `evaluators/sentiment/README.md` as the primary single-evaluator reference.
+- Use `evaluators/sentiment-basic-en/README.md` as the primary single-evaluator reference.
 - Keep examples small, runnable, and versioned.
 
 ## Change Hygiene

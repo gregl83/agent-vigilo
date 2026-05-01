@@ -28,6 +28,6 @@ This file applies to evaluator crates under `evaluators/`.
 
 ## Reference
 
-- Example crate: `evaluators/sentiment`
+- Example crate: `evaluators/sentiment-basic-en`
 - Guide: `web/docs/guides/creating-evaluators.mdx`
-- Template details: `evaluators/sentiment/README.md`
+- Template details: `evaluators/sentiment-basic-en/README.md`

@@ -45,5 +45,5 @@ Replace `<evaluator-name>` with the evaluator crate directory/name.
 Example:
 
 ```bash
-cargo build --manifest-path "evaluators/sentiment/Cargo.toml" --target wasm32-wasip2 --release
+cargo build --manifest-path "evaluators/sentiment-basic-en/Cargo.toml" --target wasm32-wasip2 --release
 ```

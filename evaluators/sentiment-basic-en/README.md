@@ -2,7 +2,7 @@
 
 Basic English-only lexicon sentiment evaluator for Agent Vigilo.
 
-Template reference for cloning into a new single-evaluator crate: `evaluators/sentiment/README.md`
+Template reference for cloning into a new single-evaluator crate: `evaluators/sentiment-basic-en/README.md`
 
 General guide: `web/docs/guides/creating-evaluators.mdx`
 
@@ -43,12 +43,12 @@ The finding includes:
 ## Build
 
 ```bash
-cargo build --manifest-path evaluators/sentiment/Cargo.toml --target wasm32-wasip2 --release
+cargo build --manifest-path evaluators/sentiment-basic-en/Cargo.toml --target wasm32-wasip2 --release
 ```
 
 ## Test
 
 ```bash
-vigilo evaluators test 'vigilo:sentiment-basic-en@0.1.0' --input-file evaluators/sentiment/example-input.json
+vigilo evaluators test 'vigilo:sentiment-basic-en@0.1.0' --input-file evaluators/sentiment-basic-en/example-input.json
 ```
 
