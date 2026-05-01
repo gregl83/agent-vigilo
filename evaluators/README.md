@@ -2,6 +2,10 @@
 
 Core Generative AI evaluators.
 
+Guide: `web/docs/guides/creating-evaluators.mdx`
+
+Scoped guidance: `evaluators/AGENTS.md`
+
 Each evaluator is sourced as an independent Rust library crate.
 
 ## Build Instructions

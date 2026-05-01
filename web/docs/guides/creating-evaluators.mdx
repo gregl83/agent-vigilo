@@ -1,0 +1,104 @@
+---
+sidebar_label: Creating Evaluators
+title: Creating Evaluators
+description: Build, test, and publish a single WASM evaluator crate for Agent Vigilo.
+sidebar_position: 2
+---
+
+# Creating Evaluators
+
+This guide is the recommended path for creating a single evaluator crate that can be built to WASM and executed by Agent Vigilo.
+
+## What You Build
+
+A minimal evaluator crate should:
+
+- implement the evaluator world from `wit/evaluator.wit`
+- expose one evaluator entrypoint (`evaluate`)
+- accept the canonical evaluator `input`
+- return the canonical evaluator `output`
+
+Use `evaluators/sentiment` as the concrete reference implementation.
+
+## Recommended Project Shape
+
+A practical layout for a single evaluator crate:
+
+```text
+my-evaluator/
+  Cargo.toml
+  Vigilo.toml
+  src/
+    lib.rs
+  example-input.json
+```
+
+Key files:
+
+- `Cargo.toml`: crate identity (`name`, `version`) and dependencies
+- `Vigilo.toml`: build artifact profile paths and publish config
+- `src/lib.rs`: evaluator implementation and mapping logic
+- `example-input.json`: canonical input payload for local test runs
+
+## Contract-First Implementation
+
+Keep the evaluator contract in sync with `wit/evaluator.wit`.
+
+- Read fields from `input` (run IDs, case, actual output, evaluator config)
+- Produce one or more findings in `output.results`
+- Use evaluator metadata in `output.evaluator`
+- Keep evaluator-specific diagnostics in `output.metadata_json`
+
+If the WIT interface changes, rebuild and republish the evaluator under a new version before testing with that version.
+
+## Build and Test Loop
+
+Build your evaluator for WASI Preview 2:
+
+```bash
+cargo build --manifest-path evaluators/my-evaluator/Cargo.toml --target wasm32-wasip2 --release
+```
+
+Run a focused evaluator test using the sample input:
+
+```bash
+vigilo evaluators test 'vigilo:my-evaluator@0.1.0' --input-file evaluators/my-evaluator/example-input.json
+```
+
+If you hit an interface conversion error, check that the published evaluator version matches the current WIT contract expected by the host.
+
+## Publish
+
+After validating behavior locally:
+
+```bash
+vigilo publish ./evaluators/my-evaluator
+```
+
+For complete publish workflow details, see [Publishing Evaluators](./publishing.mdx).
+
+## Using Codex
+
+Codex works best when you keep prompts constrained to the project contract and crate shape.
+
+Recommended prompt constraints:
+
+- "Create one Rust evaluator crate with one evaluator entrypoint."
+- "Follow `wit/evaluator.wit` input/output contract exactly."
+- "Use `evaluators/sentiment` as the style reference."
+- "Add `example-input.json` and include build/test commands."
+
+Recommended validation checklist:
+
+1. Confirm the generated evaluator builds for `wasm32-wasip2`.
+2. Confirm `vigilo evaluators test ... --input-file ...` succeeds.
+3. Confirm identifiers and output fields use the canonical naming (`input`/`output`).
+4. Bump evaluator version and republish after any contract-shape change.
+
+## Troubleshooting
+
+- **`failed to convert function to given type`**: published evaluator ABI does not match current host WIT expectations.
+- **No evaluator trace/debug output**: run with appropriate log level filters so debug logs are visible.
+- **Evaluator not found**: use a fully qualified identifier: `<namespace>:<name>@<version>`.
+
+

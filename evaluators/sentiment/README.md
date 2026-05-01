@@ -2,6 +2,12 @@
 
 Lexicon-based sentiment evaluator for Agent Vigilo.
 
+Template reference for cloning into a new single-evaluator crate: `evaluators/sentiment/README.md`
+
+General guide: `web/docs/guides/creating-evaluators.mdx`
+
+Shared evaluator guidance: `evaluators/AGENTS.md`
+
 ## Input
 
 The evaluator consumes a WIT `input` envelope. This evaluator reads text from:
