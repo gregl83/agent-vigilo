@@ -69,6 +69,7 @@ impl evaluator_test_bindings::vigilo::evaluator::executor::Host for EvaluatorTes
     }
 }
 
+/// Parse JSON payload from raw str.
 fn parse_json_payload(field_name: &str, raw: &str) -> anyhow::Result<Value> {
     if raw.trim().is_empty() {
         return Ok(Value::Object(Default::default()));
@@ -77,6 +78,7 @@ fn parse_json_payload(field_name: &str, raw: &str) -> anyhow::Result<Value> {
     serde_json::from_str(raw).map_err(|err| anyhow::anyhow!("invalid {} JSON: {}", field_name, err))
 }
 
+/// Map bound evaluator dimension to evaluation dimension type.
 fn map_dimension(
     dimension: evaluator_test_bindings::vigilo::evaluator::types::EvaluationDimension,
 ) -> EvaluationDimension {
@@ -94,6 +96,7 @@ fn map_dimension(
     }
 }
 
+/// Map bound evaluator status to evaluation status type.
 fn map_status(
     status: evaluator_test_bindings::vigilo::evaluator::types::EvaluationStatus,
 ) -> EvaluationStatus {
@@ -107,6 +110,7 @@ fn map_status(
     }
 }
 
+/// Map bound evaluator severity to evaluation severity type.
 fn map_severity(severity: evaluator_test_bindings::vigilo::evaluator::types::Severity) -> Severity {
     use evaluator_test_bindings::vigilo::evaluator::types::Severity as BindingSeverity;
 
@@ -119,6 +123,7 @@ fn map_severity(severity: evaluator_test_bindings::vigilo::evaluator::types::Sev
     }
 }
 
+/// Map bound evaluator preference outcome to evaluation preference outcome type.
 fn map_preference_outcome(
     outcome: evaluator_test_bindings::vigilo::evaluator::types::PreferenceOutcome,
 ) -> PreferenceOutcome {
@@ -131,6 +136,7 @@ fn map_preference_outcome(
     }
 }
 
+/// Map bound evaluator score to evaluation score type.
 fn map_score(score: evaluator_test_bindings::vigilo::evaluator::types::Score) -> Score {
     use evaluator_test_bindings::vigilo::evaluator::types::Score as BindingScore;
 
@@ -148,6 +154,7 @@ fn map_score(score: evaluator_test_bindings::vigilo::evaluator::types::Score) ->
     }
 }
 
+/// Map evaluator output to response struct.
 fn map_output_to_response(
     output: evaluator_test_bindings::vigilo::evaluator::types::Output,
 ) -> anyhow::Result<EvaluatorResponse> {
@@ -237,6 +244,9 @@ struct EmbeddedPackageMetadata {
     version: String,
 }
 
+/// Read custom section in wasm bytes.
+///
+/// Retrieves evaluator metadata from wasm bytes (e.g., name and version).
 fn read_embedded_package_metadata(
     wasm_bytes: &[u8],
 ) -> anyhow::Result<Option<EmbeddedPackageMetadata>> {
@@ -259,6 +269,7 @@ fn read_embedded_package_metadata(
     Ok(None)
 }
 
+/// Push LEB128 (Little Endian Base 128) compressed value into vector buffer.
 fn push_u32_leb128(buf: &mut Vec<u8>, mut value: u32) {
     loop {
         let mut byte = (value & 0x7f) as u8;
@@ -276,6 +287,9 @@ fn push_u32_leb128(buf: &mut Vec<u8>, mut value: u32) {
     }
 }
 
+/// Appends custom section of metadata to wasm bytes.
+///
+/// Used to attach evaluator metadata (e.g., name and version).
 fn append_custom_section(
     wasm_bytes: &[u8],
     section_name: &str,
@@ -300,6 +314,7 @@ fn append_custom_section(
     Ok(out)
 }
 
+/// Ensure that custom section evaluator metadata has been appended to wasm bytes.
 fn ensure_embedded_package_metadata(
     wasm_bytes: Vec<u8>,
     package_name: &str,
@@ -352,6 +367,7 @@ fn ensure_embedded_package_metadata(
     }
 }
 
+/// Parse wit file and return struct.
 fn parse_wit_file(path: &PathBuf) -> anyhow::Result<WitDocument> {
     let content = fs::read_to_string(path)?;
 
@@ -435,6 +451,7 @@ fn parse_wit_file(path: &PathBuf) -> anyhow::Result<WitDocument> {
     })
 }
 
+/// Resolve wit file metadata and return as struct.
 fn resolve_wit_metadata(
     package_path: &PathBuf,
     manifest_wit: Option<&Wit>,
@@ -504,11 +521,13 @@ fn resolve_wit_metadata(
     })
 }
 
+/// Convert toml value to serde value.
 fn value_from_toml(value: &toml::Value) -> anyhow::Result<Value> {
     serde_json::to_value(value)
         .map_err(|err| anyhow::anyhow!("failed to encode TOML value to JSON: {}", err))
 }
 
+/// Resolve evaluator metadata and return as struct.
 fn resolve_evaluator_metadata(
     package: &super::super::manifest::Package,
     cargo: &PackageMetadata,
@@ -539,6 +558,7 @@ fn resolve_evaluator_metadata(
     })
 }
 
+/// Get metadata from package manifest defined in Vigilo.toml.
 fn get_package_metadata(
     package_path: &PathBuf,
     manifest_file: &String,
@@ -607,12 +627,14 @@ fn get_package_metadata(
     }
 }
 
+/// Get fingerprint for wasmtime engine.
 fn get_engine_fingerprint(engine: &Engine) -> String {
     let mut hasher = DefaultHasher::new();
     engine.precompile_compatibility_hash().hash(&mut hasher);
     format!("{:x}-{}", hasher.finish(), ARCH)
 }
 
+/// Resolve wasm runtime version from `Cargo.lock` file.
 fn resolve_runtime_version() -> anyhow::Result<String> {
     let lock_content = include_str!("../../../Cargo.lock");
     let lock = toml::from_str::<CargoLockDocument>(lock_content)
@@ -630,6 +652,7 @@ fn resolve_runtime_version() -> anyhow::Result<String> {
         })
 }
 
+/// Wasm component wrapper.
 pub struct Component {
     pub name: String,
     pub version: String,
@@ -657,6 +680,7 @@ impl Default for Config {
     }
 }
 
+/// Wasm engine wrapper.
 pub struct Wasm {
     engine: Engine,
     fingerprint: String,
@@ -676,6 +700,7 @@ impl Wasm {
         })
     }
 
+    /// Prepare evaluator for execution.
     pub fn prepare_evaluator(
         &self,
         package_path: PathBuf,
@@ -729,6 +754,7 @@ impl Wasm {
         })
     }
 
+    /// Run evaluator in test mode.
     pub fn test_evaluator(
         &self,
         wasm_bytes: &[u8],
