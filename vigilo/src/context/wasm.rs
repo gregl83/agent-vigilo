@@ -17,8 +17,8 @@ use wasmtime::{Config as EngineConfig, Engine, Store, component, component::Reso
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::contracts::evaluator::{
-    EvaluationDimension, EvaluationStatus, EvaluatorFinding, EvaluatorIdentity, EvaluatorResponse,
-    PreferenceOutcome, Score, Severity,
+    EvaluationDimension, EvaluationStatus, EvaluatorFinding, EvaluatorIdentity, EvaluatorInput,
+    EvaluatorOutput, PreferenceOutcome, Score, Severity,
 };
 
 use super::super::manifest::{Wit, read_manifest};
@@ -76,6 +76,86 @@ fn parse_json_payload(field_name: &str, raw: &str) -> anyhow::Result<Value> {
     }
 
     serde_json::from_str(raw).map_err(|err| anyhow::anyhow!("invalid {} JSON: {}", field_name, err))
+}
+
+fn serialize_json_payload(field_name: &str, value: &Value) -> anyhow::Result<String> {
+    serde_json::to_string(value)
+        .map_err(|err| anyhow::anyhow!("invalid {} JSON value: {}", field_name, err))
+}
+
+fn serialize_optional_json_payload(
+    field_name: &str,
+    value: &Option<Value>,
+) -> anyhow::Result<Option<String>> {
+    value
+        .as_ref()
+        .map(|v| serialize_json_payload(field_name, v))
+        .transpose()
+}
+
+fn map_input_to_wit_input(
+    input: EvaluatorInput,
+) -> anyhow::Result<evaluator_test_bindings::vigilo::evaluator::types::Input> {
+    let tool_calls = input
+        .actual
+        .tool_calls
+        .into_iter()
+        .map(|call| {
+            Ok(
+                evaluator_test_bindings::vigilo::evaluator::types::ToolCall {
+                    name: call.name,
+                    arguments_json: serialize_json_payload("tool-call.arguments", &call.arguments)?,
+                    result_json: serialize_optional_json_payload("tool-call.result", &call.result)?,
+                },
+            )
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let trace = input
+        .actual
+        .trace
+        .into_iter()
+        .map(|event| {
+            Ok(
+                evaluator_test_bindings::vigilo::evaluator::types::AgentTraceEvent {
+                    kind: event.kind,
+                    name: event.name,
+                    payload_json: serialize_json_payload("trace.payload", &event.payload)?,
+                },
+            )
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    Ok(evaluator_test_bindings::vigilo::evaluator::types::Input {
+        run_id: input.run_id,
+        execution_id: input.execution_id,
+        attempt_id: input.attempt_id,
+        test_case: evaluator_test_bindings::vigilo::evaluator::types::TestCase {
+            id: input.case.id,
+            task_type: input.case.task_type,
+            case_group: input.case.case_group,
+            input_json: serialize_json_payload("case.input", &input.case.input)?,
+            expected_json: serialize_optional_json_payload("case.expected", &input.case.expected)?,
+            context_json: serialize_optional_json_payload("case.context", &input.case.context)?,
+            tags: input.case.tags,
+            metadata_json: serialize_json_payload(
+                "case.metadata",
+                &serde_json::to_value(input.case.metadata)?,
+            )?,
+        },
+        actual: evaluator_test_bindings::vigilo::evaluator::types::AgentOutput {
+            text: input.actual.text,
+            structured_json: serialize_optional_json_payload(
+                "actual.structured",
+                &input.actual.structured,
+            )?,
+            tool_calls,
+            trace,
+            raw_json: serialize_json_payload("actual.raw", &input.actual.raw)?,
+            metadata_json: serialize_json_payload("actual.metadata", &input.actual.metadata)?,
+        },
+        evaluator_config_json: serialize_json_payload("evaluator_config", &input.evaluator_config)?,
+    })
 }
 
 /// Map bound evaluator dimension to evaluation dimension type.
@@ -154,10 +234,10 @@ fn map_score(score: evaluator_test_bindings::vigilo::evaluator::types::Score) ->
     }
 }
 
-/// Map evaluator output to response struct.
-fn map_output_to_response(
+/// Map WIT evaluator output to host output struct.
+fn map_wit_output_to_output(
     output: evaluator_test_bindings::vigilo::evaluator::types::Output,
-) -> anyhow::Result<EvaluatorResponse> {
+) -> anyhow::Result<EvaluatorOutput> {
     let metadata = parse_json_payload("metadata-json", &output.metadata_json)?;
 
     let results = output
@@ -178,7 +258,7 @@ fn map_output_to_response(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    Ok(EvaluatorResponse {
+    Ok(EvaluatorOutput {
         evaluator: EvaluatorIdentity {
             namespace: output.evaluator.namespace,
             name: output.evaluator.name,
@@ -758,8 +838,8 @@ impl Wasm {
     pub fn test_evaluator(
         &self,
         wasm_bytes: &[u8],
-        db_context: String,
-    ) -> anyhow::Result<EvaluatorResponse> {
+        input: EvaluatorInput,
+    ) -> anyhow::Result<EvaluatorOutput> {
         let component = component::Component::new(&self.engine, wasm_bytes)?;
         let mut linker = component::Linker::new(&self.engine);
 
@@ -780,16 +860,14 @@ impl Wasm {
         let bindings =
             evaluator_test_bindings::EvaluatorWorld::instantiate(&mut store, &component, &linker)?;
 
-        let input = evaluator_test_bindings::vigilo::evaluator::types::Input {
-            context: evaluator_test_bindings::vigilo::evaluator::types::Context { db: db_context },
-        };
+        let input = map_input_to_wit_input(input)?;
 
         let output = bindings
             .vigilo_evaluator_evaluator()
             .call_evaluate(&mut store, &input)?
             .map_err(|err| anyhow::anyhow!("evaluator returned error: {}", err))?;
 
-        map_output_to_response(output)
+        map_wit_output_to_output(output)
     }
 }
 

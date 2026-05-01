@@ -4,10 +4,12 @@ Lexicon-based sentiment evaluator for Agent Vigilo.
 
 ## Input
 
-`context.db` accepts either:
+The evaluator consumes a WIT `input` envelope. This evaluator reads text from:
 
-- Plain text (example: `"great support and fast response"`)
-- JSON object with a `text` field (example: `{"text":"great support"}`)
+- `input.actual.text` (preferred)
+- `input.test_case.input_json.user_message` (fallback)
+
+Text values can be plain text or a JSON object containing a `text` field.
 
 ## Output
 

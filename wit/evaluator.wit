@@ -2,11 +2,45 @@ package vigilo:evaluator@0.1.0;
 
 // data types
 interface types {
-    record context {
-        db: string,
+    record test-case {
+        id: string,
+        task-type: string,
+        case-group: option<string>,
+        input-json: string,
+        expected-json: option<string>,
+        context-json: option<string>,
+        tags: list<string>,
+        metadata-json: string,
     }
+
+    record tool-call {
+        name: string,
+        arguments-json: string,
+        result-json: option<string>,
+    }
+
+    record agent-trace-event {
+        kind: string,
+        name: option<string>,
+        payload-json: string,
+    }
+
+    record agent-output {
+        text: option<string>,
+        structured-json: option<string>,
+        tool-calls: list<tool-call>,
+        trace: list<agent-trace-event>,
+        raw-json: string,
+        metadata-json: string,
+    }
+
     record input {
-        context: context,
+        run-id: string,
+        execution-id: string,
+        attempt-id: string,
+        test-case: test-case,
+        actual: agent-output,
+        evaluator-config-json: string,
     }
 
     record evaluator-identity {

@@ -8,6 +8,7 @@ use tracing::{info, warn};
 use super::Executable;
 use super::args::parsers::{parse_dir, parse_filepath};
 use crate::context::Context;
+use crate::contracts::evaluator::EvaluatorInput;
 use crate::db::evaluators;
 use crate::models::evaluator::{EvaluatorDraft, EvaluatorPatch, EvaluatorState};
 
@@ -19,16 +20,6 @@ struct EvaluatorIdentity {
     namespace: String,
     name: String,
     version: String,
-}
-
-#[derive(serde::Deserialize)]
-struct EvaluatorTestInputContext {
-    db: String,
-}
-
-#[derive(serde::Deserialize)]
-struct EvaluatorTestInput {
-    context: EvaluatorTestInputContext,
 }
 
 fn parse_fully_qualified_evaluator(input: &str) -> anyhow::Result<EvaluatorIdentity> {
@@ -105,7 +96,7 @@ pub(crate) enum SubCommand {
         #[arg()]
         query: Option<String>,
     },
-    /// Execute a single evaluator with test input
+    /// Execute a single evaluator with canonical test input
     Test {
         /// Fully qualified evaluator identifier (<namespace>:<name>@<version>)
         #[arg()]
@@ -116,12 +107,20 @@ pub(crate) enum SubCommand {
             long,
             value_name = "JSON",
             conflicts_with = "input_file",
-            required_unless_present = "input_file"
+            required_unless_present = "input_file",
+            alias = "request"
         )]
         input: Option<String>,
 
         /// Path to input JSON file
-        #[arg(long, value_name = "FILE", value_parser = parse_filepath, conflicts_with = "input", required_unless_present = "input")]
+        #[arg(
+            long,
+            value_name = "FILE",
+            value_parser = parse_filepath,
+            conflicts_with = "input",
+            required_unless_present = "input",
+            alias = "request-file"
+        )]
         input_file: Option<PathBuf>,
     },
     /// Set evaluator state
@@ -317,13 +316,13 @@ impl Executable for SubCommand {
                     _ => anyhow::bail!("exactly one of --input or --input-file must be provided"),
                 };
 
-                let parsed: EvaluatorTestInput = serde_json::from_str(&input_raw)
+                let parsed_input: EvaluatorInput = serde_json::from_str(&input_raw)
                     .map_err(|err| anyhow::anyhow!("invalid evaluator test input json: {}", err))?;
 
-                let evaluation_result =
-                    wasm.test_evaluator(&evaluator_record.wasm_bytes, parsed.context.db)?;
+                let evaluation_output =
+                    wasm.test_evaluator(&evaluator_record.wasm_bytes, parsed_input)?;
 
-                let normalized_results = evaluation_result.clone().normalize();
+                let normalized_results = evaluation_output.clone().normalize();
 
                 let payload = json!({
                     "data": {
@@ -331,7 +330,7 @@ impl Executable for SubCommand {
                         "name": evaluator_record.name,
                         "version": evaluator_record.version,
                         "state": evaluator_record.state,
-                        "result": evaluation_result,
+                        "output": evaluation_output,
                         "normalized_results": normalized_results,
                     }
                 });

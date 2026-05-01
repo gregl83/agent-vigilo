@@ -21,10 +21,6 @@ pub(super) trait Executable {
     long_about = None
 )]
 pub(crate) struct App {
-    /// Path to config file
-    #[arg(global = true, long)]
-    pub config: Option<PathBuf>,
-
     /// Database URI (connection string)
     #[arg(long, env = "DATABASE_URL")]
     pub database_url: String,

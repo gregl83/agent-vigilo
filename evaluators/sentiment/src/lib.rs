@@ -58,6 +58,24 @@ fn extract_text(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+fn extract_text_from_input(input: &Input) -> Result<String, String> {
+    if let Some(text) = input.actual.text.as_deref() {
+        return extract_text(text);
+    }
+
+    let input_json: serde_json::Value = serde_json::from_str(&input.test_case.input_json)
+        .map_err(|err| format!("invalid test-case.input-json: {err}"))?;
+
+    if let Some(user_message) = input_json
+        .get("user_message")
+        .and_then(serde_json::Value::as_str)
+    {
+        return extract_text(user_message);
+    }
+
+    Err("input must include actual.text or test-case.input-json.user_message".to_string())
+}
+
 fn tokenize(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|token| !token.is_empty())
@@ -98,9 +116,12 @@ fn label_from_score(score: i32) -> &'static str {
 impl Guest for Evaluator {
     fn evaluate(input: Input) -> Result<Output, String> {
         executor::trace("sentiment evaluator started");
-        executor::debug(&format!("db context: {}", input.context.db));
+        executor::debug(&format!(
+            "input ids run={} execution={} attempt={}",
+            input.run_id, input.execution_id, input.attempt_id
+        ));
 
-        let text = extract_text(&input.context.db)?;
+        let text = extract_text_from_input(&input)?;
         let (score, positive_matches, negative_matches) = score_text(&text);
         let label = label_from_score(score);
 
@@ -163,7 +184,8 @@ export!(Evaluator);
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_text, label_from_score, score_text, tokenize};
+    use super::{extract_text, extract_text_from_input, label_from_score, score_text, tokenize};
+    use crate::vigilo::evaluator::types::{AgentOutput, Input, TestCase};
 
     #[test]
     fn tokenize_normalizes_and_strips_symbols() {
@@ -208,5 +230,35 @@ mod tests {
     fn extract_text_rejects_invalid_or_empty_input() {
         assert!(extract_text("   ").is_err());
         assert!(extract_text(r#"{"message":"missing text"}"#).is_err());
+    }
+
+    #[test]
+    fn extract_text_from_input_prefers_actual_text() {
+        let input = Input {
+            run_id: "run-1".to_string(),
+            execution_id: "exec-1".to_string(),
+            attempt_id: "attempt-1".to_string(),
+            test_case: TestCase {
+                id: "case-1".to_string(),
+                task_type: "classification".to_string(),
+                case_group: None,
+                input_json: r#"{"user_message":"fallback"}"#.to_string(),
+                expected_json: None,
+                context_json: None,
+                tags: vec![],
+                metadata_json: "{}".to_string(),
+            },
+            actual: AgentOutput {
+                text: Some("great experience".to_string()),
+                structured_json: None,
+                tool_calls: vec![],
+                trace: vec![],
+                raw_json: "{}".to_string(),
+                metadata_json: "{}".to_string(),
+            },
+            evaluator_config_json: "{}".to_string(),
+        };
+
+        assert_eq!(extract_text_from_input(&input).unwrap(), "great experience");
     }
 }
