@@ -10,7 +10,7 @@ This example demonstrates the `vigilo run test` input format using file-based pr
 ## Run
 
 ```bash
-DATABASE_URL='postgres://postgres:password@localhost:5432/agent_vigilo' ./target/debug/vigilo.exe run test --profile-file example-project/profile.yaml --dataset-file example-project/dataset.yaml
+DATABASE_URL='postgres://postgres:password@localhost:5432/agent_vigilo' ./target/debug/vigilo.exe run test --profile-file example/profile.yaml --dataset-file example/dataset.yaml
 ```
 
 Notes:
