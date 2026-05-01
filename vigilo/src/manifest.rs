@@ -39,9 +39,9 @@ pub(crate) struct Manifest {
 }
 
 impl Manifest {
-    pub fn get_profile(&self, profile_name: String) -> anyhow::Result<&Profile> {
+    pub fn get_profile(&self, profile_name: &str) -> anyhow::Result<&Profile> {
         self.profile
-            .get(&profile_name)
+            .get(profile_name)
             .ok_or(anyhow!("manifest profile {} not supported", profile_name))
     }
 }

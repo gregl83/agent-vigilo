@@ -2,6 +2,7 @@ use std::{
     env::consts::ARCH,
     fs,
     hash::{DefaultHasher, Hash, Hasher},
+    io::ErrorKind,
     path::PathBuf,
     time::SystemTime,
 };
@@ -787,7 +788,7 @@ impl Wasm {
         profile: String,
     ) -> anyhow::Result<Component> {
         let manifest = read_manifest(&package_path)?;
-        let manifest_profile = manifest.get_profile(profile)?;
+        let manifest_profile = manifest.get_profile(&profile)?;
         let wit_metadata = resolve_wit_metadata(&package_path, manifest.wit.as_ref())?;
 
         let package_metadata = get_package_metadata(&package_path, &manifest.package.manifest)?;
@@ -795,14 +796,44 @@ impl Wasm {
 
         let wasm_path = package_metadata.target_dir.join(&manifest_profile.wasm);
 
-        let fs_wasm_metadata = fs::metadata(&wasm_path)?;
+        let fs_wasm_metadata = match fs::metadata(&wasm_path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                let release_flag = if profile == "release" {
+                    " --release"
+                } else {
+                    ""
+                };
+
+                anyhow::bail!(
+                    "configured wasm artifact was not found at {} (profile '{}'); build it first with: cargo build --manifest-path {} --target wasm32-wasip2{}",
+                    wasm_path.display(),
+                    profile,
+                    package_path.join(&manifest.package.manifest).display(),
+                    release_flag,
+                );
+            }
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "failed to read wasm metadata at {}: {}",
+                    wasm_path.display(),
+                    err
+                ));
+            }
+        };
         let wasm_modified = fs_wasm_metadata.modified()?;
         if package_metadata.modified > wasm_modified {
             return Err(anyhow::anyhow!(
                 "evaluation manifest was modified after wasm build"
             ));
         }
-        let wasm_bytes = fs::read(wasm_path)?;
+        let wasm_bytes = fs::read(&wasm_path).map_err(|err| {
+            anyhow::anyhow!(
+                "failed to read wasm bytes at {}: {}",
+                wasm_path.display(),
+                err
+            )
+        })?;
         let wasm_bytes = ensure_embedded_package_metadata(
             wasm_bytes,
             &package_metadata.name,
