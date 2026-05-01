@@ -1,0 +1,144 @@
+---
+sidebar_label: Run Profile
+title: Run Profile Configuration Reference
+description: Reference for the run profile YAML/JSON format used by `vigilo run test`.
+---
+
+# Run Profile Configuration
+
+A run profile defines how evaluation should be performed across task types and case groups.
+
+Use this profile with:
+
+```bash
+vigilo run test --profile-file <profile.yaml> --dataset-file <dataset.yaml>
+```
+
+## File Format
+
+The CLI accepts YAML or JSON.
+
+Recommended filename:
+
+- `profile.yaml`
+
+Top-level shape:
+
+```yaml
+profile_id: mixed_agent_release
+profile_version: 1.0.0
+description: Release-grade evaluation profile for mixed generative AI agent tasks.
+defaults: {}
+persistence: {}
+case_groups: []
+```
+
+## Top-Level Fields
+
+- `profile_id` (string): stable identifier for this profile.
+- `profile_version` (string): profile version, independent of evaluator versions.
+- `description` (string): human-readable profile summary.
+- `defaults` (object): run-level behavior defaults.
+- `persistence` (object): persistence policy controls.
+- `case_groups` (array): per-task evaluator and aggregation definitions.
+
+## `defaults`
+
+```yaml
+defaults:
+  max_attempts: 2
+  request_timeout_secs: 60
+  fail_on_any_blocking_failure: true
+  min_execution_score: 0.85
+```
+
+- `max_attempts` (u32)
+- `request_timeout_secs` (u32)
+- `fail_on_any_blocking_failure` (bool)
+- `min_execution_score` (f64)
+
+## `persistence`
+
+```yaml
+persistence:
+  mode: full
+  persist_raw_outputs: failures_only
+  persist_evaluator_evidence: true
+```
+
+- `mode` (enum): `full` | `summary`
+- `persist_raw_outputs` (enum): `all` | `failures_only` | `none`
+- `persist_evaluator_evidence` (bool)
+
+## `case_groups`
+
+Each case group controls evaluator selection and aggregation for matching cases.
+
+```yaml
+case_groups:
+  - id: classification
+    description: Evaluates classification-style cases.
+    applies_to:
+      task_type: classification
+      tags_any: [safety]
+      tags_all: []
+    evaluators: []
+    aggregation:
+      dimensions: {}
+```
+
+### `applies_to`
+
+- `task_type` (string, required)
+- `tags_any` (string[], optional)
+- `tags_all` (string[], optional)
+
+### `evaluators[]`
+
+```yaml
+evaluators:
+  - ref: core/json-schema@1.0.0
+    dimension: format
+    blocking: true
+    weight: 1.0
+    config:
+      schema:
+        type: object
+```
+
+- `ref` (string): evaluator reference as provided in profile payload.
+- `dimension` (string)
+- `blocking` (bool)
+- `weight` (f64)
+- `config` (object, optional)
+
+### `aggregation.dimensions`
+
+```yaml
+aggregation:
+  dimensions:
+    format:
+      method: min_score
+      blocking: true
+      weight: 0.0
+    correctness:
+      method: weighted_mean
+      blocking: false
+      weight: 1.0
+```
+
+- `method` (enum): `min_score` | `weighted_mean`
+- `blocking` (bool)
+- `weight` (f64)
+
+## Full Example
+
+See the repository example profile:
+
+- `example-project/profile.yaml`
+
+## Related
+
+- Dataset format: `web/docs/configuration/dataset-format.mdx`
+- Example project: `example-project/README.md`
+

@@ -1,0 +1,84 @@
+---
+sidebar_label: Dataset Format
+title: Dataset Format Reference
+description: Reference for dataset YAML/JSON consumed by `vigilo run test`.
+---
+
+# Dataset Format
+
+A dataset provides the set of test cases evaluated by a run profile.
+
+Use this dataset with:
+
+```bash
+vigilo run test --profile-file <profile.yaml> --dataset-file <dataset.yaml>
+```
+
+## File Format
+
+The CLI accepts YAML or JSON.
+
+Recommended filename:
+
+- `dataset.yaml`
+
+Top-level shape:
+
+```yaml
+dataset_id: mixed-agent-sample
+dataset_version: 1.0.0
+cases: []
+```
+
+## Top-Level Fields
+
+- `dataset_id` (string, optional)
+- `dataset_version` (string, optional)
+- `cases` (array, optional; empty array if omitted)
+
+## `cases[]`
+
+Each case should map to a task type expected by at least one profile case group.
+
+```yaml
+cases:
+  - id: sentiment_001
+    task_type: classification
+    case_group: classification
+    input:
+      user_message: "I love this product."
+    expected:
+      label: positive
+    context: {}
+    tags: [smoke, easy]
+    metadata:
+      source: synthetic
+```
+
+Fields:
+
+- `id` (string, required)
+- `task_type` (string, required)
+- `case_group` (string, optional)
+- `input` (object/value, required)
+- `expected` (object/value, optional)
+- `context` (object/value, optional)
+- `tags` (string[], optional)
+- `metadata` (object, optional)
+
+## Alignment with Run Profile
+
+- `cases[].task_type` should match `case_groups[].applies_to.task_type`.
+- `cases[].tags` can be matched against `tags_any` and `tags_all`.
+- `case_group` can be used for routing and reporting consistency.
+
+## Example
+
+See the repository sample dataset:
+
+- `example-project/dataset.yaml`
+
+## Related
+
+- Run profile configuration: `web/docs/configuration/run-profile.mdx`
+- Example project: `example-project/README.md`

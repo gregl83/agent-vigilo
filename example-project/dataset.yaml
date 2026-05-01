@@ -1,0 +1,28 @@
+dataset_id: mixed-agent-sample
+dataset_version: 1.0.0
+cases:
+  - id: sentiment_001
+    task_type: classification
+    case_group: classification
+    input:
+      user_message: "I love this product."
+    expected:
+      label: positive
+    tags: [smoke, easy]
+    metadata:
+      source: synthetic
+
+  - id: tool_use_001
+    task_type: tool_use
+    case_group: tool_use
+    input:
+      user_message: "Schedule a meeting with Sam tomorrow afternoon."
+    expected:
+      tool_calls:
+        - name: create_calendar_event
+          arguments:
+            attendee: Sam
+    tags: [tool_use]
+    metadata:
+      source: synthetic
+
