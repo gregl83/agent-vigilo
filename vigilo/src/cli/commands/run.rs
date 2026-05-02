@@ -70,6 +70,12 @@ pub(crate) enum SubCommand {
 		)]
 		dataset_file: Option<PathBuf>,
 	},
+
+	/// Watch run progress and stream status updates
+	Watch {
+		/// Run identifier to watch
+		run_id: String,
+	},
 }
 
 #[derive(Debug, Args)]
@@ -82,6 +88,14 @@ pub(crate) struct Command {
 impl Executable for Command {
 	async fn exec(self, context: Context) -> anyhow::Result<()> {
 		match self.command {
+			Some(SubCommand::Watch { run_id }) => {
+				info!("watching run {}", run_id);
+
+				// TODO: Poll run/execution state changes with backoff until terminal state.
+				// TODO: Stream incremental progress snapshots to output context.
+				// TODO: Add optional follow mode and structured event output.
+				anyhow::bail!("run watch is not implemented yet")
+			}
 			Some(SubCommand::Test {
 				profile,
 				profile_file,
