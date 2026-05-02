@@ -1,0 +1,18 @@
+[toolchain]
+# track latest stable Rust
+channel = "stable"
+
+# keep installation lean for CI/dev environments
+profile = "minimal"
+
+# automatically install these for every developer
+components = [
+    "clippy",
+    "rustfmt",
+    "rust-src"
+]
+
+# ensure the WASI Preview2 evaluator target is installed
+targets = [
+    "wasm32-wasip2"
+]
