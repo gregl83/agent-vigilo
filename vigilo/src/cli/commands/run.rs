@@ -30,6 +30,47 @@ fn parse_structured_payload(raw: &str, field: &str) -> anyhow::Result<Value> {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum SubCommand {
+	/// Create a run from profile + dataset inputs
+	Create {
+		/// Run profile YAML/JSON inline string
+		#[arg(
+			long,
+			value_name = "YAML_OR_JSON",
+			conflicts_with = "profile_file",
+			required_unless_present = "profile_file"
+		)]
+		profile: Option<String>,
+
+		/// Path to run profile YAML/JSON file
+		#[arg(
+			long,
+			value_name = "FILE",
+			value_parser = parse_filepath,
+			conflicts_with = "profile",
+			required_unless_present = "profile"
+		)]
+		profile_file: Option<PathBuf>,
+
+		/// Dataset YAML/JSON inline string
+		#[arg(
+			long,
+			value_name = "YAML_OR_JSON",
+			conflicts_with = "dataset_file",
+			required_unless_present = "dataset_file"
+		)]
+		dataset: Option<String>,
+
+		/// Path to dataset YAML/JSON file
+		#[arg(
+			long,
+			value_name = "FILE",
+			value_parser = parse_filepath,
+			conflicts_with = "dataset",
+			required_unless_present = "dataset"
+		)]
+		dataset_file: Option<PathBuf>,
+	},
+
 	/// Parse and validate run profile + dataset inputs
 	Test {
 		/// Run profile YAML/JSON inline string
@@ -76,6 +117,30 @@ pub(crate) enum SubCommand {
 		/// Run identifier to watch
 		run_id: String,
 	},
+
+	/// Show run status snapshot
+	Status {
+		/// Run identifier
+		run_id: String,
+	},
+
+	/// Cancel an active run
+	Cancel {
+		/// Run identifier
+		run_id: String,
+	},
+
+	/// Show run results summary
+	Results {
+		/// Run identifier
+		run_id: String,
+	},
+
+	/// Export run results and artifacts
+	Export {
+		/// Run identifier
+		run_id: String,
+	},
 }
 
 #[derive(Debug, Args)]
@@ -88,6 +153,50 @@ pub(crate) struct Command {
 impl Executable for Command {
 	async fn exec(self, context: Context) -> anyhow::Result<()> {
 		match self.command {
+			Some(SubCommand::Create {
+				profile,
+				profile_file,
+				dataset,
+				dataset_file,
+			}) => {
+				info!("creating run from profile and dataset inputs");
+
+				let _profile_raw = read_inline_or_file(profile, profile_file, "profile")?;
+				let _dataset_raw = read_inline_or_file(dataset, dataset_file, "dataset")?;
+
+				// TODO: Parse/validate profile and dataset payloads.
+				// TODO: Persist run and execution rows in the database.
+				// TODO: Return created run identifier and initial status payload.
+				anyhow::bail!("run create is not implemented yet")
+			}
+			Some(SubCommand::Status { run_id }) => {
+				info!("fetching status for run {}", run_id);
+
+				// TODO: Query run + execution aggregate state from persistence.
+				// TODO: Return machine-readable status payload.
+				anyhow::bail!("run status is not implemented yet")
+			}
+			Some(SubCommand::Cancel { run_id }) => {
+				info!("cancelling run {}", run_id);
+
+				// TODO: Transition run to cancelled if still non-terminal.
+				// TODO: Mark in-flight executions/attempts for cooperative stop.
+				anyhow::bail!("run cancel is not implemented yet")
+			}
+			Some(SubCommand::Results { run_id }) => {
+				info!("fetching results for run {}", run_id);
+
+				// TODO: Read execution aggregates and evaluator summaries.
+				// TODO: Emit machine-readable results payload.
+				anyhow::bail!("run results is not implemented yet")
+			}
+			Some(SubCommand::Export { run_id }) => {
+				info!("exporting run {}", run_id);
+
+				// TODO: Support export format selection and output destinations.
+				// TODO: Stream run results/evidence into export artifact.
+				anyhow::bail!("run export is not implemented yet")
+			}
 			Some(SubCommand::Watch { run_id }) => {
 				info!("watching run {}", run_id);
 

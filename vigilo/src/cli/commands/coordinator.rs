@@ -9,6 +9,9 @@ use crate::context::Context;
 pub(crate) enum SubCommand {
     /// Start a coordinator process
     Start,
+
+    /// Run one coordinator cycle and exit
+    Once,
 }
 
 #[derive(Debug, Args)]
@@ -27,6 +30,13 @@ impl Executable for Command {
                 // TODO: Advance run lifecycle transitions (running -> finalizing -> completed).
                 // TODO: Publish outbox completion events with retry-safe semantics.
                 anyhow::bail!("coordinator start is not implemented yet")
+            }
+            Some(SubCommand::Once) => {
+                info!("running single coordinator cycle");
+
+                // TODO: Perform one pass of run-finalization and outbox publication work.
+                // TODO: Exit after one bounded cycle suitable for cron/batch invocation.
+                anyhow::bail!("coordinator once is not implemented yet")
             }
             None => anyhow::bail!("missing coordinator subcommand; use `vigilo coordinator start`"),
         }
