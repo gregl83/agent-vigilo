@@ -1,12 +1,18 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use clap::{ArgAction, Parser, crate_description, crate_version};
+use clap::{
+    ArgAction,
+    Parser,
+    crate_description,
+    crate_version,
+};
 
 mod args;
 mod commands;
-use super::context::Context;
 use commands::Command;
+
+use super::context::Context;
 
 #[async_trait]
 pub(super) trait Executable {

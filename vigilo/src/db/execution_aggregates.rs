@@ -2,7 +2,9 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::models::execution_aggregate::{
-    ExecutionAggregate, ExecutionAggregateDraft, ExecutionAggregatePatch,
+    ExecutionAggregate,
+    ExecutionAggregateDraft,
+    ExecutionAggregatePatch,
 };
 
 pub(crate) async fn insert_execution_aggregate(

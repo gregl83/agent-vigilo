@@ -1,7 +1,11 @@
 use std::{
     env::consts::ARCH,
     fs,
-    hash::{DefaultHasher, Hash, Hasher},
+    hash::{
+        DefaultHasher,
+        Hash,
+        Hasher,
+    },
     io::ErrorKind,
     path::PathBuf,
     time::SystemTime,
@@ -9,20 +13,49 @@ use std::{
 
 use cargo_metadata::MetadataCommand;
 use cargo_toml::Manifest;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use serde_json::Value;
 use tokio::sync::OnceCell;
-use tracing::{debug, warn};
-use wasmparser::{Parser, Payload};
-use wasmtime::{Config as EngineConfig, Engine, Store, component, component::ResourceTable};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
-
-use crate::contracts::evaluator::{
-    EvaluationDimension, EvaluationStatus, EvaluatorFinding, EvaluatorIdentity, EvaluatorInput,
-    EvaluatorOutput, PreferenceOutcome, Score, Severity,
+use tracing::{
+    debug,
+    warn,
+};
+use wasmparser::{
+    Parser,
+    Payload,
+};
+use wasmtime::{
+    Config as EngineConfig,
+    Engine,
+    Store,
+    component,
+    component::ResourceTable,
+};
+use wasmtime_wasi::{
+    WasiCtx,
+    WasiCtxBuilder,
+    WasiCtxView,
+    WasiView,
 };
 
-use super::super::manifest::{Wit, read_manifest};
+use super::super::manifest::{
+    Wit,
+    read_manifest,
+};
+use crate::contracts::evaluator::{
+    EvaluationDimension,
+    EvaluationStatus,
+    EvaluatorFinding,
+    EvaluatorIdentity,
+    EvaluatorInput,
+    EvaluatorOutput,
+    PreferenceOutcome,
+    Score,
+    Severity,
+};
 
 mod evaluator_test_bindings {
     wasmtime::component::bindgen!({

@@ -3,11 +3,22 @@ wit_bindgen::generate!({
     world: "evaluator-world",
 });
 
-use exports::vigilo::evaluator::evaluator::{Guest, Input, Output};
+use exports::vigilo::evaluator::evaluator::{
+    Guest,
+    Input,
+    Output,
+};
 use serde_json::json;
-use vigilo::evaluator::executor;
-use vigilo::evaluator::types::{
-    EvaluationDimension, EvaluationStatus, EvaluatorFinding, EvaluatorIdentity, Score, Severity,
+use vigilo::evaluator::{
+    executor,
+    types::{
+        EvaluationDimension,
+        EvaluationStatus,
+        EvaluatorFinding,
+        EvaluatorIdentity,
+        Score,
+        Severity,
+    },
 };
 
 struct Evaluator;
@@ -200,8 +211,18 @@ export!(Evaluator);
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_text, extract_text_from_input, label_from_score, score_text, tokenize};
-    use crate::vigilo::evaluator::types::{AgentOutput, Input, TestCase};
+    use super::{
+        extract_text,
+        extract_text_from_input,
+        label_from_score,
+        score_text,
+        tokenize,
+    };
+    use crate::vigilo::evaluator::types::{
+        AgentOutput,
+        Input,
+        TestCase,
+    };
 
     #[test]
     fn tokenize_normalizes_and_strips_symbols() {

@@ -1,7 +1,11 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::models::outbox_event::{OutboxEvent, OutboxEventDraft, OutboxEventPatch};
+use crate::models::outbox_event::{
+    OutboxEvent,
+    OutboxEventDraft,
+    OutboxEventPatch,
+};
 
 pub(crate) async fn insert_outbox_event(
     db: &PgPool,

@@ -3,9 +3,13 @@
 //! These types represent the canonical payload exchanged between a WASM evaluator and
 //! the host runtime before persistence/aggregation mapping.
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::BTreeMap;
+
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use serde_json::Value;
 
 fn default_json_object() -> Value {
     Value::Object(Default::default())

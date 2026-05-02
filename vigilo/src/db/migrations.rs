@@ -1,10 +1,20 @@
-use std::{collections::HashSet, path::PathBuf, time::Instant};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    time::Instant,
+};
 
 use sqlx::{
     PgPool,
-    migrate::{Migrate, Migrator},
+    migrate::{
+        Migrate,
+        Migrator,
+    },
 };
-use tracing::{debug, info};
+use tracing::{
+    debug,
+    info,
+};
 
 pub(crate) async fn migrate(db: &PgPool, migrations_dir: PathBuf) -> anyhow::Result<()> {
     let migrator = Migrator::new(migrations_dir.as_path()).await?;

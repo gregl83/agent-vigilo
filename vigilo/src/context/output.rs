@@ -1,10 +1,18 @@
 use std::{
-    io::{BufWriter, Stdout, Write, stdout},
+    io::{
+        BufWriter,
+        Stdout,
+        Write,
+        stdout,
+    },
     sync::Mutex,
 };
 
 use tokio::sync::OnceCell;
-use tracing::{debug, error};
+use tracing::{
+    debug,
+    error,
+};
 
 pub struct Buffer {
     buffer: Mutex<BufWriter<Stdout>>,

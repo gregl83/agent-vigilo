@@ -1,6 +1,11 @@
+use std::{
+    collections::HashMap,
+    fs,
+    path::PathBuf,
+};
+
 use anyhow::anyhow;
 use serde::Deserialize;
-use std::{collections::HashMap, fs, path::PathBuf};
 
 #[derive(Deserialize)]
 pub(crate) struct Package {

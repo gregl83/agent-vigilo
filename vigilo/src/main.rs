@@ -1,13 +1,30 @@
-use std::{io::stderr, process::ExitCode};
+use std::{
+    io::stderr,
+    process::ExitCode,
+};
 
 use clap::Parser;
-use tracing::{Level, error};
-use tracing_subscriber::{EnvFilter, Registry, fmt, prelude::*};
+use tracing::{
+    Level,
+    error,
+};
+use tracing_subscriber::{
+    EnvFilter,
+    Registry,
+    fmt,
+    prelude::*,
+};
 
 mod cli;
-use cli::{App, Executable};
+use cli::{
+    App,
+    Executable,
+};
 mod context;
-use context::{Context, wasm};
+use context::{
+    Context,
+    wasm,
+};
 mod contracts;
 mod db;
 mod manifest;

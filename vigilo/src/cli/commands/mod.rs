@@ -1,6 +1,7 @@
-use crate::context::Context;
 use async_trait::async_trait;
 use clap::Subcommand;
+
+use crate::context::Context;
 
 pub(super) mod coordinator;
 pub(super) mod evaluators;
@@ -8,8 +9,10 @@ pub(super) mod run;
 pub(super) mod setup;
 pub(super) mod worker;
 
-use super::Executable;
-use super::args;
+use super::{
+    Executable,
+    args,
+};
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {

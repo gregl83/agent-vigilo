@@ -1,9 +1,12 @@
 use async_trait::async_trait;
-use clap::{Args, Subcommand};
+use clap::{
+    Args,
+    Subcommand,
+};
 use tracing::info;
+
 use super::Executable;
 use crate::context::Context;
-
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum SubCommand {

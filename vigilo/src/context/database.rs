@@ -1,4 +1,7 @@
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{
+    PgPool,
+    postgres::PgPoolOptions,
+};
 use tokio::sync::OnceCell;
 use tracing::debug;
 

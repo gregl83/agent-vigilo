@@ -1,16 +1,36 @@
-use async_trait::async_trait;
-use clap::{Args, Subcommand};
-use serde_json::json;
-use std::fs;
-use std::path::PathBuf;
-use tracing::{info, warn};
+use std::{
+    fs,
+    path::PathBuf,
+};
 
-use super::Executable;
-use super::args::parsers::{parse_dir, parse_filepath};
-use crate::context::Context;
-use crate::contracts::evaluator::EvaluatorInput;
-use crate::db::evaluators;
-use crate::models::evaluator::{EvaluatorDraft, EvaluatorPatch, EvaluatorState};
+use async_trait::async_trait;
+use clap::{
+    Args,
+    Subcommand,
+};
+use serde_json::json;
+use tracing::{
+    info,
+    warn,
+};
+
+use super::{
+    Executable,
+    args::parsers::{
+        parse_dir,
+        parse_filepath,
+    },
+};
+use crate::{
+    context::Context,
+    contracts::evaluator::EvaluatorInput,
+    db::evaluators,
+    models::evaluator::{
+        EvaluatorDraft,
+        EvaluatorPatch,
+        EvaluatorState,
+    },
+};
 
 const DEFAULT_NAMESPACE: &str = "vigilo";
 const DEFAULT_SEARCH_LIMIT: i64 = 10;
@@ -436,4 +456,3 @@ mod tests {
         assert!(message.contains("<namespace>/<name>:<version>"));
     }
 }
-

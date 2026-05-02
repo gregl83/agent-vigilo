@@ -4,9 +4,13 @@
 //! `vigilo run test`. They are intentionally transport-focused contracts used
 //! for parsing and validation before orchestration/runtime execution logic.
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::BTreeMap;
+
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use serde_json::Value;
 
 fn default_json_object() -> Value {
     Value::Object(Default::default())
@@ -307,4 +311,3 @@ cases:
         assert_eq!(dataset.cases[0].task_type, "classification");
     }
 }
-

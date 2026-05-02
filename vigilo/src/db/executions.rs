@@ -1,7 +1,11 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::models::execution::{Execution, ExecutionDraft, ExecutionPatch};
+use crate::models::execution::{
+    Execution,
+    ExecutionDraft,
+    ExecutionPatch,
+};
 
 pub(crate) async fn insert_execution(
     db: &PgPool,
