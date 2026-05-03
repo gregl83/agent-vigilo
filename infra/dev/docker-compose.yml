@@ -10,6 +10,8 @@ services:
       - "5432:5432"
     volumes:
       - agent_vigilo_db_data:/var/lib/postgresql/data
+    networks:
+      - agent_vigilo_network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d agent_vigilo"]
       interval: 5s
@@ -17,5 +19,30 @@ services:
       retries: 5
     restart: unless-stopped
 
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: agent_vigilo_mq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - agent_vigilo_mq_data:/var/lib/rabbitmq
+    networks:
+      - agent_vigilo_network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
 volumes:
   agent_vigilo_db_data:
+  agent_vigilo_mq_data:
+
+networks:
+  agent_vigilo_network:
+    driver: bridge
