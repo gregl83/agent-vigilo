@@ -5,7 +5,7 @@ use clap::{
 };
 use std::time::Duration;
 use tracing::info;
-
+use tracing::log::warn;
 use super::Executable;
 use crate::{
     context::Context,
@@ -59,7 +59,10 @@ async fn run_worker_start_cycle() -> anyhow::Result<()> {
     // TODO: Load worker runtime configuration and lease settings.
     // TODO: Start polling pending executions and claiming work safely.
     // TODO: Process execution attempts with heartbeats and retry transitions.
-    anyhow::bail!("worker start is not implemented yet")
+
+    warn!("worker start is not implemented yet");
+
+    Ok(())
 }
 
 async fn run_worker_once_cycle() -> anyhow::Result<()> {
