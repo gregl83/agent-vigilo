@@ -3,6 +3,7 @@ use clap::{
     Args,
     Subcommand,
 };
+use std::time::Duration;
 use tracing::info;
 
 use super::Executable;
@@ -45,6 +46,7 @@ impl Executable for Command {
 
 async fn handle_start() -> anyhow::Result<()> {
     ServiceRunner::new("coordinator")
+        .tick_interval(Duration::from_secs(5))
         .run_loop(|| async { run_coordinator_start_cycle().await })
         .await
 }

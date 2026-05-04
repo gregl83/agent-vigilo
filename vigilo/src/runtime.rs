@@ -22,6 +22,7 @@ use tracing::{
 ///
 /// ServiceRunner::new("worker")
 ///     .shutdown_timeout(Duration::from_secs(55))
+///     .tick_interval(Duration::from_secs(5))
 ///     .run_loop(|| async {
 ///         // Process one unit of work per tick.
 ///         process_one_job().await
@@ -56,6 +57,7 @@ use tracing::{
 pub struct ServiceRunner<ShutdownHook = NoShutdownHook> {
     service_name: &'static str,
     shutdown_timeout: Duration,
+    tick_interval: Option<Duration>,
     shutdown_hook: ShutdownHook,
 }
 
@@ -89,6 +91,7 @@ impl ServiceRunner<NoShutdownHook> {
         Self {
             service_name,
             shutdown_timeout: Duration::from_secs(30),
+            tick_interval: None,
             shutdown_hook: NoShutdownHook,
         }
     }
@@ -113,6 +116,7 @@ impl ServiceRunner<NoShutdownHook> {
         ServiceRunner {
             service_name: self.service_name,
             shutdown_timeout: self.shutdown_timeout,
+            tick_interval: self.tick_interval,
             shutdown_hook,
         }
     }
@@ -128,10 +132,21 @@ where
         self
     }
 
+    /// Optionally throttles loop ticks to avoid hot-loop thrashing.
+    ///
+    /// Missed ticks are skipped to prevent burst execution after delays.
+    pub fn tick_interval(mut self, interval: Duration) -> Self {
+        self.tick_interval = Some(interval);
+        self
+    }
+
     /// Runs a service loop until process shutdown is requested.
     ///
     /// ```ignore
+    /// use std::time::Duration;
+    ///
     /// ServiceRunner::new("coordinator")
+    ///     .tick_interval(Duration::from_secs(5))
     ///     .run_loop(|| async {
     ///         run_one_coordinator_cycle().await
     ///     })
@@ -145,17 +160,37 @@ where
         TickFut: Future<Output = anyhow::Result<()>> + Send,
     {
         let service_name = self.service_name;
+        let tick_interval = self.tick_interval;
 
         self.run(move |shutdown| async move {
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => {
-                        info!(service = service_name, "service stopping");
-                        return Ok(());
-                    }
+            let mut interval = tick_interval.map(tokio::time::interval);
 
-                    result = tick() => {
-                        result?;
+            if let Some(interval) = &mut interval {
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            }
+
+            loop {
+                if let Some(interval) = &mut interval {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            info!(service = service_name, "service stopping");
+                            return Ok(());
+                        }
+
+                        _ = interval.tick() => {
+                            tick().await?;
+                        }
+                    }
+                } else {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            info!(service = service_name, "service stopping");
+                            return Ok(());
+                        }
+
+                        result = tick() => {
+                            result?;
+                        }
                     }
                 }
             }
