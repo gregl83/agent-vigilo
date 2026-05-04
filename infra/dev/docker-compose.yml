@@ -39,9 +39,58 @@ services:
       retries: 5
       start_period: 20s
 
+  coordinator:
+    image: rust:latest
+    container_name: agent_vigilo_coordinator
+    working_dir: /workspace
+    command: ["cargo", "run", "-p", "vigilo", "--", "coordinator", "start"]
+    environment:
+      DATABASE_URL: postgresql://postgres:password@agent_vigilo_db:5432/agent_vigilo
+      RABBITMQ_URL: amqp://guest:guest@agent_vigilo_mq:5672
+    volumes:
+      - ../../:/workspace
+      - agent_vigilo_cargo_registry:/usr/local/cargo/registry
+      - agent_vigilo_cargo_git:/usr/local/cargo/git
+      - agent_vigilo_target:/workspace/target
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - agent_vigilo_network
+    restart: unless-stopped
+
+  worker:
+    image: rust:latest
+    container_name: agent_vigilo_worker
+    working_dir: /workspace
+    command: ["cargo", "run", "-p", "vigilo", "--", "worker", "start"]
+    environment:
+      DATABASE_URL: postgresql://postgres:password@agent_vigilo_db:5432/agent_vigilo
+      RABBITMQ_URL: amqp://guest:guest@agent_vigilo_mq:5672
+    volumes:
+      - ../../:/workspace
+      - agent_vigilo_cargo_registry:/usr/local/cargo/registry
+      - agent_vigilo_cargo_git:/usr/local/cargo/git
+      - agent_vigilo_target:/workspace/target
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - agent_vigilo_network
+    restart: unless-stopped
+    deploy:
+      replicas: ${WORKER_REPLICAS:-1}
+
 volumes:
   agent_vigilo_db_data:
   agent_vigilo_mq_data:
+  agent_vigilo_cargo_registry:
+  agent_vigilo_cargo_git:
+  agent_vigilo_target:
 
 networks:
   agent_vigilo_network:
