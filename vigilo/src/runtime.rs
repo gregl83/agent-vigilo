@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    pin::Pin,
     time::Duration,
 };
 
@@ -12,133 +13,231 @@ use tracing::{
     warn,
 };
 
-
-/*
-todo - refactor to use builder pattern
-
-ServiceRunner::new("worker")
-    .shutdown_timeout(Duration::from_secs(55))
-    .on_shutdown(|| async {
-        release_current_job().await?;
-        flush_metrics().await?;
-        Ok(())
-    })
-    .run_loop(process_one_job)
-    .await
- */
-
-
-
-pub async fn run_loop_service<Tick, TickFut, Cleanup, CleanupFut>(
+/// Fluent runtime helper for long-running services.
+///
+/// Loop-style service usage (no explicit shutdown hook):
+///
+/// ```ignore
+/// use std::time::Duration;
+///
+/// ServiceRunner::new("worker")
+///     .shutdown_timeout(Duration::from_secs(55))
+///     .run_loop(|| async {
+///         // Process one unit of work per tick.
+///         process_one_job().await
+///     })
+///     .await
+/// ```
+///
+/// Task-style service usage (with optional shutdown hook):
+///
+/// ```ignore
+/// use std::time::Duration;
+/// use tokio_util::sync::CancellationToken;
+///
+/// ServiceRunner::new("worker")
+///     .shutdown_timeout(Duration::from_secs(55))
+///     .on_shutdown(|| async {
+///         // Best-effort cleanup after cancellation is requested.
+///         release_current_job().await?;
+///         flush_metrics().await?;
+///         Ok(())
+///     })
+///     .run(|shutdown: CancellationToken| async move {
+///         while !shutdown.is_cancelled() {
+///             process_one_job().await?;
+///         }
+///
+///         Ok(())
+///     })
+///     .await
+/// ```
+#[derive(Debug)]
+pub struct ServiceRunner<ShutdownHook = NoShutdownHook> {
     service_name: &'static str,
-    shutdown: CancellationToken,
-    mut tick: Tick,
-    cleanup: Cleanup,
-) -> anyhow::Result<()>
-where
-    Tick: FnMut() -> TickFut,
-    TickFut: Future<Output = anyhow::Result<()>>,
-    Cleanup: FnOnce() -> CleanupFut,
-    CleanupFut: Future<Output = anyhow::Result<()>>,
-{
-    loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => {
-                info!(service = service_name, "service stopping");
-                cleanup().await?;
-                return Ok(());
-            }
+    shutdown_timeout: Duration,
+    shutdown_hook: ShutdownHook,
+}
 
-            result = tick() => {
-                result?;
-            }
+/// Marker hook used when no explicit shutdown callback is configured.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoShutdownHook;
+
+pub(crate) trait ShutdownCallback {
+    fn call(self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
+}
+
+impl ShutdownCallback for NoShutdownHook {
+    fn call(self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl<F, Fut> ShutdownCallback for F
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    fn call(self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+        Box::pin(self())
+    }
+}
+
+impl ServiceRunner<NoShutdownHook> {
+    /// Creates a runner with a default shutdown timeout of 30 seconds.
+    pub fn new(service_name: &'static str) -> Self {
+        Self {
+            service_name,
+            shutdown_timeout: Duration::from_secs(30),
+            shutdown_hook: NoShutdownHook,
+        }
+    }
+
+    /// Registers an optional hook that runs after cancellation is requested.
+    ///
+    /// The hook runs only after the runtime receives a shutdown signal and
+    /// cancels the service token.
+    ///
+    /// ```ignore
+    /// ServiceRunner::new("coordinator")
+    ///     .on_shutdown(|| async {
+    ///         persist_checkpoint().await?;
+    ///         Ok(())
+    ///     });
+    /// ```
+    pub fn on_shutdown<Hook, HookFut>(self, shutdown_hook: Hook) -> ServiceRunner<Hook>
+    where
+        Hook: FnOnce() -> HookFut,
+        HookFut: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        ServiceRunner {
+            service_name: self.service_name,
+            shutdown_timeout: self.shutdown_timeout,
+            shutdown_hook,
         }
     }
 }
 
-/// Runs a long-lived service task and coordinates graceful shutdown.
-///
-/// The `run` function performs cooperative shutdown when it observes the
-/// `CancellationToken`, allowing it to complete in-flight work and release
-/// resources in an ordered manner.
-///
-/// However, this relies on the service loop making progress. In cases where the
-/// loop is slow, blocked, or unable to reach a cancellation point within the
-/// shutdown deadline, `shutdown_hook` provides an out-of-band, best-effort path
-/// for critical state transitions required for safe shutdown.
-///
-/// The `shutdown_hook` should be fast, idempotent, and limited to external state
-/// changes (e.g., marking the instance as draining or releasing leases).
-///
-/// Returns an error when:
-/// - Service task returns an error
-/// - Service task panics or is canceled
-/// - Service exits normally before any shutdown signal
-/// - Graceful stop exceeds `shutdown_timeout`
-pub async fn run_service<Run, RunFut, Shutdown, ShutdownFut>(
-    service_name: &'static str,
-    shutdown_timeout: Duration,
-    run: Run,
-    shutdown_hook: Shutdown,
-) -> anyhow::Result<()>
+impl<ShutdownHook> ServiceRunner<ShutdownHook>
 where
-    Run: FnOnce(CancellationToken) -> RunFut,
-    RunFut: Future<Output = anyhow::Result<()>> + Send + 'static,
-    Shutdown: FnOnce() -> ShutdownFut,
-    ShutdownFut: Future<Output = anyhow::Result<()>>,
+    ShutdownHook: ShutdownCallback,
 {
-    let shutdown = CancellationToken::new();
+    /// Sets the maximum time to wait for cooperative shutdown before aborting.
+    pub fn shutdown_timeout(mut self, shutdown_timeout: Duration) -> Self {
+        self.shutdown_timeout = shutdown_timeout;
+        self
+    }
 
-    info!(service = service_name, "service started");
+    /// Runs a service loop until process shutdown is requested.
+    ///
+    /// ```ignore
+    /// ServiceRunner::new("coordinator")
+    ///     .run_loop(|| async {
+    ///         run_one_coordinator_cycle().await
+    ///     })
+    ///     .await?;
+    ///
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub async fn run_loop<Tick, TickFut>(self, mut tick: Tick) -> anyhow::Result<()>
+    where
+        Tick: FnMut() -> TickFut + Send + 'static,
+        TickFut: Future<Output = anyhow::Result<()>> + Send,
+    {
+        let service_name = self.service_name;
 
-    let mut service_task = tokio::spawn(run(shutdown.clone()));
+        self.run(move |shutdown| async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        info!(service = service_name, "service stopping");
+                        return Ok(());
+                    }
 
-    tokio::select! {
-        join_result = &mut service_task => {
-            let result = join_result
-                .with_context(|| format!("{service_name} task panicked or was cancelled"))?;
-
-            match result {
-                Ok(()) => {
-                    warn!(
-                        service = service_name,
-                        "service exited normally without shutdown signal"
-                    );
-
-                    anyhow::bail!("{service_name} exited unexpectedly");
-                }
-
-                Err(err) => {
-                    error!(
-                        service = service_name,
-                        error = ?err,
-                        "service failed"
-                    );
-
-                    Err(err)
+                    result = tick() => {
+                        result?;
+                    }
                 }
             }
-        }
+        })
+        .await
+    }
 
-        _ = shutdown_signal() => {
-            info!(service = service_name, "shutdown signal received");
+    /// Runs a long-lived service task and coordinates graceful shutdown.
+    ///
+    /// ```ignore
+    /// use tokio_util::sync::CancellationToken;
+    ///
+    /// ServiceRunner::new("worker")
+    ///     .run(|shutdown: CancellationToken| async move {
+    ///         while !shutdown.is_cancelled() {
+    ///             process_one_job().await?;
+    ///         }
+    ///
+    ///         Ok(())
+    ///     })
+    ///     .await?;
+    ///
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub async fn run<Run, RunFut>(self, run: Run) -> anyhow::Result<()>
+    where
+        Run: FnOnce(CancellationToken) -> RunFut,
+        RunFut: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let shutdown = CancellationToken::new();
 
-            shutdown.cancel();
-            // run caller-provided cleanup after cancellation is requested so
-            // dependencies (queues, db pools, telemetry) can drain/flush first
-            shutdown_hook().await?;
+        info!(service = self.service_name, "service started");
 
-            info!(
-                service = service_name,
-                timeout_secs = shutdown_timeout.as_secs(),
-                "waiting for service task to stop"
-            );
+        let mut service_task = tokio::spawn(run(shutdown.clone()));
 
-            wait_for_service_stop(service_name, &mut service_task, shutdown_timeout).await?;
+        tokio::select! {
+            join_result = &mut service_task => {
+                let result = join_result
+                    .with_context(|| format!("{} task panicked or was cancelled", self.service_name))?;
 
-            info!(service = service_name, "service shutdown complete");
+                match result {
+                    Ok(()) => {
+                        warn!(
+                            service = self.service_name,
+                            "service exited normally without shutdown signal"
+                        );
 
-            Ok(())
+                        anyhow::bail!("{} exited unexpectedly", self.service_name);
+                    }
+
+                    Err(err) => {
+                        error!(
+                            service = self.service_name,
+                            error = ?err,
+                            "service failed"
+                        );
+
+                        Err(err)
+                    }
+                }
+            }
+
+            _ = shutdown_signal() => {
+                info!(service = self.service_name, "shutdown signal received");
+
+                shutdown.cancel();
+                // run caller-provided cleanup after cancellation is requested so
+                // dependencies (queues, db pools, telemetry) can drain/flush first
+                self.shutdown_hook.call().await?;
+
+                info!(
+                    service = self.service_name,
+                    timeout_secs = self.shutdown_timeout.as_secs(),
+                    "waiting for service task to stop"
+                );
+
+                wait_for_service_stop(self.service_name, &mut service_task, self.shutdown_timeout).await?;
+
+                info!(service = self.service_name, "service shutdown complete");
+
+                Ok(())
+            }
         }
     }
 }
