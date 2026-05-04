@@ -6,7 +6,10 @@ use clap::{
 use tracing::info;
 
 use super::Executable;
-use crate::context::Context;
+use crate::{
+    context::Context,
+    runtime::ServiceRunner,
+};
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum SubCommand {
@@ -29,20 +32,36 @@ impl Executable for Command {
         match self.command {
             Some(SubCommand::Start) => {
                 info!("starting worker process");
-
-                // TODO: Load worker runtime configuration and lease settings.
-                // TODO: Start polling pending executions and claiming work safely.
-                // TODO: Process execution attempts with heartbeats and retry transitions.
-                anyhow::bail!("worker start is not implemented yet")
+                handle_start().await
             }
             Some(SubCommand::Once) => {
                 info!("running single worker cycle");
-
-                // TODO: Claim at most one available execution unit.
-                // TODO: Execute one attempt cycle and persist resulting state transitions.
-                anyhow::bail!("worker once is not implemented yet")
+                handle_once().await
             }
             None => anyhow::bail!("missing worker subcommand; use `vigilo worker start`"),
         }
     }
+}
+
+async fn handle_start() -> anyhow::Result<()> {
+    ServiceRunner::new("worker")
+        .run_loop(|| async { run_worker_start_cycle().await })
+        .await
+}
+
+async fn handle_once() -> anyhow::Result<()> {
+    run_worker_once_cycle().await
+}
+
+async fn run_worker_start_cycle() -> anyhow::Result<()> {
+    // TODO: Load worker runtime configuration and lease settings.
+    // TODO: Start polling pending executions and claiming work safely.
+    // TODO: Process execution attempts with heartbeats and retry transitions.
+    anyhow::bail!("worker start is not implemented yet")
+}
+
+async fn run_worker_once_cycle() -> anyhow::Result<()> {
+    // TODO: Claim at most one available execution unit.
+    // TODO: Execute one attempt cycle and persist resulting state transitions.
+    anyhow::bail!("worker once is not implemented yet")
 }
