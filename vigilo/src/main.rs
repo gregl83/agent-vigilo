@@ -29,6 +29,7 @@ mod contracts;
 mod db;
 mod manifest;
 mod models;
+mod runtime;
 
 fn init_logger(quiet: bool, verbose: u8) {
     let level = if quiet {
