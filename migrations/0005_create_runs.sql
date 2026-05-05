@@ -11,10 +11,14 @@ CREATE TABLE runs (
     -- what is being evaluated
     dataset_id TEXT NOT NULL,
     dataset_version TEXT NOT NULL,
+    dataset_version_id TEXT NOT NULL,
     evaluation_profile_id TEXT NOT NULL,
     evaluation_profile_version TEXT NOT NULL,
+    profile_version_id TEXT NOT NULL,
+    profile_hash TEXT NOT NULL,
     aggregation_policy_id TEXT NOT NULL,
     aggregation_policy_version TEXT NOT NULL,
+    aggregation_policy_hash TEXT NOT NULL,
 
     -- agent + prompt/config identity
     agent_provider TEXT NOT NULL,
@@ -61,6 +65,8 @@ CREATE INDEX idx_runs_gate_status ON runs(gate_status);
 
 CREATE INDEX idx_runs_dataset ON runs(dataset_id, dataset_version);
 
+CREATE INDEX idx_runs_dataset_version_id ON runs(dataset_version_id);
+
 CREATE INDEX idx_runs_coordinator_lease ON runs(coordinator_leased_until)
     WHERE status IN ('pending', 'running', 'finalizing');
 
@@ -82,17 +88,29 @@ COMMENT ON COLUMN runs.dataset_id IS
 COMMENT ON COLUMN runs.dataset_version IS
     'Version of the dataset to ensure reproducibility of test cases.';
 
+COMMENT ON COLUMN runs.dataset_version_id IS
+    'Identifier for the dataset version, used for internal tracking.';
+
 COMMENT ON COLUMN runs.evaluation_profile_id IS
     'Identifier of the evaluation profile defining which evaluators are applied.';
 
 COMMENT ON COLUMN runs.evaluation_profile_version IS
     'Version of the evaluation profile to ensure consistent evaluator configuration.';
 
+COMMENT ON COLUMN runs.profile_version_id IS
+    'Identifier for the profile version, used for internal tracking.';
+
+COMMENT ON COLUMN runs.profile_hash IS
+    'Hash of the profile configuration for integrity verification.';
+
 COMMENT ON COLUMN runs.aggregation_policy_id IS
     'Identifier of the aggregation policy used to combine evaluator results into scores and gate decisions.';
 
 COMMENT ON COLUMN runs.aggregation_policy_version IS
     'Version of the aggregation policy to ensure consistent scoring and gating behavior.';
+
+COMMENT ON COLUMN runs.aggregation_policy_hash IS
+    'Hash of the aggregation policy configuration for integrity verification.';
 
 COMMENT ON COLUMN runs.agent_provider IS
     'Provider or platform of the evaluated target (e.g., OpenAI, internal service).';

@@ -15,15 +15,21 @@ pub(crate) struct RunDraft {
     pub(crate) description: Option<String>,
     pub(crate) dataset_id: String,
     pub(crate) dataset_version: String,
+    pub(crate) dataset_version_id: String,
     pub(crate) evaluation_profile_id: String,
     pub(crate) evaluation_profile_version: String,
+    pub(crate) profile_version_id: String,
+    pub(crate) profile_hash: String,
     pub(crate) aggregation_policy_id: String,
     pub(crate) aggregation_policy_version: String,
+    pub(crate) aggregation_policy_hash: String,
     pub(crate) agent_provider: String,
     pub(crate) agent_name: String,
     pub(crate) agent_version: Option<String>,
     pub(crate) prompt_config_id: String,
     pub(crate) prompt_config_version: String,
+    pub(crate) config_snapshot: serde_json::Value,
+    pub(crate) expected_execution_count: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

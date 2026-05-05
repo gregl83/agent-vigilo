@@ -11,13 +11,16 @@ pub(crate) async fn insert_run(db: &PgPool, draft: &RunDraft) -> anyhow::Result<
     let run = sqlx::query_as::<_, Run>(
         r#"
         INSERT INTO runs (
-            run_key, name, description, dataset_id, dataset_version,
-            evaluation_profile_id, evaluation_profile_version,
-            aggregation_policy_id, aggregation_policy_version,
+            id,
+            run_key, name, description, dataset_id, dataset_version, dataset_version_id,
+            evaluation_profile_id, evaluation_profile_version, profile_version_id, profile_hash,
+            aggregation_policy_id, aggregation_policy_version, aggregation_policy_hash,
             agent_provider, agent_name, agent_version,
-            prompt_config_id, prompt_config_version
+            prompt_config_id, prompt_config_version,
+            config_snapshot,
+            expected_execution_count
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb, $21)
         RETURNING
             id, run_key, name, description,
             dataset_id::uuid as dataset_id, dataset_version,
@@ -46,20 +49,27 @@ pub(crate) async fn insert_run(db: &PgPool, draft: &RunDraft) -> anyhow::Result<
             updated_at
         "#,
     )
+    .bind(Uuid::now_v7())
     .bind(&draft.run_key)
     .bind(&draft.name)
     .bind(&draft.description)
     .bind(&draft.dataset_id)
     .bind(&draft.dataset_version)
+    .bind(&draft.dataset_version_id)
     .bind(&draft.evaluation_profile_id)
     .bind(&draft.evaluation_profile_version)
+    .bind(&draft.profile_version_id)
+    .bind(&draft.profile_hash)
     .bind(&draft.aggregation_policy_id)
     .bind(&draft.aggregation_policy_version)
+    .bind(&draft.aggregation_policy_hash)
     .bind(&draft.agent_provider)
     .bind(&draft.agent_name)
     .bind(&draft.agent_version)
     .bind(&draft.prompt_config_id)
     .bind(&draft.prompt_config_version)
+    .bind(&draft.config_snapshot)
+    .bind(draft.expected_execution_count)
     .fetch_one(db)
     .await?;
 

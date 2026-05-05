@@ -1,10 +1,14 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use clap::{
     Args,
     Subcommand,
 };
-use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{
+    info,
+    warn,
+};
 
 use super::Executable;
 use crate::{
@@ -59,7 +63,7 @@ async fn run_coordinator_start_cycle() -> anyhow::Result<()> {
     // TODO: Scan for finalized runs and compute global gate outcomes.
     // TODO: Advance run lifecycle transitions (running -> finalizing -> completed).
     // TODO: Publish outbox completion events with retry-safe semantics.
-    
+
     warn!("coordinator start is not implemented yet");
 
     Ok(())

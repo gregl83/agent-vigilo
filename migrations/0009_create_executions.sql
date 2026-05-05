@@ -4,6 +4,8 @@ CREATE TABLE executions (
 
     -- stable identity of the dataset case within a run
     case_id TEXT NOT NULL,
+    case_hash TEXT NOT NULL,
+    profile_group_id TEXT NOT NULL,
 
     task_type TEXT NOT NULL,
     tags JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -41,6 +43,8 @@ CREATE INDEX idx_executions_run_status ON executions(run_id, status);
 
 CREATE INDEX idx_executions_current_attempt_id ON executions(current_attempt_id);
 
+CREATE INDEX idx_executions_run_case_hash ON executions(run_id, case_hash);
+
 COMMENT ON TABLE executions IS
     'Represents a single evaluation of a dataset case against the target system. Each execution is part of a run and may have multiple attempts due to retries or failures.';
 
@@ -52,6 +56,12 @@ COMMENT ON COLUMN executions.run_id IS
 
 COMMENT ON COLUMN executions.case_id IS
     'Identifier of the dataset case within the run. Unique per run and used to correlate input, expected output, and results.';
+
+COMMENT ON COLUMN executions.case_hash IS
+    'Content hash of the immutable case payload used for this execution, enabling reproducibility and regression comparability.';
+
+COMMENT ON COLUMN executions.profile_group_id IS
+    'Resolved profile group identifier applied to this execution at processing time.';
 
 COMMENT ON COLUMN executions.task_type IS
     'Logical task category for the execution (e.g., classification, generation, tool-use). Used for routing or conditional evaluation.';

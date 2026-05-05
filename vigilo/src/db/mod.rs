@@ -5,4 +5,5 @@ pub(crate) mod execution_attempts;
 pub(crate) mod executions;
 pub(crate) mod migrations;
 pub(crate) mod outbox_events;
+pub(crate) mod run_planning;
 pub(crate) mod runs;

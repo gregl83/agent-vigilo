@@ -1,11 +1,15 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use clap::{
     Args,
     Subcommand,
 };
-use std::time::Duration;
-use tracing::info;
-use tracing::log::warn;
+use tracing::{
+    info,
+    log::warn,
+};
+
 use super::Executable;
 use crate::{
     context::Context,
