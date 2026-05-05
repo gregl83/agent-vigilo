@@ -1,6 +1,6 @@
 CREATE TABLE run_chunks (
     id UUID PRIMARY KEY,
-    run_id UUID NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    run_id UUID NOT NULL,
     dataset_version_id TEXT NOT NULL,
     profile_group_id TEXT NOT NULL,
     ordinal_start INTEGER NOT NULL CHECK (ordinal_start >= 0),
@@ -8,7 +8,12 @@ CREATE TABLE run_chunks (
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'leased', 'completed', 'failed', 'cancelled')),
     leased_until TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT fk_run_chunks_run_dataset
+        FOREIGN KEY (run_id, dataset_version_id)
+        REFERENCES runs(id, dataset_version_id)
+        ON DELETE CASCADE
 );
 
 CREATE INDEX idx_run_chunks_run_status ON run_chunks(run_id, status);

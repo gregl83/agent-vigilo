@@ -10,8 +10,8 @@ CREATE TABLE runs (
 
     -- what is being evaluated
     dataset_id TEXT NOT NULL,
-    dataset_version TEXT NOT NULL,
     dataset_version_id TEXT NOT NULL,
+    dataset_version TEXT NOT NULL,
     evaluation_profile_id TEXT NOT NULL,
     evaluation_profile_version TEXT NOT NULL,
     profile_version_id TEXT NOT NULL,
@@ -56,7 +56,9 @@ CREATE TABLE runs (
     dispatched_at TIMESTAMPTZ,
     finalized_at TIMESTAMPTZ,
     completed_at TIMESTAMPTZ,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT uq_runs_id_dataset_version_id UNIQUE (id, dataset_version_id)
 );
 
 CREATE INDEX idx_runs_status ON runs(status);
@@ -85,11 +87,11 @@ COMMENT ON COLUMN runs.description IS
 COMMENT ON COLUMN runs.dataset_id IS
     'Identifier of the dataset used to generate executions for this run.';
 
-COMMENT ON COLUMN runs.dataset_version IS
-    'Version of the dataset to ensure reproducibility of test cases.';
-
 COMMENT ON COLUMN runs.dataset_version_id IS
     'Identifier for the dataset version, used for internal tracking.';
+
+COMMENT ON COLUMN runs.dataset_version IS
+    'Version of the dataset to ensure reproducibility of test cases.';
 
 COMMENT ON COLUMN runs.evaluation_profile_id IS
     'Identifier of the evaluation profile defining which evaluators are applied.';

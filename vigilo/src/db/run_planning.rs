@@ -59,10 +59,18 @@ pub(crate) async fn bulk_insert_dataset_membership(
 
     query_builder.push(
         " ON CONFLICT (dataset_version_id, case_id) DO UPDATE \
-         SET case_ordinal = EXCLUDED.case_ordinal, case_hash = EXCLUDED.case_hash",
+         SET case_ordinal = EXCLUDED.case_ordinal, case_hash = EXCLUDED.case_hash \
+         WHERE dataset_version_cases.case_ordinal = EXCLUDED.case_ordinal \
+           AND dataset_version_cases.case_hash = EXCLUDED.case_hash",
     );
 
-    query_builder.build().execute(tx.as_mut()).await?;
+    let rows_affected = query_builder.build().execute(tx.as_mut()).await?.rows_affected();
+    if rows_affected != cases.len() as u64 {
+        anyhow::bail!(
+            "dataset_version_id '{}' already exists with different membership; dataset versions are immutable",
+            dataset_version_id
+        );
+    }
 
     Ok(())
 }
