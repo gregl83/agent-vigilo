@@ -28,8 +28,8 @@ use context::{
 mod contracts;
 mod db;
 mod manifest;
-mod mq;
 mod models;
+mod mq;
 mod outbox;
 mod runtime;
 

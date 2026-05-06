@@ -7,8 +7,8 @@ use tracing::{
 
 use crate::{
     db::outbox_events,
-    mq,
     models::outbox_event::OutboxEvent,
+    mq,
 };
 
 #[derive(Debug, Clone)]
@@ -73,7 +73,9 @@ impl EventPublisher for LoggingEventPublisher {
 #[async_trait]
 impl EventPublisher for MqEventPublisher<'_> {
     async fn publish(&self, event: &OutboxEvent) -> anyhow::Result<()> {
-        self.client.publish_json(&event.event_type, &event.payload).await
+        self.client
+            .publish_json(&event.event_type, &event.payload)
+            .await
     }
 }
 

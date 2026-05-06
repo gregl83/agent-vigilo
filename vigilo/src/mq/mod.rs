@@ -78,14 +78,20 @@ impl Client {
                         FieldTable::default(),
                     )
                     .await
-                    .map_err(|err| anyhow::anyhow!("rabbitmq exchange declaration failed: {}", err))?;
+                    .map_err(|err| {
+                        anyhow::anyhow!("rabbitmq exchange declaration failed: {}", err)
+                    })?;
 
                 Ok(channel)
             })
             .await
     }
 
-    pub(crate) async fn publish_json(&self, routing_key: &str, payload: &Value) -> anyhow::Result<()> {
+    pub(crate) async fn publish_json(
+        &self,
+        routing_key: &str,
+        payload: &Value,
+    ) -> anyhow::Result<()> {
         let body = serde_json::to_vec(payload)
             .map_err(|err| anyhow::anyhow!("failed to serialize message payload: {}", err))?;
 
@@ -106,6 +112,3 @@ impl Client {
         Ok(())
     }
 }
-
-
-
