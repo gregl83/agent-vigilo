@@ -106,6 +106,93 @@ pub(crate) async fn list_outbox_events_by_status(
     Ok(events)
 }
 
+pub(crate) async fn claim_publishable_outbox_events(
+    db: &PgPool,
+    limit: i64,
+    lease_seconds: i32,
+) -> anyhow::Result<Vec<OutboxEvent>> {
+    let events = sqlx::query_as::<_, OutboxEvent>(
+        r#"
+        WITH claim AS (
+            SELECT id
+            FROM outbox_events
+            WHERE status = 'pending'::outbox_status
+              AND available_at <= now()
+            ORDER BY available_at ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT $1
+        )
+        UPDATE outbox_events oe
+        SET available_at = now() + ($2::int * interval '1 second'),
+            updated_at = now()
+        FROM claim
+        WHERE oe.id = claim.id
+        RETURNING
+            oe.id,
+            oe.event_type,
+            oe.aggregate_type,
+            oe.aggregate_id,
+            oe.dedupe_key,
+            oe.payload,
+            oe.status::text as status,
+            oe.available_at,
+            oe.published_at,
+            oe.error_message,
+            oe.created_at,
+            oe.updated_at
+        "#,
+    )
+    .bind(limit)
+    .bind(lease_seconds)
+    .fetch_all(db)
+    .await?;
+
+    Ok(events)
+}
+
+pub(crate) async fn mark_outbox_event_published(db: &PgPool, id: Uuid) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        r#"
+        UPDATE outbox_events
+        SET status = 'published'::outbox_status,
+            published_at = now(),
+            error_message = NULL,
+            updated_at = now()
+        WHERE id = $1::uuid
+        "#,
+    )
+    .bind(id)
+    .execute(db)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+pub(crate) async fn reschedule_outbox_event(
+    db: &PgPool,
+    id: Uuid,
+    retry_after_seconds: i32,
+    error_message: &str,
+) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        r#"
+        UPDATE outbox_events
+        SET status = 'pending'::outbox_status,
+            available_at = now() + ($2::int * interval '1 second'),
+            error_message = $3,
+            updated_at = now()
+        WHERE id = $1::uuid
+        "#,
+    )
+    .bind(id)
+    .bind(retry_after_seconds)
+    .bind(error_message)
+    .execute(db)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
 pub(crate) async fn update_outbox_event_status(
     db: &PgPool,
     id: Uuid,

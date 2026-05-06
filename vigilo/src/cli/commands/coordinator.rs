@@ -12,11 +12,19 @@ use super::Executable;
 use crate::{
     context::Context,
     db::coordinator,
+    outbox::publisher::{
+        LoggingEventPublisher,
+        OutboxPublisherConfig,
+        publish_pending_events,
+    },
     runtime::ServiceRunner,
 };
 
 const COORDINATOR_TICK_SECONDS: u64 = 5;
 const COORDINATOR_LEASE_SECONDS: i32 = 60;
+const OUTBOX_BATCH_SIZE: i64 = 32;
+const OUTBOX_LEASE_SECONDS: i32 = 30;
+const OUTBOX_RETRY_DELAY_SECONDS: i32 = 10;
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum SubCommand {
@@ -69,23 +77,36 @@ async fn handle_once(context: Context) -> anyhow::Result<()> {
 
 async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow::Result<()> {
     let db = context.db().await?;
-
-    let Some(run) =
-        coordinator::claim_next_pending_run(db, coordinator_id, COORDINATOR_LEASE_SECONDS).await?
-    else {
-        info!("no pending runs available for coordinator cycle");
-        return Ok(());
+    let publisher = LoggingEventPublisher;
+    let outbox_config = OutboxPublisherConfig {
+        batch_size: OUTBOX_BATCH_SIZE,
+        lease_seconds: OUTBOX_LEASE_SECONDS,
+        retry_delay_seconds: OUTBOX_RETRY_DELAY_SECONDS,
     };
 
-    let chunk_events = coordinator::enqueue_missing_chunk_ready_events(db, run.id).await?;
-    let started_events = coordinator::enqueue_run_started_event(db, run.id).await?;
+    if let Some(run) =
+        coordinator::claim_next_pending_run(db, coordinator_id, COORDINATOR_LEASE_SECONDS).await?
+    {
+        let chunk_events = coordinator::enqueue_missing_chunk_ready_events(db, run.id).await?;
+        let started_events = coordinator::enqueue_run_started_event(db, run.id).await?;
 
+        info!(
+            run_id = %run.id,
+            run_key = %run.run_key,
+            chunk_events_enqueued = chunk_events,
+            run_started_events_enqueued = started_events,
+            "claimed run and prepared dispatch events"
+        );
+    } else {
+        info!("no pending runs available for coordinator cycle");
+    }
+
+    let publish_stats = publish_pending_events(db, &publisher, &outbox_config).await?;
     info!(
-        run_id = %run.id,
-        run_key = %run.run_key,
-        chunk_events_enqueued = chunk_events,
-        run_started_events_enqueued = started_events,
-        "claimed run and prepared dispatch events"
+        outbox_events_claimed = publish_stats.claimed,
+        outbox_events_published = publish_stats.published,
+        outbox_events_failed = publish_stats.failed,
+        "completed outbox publish cycle"
     );
 
     Ok(())
