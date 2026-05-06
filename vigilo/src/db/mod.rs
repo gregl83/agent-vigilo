@@ -1,3 +1,4 @@
+pub(crate) mod coordinator;
 pub(crate) mod evaluator_results;
 pub(crate) mod evaluators;
 pub(crate) mod execution_aggregates;

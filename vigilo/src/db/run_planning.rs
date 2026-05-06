@@ -102,7 +102,11 @@ pub(crate) async fn bulk_insert_dataset_membership(
            AND dataset_version_cases.case_hash = EXCLUDED.case_hash",
     );
 
-    let rows_affected = query_builder.build().execute(tx.as_mut()).await?.rows_affected();
+    let rows_affected = query_builder
+        .build()
+        .execute(tx.as_mut())
+        .await?
+        .rows_affected();
     if rows_affected != cases.len() as u64 {
         anyhow::bail!(
             "dataset_version_id '{}' already exists with different membership; dataset versions are immutable",

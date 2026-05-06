@@ -29,4 +29,3 @@ pub(crate) struct CaseBlob {
     pub(crate) metadata: serde_json::Value,
     pub(crate) created_at: DateTime<Utc>,
 }
-

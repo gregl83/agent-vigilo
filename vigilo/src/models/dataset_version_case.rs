@@ -23,4 +23,3 @@ pub(crate) struct DatasetVersionCase {
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) updated_at: DateTime<Utc>,
 }
-

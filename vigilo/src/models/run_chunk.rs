@@ -29,4 +29,3 @@ pub(crate) struct RunChunk {
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) updated_at: DateTime<Utc>,
 }
-
