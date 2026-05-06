@@ -27,7 +27,7 @@ use crate::{
         RunDataset,
         RunProfile,
     },
-    db::run_planning,
+    db::run_create,
     models::{
         case_blob::CaseBlobDraft,
         dataset_version_case::DatasetVersionCaseDraft,
@@ -303,19 +303,19 @@ async fn handle_create(
 
     let mut tx = db.begin().await?;
 
-    run_planning::bulk_insert_case_blobs(&mut tx, &case_blobs).await?;
-    run_planning::upsert_dataset_version(
+    run_create::bulk_insert_case_blobs(&mut tx, &case_blobs).await?;
+    run_create::upsert_dataset_version(
         &mut tx,
         &dataset_version_id,
         &run_draft.dataset_id,
         &run_draft.dataset_version,
     )
     .await?;
-    run_planning::bulk_insert_dataset_membership(&mut tx, &dataset_version_id, &dataset_cases)
+    run_create::bulk_insert_dataset_membership(&mut tx, &dataset_version_id, &dataset_cases)
         .await?;
-    run_planning::insert_run_create(&mut tx, run_id, &run_draft).await?;
-    run_planning::bulk_insert_run_chunks(&mut tx, run_id, &dataset_version_id, &chunks).await?;
-    run_planning::bulk_enqueue_chunk_events(&mut tx, run_id, &chunks).await?;
+    run_create::insert_run_create(&mut tx, run_id, &run_draft).await?;
+    run_create::bulk_insert_run_chunks(&mut tx, run_id, &dataset_version_id, &chunks).await?;
+    run_create::bulk_enqueue_chunk_events(&mut tx, run_id, &chunks).await?;
 
     tx.commit().await?;
 

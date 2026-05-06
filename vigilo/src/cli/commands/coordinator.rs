@@ -11,7 +11,7 @@ use uuid::Uuid;
 use super::Executable;
 use crate::{
     context::Context,
-    db::coordinator,
+    db::run_dispatch,
     outbox::publisher::{
         MqEventPublisher,
         OutboxPublisherConfig,
@@ -80,10 +80,10 @@ async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow
     let mq = context.mq().await?;
 
     if let Some(run) =
-        coordinator::claim_next_pending_run(db, coordinator_id, COORDINATOR_LEASE_SECONDS).await?
+        run_dispatch::claim_next_pending_run(db, coordinator_id, COORDINATOR_LEASE_SECONDS).await?
     {
-        let chunk_events = coordinator::enqueue_missing_chunk_ready_events(db, run.id).await?;
-        let started_events = coordinator::enqueue_run_started_event(db, run.id).await?;
+        let chunk_events = run_dispatch::enqueue_missing_chunk_ready_events(db, run.id).await?;
+        let started_events = run_dispatch::enqueue_run_started_event(db, run.id).await?;
 
         info!(
             run_id = %run.id,

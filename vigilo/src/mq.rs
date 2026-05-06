@@ -5,8 +5,13 @@ use lapin::{
     ConnectionProperties,
     ExchangeKind,
     options::{
+        BasicAckOptions,
+        BasicGetOptions,
+        BasicNackOptions,
         BasicPublishOptions,
         ExchangeDeclareOptions,
+        QueueBindOptions,
+        QueueDeclareOptions,
     },
     types::FieldTable,
 };
@@ -18,6 +23,7 @@ use tracing::debug;
 pub(crate) struct Config {
     pub(crate) uri: String,
     pub(crate) exchange: String,
+    pub(crate) worker_queue: String,
 }
 
 impl Config {
@@ -25,8 +31,14 @@ impl Config {
         Self {
             uri,
             exchange: "vigilo.events".to_string(),
+            worker_queue: "vigilo.worker".to_string(),
         }
     }
+}
+
+pub(crate) struct ConsumedMessage {
+    pub(crate) delivery_tag: u64,
+    pub(crate) payload: Value,
 }
 
 pub(crate) struct Client {
@@ -109,6 +121,77 @@ impl Client {
             .await
             .map_err(|err| anyhow::anyhow!("rabbitmq publish confirmation failed: {}", err))?;
 
+        Ok(())
+    }
+
+    pub(crate) async fn consume_worker_message(&self) -> anyhow::Result<Option<ConsumedMessage>> {
+        let channel = self.channel().await?;
+
+        channel
+            .queue_declare(
+                &self.config.worker_queue,
+                QueueDeclareOptions {
+                    passive: false,
+                    durable: true,
+                    exclusive: false,
+                    auto_delete: false,
+                    nowait: false,
+                },
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("rabbitmq queue declaration failed: {}", err))?;
+
+        channel
+            .queue_bind(
+                &self.config.worker_queue,
+                &self.config.exchange,
+                "run.chunk.ready",
+                QueueBindOptions::default(),
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("rabbitmq queue binding failed: {}", err))?;
+
+        let maybe_delivery = channel
+            .basic_get(&self.config.worker_queue, BasicGetOptions::default())
+            .await
+            .map_err(|err| anyhow::anyhow!("rabbitmq consume failed: {}", err))?;
+
+        let Some(delivery) = maybe_delivery else {
+            return Ok(None);
+        };
+
+        let payload = serde_json::from_slice::<Value>(&delivery.data)
+            .map_err(|err| anyhow::anyhow!("failed to deserialize message payload: {}", err))?;
+
+        Ok(Some(ConsumedMessage {
+            delivery_tag: delivery.delivery_tag,
+            payload,
+        }))
+    }
+
+    pub(crate) async fn ack(&self, delivery_tag: u64) -> anyhow::Result<()> {
+        let channel = self.channel().await?;
+        channel
+            .basic_ack(delivery_tag, BasicAckOptions::default())
+            .await
+            .map_err(|err| anyhow::anyhow!("rabbitmq ack failed: {}", err))?;
+        Ok(())
+    }
+
+    pub(crate) async fn nack_requeue(&self, delivery_tag: u64) -> anyhow::Result<()> {
+        let channel = self.channel().await?;
+        channel
+            .basic_nack(
+                delivery_tag,
+                BasicNackOptions {
+                    multiple: false,
+                    requeue: true,
+                },
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("rabbitmq nack failed: {}", err))?;
         Ok(())
     }
 }
