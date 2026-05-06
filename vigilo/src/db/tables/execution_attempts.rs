@@ -195,4 +195,3 @@ pub(crate) async fn delete_execution_attempt_by_id(db: &PgPool, id: Uuid) -> any
 
     Ok(result.rows_affected())
 }
-

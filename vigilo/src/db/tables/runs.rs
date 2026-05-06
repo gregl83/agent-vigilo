@@ -262,4 +262,3 @@ pub(crate) async fn delete_run_by_id(db: &PgPool, id: Uuid) -> anyhow::Result<u6
 
     Ok(result.rows_affected())
 }
-

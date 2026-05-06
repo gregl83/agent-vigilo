@@ -243,4 +243,3 @@ pub(crate) async fn delete_outbox_event_by_id(db: &PgPool, id: Uuid) -> anyhow::
 
     Ok(result.rows_affected())
 }
-
