@@ -21,18 +21,56 @@ pub(crate) async fn bulk_insert_case_blobs(
     }
 
     let mut query_builder = QueryBuilder::<Postgres>::new(
-        "INSERT INTO case_blobs (case_hash, input_payload, expected_output, metadata) ",
+        "INSERT INTO case_blobs (case_hash, task_type, input_payload, expected_output, context_payload, tags, metadata) ",
     );
 
     query_builder.push_values(case_blobs, |mut b, row| {
         b.push_bind(&row.case_hash)
+            .push_bind(&row.task_type)
             .push_bind(&row.input_payload)
             .push_bind(&row.expected_output)
+            .push_bind(&row.context_payload)
+            .push_bind(&row.tags)
             .push_bind(&row.metadata);
     });
 
     query_builder.push(" ON CONFLICT (case_hash) DO NOTHING");
     query_builder.build().execute(tx.as_mut()).await?;
+
+    Ok(())
+}
+
+pub(crate) async fn upsert_dataset_version(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    dataset_version_id: &str,
+    dataset_id: &str,
+    dataset_version: &str,
+) -> anyhow::Result<()> {
+    let rows_affected = sqlx::query(
+        r#"
+        INSERT INTO dataset_versions (dataset_version_id, dataset_id, dataset_version)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (dataset_version_id) DO UPDATE
+        SET dataset_id = EXCLUDED.dataset_id,
+            dataset_version = EXCLUDED.dataset_version,
+            updated_at = now()
+        WHERE dataset_versions.dataset_id = EXCLUDED.dataset_id
+          AND dataset_versions.dataset_version = EXCLUDED.dataset_version
+        "#,
+    )
+    .bind(dataset_version_id)
+    .bind(dataset_id)
+    .bind(dataset_version)
+    .execute(tx.as_mut())
+    .await?
+    .rows_affected();
+
+    if rows_affected != 1 {
+        anyhow::bail!(
+            "dataset_version_id '{}' already exists with different dataset identity",
+            dataset_version_id
+        );
+    }
 
     Ok(())
 }

@@ -1,3 +1,4 @@
+
 CREATE TABLE runs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
@@ -10,7 +11,7 @@ CREATE TABLE runs (
 
     -- what is being evaluated
     dataset_id TEXT NOT NULL,
-    dataset_version_id TEXT NOT NULL,
+    dataset_version_id TEXT NOT NULL REFERENCES dataset_versions(dataset_version_id),
     dataset_version TEXT NOT NULL,
     evaluation_profile_id TEXT NOT NULL,
     evaluation_profile_version TEXT NOT NULL,

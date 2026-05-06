@@ -94,6 +94,12 @@ fn hash_json(value: &Value) -> anyhow::Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+fn canonical_tags(tags: &[String]) -> Value {
+    let mut ordered = tags.to_vec();
+    ordered.sort();
+    Value::Array(ordered.into_iter().map(Value::String).collect())
+}
+
 fn build_case_plans(
     dataset: &RunDataset,
 ) -> anyhow::Result<(Vec<CaseBlobDraft>, Vec<DatasetVersionCaseDraft>)> {
@@ -104,10 +110,15 @@ fn build_case_plans(
         let expected_output = canonical_json(case.expected.as_ref().unwrap_or(&Value::Null));
         let metadata = canonical_json(&serde_json::to_value(&case.metadata)?);
         let input_payload = canonical_json(&case.input);
+        let context_payload = canonical_json(case.context.as_ref().unwrap_or(&Value::Null));
+        let tags = canonical_tags(&case.tags);
 
         let blob_payload = json!({
+            "task_type": case.task_type.clone(),
             "input": input_payload,
             "expected_output": expected_output,
+            "context": context_payload,
+            "tags": tags,
             "metadata": metadata,
         });
 
@@ -115,8 +126,11 @@ fn build_case_plans(
 
         case_blobs.push(CaseBlobDraft {
             case_hash: case_hash.clone(),
+            task_type: case.task_type.clone(),
             input_payload: blob_payload["input"].clone(),
             expected_output: blob_payload["expected_output"].clone(),
+            context_payload: blob_payload["context"].clone(),
+            tags: blob_payload["tags"].clone(),
             metadata: blob_payload["metadata"].clone(),
         });
 
@@ -290,6 +304,13 @@ async fn handle_create(
     let mut tx = db.begin().await?;
 
     run_planning::bulk_insert_case_blobs(&mut tx, &case_blobs).await?;
+    run_planning::upsert_dataset_version(
+        &mut tx,
+        &dataset_version_id,
+        &run_draft.dataset_id,
+        &run_draft.dataset_version,
+    )
+    .await?;
     run_planning::bulk_insert_dataset_membership(&mut tx, &dataset_version_id, &dataset_cases)
         .await?;
     run_planning::insert_run_create(&mut tx, run_id, &run_draft).await?;
