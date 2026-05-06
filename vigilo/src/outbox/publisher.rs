@@ -6,7 +6,7 @@ use tracing::{
 };
 
 use crate::{
-    db::outbox_events,
+    db::tables::outbox_events,
     models::outbox_event::OutboxEvent,
     mq,
 };

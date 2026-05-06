@@ -92,3 +92,4 @@ pub(crate) async fn enqueue_run_started_event(db: &PgPool, run_id: Uuid) -> anyh
 
     Ok(result.rows_affected())
 }
+

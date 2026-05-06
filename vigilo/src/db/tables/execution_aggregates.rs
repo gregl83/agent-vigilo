@@ -156,3 +156,4 @@ pub(crate) async fn delete_execution_aggregate_by_execution_id(
 
     Ok(result.rows_affected())
 }
+

@@ -15,7 +15,7 @@ use uuid::Uuid;
 use super::Executable;
 use crate::{
     context::Context,
-    db::chunk_processing,
+    db::workflows::chunk_processing,
     runtime::ServiceRunner,
 };
 

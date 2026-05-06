@@ -24,7 +24,7 @@ use super::{
 use crate::{
     context::Context,
     contracts::evaluator::EvaluatorInput,
-    db::evaluators,
+    db::tables::evaluators,
     models::evaluator::{
         EvaluatorDraft,
         EvaluatorPatch,

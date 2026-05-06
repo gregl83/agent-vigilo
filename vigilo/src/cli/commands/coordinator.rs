@@ -11,7 +11,7 @@ use uuid::Uuid;
 use super::Executable;
 use crate::{
     context::Context,
-    db::run_dispatch,
+    db::workflows::run_dispatch,
     outbox::publisher::{
         MqEventPublisher,
         OutboxPublisherConfig,

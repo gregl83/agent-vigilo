@@ -119,3 +119,4 @@ pub(crate) async fn release_chunk_as_pending(db: &PgPool, chunk_id: Uuid) -> any
 
     Ok(result.rows_affected())
 }
+

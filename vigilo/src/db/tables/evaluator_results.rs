@@ -249,3 +249,4 @@ pub(crate) async fn delete_evaluator_result_by_id(db: &PgPool, id: Uuid) -> anyh
 
     Ok(result.rows_affected())
 }
+

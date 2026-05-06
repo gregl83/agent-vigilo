@@ -216,3 +216,4 @@ pub(crate) async fn update_evaluator_state(
 
     Ok(result.rows_affected())
 }
+
