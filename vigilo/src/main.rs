@@ -28,6 +28,7 @@ use context::{
 mod contracts;
 mod db;
 mod manifest;
+mod mq;
 mod models;
 mod outbox;
 mod runtime;
@@ -63,7 +64,11 @@ async fn main() -> ExitCode {
             init_logger(app.quiet, app.verbose);
 
             let wasm_config = wasm::Config::default();
-            let context = Context::new(app.database_url.clone(), wasm_config);
+            let context = Context::new(
+                app.database_url.clone(),
+                app.messaging_url.clone(),
+                wasm_config,
+            );
 
             match app.exec(context).await {
                 Err(e) => {

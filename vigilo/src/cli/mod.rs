@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use async_trait::async_trait;
 use clap::{
     ArgAction,
@@ -27,9 +25,13 @@ pub(super) trait Executable {
     long_about = None
 )]
 pub(crate) struct App {
-    /// Database URI (connection string)
+    /// Database URL (connection string)
     #[arg(long, env = "DATABASE_URL")]
     pub database_url: String,
+
+    /// Messaging URL (connection string)
+    #[arg(long, env = "MESSAGING_URL")]
+    pub messaging_url: String,
 
     /// Suppress all diagnostic output and progress messages
     #[arg(global = true, short, long, default_value_t = false)]

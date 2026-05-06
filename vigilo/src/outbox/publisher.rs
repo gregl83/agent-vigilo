@@ -7,6 +7,7 @@ use tracing::{
 
 use crate::{
     db::outbox_events,
+    mq,
     models::outbox_event::OutboxEvent,
 };
 
@@ -42,6 +43,16 @@ pub(crate) trait EventPublisher: Send + Sync {
 #[derive(Debug, Default)]
 pub(crate) struct LoggingEventPublisher;
 
+pub(crate) struct MqEventPublisher<'a> {
+    client: &'a mq::Client,
+}
+
+impl<'a> MqEventPublisher<'a> {
+    pub(crate) fn new(client: &'a mq::Client) -> Self {
+        Self { client }
+    }
+}
+
 #[async_trait]
 impl EventPublisher for LoggingEventPublisher {
     async fn publish(&self, event: &OutboxEvent) -> anyhow::Result<()> {
@@ -56,6 +67,13 @@ impl EventPublisher for LoggingEventPublisher {
         );
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl EventPublisher for MqEventPublisher<'_> {
+    async fn publish(&self, event: &OutboxEvent) -> anyhow::Result<()> {
+        self.client.publish_json(&event.event_type, &event.payload).await
     }
 }
 

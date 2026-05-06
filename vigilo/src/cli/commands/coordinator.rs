@@ -13,7 +13,7 @@ use crate::{
     context::Context,
     db::coordinator,
     outbox::publisher::{
-        LoggingEventPublisher,
+        MqEventPublisher,
         OutboxPublisherConfig,
         publish_pending_events,
     },
@@ -77,12 +77,7 @@ async fn handle_once(context: Context) -> anyhow::Result<()> {
 
 async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow::Result<()> {
     let db = context.db().await?;
-    let publisher = LoggingEventPublisher;
-    let outbox_config = OutboxPublisherConfig {
-        batch_size: OUTBOX_BATCH_SIZE,
-        lease_seconds: OUTBOX_LEASE_SECONDS,
-        retry_delay_seconds: OUTBOX_RETRY_DELAY_SECONDS,
-    };
+    let mq = context.mq().await?;
 
     if let Some(run) =
         coordinator::claim_next_pending_run(db, coordinator_id, COORDINATOR_LEASE_SECONDS).await?
@@ -101,6 +96,12 @@ async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow
         info!("no pending runs available for coordinator cycle");
     }
 
+    let publisher = MqEventPublisher::new(mq);
+    let outbox_config = OutboxPublisherConfig {
+        batch_size: OUTBOX_BATCH_SIZE,
+        lease_seconds: OUTBOX_LEASE_SECONDS,
+        retry_delay_seconds: OUTBOX_RETRY_DELAY_SECONDS,
+    };
     let publish_stats = publish_pending_events(db, &publisher, &outbox_config).await?;
     info!(
         outbox_events_claimed = publish_stats.claimed,

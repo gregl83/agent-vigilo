@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
 pub(crate) mod database;
+pub(crate) mod messaging;
 pub(crate) mod output;
 pub(crate) mod registry;
 pub(crate) mod wasm;
 
 struct ContextInner {
     pub db: database::Context,
+    pub mq: messaging::Context,
     pub out: output::Context,
     pub reg: registry::Context,
     pub wasm: wasm::Context,
@@ -16,10 +18,14 @@ struct ContextInner {
 pub(crate) struct Context(Arc<ContextInner>);
 
 impl Context {
-    pub fn new(db_uri: String, wasm_config: wasm::Config) -> Self {
+    pub fn new(db_uri: String, mq_uri: String, wasm_config: wasm::Config) -> Self {
         Self(Arc::new(ContextInner {
             db: database::Context {
                 uri: db_uri,
+                cell: Default::default(),
+            },
+            mq: messaging::Context {
+                config: crate::mq::Config::new(mq_uri),
                 cell: Default::default(),
             },
             out: output::Context {
@@ -41,6 +47,10 @@ impl Context {
 
     pub async fn out(&self) -> anyhow::Result<&output::Buffer> {
         self.0.out.get().await
+    }
+
+    pub async fn mq(&self) -> anyhow::Result<&crate::mq::Client> {
+        self.0.mq.get().await
     }
 
     pub async fn reg(

@@ -48,7 +48,7 @@ services:
     command: ["cargo", "run", "-p", "vigilo", "--", "setup"]
     environment:
       DATABASE_URL: postgresql://postgres:password@agent_vigilo_db:5432/agent_vigilo
-      RABBITMQ_URL: amqp://guest:guest@agent_vigilo_mq:5672
+      MESSAGING_URL: amqp://guest:guest@agent_vigilo_mq:5672
     volumes:
       - ../../:/workspace
       - agent_vigilo_cargo_registry:/usr/local/cargo/registry
@@ -70,7 +70,7 @@ services:
     command: ["cargo", "run", "-p", "vigilo", "--", "coordinator", "start"]
     environment:
       DATABASE_URL: postgresql://postgres:password@agent_vigilo_db:5432/agent_vigilo
-      RABBITMQ_URL: amqp://guest:guest@agent_vigilo_mq:5672
+      MESSAGING_URL: amqp://guest:guest@agent_vigilo_mq:5672
     volumes:
       - ../../:/workspace
       - agent_vigilo_cargo_registry:/usr/local/cargo/registry
@@ -94,7 +94,7 @@ services:
     command: ["cargo", "run", "-p", "vigilo", "--", "worker", "start"]
     environment:
       DATABASE_URL: postgresql://postgres:password@agent_vigilo_db:5432/agent_vigilo
-      RABBITMQ_URL: amqp://guest:guest@agent_vigilo_mq:5672
+      MESSAGING_URL: amqp://guest:guest@agent_vigilo_mq:5672
     volumes:
       - ../../:/workspace
       - agent_vigilo_cargo_registry:/usr/local/cargo/registry

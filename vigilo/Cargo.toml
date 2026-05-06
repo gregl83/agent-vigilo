@@ -32,6 +32,7 @@ cargo_toml = { version = "0.22.3" }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6.1", features = ["cargo", "derive", "env"] }
 moka = { version = "0.12.15", features = ["future"] }
+lapin = { version = "2.5.5" }
 serde = { version = "1.0.228", features = ["derive"] }
 sqlx = { version = "0.8.6", features = ["chrono", "macros", "migrate", "postgres", "runtime-tokio-rustls", "uuid"] }
 tokio = { version = "1.52.1", features = ["full"] }
