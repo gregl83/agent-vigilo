@@ -11,7 +11,10 @@ use uuid::Uuid;
 use super::Executable;
 use crate::{
     context::Context,
-    db::workflows::run_dispatch,
+    db::workflows::{
+        run_dispatch,
+        run_finalize,
+    },
     outbox::publisher::{
         MqEventPublisher,
         OutboxPublisherConfig,
@@ -94,6 +97,24 @@ async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow
         );
     } else {
         info!("no pending runs available for coordinator cycle");
+    }
+
+    if let Some(run) =
+        run_finalize::claim_next_finalizable_run(db, coordinator_id, COORDINATOR_LEASE_SECONDS)
+            .await?
+    {
+        if let Some(finalized) = run_finalize::finalize_claimed_run(db, run.id).await? {
+            info!(
+                run_id = %finalized.id,
+                run_key = %finalized.run_key,
+                gate_status = %finalized.gate_status,
+                terminal_execution_count = finalized.terminal_execution_count,
+                passed_execution_count = finalized.passed_execution_count,
+                failed_execution_count = finalized.failed_execution_count,
+                errored_execution_count = finalized.errored_execution_count,
+                "finalized run and enqueued completion event"
+            );
+        }
     }
 
     let publisher = MqEventPublisher::new(mq);

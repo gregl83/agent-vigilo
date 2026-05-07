@@ -177,4 +177,3 @@ case_groups:
           method: weighted_mean
           blocking: true
           weight: 1.0
-
