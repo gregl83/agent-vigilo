@@ -5,7 +5,10 @@ use clap::{
     Args,
     Subcommand,
 };
-use tracing::info;
+use tracing::{
+    debug,
+    info,
+};
 use uuid::Uuid;
 
 use super::Executable;
@@ -79,12 +82,22 @@ async fn handle_once(context: Context) -> anyhow::Result<()> {
 }
 
 async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow::Result<()> {
+    debug!(coordinator_id, "starting coordinator cycle pre-flight");
+
+    debug!(coordinator_id, "acquiring database context");
     let db = context.db().await?;
+    debug!(coordinator_id, "database context ready");
+
+    debug!(coordinator_id, "acquiring messaging context");
     let mq = context.mq().await?;
+    debug!(coordinator_id, "messaging context ready");
+
+    debug!(coordinator_id, "attempting to claim pending run for dispatch");
 
     if let Some(run) =
         run_dispatch::claim_next_pending_run(db, coordinator_id, COORDINATOR_LEASE_SECONDS).await?
     {
+        debug!(run_id = %run.id, run_key = %run.run_key, "claimed pending run");
         let chunk_events = run_dispatch::enqueue_missing_chunk_ready_events(db, run.id).await?;
         let started_events = run_dispatch::enqueue_run_started_event(db, run.id).await?;
 
@@ -99,10 +112,13 @@ async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow
         info!("no pending runs available for coordinator cycle");
     }
 
+    debug!(coordinator_id, "attempting to claim finalizable run");
+
     if let Some(run) =
         run_finalize::claim_next_finalizable_run(db, coordinator_id, COORDINATOR_LEASE_SECONDS)
             .await?
     {
+        debug!(run_id = %run.id, run_key = %run.run_key, "claimed run for finalization");
         if let Some(finalized) = run_finalize::finalize_claimed_run(db, run.id).await? {
             info!(
                 run_id = %finalized.id,
@@ -114,9 +130,14 @@ async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow
                 errored_execution_count = finalized.errored_execution_count,
                 "finalized run and enqueued completion event"
             );
+        } else {
+            debug!(run_id = %run.id, "claimed finalizable run but no finalization update was applied");
         }
+    } else {
+        debug!(coordinator_id, "no finalizable runs available for this cycle");
     }
 
+    debug!(coordinator_id, "starting outbox publish pass");
     let publisher = MqEventPublisher::new(mq);
     let outbox_config = OutboxPublisherConfig {
         batch_size: OUTBOX_BATCH_SIZE,
@@ -130,6 +151,8 @@ async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow
         outbox_events_failed = publish_stats.failed,
         "completed outbox publish cycle"
     );
+
+    debug!(coordinator_id, "coordinator cycle complete");
 
     Ok(())
 }

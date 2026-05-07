@@ -7,6 +7,7 @@ use clap::{
 };
 use serde::Deserialize;
 use tracing::{
+    debug,
     info,
     warn,
 };
@@ -75,22 +76,41 @@ async fn handle_once(context: Context) -> anyhow::Result<()> {
 }
 
 async fn run_worker_cycle(context: Context) -> anyhow::Result<()> {
+    debug!("starting worker cycle pre-flight");
+
+    debug!("acquiring database context");
     let db = context.db().await?;
+    debug!("database context ready");
+
+    debug!("acquiring messaging context");
     let mq = context.mq().await?;
+    debug!("messaging context ready");
+
+    debug!("attempting to consume worker message");
 
     let Some(message) = mq.consume_worker_message().await? else {
         info!("no worker messages available");
+        debug!("worker cycle complete with no message");
         return Ok(());
     };
+
+    debug!(delivery_tag = message.delivery_tag, "consumed worker message");
 
     let payload = match serde_json::from_value::<ChunkReadyMessage>(message.payload.clone()) {
         Ok(payload) => payload,
         Err(err) => {
             mq.ack(message.delivery_tag).await?;
             warn!(error = %err, "dropping invalid chunk-ready message payload");
+            debug!(delivery_tag = message.delivery_tag, "invalid message acknowledged and dropped");
             return Ok(());
         }
     };
+
+    debug!(
+        run_id = %payload.run_id,
+        chunk_id = %payload.chunk_id,
+        "parsed chunk-ready message payload"
+    );
 
     let Some(chunk) =
         chunk_processing::claim_chunk_for_processing(db, payload.chunk_id, CHUNK_LEASE_SECONDS)
@@ -102,8 +122,17 @@ async fn run_worker_cycle(context: Context) -> anyhow::Result<()> {
             run_id = %payload.run_id,
             "chunk not claimable; acknowledging message"
         );
+        debug!(delivery_tag = message.delivery_tag, "unclaimable chunk message acknowledged");
         return Ok(());
     };
+
+    debug!(
+        run_id = %chunk.run_id,
+        chunk_id = %chunk.id,
+        ordinal_start = chunk.ordinal_start,
+        ordinal_end = chunk.ordinal_end,
+        "claimed chunk for processing"
+    );
 
     let batch_result = chunk_processing::load_chunk_case_batch(db, &chunk).await;
     match batch_result {
@@ -116,6 +145,11 @@ async fn run_worker_cycle(context: Context) -> anyhow::Result<()> {
                 case_count = cases.len(),
                 "loaded case batch from queue chunk"
             );
+            debug!(
+                delivery_tag = message.delivery_tag,
+                chunk_id = %chunk.id,
+                "chunk processing complete; message acknowledged"
+            );
             Ok(())
         }
         Err(err) => {
@@ -126,6 +160,11 @@ async fn run_worker_cycle(context: Context) -> anyhow::Result<()> {
                 chunk_id = %chunk.id,
                 error = %err,
                 "failed to load chunk case batch; message requeued"
+            );
+            debug!(
+                delivery_tag = message.delivery_tag,
+                chunk_id = %chunk.id,
+                "chunk processing failed; message requeued"
             );
             Ok(())
         }
