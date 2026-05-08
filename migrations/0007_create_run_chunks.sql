@@ -18,6 +18,8 @@ CREATE TABLE run_chunks (
 
 CREATE INDEX idx_run_chunks_run_status ON run_chunks(run_id, status);
 
+CREATE INDEX idx_run_chunks_status_leased_until ON run_chunks(status, leased_until);
+
 COMMENT ON TABLE run_chunks IS
     'Chunk-level scheduling units for run processing. Workers lease chunks and process dataset ordinals in bounded ranges.';
 

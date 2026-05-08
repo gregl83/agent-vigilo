@@ -64,6 +64,10 @@ CREATE TABLE runs (
 
 CREATE INDEX idx_runs_status ON runs(status);
 
+CREATE INDEX idx_runs_status_created_at ON runs(status, created_at);
+
+CREATE INDEX idx_runs_status_updated_at ON runs(status, updated_at);
+
 CREATE INDEX idx_runs_gate_status ON runs(gate_status);
 
 CREATE INDEX idx_runs_dataset ON runs(dataset_id, dataset_version);

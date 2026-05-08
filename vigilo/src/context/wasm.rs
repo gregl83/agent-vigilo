@@ -910,6 +910,15 @@ impl Wasm {
         input: EvaluatorInput,
     ) -> anyhow::Result<EvaluatorOutput> {
         let component = component::Component::new(&self.engine, wasm_bytes)?;
+        self.test_evaluator_component(&component, input)
+    }
+
+    /// Run evaluator in test mode using a precompiled component.
+    pub fn test_evaluator_component(
+        &self,
+        component: &component::Component,
+        input: EvaluatorInput,
+    ) -> anyhow::Result<EvaluatorOutput> {
         let mut linker = component::Linker::new(&self.engine);
 
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
@@ -927,7 +936,7 @@ impl Wasm {
             },
         );
         let bindings =
-            evaluator_test_bindings::EvaluatorWorld::instantiate(&mut store, &component, &linker)?;
+            evaluator_test_bindings::EvaluatorWorld::instantiate(&mut store, component, &linker)?;
 
         let input = map_input_to_wit_input(input)?;
 

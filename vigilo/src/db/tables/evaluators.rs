@@ -5,8 +5,62 @@ use crate::models::evaluator::{
     Evaluator,
     EvaluatorDraft,
     EvaluatorPatch,
+    EvaluatorState,
     EvaluatorSummary,
 };
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub(crate) struct EvaluatorRuntimeMetadata {
+    pub(crate) namespace: String,
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) id: Uuid,
+    pub(crate) state: EvaluatorState,
+    pub(crate) interface_version: Option<String>,
+    pub(crate) runtime_version: String,
+}
+
+pub(crate) async fn select_evaluator_runtime_metadata_by_identities(
+    db: &PgPool,
+    identities: &[(String, String, String)],
+) -> anyhow::Result<Vec<EvaluatorRuntimeMetadata>> {
+    if identities.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let namespaces = identities.iter().map(|v| v.0.clone()).collect::<Vec<_>>();
+    let names = identities.iter().map(|v| v.1.clone()).collect::<Vec<_>>();
+    let versions = identities.iter().map(|v| v.2.clone()).collect::<Vec<_>>();
+
+    let rows = sqlx::query_as::<_, EvaluatorRuntimeMetadata>(
+        r#"
+        WITH requested AS (
+            SELECT *
+            FROM unnest($1::text[], $2::text[], $3::text[]) AS r(namespace, name, version)
+        )
+        SELECT
+            e.namespace,
+            e.name,
+            e.version,
+            e.id,
+            e.state,
+            e.interface_version,
+            e.runtime_version
+        FROM requested r
+        JOIN evaluators e
+          ON e.namespace = r.namespace
+         AND e.name = r.name
+         AND e.version = r.version
+        "#,
+    )
+    .bind(namespaces)
+    .bind(names)
+    .bind(versions)
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows)
+}
 
 pub(crate) async fn insert_evaluator(
     db: &PgPool,

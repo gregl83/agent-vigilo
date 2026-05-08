@@ -4,13 +4,17 @@
 //! components, execute case-level evaluation workflows, and acknowledge or
 //! requeue queue messages based on outcome.
 
-use std::time::Duration;
+use std::{
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use clap::{
     Args,
     Subcommand,
 };
+use moka::future::Cache;
 use serde::Deserialize;
 use tracing::{
     debug,
@@ -24,7 +28,6 @@ use crate::{
     context::Context,
     db::{
         tables::{
-            evaluators,
             runs,
         },
         workflows::{
@@ -37,6 +40,8 @@ use crate::{
 
 const WORKER_TICK_SECONDS: u64 = 5;
 const CHUNK_LEASE_SECONDS: i32 = 60;
+const RUN_CATALOG_CACHE_MAX_ENTRIES: u64 = 1024;
+const RUN_CATALOG_CACHE_TTI_SECONDS: u64 = 900;
 
 #[derive(Debug, Deserialize)]
 /// Queue payload that signals a run chunk is ready for processing.
@@ -61,12 +66,21 @@ struct WarmupStats {
 /// Wasmtime components.
 struct EvaluatorLoaderService {
     context: Context,
+    run_catalog_cache: Arc<Cache<Uuid, Arc<execution_processing::RunEvaluatorCatalog>>>,
 }
 
 impl EvaluatorLoaderService {
     /// Creates a loader service bound to the current command context.
     fn new(context: Context) -> Self {
-        Self { context }
+        Self {
+            context,
+            run_catalog_cache: Arc::new(
+                Cache::builder()
+                    .max_capacity(RUN_CATALOG_CACHE_MAX_ENTRIES)
+                    .time_to_idle(Duration::from_secs(RUN_CATALOG_CACHE_TTI_SECONDS))
+                    .build(),
+            ),
+        }
     }
 
     /// Returns a compiled component from cache or loads it from registry.
@@ -80,42 +94,7 @@ impl EvaluatorLoaderService {
         &self,
         evaluator_ref: &str,
     ) -> anyhow::Result<wasmtime::component::Component> {
-        let cache = self.context.reg().await?;
-        if let Some(component) = cache.get(evaluator_ref).await {
-            return Ok(component);
-        }
-
-        let identity =
-            crate::contracts::evaluator_ref::parse_fully_qualified_evaluator(evaluator_ref)?;
-        let db = self.context.db().await?;
-        let evaluator_record = evaluators::select_evaluator(
-            db,
-            &identity.namespace,
-            &identity.name,
-            &identity.version,
-        )
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "evaluator '{}' was not found in registry during worker warmup",
-                evaluator_ref
-            )
-        })?;
-
-        if !execution_processing::is_runnable_evaluator_state(&evaluator_record.state) {
-            anyhow::bail!(
-                "evaluator '{}' is not runnable in state '{:?}'",
-                evaluator_ref,
-                evaluator_record.state
-            );
-        }
-
-        let wasm = self.context.wasm().await?;
-        let component = wasm.compile_component(&evaluator_record.wasm_bytes)?;
-        cache
-            .insert(evaluator_ref.to_string(), component.clone())
-            .await;
-        Ok(component)
+        execution_processing::get_or_load_component(&self.context, evaluator_ref).await
     }
 
     /// Preloads a set of evaluator refs into the registry cache.
@@ -139,16 +118,21 @@ impl EvaluatorLoaderService {
         Ok(stats)
     }
 
-    /// Preloads all evaluator refs declared in the run snapshot profile.
-    async fn warm_run_evaluators(&self, run_id: Uuid) -> anyhow::Result<WarmupStats> {
-        let db = self.context.db().await?;
-        let run = runs::select_run_by_id(db, run_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("run '{}' not found during evaluator warmup", run_id))?;
+    /// Returns a run-scoped evaluator catalog, using cache when available.
+    async fn get_or_build_run_evaluator_catalog(
+        &self,
+        run_id: Uuid,
+        profile: &crate::contracts::run::RunProfile,
+    ) -> anyhow::Result<Arc<execution_processing::RunEvaluatorCatalog>> {
+        if let Some(cached) = self.run_catalog_cache.get(&run_id).await {
+            return Ok(cached);
+        }
 
-        let evaluator_refs =
-            execution_processing::evaluator_refs_from_snapshot(&run.config_snapshot)?;
-        self.warm_refs(&evaluator_refs).await
+        let db = self.context.db().await?;
+        let built = Arc::new(execution_processing::build_run_evaluator_catalog(db, profile).await?);
+
+        self.run_catalog_cache.insert(run_id, built.clone()).await;
+        Ok(built)
     }
 }
 
@@ -189,18 +173,21 @@ impl Executable for Command {
 
 /// Starts the long-running worker loop.
 async fn handle_start(context: Context) -> anyhow::Result<()> {
+    let evaluator_loader = EvaluatorLoaderService::new(context.clone());
     ServiceRunner::new("worker")
         .tick_interval(Duration::from_secs(WORKER_TICK_SECONDS))
         .run_loop(move || {
             let context = context.clone();
-            async move { run_worker_cycle(context).await }
+            let evaluator_loader = evaluator_loader.clone();
+            async move { run_worker_cycle(context, &evaluator_loader).await }
         })
         .await
 }
 
 /// Processes one worker cycle and exits.
 async fn handle_once(context: Context) -> anyhow::Result<()> {
-    run_worker_cycle(context).await
+    let evaluator_loader = EvaluatorLoaderService::new(context.clone());
+    run_worker_cycle(context, &evaluator_loader).await
 }
 
 /// Executes a single worker cycle.
@@ -211,9 +198,10 @@ async fn handle_once(context: Context) -> anyhow::Result<()> {
 /// 3. warm evaluator components from run profile
 /// 4. load chunk case batch and process each case
 /// 5. ack on success, nack+requeue on recoverable failures
-async fn run_worker_cycle(context: Context) -> anyhow::Result<()> {
-    let evaluator_loader = EvaluatorLoaderService::new(context.clone());
-
+async fn run_worker_cycle(
+    context: Context,
+    evaluator_loader: &EvaluatorLoaderService,
+) -> anyhow::Result<()> {
     debug!("starting worker cycle pre-flight");
 
     debug!("acquiring database context");
@@ -281,7 +269,13 @@ async fn run_worker_cycle(context: Context) -> anyhow::Result<()> {
         "claimed chunk for processing"
     );
 
-    match evaluator_loader.warm_run_evaluators(chunk.run_id).await {
+    let run = runs::select_run_by_id(db, chunk.run_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("run '{}' missing while processing chunk", chunk.run_id))?;
+    let run_profile = execution_processing::run_profile_from_snapshot(&run.config_snapshot)?;
+    let evaluator_refs = execution_processing::evaluator_refs_from_profile(&run_profile)?;
+
+    match evaluator_loader.warm_refs(&evaluator_refs).await {
         Ok(stats) => {
             debug!(
                 run_id = %chunk.run_id,
@@ -304,10 +298,9 @@ async fn run_worker_cycle(context: Context) -> anyhow::Result<()> {
         }
     }
 
-    let run = runs::select_run_by_id(db, chunk.run_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("run '{}' missing while processing chunk", chunk.run_id))?;
-    let run_profile = execution_processing::run_profile_from_snapshot(&run.config_snapshot)?;
+    let evaluator_catalog = evaluator_loader
+        .get_or_build_run_evaluator_catalog(chunk.run_id, &run_profile)
+        .await?;
 
     let batch_result = chunk_processing::load_chunk_case_batch(db, &chunk).await;
     match batch_result {
@@ -321,6 +314,7 @@ async fn run_worker_cycle(context: Context) -> anyhow::Result<()> {
                     db,
                     chunk.run_id,
                     &run_profile,
+                    evaluator_catalog.as_ref(),
                     case,
                 )
                 .await;

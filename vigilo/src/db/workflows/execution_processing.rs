@@ -18,13 +18,17 @@ use crate::{
             Severity,
             TestCase,
         },
+        evaluator_ref::parse_fully_qualified_evaluator,
         run::{
             CaseGroupProfile,
             EvaluatorBinding,
             RunProfile,
         },
     },
-    db::tables::evaluators,
+    db::tables::{
+        evaluator_results,
+        evaluators,
+    },
     models::evaluator::EvaluatorState,
 };
 
@@ -39,6 +43,16 @@ struct EvaluatorExecutionRecord {
     reason: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct RunEvaluatorCatalogEntry {
+    pub(crate) evaluator_id: Uuid,
+    pub(crate) evaluator_version: String,
+    pub(crate) evaluator_interface_version: Option<String>,
+    pub(crate) evaluator_runtime_version: Option<String>,
+}
+
+pub(crate) type RunEvaluatorCatalog = BTreeMap<String, RunEvaluatorCatalogEntry>;
+
 #[derive(Debug)]
 pub(crate) struct ProcessedExecution {
     pub(crate) execution_id: Uuid,
@@ -50,15 +64,124 @@ pub(crate) fn evaluator_refs_from_snapshot(
     snapshot: &serde_json::Value,
 ) -> anyhow::Result<Vec<String>> {
     let profile = run_profile_from_snapshot(snapshot)?;
+    evaluator_refs_from_profile(&profile)
+}
 
+pub(crate) fn evaluator_refs_from_profile(profile: &RunProfile) -> anyhow::Result<Vec<String>> {
     let mut unique_refs = BTreeSet::new();
-    for group in profile.case_groups {
-        for binding in group.evaluators {
-            unique_refs.insert(binding.evaluator_ref);
+    for group in &profile.case_groups {
+        for binding in &group.evaluators {
+            unique_refs.insert(binding.evaluator_ref.clone());
         }
     }
 
     Ok(unique_refs.into_iter().collect())
+}
+
+pub(crate) async fn build_run_evaluator_catalog(
+    db: &PgPool,
+    profile: &RunProfile,
+) -> anyhow::Result<RunEvaluatorCatalog> {
+    let evaluator_refs = evaluator_refs_from_profile(profile)?;
+    let parsed = evaluator_refs
+        .iter()
+        .map(|evaluator_ref| {
+            parse_fully_qualified_evaluator(evaluator_ref)
+                .map(|identity| (evaluator_ref.clone(), identity))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let identities = parsed
+        .iter()
+        .map(|(_, identity)| {
+            (
+                identity.namespace.clone(),
+                identity.name.clone(),
+                identity.version.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let fetched =
+        evaluators::select_evaluator_runtime_metadata_by_identities(db, &identities).await?;
+    let fetched_by_identity = fetched
+        .into_iter()
+        .map(|row| {
+            let key = (row.namespace.clone(), row.name.clone(), row.version.clone());
+            (key, row)
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut catalog = BTreeMap::new();
+    for (evaluator_ref, identity) in parsed {
+        let key = (
+            identity.namespace.clone(),
+            identity.name.clone(),
+            identity.version.clone(),
+        );
+
+        let Some(evaluator) = fetched_by_identity.get(&key) else {
+            anyhow::bail!("evaluator '{}' no longer exists", evaluator_ref);
+        };
+
+        if !is_runnable_evaluator_state(&evaluator.state) {
+            anyhow::bail!(
+                "evaluator '{}' is not runnable in state '{:?}'",
+                evaluator_ref,
+                evaluator.state
+            );
+        }
+
+        catalog.insert(
+            evaluator_ref,
+            RunEvaluatorCatalogEntry {
+                evaluator_id: evaluator.id,
+                evaluator_version: evaluator.version.clone(),
+                evaluator_interface_version: evaluator.interface_version.clone(),
+                evaluator_runtime_version: Some(evaluator.runtime_version.clone()),
+            },
+        );
+    }
+
+    Ok(catalog)
+}
+
+pub(crate) async fn get_or_load_component(
+    context: &Context,
+    evaluator_ref: &str,
+) -> anyhow::Result<wasmtime::component::Component> {
+    let cache = context.reg().await?;
+    if let Some(component) = cache.get(evaluator_ref).await {
+        return Ok(component);
+    }
+
+    let identity = parse_fully_qualified_evaluator(evaluator_ref)?;
+    let db = context.db().await?;
+    let evaluator_record =
+        evaluators::select_evaluator(db, &identity.namespace, &identity.name, &identity.version)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "evaluator '{}' was not found in registry during worker execution",
+                    evaluator_ref
+                )
+            })?;
+
+    if !is_runnable_evaluator_state(&evaluator_record.state) {
+        anyhow::bail!(
+            "evaluator '{}' is not runnable in state '{:?}'",
+            evaluator_ref,
+            evaluator_record.state
+        );
+    }
+
+    let wasm = context.wasm().await?;
+    let component = wasm.compile_component(&evaluator_record.wasm_bytes)?;
+    cache
+        .insert(evaluator_ref.to_string(), component.clone())
+        .await;
+
+    Ok(component)
 }
 
 pub(crate) fn run_profile_from_snapshot(
@@ -354,6 +477,7 @@ pub(crate) async fn process_case_execution(
     db: &PgPool,
     run_id: Uuid,
     run_profile: &RunProfile,
+    evaluator_catalog: &RunEvaluatorCatalog,
     case: &chunk_processing::WorkerCaseBatchItem,
 ) -> anyhow::Result<ProcessedExecution> {
     let evaluator_bindings = evaluator_bindings_for_case(run_profile, case);
@@ -412,32 +536,23 @@ pub(crate) async fn process_case_execution(
         let wasm = context.wasm().await?;
 
         let mut records = Vec::with_capacity(evaluator_bindings.len());
+        let mut result_rows = Vec::with_capacity(evaluator_bindings.len());
 
         for binding in &evaluator_bindings {
-            let identity = crate::contracts::evaluator_ref::parse_fully_qualified_evaluator(
-                &binding.evaluator_ref,
-            )?;
-            let evaluator = evaluators::select_evaluator(
-                db,
-                &identity.namespace,
-                &identity.name,
-                &identity.version,
-            )
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!("evaluator '{}' no longer exists", binding.evaluator_ref)
-            })?;
+            let evaluator_entry =
+                evaluator_catalog
+                    .get(&binding.evaluator_ref)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "evaluator '{}' is missing from run evaluator catalog",
+                            binding.evaluator_ref
+                        )
+                    })?;
 
-            if !is_runnable_evaluator_state(&evaluator.state) {
-                anyhow::bail!(
-                    "evaluator '{}' is not runnable in state '{:?}'",
-                    binding.evaluator_ref,
-                    evaluator.state
-                );
-            }
+            let component = get_or_load_component(context, &binding.evaluator_ref).await?;
 
-            let output = wasm.test_evaluator(
-                &evaluator.wasm_bytes,
+            let output = wasm.test_evaluator_component(
+                &component,
                 EvaluatorInput {
                     run_id: run_id.to_string(),
                     execution_id: execution_id.to_string(),
@@ -524,88 +639,34 @@ pub(crate) async fn process_case_execution(
                 ),
             };
 
-            sqlx::query(
-                r#"
-            INSERT INTO evaluator_results (
+            result_rows.push(evaluator_results::EvaluatorResultInsertRow {
                 run_id,
                 execution_id,
                 attempt_id,
-                evaluator_id,
-                evaluator_version,
-                evaluator_profile_id,
-                evaluator_profile_version,
-                evaluator_interface_version,
-                evaluator_runtime_version,
-                dimension,
-                status,
-                blocking,
+                evaluator_id: evaluator_entry.evaluator_id,
+                evaluator_version: evaluator_entry.evaluator_version.clone(),
+                evaluator_profile_id: run_profile.profile_id.clone(),
+                evaluator_profile_version: run_profile.profile_version.clone(),
+                evaluator_interface_version: evaluator_entry.evaluator_interface_version.clone(),
+                evaluator_runtime_version: evaluator_entry.evaluator_runtime_version.clone(),
+                dimension: binding.dimension.clone(),
+                status: status.clone(),
+                blocking: binding.blocking,
                 score_kind,
                 raw_score,
                 raw_score_min,
                 raw_score_max,
                 normalized_score,
-                weight,
+                weight: binding.weight,
                 severity,
-                failure_category,
-                reason,
+                failure_category: failure_category.clone(),
+                reason: reason.clone(),
                 evidence,
-                raw_evaluator_output
-            )
-            VALUES (
-                $1::uuid,
-                $2::uuid,
-                $3::uuid,
-                $4,
-                $5,
-                $6,
-                $7,
-                $8,
-                $9,
-                $10,
-                $11::evaluation_status,
-                $12,
-                $13,
-                $14,
-                $15,
-                $16,
-                $17,
-                $18,
-                $19::severity,
-                $20,
-                $21,
-                $22::jsonb,
-                $23::jsonb
-            )
-                "#,
-            )
-            .bind(run_id)
-            .bind(execution_id)
-            .bind(attempt_id)
-            .bind(evaluator.id.to_string())
-            .bind(&evaluator.version)
-            .bind(&run_profile.profile_id)
-            .bind(&run_profile.profile_version)
-            .bind(&evaluator.interface_version)
-            .bind(&evaluator.runtime_version)
-            .bind(&binding.dimension)
-            .bind(&status)
-            .bind(binding.blocking)
-            .bind(&score_kind)
-            .bind(raw_score)
-            .bind(raw_score_min)
-            .bind(raw_score_max)
-            .bind(normalized_score)
-            .bind(binding.weight)
-            .bind(&severity)
-            .bind(&failure_category)
-            .bind(&reason)
-            .bind(&evidence)
-            .bind(&raw_evaluator_output)
-            .execute(db)
-            .await?;
+                raw_evaluator_output,
+            });
 
             records.push(EvaluatorExecutionRecord {
-                evaluator_id: evaluator.id,
+                evaluator_id: evaluator_entry.evaluator_id,
                 status,
                 dimension: binding.dimension.clone(),
                 normalized_score,
@@ -614,6 +675,8 @@ pub(crate) async fn process_case_execution(
                 reason,
             });
         }
+
+        evaluator_results::insert_evaluator_results_batch(db, &result_rows).await?;
 
         let overall_status = summarize_overall_status(&records);
 
