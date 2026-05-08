@@ -1,3 +1,9 @@
+//! Run management commands.
+//!
+//! This module owns CLI flows for creating, validating, and (eventually)
+//! observing/canceling/exporting runs. It translates profile+dataset inputs
+//! into normalized persistence drafts and run orchestration metadata.
+
 use std::{
     collections::BTreeMap,
     fs,
@@ -41,6 +47,10 @@ use crate::{
 
 const DEFAULT_CHUNK_SIZE: usize = 100;
 
+/// Parsed and typed run inputs loaded from CLI sources.
+///
+/// Keeps both raw payloads (for snapshots) and typed contracts (for validation
+/// and planning) to avoid re-parsing the same input content.
 struct ParsedRunInputs {
     profile_payload: Value,
     dataset_payload: Value,
@@ -48,6 +58,9 @@ struct ParsedRunInputs {
     dataset: RunDataset,
 }
 
+/// Reads a YAML/JSON payload from either inline text or a file path.
+///
+/// Exactly one source must be provided.
 fn read_inline_or_file(
     inline: Option<String>,
     file: Option<PathBuf>,
@@ -65,11 +78,15 @@ fn read_inline_or_file(
     }
 }
 
+/// Parses YAML or JSON text into a generic JSON value.
 fn parse_structured_payload(raw: &str, field: &str) -> anyhow::Result<Value> {
     serde_yaml::from_str::<Value>(raw)
         .map_err(|err| anyhow::anyhow!("invalid {} payload (yaml/json expected): {}", field, err))
 }
 
+/// Converts JSON objects into deterministic key order recursively.
+///
+/// This ensures stable hashing and snapshot serialization.
 fn canonical_json(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
@@ -90,6 +107,7 @@ fn canonical_json(value: &Value) -> Value {
     }
 }
 
+/// Hashes a JSON value after serialization using BLAKE3.
 fn hash_json(value: &Value) -> anyhow::Result<String> {
     let bytes = serde_json::to_vec(value)?;
     let mut hasher = Hasher::new();
@@ -97,12 +115,18 @@ fn hash_json(value: &Value) -> anyhow::Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+/// Sorts tags lexicographically for deterministic storage and hashing.
 fn canonical_tags(tags: &[String]) -> Value {
     let mut ordered = tags.to_vec();
     ordered.sort();
     Value::Array(ordered.into_iter().map(Value::String).collect())
 }
 
+/// Builds case blob and dataset membership drafts from a parsed run dataset.
+///
+/// Returns:
+/// - case blob rows keyed by `case_hash`
+/// - dataset-version membership rows preserving case order
 fn build_case_plans(
     dataset: &RunDataset,
 ) -> anyhow::Result<(Vec<CaseBlobDraft>, Vec<DatasetVersionCaseDraft>)> {
@@ -147,6 +171,7 @@ fn build_case_plans(
     Ok((case_blobs, dataset_cases))
 }
 
+/// Computes a deterministic dataset version id from logical membership.
 fn compute_dataset_version_id(
     dataset: &RunDataset,
     dataset_cases: &[DatasetVersionCaseDraft],
@@ -169,6 +194,7 @@ fn compute_dataset_version_id(
     }))
 }
 
+/// Computes the hash used to version aggregation behavior from profile groups.
 fn compute_aggregation_policy_hash(profile: &RunProfile) -> anyhow::Result<String> {
     let groups = profile
         .case_groups
@@ -184,6 +210,7 @@ fn compute_aggregation_policy_hash(profile: &RunProfile) -> anyhow::Result<Strin
     hash_json(&json!({ "case_groups": groups }))
 }
 
+/// Builds run chunk drafts from total case count and requested chunk size.
 fn build_chunks(total_cases: usize, chunk_size: usize) -> Vec<RunChunkDraft> {
     let mut chunks = Vec::new();
     let mut start = 0usize;
@@ -202,6 +229,7 @@ fn build_chunks(total_cases: usize, chunk_size: usize) -> Vec<RunChunkDraft> {
     chunks
 }
 
+/// Loads and validates profile/dataset input sources into typed contracts.
 fn load_run_inputs(
     profile: Option<String>,
     profile_file: Option<PathBuf>,
@@ -227,6 +255,10 @@ fn load_run_inputs(
     })
 }
 
+/// Implements `vigilo run create`.
+///
+/// This flow validates executability, creates case/dataset/run drafts, inserts
+/// all required rows in one transaction, and emits a machine-readable summary.
 async fn handle_create(
     context: Context,
     profile: Option<String>,
@@ -353,6 +385,10 @@ async fn handle_create(
     Ok(())
 }
 
+/// Implements `vigilo run test`.
+///
+/// This command performs schema + executability validation and echoes parsed
+/// contracts for local inspection without creating persistence records.
 async fn handle_test(
     context: Context,
     profile: Option<String>,
@@ -391,6 +427,11 @@ async fn handle_test(
 }
 
 #[derive(Debug, Subcommand)]
+/// Run command operations.
+///
+/// `Create` and `Test` are implemented. Operational commands (`Watch`,
+/// `Status`, `Cancel`, `Results`, `Export`) are reserved and currently return
+/// explicit not-implemented errors.
 pub(crate) enum SubCommand {
     /// Create a run from profile + dataset inputs
     Create {
@@ -506,6 +547,7 @@ pub(crate) enum SubCommand {
 }
 
 #[derive(Debug, Args)]
+/// Arguments for `vigilo run`.
 pub(crate) struct Command {
     #[command(subcommand)]
     pub command: Option<SubCommand>,
@@ -513,6 +555,8 @@ pub(crate) struct Command {
 
 #[async_trait]
 impl Executable for Command {
+    /// Dispatches run subcommands and emits explicit TODO errors for reserved
+    /// subcommands that are not implemented yet.
     async fn exec(self, context: Context) -> anyhow::Result<()> {
         match self.command {
             Some(SubCommand::Create {

@@ -1,3 +1,8 @@
+//! Evaluator registry commands.
+//!
+//! This module provides publish, search, inspect, test, and state-management
+//! operations for evaluator artifacts stored in the registry.
+
 use std::{
     fs,
     path::PathBuf,
@@ -39,6 +44,10 @@ const DEFAULT_NAMESPACE: &str = "vigilo";
 const DEFAULT_SEARCH_LIMIT: i64 = 10;
 const MAX_SEARCH_LIMIT: i64 = 20;
 
+/// Resolves the build profile used when preparing an evaluator package.
+///
+/// `--release` always maps to `release`; otherwise an explicit profile is used
+/// with `dev` fallback.
 fn get_manifest_profile(release: bool, profile: Option<String>) -> String {
     match release {
         true => "release".to_string(),
@@ -47,6 +56,7 @@ fn get_manifest_profile(release: bool, profile: Option<String>) -> String {
 }
 
 #[derive(Debug, Subcommand)]
+/// Evaluator command operations.
 pub(crate) enum SubCommand {
     /// Publish evaluator version
     Publish {
@@ -127,6 +137,7 @@ pub(crate) enum SubCommand {
 
 #[async_trait]
 impl Executable for SubCommand {
+    /// Executes one evaluator operation against runtime + persistence context.
     async fn exec(self, context: Context) -> anyhow::Result<()> {
         match self {
             SubCommand::Publish {
@@ -370,6 +381,10 @@ impl Executable for SubCommand {
 }
 
 #[derive(Debug, Args)]
+/// Arguments for `vigilo evaluators`.
+///
+/// If no subcommand is provided, the command lists evaluator versions in the
+/// default namespace.
 pub(crate) struct Command {
     #[command(subcommand)]
     pub command: Option<SubCommand>,
@@ -377,6 +392,7 @@ pub(crate) struct Command {
 
 #[async_trait]
 impl Executable for Command {
+    /// Dispatches evaluator subcommands or falls back to list behavior.
     async fn exec(self, context: Context) -> anyhow::Result<()> {
         match self.command {
             Some(subcommand) => subcommand.exec(context).await,

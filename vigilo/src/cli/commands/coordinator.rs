@@ -1,3 +1,10 @@
+//! Coordinator process command.
+//!
+//! The coordinator drives run-level orchestration:
+//! - dispatches pending runs into chunk-ready events
+//! - finalizes runs whose chunks/executions are terminal
+//! - publishes outbox events to messaging
+
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -33,6 +40,7 @@ const OUTBOX_LEASE_SECONDS: i32 = 30;
 const OUTBOX_RETRY_DELAY_SECONDS: i32 = 10;
 
 #[derive(Debug, Subcommand)]
+/// Coordinator execution modes.
 pub(crate) enum SubCommand {
     /// Start a coordinator process
     Start,
@@ -42,6 +50,11 @@ pub(crate) enum SubCommand {
 }
 
 #[derive(Debug, Args)]
+/// Arguments for `vigilo coordinator`.
+///
+/// The command requires a subcommand:
+/// - `start` runs the loop continuously
+/// - `once` executes one orchestration cycle and exits
 pub(crate) struct Command {
     #[command(subcommand)]
     pub command: Option<SubCommand>,
@@ -49,6 +62,7 @@ pub(crate) struct Command {
 
 #[async_trait]
 impl Executable for Command {
+    /// Executes the selected coordinator mode.
     async fn exec(self, context: Context) -> anyhow::Result<()> {
         match self.command {
             Some(SubCommand::Start) => {
@@ -64,7 +78,9 @@ impl Executable for Command {
     }
 }
 
+/// Starts the long-running coordinator loop.
 async fn handle_start(context: Context) -> anyhow::Result<()> {
+    // One logical coordinator id is reused across loop iterations.
     let coordinator_id = Uuid::now_v7().to_string();
     ServiceRunner::new("coordinator")
         .tick_interval(Duration::from_secs(COORDINATOR_TICK_SECONDS))
@@ -76,11 +92,20 @@ async fn handle_start(context: Context) -> anyhow::Result<()> {
         .await
 }
 
+/// Runs a single coordinator cycle with a fresh coordinator id.
+///
+/// Useful for cron-like orchestration or local debugging.
 async fn handle_once(context: Context) -> anyhow::Result<()> {
     let coordinator_id = Uuid::now_v7().to_string();
     run_coordinator_cycle(context, &coordinator_id).await
 }
 
+/// Executes one full coordinator cycle.
+///
+/// The cycle is intentionally ordered to keep run progression deterministic:
+/// 1. claim/dispatch one pending run
+/// 2. claim/finalize one finalizable run
+/// 3. publish a bounded batch of pending outbox events
 async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow::Result<()> {
     debug!(coordinator_id, "starting coordinator cycle pre-flight");
 

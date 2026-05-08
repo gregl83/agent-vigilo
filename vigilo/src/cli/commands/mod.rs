@@ -1,3 +1,9 @@
+//! Root command router for the `vigilo` CLI.
+//!
+//! This module owns the top-level command enum used by clap and delegates
+//! execution to feature-specific command modules (`run`, `evaluators`,
+//! `coordinator`, `worker`, `setup`).
+
 use async_trait::async_trait;
 use clap::Subcommand;
 
@@ -15,6 +21,9 @@ use super::{
 };
 
 #[derive(Debug, Subcommand)]
+/// Top-level CLI commands exposed by `vigilo`.
+///
+/// Each variant wraps a subcommand module that implements [`Executable`].
 pub(crate) enum Command {
     /// Run system setup (install or upgrade)
     Setup(setup::Command),
@@ -34,6 +43,7 @@ pub(crate) enum Command {
 
 #[async_trait]
 impl Executable for Command {
+    /// Dispatches the selected top-level command to its concrete handler.
     async fn exec(self, context: Context) -> anyhow::Result<()> {
         match self {
             Command::Coordinator(cmd) => cmd.exec(context).await,

@@ -1,3 +1,9 @@
+//! Worker process command.
+//!
+//! Workers consume chunk-ready queue messages, claim work, warm evaluator
+//! components, execute case-level evaluation workflows, and acknowledge or
+//! requeue queue messages based on outcome.
+
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -33,12 +39,14 @@ const WORKER_TICK_SECONDS: u64 = 5;
 const CHUNK_LEASE_SECONDS: i32 = 60;
 
 #[derive(Debug, Deserialize)]
+/// Queue payload that signals a run chunk is ready for processing.
 struct ChunkReadyMessage {
     run_id: Uuid,
     chunk_id: Uuid,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
+/// Summary of evaluator cache warmup performed before processing a chunk.
 struct WarmupStats {
     requested: usize,
     cache_hits: usize,
@@ -46,15 +54,28 @@ struct WarmupStats {
 }
 
 #[derive(Clone)]
+/// Worker-local helper that resolves evaluator components into runtime cache.
+///
+/// This service is intentionally lightweight and command-scoped. It validates
+/// evaluator identifiers and state before compiling WASM bytes into cached
+/// Wasmtime components.
 struct EvaluatorLoaderService {
     context: Context,
 }
 
 impl EvaluatorLoaderService {
+    /// Creates a loader service bound to the current command context.
     fn new(context: Context) -> Self {
         Self { context }
     }
 
+    /// Returns a compiled component from cache or loads it from registry.
+    ///
+    /// Errors if:
+    /// - evaluator ref format is invalid
+    /// - evaluator does not exist
+    /// - evaluator is in a non-runnable state
+    /// - WASM compilation fails
     async fn get_or_load(
         &self,
         evaluator_ref: &str,
@@ -97,6 +118,7 @@ impl EvaluatorLoaderService {
         Ok(component)
     }
 
+    /// Preloads a set of evaluator refs into the registry cache.
     async fn warm_refs(&self, evaluator_refs: &[String]) -> anyhow::Result<WarmupStats> {
         let mut stats = WarmupStats {
             requested: evaluator_refs.len(),
@@ -117,6 +139,7 @@ impl EvaluatorLoaderService {
         Ok(stats)
     }
 
+    /// Preloads all evaluator refs declared in the run snapshot profile.
     async fn warm_run_evaluators(&self, run_id: Uuid) -> anyhow::Result<WarmupStats> {
         let db = self.context.db().await?;
         let run = runs::select_run_by_id(db, run_id)
@@ -130,6 +153,7 @@ impl EvaluatorLoaderService {
 }
 
 #[derive(Debug, Subcommand)]
+/// Worker execution modes.
 pub(crate) enum SubCommand {
     /// Start a worker process
     Start,
@@ -139,6 +163,7 @@ pub(crate) enum SubCommand {
 }
 
 #[derive(Debug, Args)]
+/// Arguments for `vigilo worker`.
 pub(crate) struct Command {
     #[command(subcommand)]
     pub command: Option<SubCommand>,
@@ -146,6 +171,7 @@ pub(crate) struct Command {
 
 #[async_trait]
 impl Executable for Command {
+    /// Executes the selected worker mode.
     async fn exec(self, context: Context) -> anyhow::Result<()> {
         match self.command {
             Some(SubCommand::Start) => {
@@ -161,6 +187,7 @@ impl Executable for Command {
     }
 }
 
+/// Starts the long-running worker loop.
 async fn handle_start(context: Context) -> anyhow::Result<()> {
     ServiceRunner::new("worker")
         .tick_interval(Duration::from_secs(WORKER_TICK_SECONDS))
@@ -171,10 +198,19 @@ async fn handle_start(context: Context) -> anyhow::Result<()> {
         .await
 }
 
+/// Processes one worker cycle and exits.
 async fn handle_once(context: Context) -> anyhow::Result<()> {
     run_worker_cycle(context).await
 }
 
+/// Executes a single worker cycle.
+///
+/// Cycle sequence:
+/// 1. consume queue message
+/// 2. parse payload and claim chunk lease
+/// 3. warm evaluator components from run profile
+/// 4. load chunk case batch and process each case
+/// 5. ack on success, nack+requeue on recoverable failures
 async fn run_worker_cycle(context: Context) -> anyhow::Result<()> {
     let evaluator_loader = EvaluatorLoaderService::new(context.clone());
 
