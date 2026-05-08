@@ -1,10 +1,14 @@
-use std::collections::{
-    BTreeMap,
-    BTreeSet,
+use std::{
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
+    time::Instant,
 };
 
 use serde_json::json;
 use sqlx::PgPool;
+use tracing::debug;
 use uuid::Uuid;
 
 use super::chunk_processing;
@@ -150,36 +154,47 @@ pub(crate) async fn get_or_load_component(
     context: &Context,
     evaluator_ref: &str,
 ) -> anyhow::Result<wasmtime::component::Component> {
-    let cache = context.reg().await?;
-    if let Some(component) = cache.get(evaluator_ref).await {
-        return Ok(component);
-    }
-
-    let identity = parse_fully_qualified_evaluator(evaluator_ref)?;
-    let db = context.db().await?;
-    let evaluator_record =
-        evaluators::select_evaluator(db, &identity.namespace, &identity.name, &identity.version)
+    let context = context.clone();
+    let evaluator_ref_owned = evaluator_ref.to_string();
+    let evaluator_ref_for_closure = evaluator_ref_owned.clone();
+    let cache = context.reg().await?.clone();
+    let component = cache
+        .try_get_with(evaluator_ref_owned.clone(), async move {
+            let identity = parse_fully_qualified_evaluator(&evaluator_ref_for_closure)?;
+            let db = context.db().await?;
+            let evaluator_record = evaluators::select_evaluator(
+                db,
+                &identity.namespace,
+                &identity.name,
+                &identity.version,
+            )
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "evaluator '{}' was not found in registry during worker execution",
-                    evaluator_ref
+                    evaluator_ref_for_closure
                 )
             })?;
 
-    if !is_runnable_evaluator_state(&evaluator_record.state) {
-        anyhow::bail!(
-            "evaluator '{}' is not runnable in state '{:?}'",
-            evaluator_ref,
-            evaluator_record.state
-        );
-    }
+            if !is_runnable_evaluator_state(&evaluator_record.state) {
+                anyhow::bail!(
+                    "evaluator '{}' is not runnable in state '{:?}'",
+                    evaluator_ref_for_closure,
+                    evaluator_record.state
+                );
+            }
 
-    let wasm = context.wasm().await?;
-    let component = wasm.compile_component(&evaluator_record.wasm_bytes)?;
-    cache
-        .insert(evaluator_ref.to_string(), component.clone())
-        .await;
+            let wasm = context.wasm().await?;
+            wasm.compile_component(&evaluator_record.wasm_bytes)
+        })
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "single-flight component load failed for evaluator '{}': {}",
+                evaluator_ref_owned,
+                err
+            )
+        })?;
 
     Ok(component)
 }
@@ -305,7 +320,7 @@ fn make_agent_output(case: &chunk_processing::WorkerCaseBatchItem) -> AgentOutpu
 }
 
 async fn upsert_execution_for_case(
-    db: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_id: Uuid,
     run_profile: &RunProfile,
     case: &chunk_processing::WorkerCaseBatchItem,
@@ -384,14 +399,14 @@ async fn upsert_execution_for_case(
     .bind(&run_profile.profile_version)
     .bind(&evaluator_manifest)
     .bind(i32::try_from(evaluator_bindings.len())?)
-    .fetch_one(db)
+    .fetch_one(&mut **tx)
     .await?;
 
     Ok((row.id, row.current_attempt_no))
 }
 
 async fn mark_attempt_failed(
-    db: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     execution_id: Uuid,
     attempt_id: Uuid,
     attempt_no: i32,
@@ -409,7 +424,7 @@ async fn mark_attempt_failed(
     )
     .bind(attempt_id)
     .bind(error_message)
-    .execute(db)
+    .execute(&mut **tx)
     .await?;
 
     sqlx::query(
@@ -428,7 +443,7 @@ async fn mark_attempt_failed(
     .bind(attempt_no)
     .bind(attempt_id)
     .bind(error_message)
-    .execute(db)
+    .execute(&mut **tx)
     .await?;
 
     Ok(())
@@ -488,49 +503,73 @@ pub(crate) async fn process_case_execution(
         );
     }
 
-    let (execution_id, current_attempt_no) =
-        upsert_execution_for_case(db, run_id, run_profile, case, &evaluator_bindings).await?;
-    let attempt_no = current_attempt_no + 1;
+    let setup_started = Instant::now();
 
-    #[derive(sqlx::FromRow)]
-    struct AttemptIdentity {
-        id: Uuid,
-    }
+    let (execution_id, attempt_id, attempt_no) = {
+        let mut tx = db.begin().await?;
 
-    let attempt = sqlx::query_as::<_, AttemptIdentity>(
-        r#"
-        INSERT INTO execution_attempts (execution_id, run_id, attempt_no, status, created_at, updated_at)
-        VALUES ($1::uuid, $2::uuid, $3, 'running'::attempt_status, now(), now())
-        RETURNING id
-        "#,
-    )
-    .bind(execution_id)
-    .bind(run_id)
-    .bind(attempt_no)
-    .fetch_one(db)
-    .await?;
+        let (execution_id, current_attempt_no) =
+            upsert_execution_for_case(&mut tx, run_id, run_profile, case, &evaluator_bindings)
+                .await?;
+        let attempt_no = current_attempt_no + 1;
 
-    let attempt_id = attempt.id;
+        #[derive(sqlx::FromRow)]
+        struct AttemptIdentity {
+            id: Uuid,
+        }
 
-    sqlx::query(
-        r#"
-        UPDATE executions
-        SET status = 'running'::execution_status,
-            current_attempt_no = $2,
-            current_attempt_id = $3::uuid,
-            last_error_message = NULL,
-            started_at = COALESCE(started_at, now()),
-            updated_at = now()
-        WHERE id = $1::uuid
-        "#,
-    )
-    .bind(execution_id)
-    .bind(attempt_no)
-    .bind(attempt_id)
-    .execute(db)
-    .await?;
+        let attempt = sqlx::query_as::<_, AttemptIdentity>(
+            r#"
+            INSERT INTO execution_attempts (execution_id, run_id, attempt_no, status, created_at, updated_at)
+            VALUES ($1::uuid, $2::uuid, $3, 'running'::attempt_status, now(), now())
+            RETURNING id
+            "#,
+        )
+        .bind(execution_id)
+        .bind(run_id)
+        .bind(attempt_no)
+        .fetch_one(&mut *tx)
+        .await?;
 
-    let operation_result: anyhow::Result<ProcessedExecution> = async {
+        let attempt_id = attempt.id;
+
+        sqlx::query(
+            r#"
+            UPDATE executions
+            SET status = 'running'::execution_status,
+                current_attempt_no = $2,
+                current_attempt_id = $3::uuid,
+                last_error_message = NULL,
+                started_at = COALESCE(started_at, now()),
+                updated_at = now()
+            WHERE id = $1::uuid
+            "#,
+        )
+        .bind(execution_id)
+        .bind(attempt_no)
+        .bind(attempt_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        (execution_id, attempt.id, attempt_no)
+    };
+
+    debug!(
+        run_id = %run_id,
+        case_id = %case.case_id,
+        execution_id = %execution_id,
+        attempt_id = %attempt_id,
+        setup_ms = setup_started.elapsed().as_millis() as u64,
+        "initialized execution attempt"
+    );
+
+    let runtime_started = Instant::now();
+
+    let evaluation_result: anyhow::Result<(
+        Vec<EvaluatorExecutionRecord>,
+        Vec<evaluator_results::EvaluatorResultInsertRow>,
+    )> = async {
         let test_case = make_test_case(case)?;
         let agent_output = make_agent_output(case);
         let wasm = context.wasm().await?;
@@ -676,154 +715,187 @@ pub(crate) async fn process_case_execution(
             });
         }
 
-        evaluator_results::insert_evaluator_results_batch(db, &result_rows).await?;
-
-        let overall_status = summarize_overall_status(&records);
-
-        let mut by_dimension: BTreeMap<String, (f64, usize)> = BTreeMap::new();
-        for record in &records {
-            if let Some(score) = record.normalized_score {
-                let entry = by_dimension
-                    .entry(record.dimension.clone())
-                    .or_insert((0.0, 0));
-                entry.0 += score;
-                entry.1 += 1;
-            }
-        }
-
-        let mut dimension_scores = serde_json::Map::new();
-        for (dimension, (score_sum, score_count)) in by_dimension {
-            if score_count > 0 {
-                dimension_scores.insert(dimension, json!(score_sum / score_count as f64));
-            }
-        }
-
-        let blocking_failures = records
-            .iter()
-            .filter(|record| {
-                record.blocking && (record.status == "failed" || record.status == "error")
-            })
-            .map(|record| {
-                json!({
-                    "evaluator_id": record.evaluator_id,
-                    "dimension": record.dimension,
-                    "status": record.status,
-                    "failure_category": record.failure_category,
-                    "reason": record.reason,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let aggregate_score = {
-            let scores: Vec<f64> = records
-                .iter()
-                .filter_map(|record| record.normalized_score)
-                .collect();
-            if scores.is_empty() {
-                None
-            } else {
-                Some(scores.iter().sum::<f64>() / scores.len() as f64)
-            }
-        };
-
-        sqlx::query(
-            r#"
-        INSERT INTO execution_aggregates (
-            execution_id,
-            run_id,
-            attempt_id,
-            overall_status,
-            aggregate_score,
-            evaluator_result_count,
-            dimension_scores,
-            blocking_failures,
-            summary,
-            updated_at
-        )
-        VALUES (
-            $1::uuid,
-            $2::uuid,
-            $3::uuid,
-            $4::evaluation_status,
-            $5,
-            $6,
-            $7::jsonb,
-            $8::jsonb,
-            $9::jsonb,
-            now()
-        )
-        ON CONFLICT (execution_id) DO UPDATE
-        SET attempt_id = EXCLUDED.attempt_id,
-            overall_status = EXCLUDED.overall_status,
-            aggregate_score = EXCLUDED.aggregate_score,
-            evaluator_result_count = EXCLUDED.evaluator_result_count,
-            dimension_scores = EXCLUDED.dimension_scores,
-            blocking_failures = EXCLUDED.blocking_failures,
-            summary = EXCLUDED.summary,
-            updated_at = now()
-        "#,
-        )
-        .bind(execution_id)
-        .bind(run_id)
-        .bind(attempt_id)
-        .bind(&overall_status)
-        .bind(aggregate_score)
-        .bind(i32::try_from(records.len())?)
-        .bind(serde_json::Value::Object(dimension_scores))
-        .bind(serde_json::Value::Array(blocking_failures))
-        .bind(json!({
-            "attempt_id": attempt_id,
-            "result_count": records.len(),
-            "overall_status": overall_status,
-        }))
-        .execute(db)
-        .await?;
-
-        sqlx::query(
-            r#"
-        UPDATE execution_attempts
-        SET status = 'completed'::attempt_status,
-            error_message = NULL,
-            completed_at = now(),
-            updated_at = now()
-        WHERE id = $1::uuid
-        "#,
-        )
-        .bind(attempt_id)
-        .execute(db)
-        .await?;
-
-        sqlx::query(
-            r#"
-        UPDATE executions
-        SET status = 'completed'::execution_status,
-            current_attempt_no = $2,
-            current_attempt_id = $3::uuid,
-            last_error_message = NULL,
-            completed_at = now(),
-            updated_at = now()
-        WHERE id = $1::uuid
-        "#,
-        )
-        .bind(execution_id)
-        .bind(attempt_no)
-        .bind(attempt_id)
-        .execute(db)
-        .await?;
-
-        Ok(ProcessedExecution {
-            execution_id,
-            attempt_id,
-            result_count: records.len(),
-        })
+        Ok((records, result_rows))
     }
     .await;
 
-    match operation_result {
-        Ok(processed) => Ok(processed),
+    match evaluation_result {
+        Ok((records, result_rows)) => {
+            let runtime_ms = runtime_started.elapsed().as_millis() as u64;
+            let persistence_started = Instant::now();
+
+            let mut tx = db.begin().await?;
+
+            let inserted_count =
+                evaluator_results::insert_evaluator_results_batch(&mut tx, &result_rows).await?;
+            let replay_conflicts = result_rows.len().saturating_sub(inserted_count as usize);
+
+            let overall_status = summarize_overall_status(&records);
+
+            let mut by_dimension: BTreeMap<String, (f64, usize)> = BTreeMap::new();
+            for record in &records {
+                if let Some(score) = record.normalized_score {
+                    let entry = by_dimension
+                        .entry(record.dimension.clone())
+                        .or_insert((0.0, 0));
+                    entry.0 += score;
+                    entry.1 += 1;
+                }
+            }
+
+            let mut dimension_scores = serde_json::Map::new();
+            for (dimension, (score_sum, score_count)) in by_dimension {
+                if score_count > 0 {
+                    dimension_scores.insert(dimension, json!(score_sum / score_count as f64));
+                }
+            }
+
+            let blocking_failures = records
+                .iter()
+                .filter(|record| {
+                    record.blocking && (record.status == "failed" || record.status == "error")
+                })
+                .map(|record| {
+                    json!({
+                        "evaluator_id": record.evaluator_id,
+                        "dimension": record.dimension,
+                        "status": record.status,
+                        "failure_category": record.failure_category,
+                        "reason": record.reason,
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let aggregate_score = {
+                let scores: Vec<f64> = records
+                    .iter()
+                    .filter_map(|record| record.normalized_score)
+                    .collect();
+                if scores.is_empty() {
+                    None
+                } else {
+                    Some(scores.iter().sum::<f64>() / scores.len() as f64)
+                }
+            };
+
+            sqlx::query(
+                r#"
+            INSERT INTO execution_aggregates (
+                execution_id,
+                run_id,
+                attempt_id,
+                overall_status,
+                aggregate_score,
+                evaluator_result_count,
+                dimension_scores,
+                blocking_failures,
+                summary,
+                updated_at
+            )
+            VALUES (
+                $1::uuid,
+                $2::uuid,
+                $3::uuid,
+                $4::evaluation_status,
+                $5,
+                $6,
+                $7::jsonb,
+                $8::jsonb,
+                $9::jsonb,
+                now()
+            )
+            ON CONFLICT (execution_id) DO UPDATE
+            SET attempt_id = EXCLUDED.attempt_id,
+                overall_status = EXCLUDED.overall_status,
+                aggregate_score = EXCLUDED.aggregate_score,
+                evaluator_result_count = EXCLUDED.evaluator_result_count,
+                dimension_scores = EXCLUDED.dimension_scores,
+                blocking_failures = EXCLUDED.blocking_failures,
+                summary = EXCLUDED.summary,
+                updated_at = now()
+            "#,
+            )
+            .bind(execution_id)
+            .bind(run_id)
+            .bind(attempt_id)
+            .bind(&overall_status)
+            .bind(aggregate_score)
+            .bind(i32::try_from(records.len())?)
+            .bind(serde_json::Value::Object(dimension_scores))
+            .bind(serde_json::Value::Array(blocking_failures))
+            .bind(json!({
+                "attempt_id": attempt_id,
+                "result_count": records.len(),
+                "overall_status": overall_status,
+            }))
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                r#"
+            UPDATE execution_attempts
+            SET status = 'completed'::attempt_status,
+                error_message = NULL,
+                completed_at = now(),
+                updated_at = now()
+            WHERE id = $1::uuid
+            "#,
+            )
+            .bind(attempt_id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                r#"
+            UPDATE executions
+            SET status = 'completed'::execution_status,
+                current_attempt_no = $2,
+                current_attempt_id = $3::uuid,
+                last_error_message = NULL,
+                completed_at = now(),
+                updated_at = now()
+            WHERE id = $1::uuid
+            "#,
+            )
+            .bind(execution_id)
+            .bind(attempt_no)
+            .bind(attempt_id)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+
+            debug!(
+                run_id = %run_id,
+                case_id = %case.case_id,
+                execution_id = %execution_id,
+                attempt_id = %attempt_id,
+                evaluator_results_attempted = result_rows.len(),
+                evaluator_results_inserted = inserted_count,
+                evaluator_result_conflicts = replay_conflicts,
+                runtime_ms,
+                persistence_ms = persistence_started.elapsed().as_millis() as u64,
+                "completed case execution persistence"
+            );
+
+            Ok(ProcessedExecution {
+                execution_id,
+                attempt_id,
+                result_count: records.len(),
+            })
+        }
         Err(err) => {
             let failure_message = format!("case execution processing failed: {}", err);
-            mark_attempt_failed(db, execution_id, attempt_id, attempt_no, &failure_message).await?;
+            let mut tx = db.begin().await?;
+            mark_attempt_failed(
+                &mut tx,
+                execution_id,
+                attempt_id,
+                attempt_no,
+                &failure_message,
+            )
+            .await?;
+            tx.commit().await?;
             Err(anyhow::anyhow!(failure_message))
         }
     }

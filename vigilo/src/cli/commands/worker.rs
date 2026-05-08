@@ -6,7 +6,10 @@
 
 use std::{
     sync::Arc,
-    time::Duration,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use async_trait::async_trait;
@@ -16,6 +19,7 @@ use clap::{
 };
 use moka::future::Cache;
 use serde::Deserialize;
+use tokio::task::JoinSet;
 use tracing::{
     debug,
     info,
@@ -27,9 +31,7 @@ use super::Executable;
 use crate::{
     context::Context,
     db::{
-        tables::{
-            runs,
-        },
+        tables::runs,
         workflows::{
             chunk_processing,
             execution_processing,
@@ -42,6 +44,7 @@ const WORKER_TICK_SECONDS: u64 = 5;
 const CHUNK_LEASE_SECONDS: i32 = 60;
 const RUN_CATALOG_CACHE_MAX_ENTRIES: u64 = 1024;
 const RUN_CATALOG_CACHE_TTI_SECONDS: u64 = 900;
+const WARMUP_PARALLELISM: usize = 8;
 
 #[derive(Debug, Deserialize)]
 /// Queue payload that signals a run chunk is ready for processing.
@@ -99,21 +102,54 @@ impl EvaluatorLoaderService {
 
     /// Preloads a set of evaluator refs into the registry cache.
     async fn warm_refs(&self, evaluator_refs: &[String]) -> anyhow::Result<WarmupStats> {
+        let started = Instant::now();
         let mut stats = WarmupStats {
             requested: evaluator_refs.len(),
             ..WarmupStats::default()
         };
 
         let cache = self.context.reg().await?;
+        let mut misses = Vec::new();
         for evaluator_ref in evaluator_refs {
             if cache.get(evaluator_ref).await.is_some() {
                 stats.cache_hits += 1;
                 continue;
             }
 
-            self.get_or_load(evaluator_ref).await?;
-            stats.loaded += 1;
+            misses.push(evaluator_ref.clone());
         }
+
+        for batch in misses.chunks(WARMUP_PARALLELISM) {
+            let mut tasks = JoinSet::new();
+            for evaluator_ref in batch {
+                let evaluator_ref = evaluator_ref.clone();
+                let loader = self.clone();
+                tasks.spawn(async move {
+                    loader
+                        .get_or_load(&evaluator_ref)
+                        .await
+                        .map(|_| evaluator_ref)
+                });
+            }
+
+            while let Some(task_result) = tasks.join_next().await {
+                let evaluator_ref = task_result
+                    .map_err(|err| anyhow::anyhow!("warmup worker task join failed: {}", err))??;
+                stats.loaded += 1;
+                debug!(
+                    evaluator_ref,
+                    "loaded evaluator into runtime cache during warmup"
+                );
+            }
+        }
+
+        debug!(
+            requested = stats.requested,
+            cache_hits = stats.cache_hits,
+            loaded = stats.loaded,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "completed evaluator warmup pass"
+        );
 
         Ok(stats)
     }
@@ -124,15 +160,31 @@ impl EvaluatorLoaderService {
         run_id: Uuid,
         profile: &crate::contracts::run::RunProfile,
     ) -> anyhow::Result<Arc<execution_processing::RunEvaluatorCatalog>> {
-        if let Some(cached) = self.run_catalog_cache.get(&run_id).await {
-            return Ok(cached);
-        }
+        let context = self.context.clone();
+        let profile = profile.clone();
 
-        let db = self.context.db().await?;
-        let built = Arc::new(execution_processing::build_run_evaluator_catalog(db, profile).await?);
+        let catalog_result = self
+            .run_catalog_cache
+            .try_get_with::<_, anyhow::Error>(run_id, async move {
+                let db = context.db().await?;
+                Ok(Arc::new(
+                    execution_processing::build_run_evaluator_catalog(db, &profile).await?,
+                ))
+            })
+            .await;
 
-        self.run_catalog_cache.insert(run_id, built.clone()).await;
-        Ok(built)
+        let catalog = match catalog_result {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "run catalog load failed for run '{}' (single-flight): {}",
+                    run_id,
+                    err
+                ));
+            }
+        };
+
+        Ok(catalog)
     }
 }
 

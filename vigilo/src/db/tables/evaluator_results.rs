@@ -7,6 +7,8 @@ use crate::models::evaluator_result::{
     EvaluatorResultPatch,
 };
 
+const EVALUATOR_RESULTS_BATCH_CHUNK_SIZE: usize = 500;
+
 #[derive(Debug, Clone)]
 pub(crate) struct EvaluatorResultInsertRow {
     pub(crate) run_id: Uuid,
@@ -35,73 +37,84 @@ pub(crate) struct EvaluatorResultInsertRow {
 }
 
 pub(crate) async fn insert_evaluator_results_batch(
-    db: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     rows: &[EvaluatorResultInsertRow],
 ) -> anyhow::Result<u64> {
     if rows.is_empty() {
         return Ok(0);
     }
+    let mut total_rows_affected = 0u64;
 
-    let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-        r#"
-        INSERT INTO evaluator_results (
-            run_id,
-            execution_id,
-            attempt_id,
-            evaluator_id,
-            evaluator_version,
-            evaluator_profile_id,
-            evaluator_profile_version,
-            evaluator_interface_version,
-            evaluator_runtime_version,
-            dimension,
-            status,
-            blocking,
-            score_kind,
-            raw_score,
-            raw_score_min,
-            raw_score_max,
-            normalized_score,
-            weight,
-            severity,
-            failure_category,
-            reason,
-            evidence,
-            raw_evaluator_output
-        )
-        "#,
-    );
+    for chunk in rows.chunks(EVALUATOR_RESULTS_BATCH_CHUNK_SIZE) {
+        let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            r#"
+            INSERT INTO evaluator_results (
+                run_id,
+                execution_id,
+                attempt_id,
+                evaluator_id,
+                evaluator_version,
+                evaluator_profile_id,
+                evaluator_profile_version,
+                evaluator_interface_version,
+                evaluator_runtime_version,
+                dimension,
+                status,
+                blocking,
+                score_kind,
+                raw_score,
+                raw_score_min,
+                raw_score_max,
+                normalized_score,
+                weight,
+                severity,
+                failure_category,
+                reason,
+                evidence,
+                raw_evaluator_output
+            )
+            "#,
+        );
 
-    qb.push_values(rows, |mut b, row| {
-        b.push_bind(row.run_id)
-            .push_bind(row.execution_id)
-            .push_bind(row.attempt_id)
-            .push_bind(row.evaluator_id.to_string())
-            .push_bind(&row.evaluator_version)
-            .push_bind(&row.evaluator_profile_id)
-            .push_bind(&row.evaluator_profile_version)
-            .push_bind(&row.evaluator_interface_version)
-            .push_bind(&row.evaluator_runtime_version)
-            .push_bind(&row.dimension)
-            .push_bind(&row.status)
-            .push("::evaluation_status")
-            .push_bind(row.blocking)
-            .push_bind(&row.score_kind)
-            .push_bind(row.raw_score)
-            .push_bind(row.raw_score_min)
-            .push_bind(row.raw_score_max)
-            .push_bind(row.normalized_score)
-            .push_bind(row.weight)
-            .push_bind(&row.severity)
-            .push("::severity")
-            .push_bind(&row.failure_category)
-            .push_bind(&row.reason)
-            .push_bind(&row.evidence)
-            .push_bind(&row.raw_evaluator_output);
-    });
+        qb.push_values(chunk, |mut b, row| {
+            b.push_bind(row.run_id)
+                .push_bind(row.execution_id)
+                .push_bind(row.attempt_id)
+                .push_bind(row.evaluator_id.to_string())
+                .push_bind(&row.evaluator_version)
+                .push_bind(&row.evaluator_profile_id)
+                .push_bind(&row.evaluator_profile_version)
+                .push_bind(&row.evaluator_interface_version)
+                .push_bind(&row.evaluator_runtime_version)
+                .push_bind(&row.dimension)
+                .push_bind(&row.status)
+                .push("::evaluation_status")
+                .push_bind(row.blocking)
+                .push_bind(&row.score_kind)
+                .push_bind(row.raw_score)
+                .push_bind(row.raw_score_min)
+                .push_bind(row.raw_score_max)
+                .push_bind(row.normalized_score)
+                .push_bind(row.weight)
+                .push_bind(&row.severity)
+                .push("::severity")
+                .push_bind(&row.failure_category)
+                .push_bind(&row.reason)
+                .push_bind(&row.evidence)
+                .push_bind(&row.raw_evaluator_output);
+        });
 
-    let result = qb.build().execute(db).await?;
-    Ok(result.rows_affected())
+        qb.push(
+            r#"
+            ON CONFLICT (attempt_id, evaluator_id) DO NOTHING
+            "#,
+        );
+
+        let result = qb.build().execute(&mut **tx).await?;
+        total_rows_affected += result.rows_affected();
+    }
+
+    Ok(total_rows_affected)
 }
 
 pub(crate) async fn insert_evaluator_result(
