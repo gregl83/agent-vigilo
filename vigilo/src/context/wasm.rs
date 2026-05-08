@@ -795,6 +795,7 @@ impl Default for Config {
 }
 
 /// Wasm engine wrapper.
+#[derive(Clone)]
 pub struct Wasm {
     engine: Engine,
     fingerprint: String,

@@ -8,6 +8,10 @@ use std::{
 
 use serde_json::json;
 use sqlx::PgPool;
+use tokio::task::{
+    self,
+    JoinSet,
+};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -57,11 +61,43 @@ pub(crate) struct RunEvaluatorCatalogEntry {
 
 pub(crate) type RunEvaluatorCatalog = BTreeMap<String, RunEvaluatorCatalogEntry>;
 
+const EVALUATOR_EXECUTION_PARALLELISM: usize = 8;
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExecutionTerminalTransition {
+    pub(crate) execution_id: Uuid,
+    pub(crate) attempt_id: Uuid,
+    pub(crate) attempt_no: i32,
+    pub(crate) completed: bool,
+    pub(crate) error_message: Option<String>,
+}
+
 #[derive(Debug)]
 pub(crate) struct ProcessedExecution {
     pub(crate) execution_id: Uuid,
     pub(crate) attempt_id: Uuid,
     pub(crate) result_count: usize,
+    pub(crate) terminal_transition: ExecutionTerminalTransition,
+}
+
+fn processed_terminal_failure(
+    execution_id: Uuid,
+    attempt_id: Uuid,
+    attempt_no: i32,
+    error_message: String,
+) -> ProcessedExecution {
+    ProcessedExecution {
+        execution_id,
+        attempt_id,
+        result_count: 0,
+        terminal_transition: ExecutionTerminalTransition {
+            execution_id,
+            attempt_id,
+            attempt_no,
+            completed: false,
+            error_message: Some(error_message),
+        },
+    }
 }
 
 pub(crate) fn evaluator_refs_from_snapshot(
@@ -319,72 +355,118 @@ fn make_agent_output(case: &chunk_processing::WorkerCaseBatchItem) -> AgentOutpu
     }
 }
 
-async fn upsert_execution_for_case(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+async fn allocate_execution_attempt_for_case(
+    db: &PgPool,
     run_id: Uuid,
     run_profile: &RunProfile,
     case: &chunk_processing::WorkerCaseBatchItem,
     evaluator_bindings: &[EvaluatorBinding],
-) -> anyhow::Result<(Uuid, i32)> {
+) -> anyhow::Result<(Uuid, Uuid, i32)> {
     #[derive(sqlx::FromRow)]
-    struct ExecutionIdentity {
-        id: Uuid,
-        current_attempt_no: i32,
+    struct AttemptAllocation {
+        execution_id: Uuid,
+        attempt_id: Uuid,
+        attempt_no: i32,
     }
 
     let evaluator_manifest = serde_json::to_value(evaluator_bindings)?;
+    let mut tx = db.begin().await?;
 
-    let row = sqlx::query_as::<_, ExecutionIdentity>(
+    let row = sqlx::query_as::<_, AttemptAllocation>(
         r#"
-        INSERT INTO executions (
-            run_id,
-            case_id,
-            case_hash,
-            profile_group_id,
-            task_type,
-            tags,
-            input_payload,
-            expected_output,
-            case_metadata,
-            evaluation_profile_id,
-            evaluation_profile_version,
-            evaluator_manifest,
-            expected_evaluator_count,
-            status,
-            started_at,
-            updated_at
+        WITH upserted AS (
+            INSERT INTO executions (
+                run_id,
+                case_id,
+                case_hash,
+                profile_group_id,
+                task_type,
+                tags,
+                input_payload,
+                expected_output,
+                case_metadata,
+                evaluation_profile_id,
+                evaluation_profile_version,
+                evaluator_manifest,
+                expected_evaluator_count,
+                status,
+                started_at,
+                updated_at
+            )
+            VALUES (
+                $1::uuid,
+                $2,
+                $3,
+                'default',
+                $4,
+                $5::jsonb,
+                $6::jsonb,
+                $7::jsonb,
+                $8::jsonb,
+                $9,
+                $10,
+                $11::jsonb,
+                $12,
+                'pending'::execution_status,
+                NULL,
+                now()
+            )
+            ON CONFLICT (run_id, case_id) DO UPDATE
+            SET case_hash = EXCLUDED.case_hash,
+                task_type = EXCLUDED.task_type,
+                tags = EXCLUDED.tags,
+                input_payload = EXCLUDED.input_payload,
+                expected_output = EXCLUDED.expected_output,
+                case_metadata = EXCLUDED.case_metadata,
+                evaluation_profile_id = EXCLUDED.evaluation_profile_id,
+                evaluation_profile_version = EXCLUDED.evaluation_profile_version,
+                evaluator_manifest = EXCLUDED.evaluator_manifest,
+                expected_evaluator_count = EXCLUDED.expected_evaluator_count,
+                updated_at = now()
+            RETURNING id
+        ),
+        bumped AS (
+            UPDATE executions
+            SET status = 'running'::execution_status,
+                current_attempt_no = executions.current_attempt_no + 1,
+                last_error_message = NULL,
+                started_at = COALESCE(executions.started_at, now()),
+                completed_at = NULL,
+                updated_at = now()
+            FROM upserted
+            WHERE executions.id = upserted.id
+            RETURNING executions.id AS execution_id, executions.current_attempt_no AS attempt_no
+        ),
+        inserted_attempt AS (
+            INSERT INTO execution_attempts (
+                execution_id,
+                run_id,
+                attempt_no,
+                status,
+                started_at,
+                created_at,
+                updated_at
+            )
+            SELECT
+                bumped.execution_id,
+                $1::uuid,
+                bumped.attempt_no,
+                'running'::attempt_status,
+                now(),
+                now(),
+                now()
+            FROM bumped
+            RETURNING id AS attempt_id, execution_id, attempt_no
+        ),
+        updated_execution AS (
+            UPDATE executions
+            SET current_attempt_id = inserted_attempt.attempt_id
+            FROM inserted_attempt
+            WHERE executions.id = inserted_attempt.execution_id
+            RETURNING executions.id
         )
-        VALUES (
-            $1::uuid,
-            $2,
-            $3,
-            'default',
-            $4,
-            $5::jsonb,
-            $6::jsonb,
-            $7::jsonb,
-            $8::jsonb,
-            $9,
-            $10,
-            $11::jsonb,
-            $12,
-            'pending'::execution_status,
-            NULL,
-            now()
-        )
-        ON CONFLICT (run_id, case_id) DO UPDATE
-        SET case_hash = EXCLUDED.case_hash,
-            task_type = EXCLUDED.task_type,
-            tags = EXCLUDED.tags,
-            input_payload = EXCLUDED.input_payload,
-            expected_output = EXCLUDED.expected_output,
-            case_metadata = EXCLUDED.case_metadata,
-            evaluation_profile_id = EXCLUDED.evaluation_profile_id,
-            evaluation_profile_version = EXCLUDED.evaluation_profile_version,
-            evaluator_manifest = EXCLUDED.evaluator_manifest,
-            expected_evaluator_count = EXCLUDED.expected_evaluator_count,
-            updated_at = now()
-        RETURNING id, current_attempt_no
+        SELECT execution_id, attempt_id, attempt_no
+        FROM inserted_attempt
         "#,
     )
     .bind(run_id)
@@ -399,52 +481,154 @@ async fn upsert_execution_for_case(
     .bind(&run_profile.profile_version)
     .bind(&evaluator_manifest)
     .bind(i32::try_from(evaluator_bindings.len())?)
-    .fetch_one(&mut **tx)
+    .fetch_one(&mut *tx)
     .await?;
 
-    Ok((row.id, row.current_attempt_no))
+    tx.commit().await?;
+
+    Ok((row.execution_id, row.attempt_id, row.attempt_no))
 }
 
-async fn mark_attempt_failed(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    execution_id: Uuid,
-    attempt_id: Uuid,
-    attempt_no: i32,
-    error_message: &str,
+pub(crate) async fn finalize_execution_terminal_transitions(
+    db: &PgPool,
+    transitions: &[ExecutionTerminalTransition],
 ) -> anyhow::Result<()> {
-    sqlx::query(
+    if transitions.is_empty() {
+        return Ok(());
+    }
+
+    let execution_ids = transitions
+        .iter()
+        .map(|transition| transition.execution_id)
+        .collect::<Vec<_>>();
+    let attempt_ids = transitions
+        .iter()
+        .map(|transition| transition.attempt_id)
+        .collect::<Vec<_>>();
+    let attempt_nos = transitions
+        .iter()
+        .map(|transition| transition.attempt_no)
+        .collect::<Vec<_>>();
+    let completed_flags = transitions
+        .iter()
+        .map(|transition| transition.completed)
+        .collect::<Vec<_>>();
+    let error_messages = transitions
+        .iter()
+        .map(|transition| transition.error_message.clone())
+        .collect::<Vec<_>>();
+
+    let result = sqlx::query(
         r#"
-        UPDATE execution_attempts
-        SET status = 'failed_evaluation'::attempt_status,
-            error_message = $2,
+        WITH transition_input AS (
+            SELECT *
+            FROM UNNEST(
+                $1::uuid[],
+                $2::uuid[],
+                $3::int4[],
+                $4::bool[],
+                $5::text[]
+            ) AS t(execution_id, attempt_id, attempt_no, completed, error_message)
+        ),
+        transition_count AS (
+            SELECT COUNT(*) AS expected_count
+            FROM transition_input
+        ),
+        authoritative_input AS (
+            SELECT transition_input.*
+            FROM transition_input
+            JOIN executions
+              ON executions.id = transition_input.execution_id
+             AND executions.current_attempt_id = transition_input.attempt_id
+             AND executions.current_attempt_no = transition_input.attempt_no
+        ),
+        authority_check AS (
+            SELECT transition_count.expected_count
+            FROM transition_count
+            WHERE transition_count.expected_count = (
+                SELECT COUNT(*)
+                FROM authoritative_input
+            )
+        ),
+        stale_attempt_update AS (
+            UPDATE execution_attempts
+            SET status = 'stale'::attempt_status,
+                error_message = COALESCE(
+                    transition_input.error_message,
+                    'attempt lost authority before terminal transition'
+                ),
+                completed_at = now(),
+                updated_at = now()
+            FROM transition_input
+            JOIN executions
+              ON executions.id = transition_input.execution_id
+            WHERE execution_attempts.id = transition_input.attempt_id
+              AND execution_attempts.execution_id = transition_input.execution_id
+              AND execution_attempts.status = 'running'::attempt_status
+              AND (
+                  executions.current_attempt_id IS DISTINCT FROM transition_input.attempt_id
+                  OR executions.current_attempt_no IS DISTINCT FROM transition_input.attempt_no
+              )
+            RETURNING execution_attempts.id
+        ),
+        attempt_update AS (
+            UPDATE execution_attempts
+            SET status = CASE
+                    WHEN authoritative_input.completed THEN 'completed'::attempt_status
+                    ELSE 'failed_evaluation'::attempt_status
+                END,
+                error_message = CASE
+                    WHEN authoritative_input.completed THEN NULL
+                    ELSE authoritative_input.error_message
+                END,
+                completed_at = now(),
+                updated_at = now()
+            FROM authoritative_input, authority_check
+            WHERE execution_attempts.id = authoritative_input.attempt_id
+              AND execution_attempts.execution_id = authoritative_input.execution_id
+            RETURNING
+                authoritative_input.execution_id,
+                authoritative_input.attempt_id,
+                authoritative_input.attempt_no,
+                authoritative_input.completed,
+                authoritative_input.error_message
+        )
+        UPDATE executions
+        SET status = CASE
+                WHEN attempt_update.completed THEN 'completed'::execution_status
+                ELSE 'failed'::execution_status
+            END,
+            current_attempt_no = attempt_update.attempt_no,
+            current_attempt_id = attempt_update.attempt_id,
+            last_error_message = CASE
+                WHEN attempt_update.completed THEN NULL
+                ELSE attempt_update.error_message
+            END,
             completed_at = now(),
             updated_at = now()
-        WHERE id = $1::uuid
+        FROM attempt_update
+        WHERE executions.id = attempt_update.execution_id
+          AND executions.current_attempt_id = attempt_update.attempt_id
+          AND executions.current_attempt_no = attempt_update.attempt_no
         "#,
     )
-    .bind(attempt_id)
-    .bind(error_message)
-    .execute(&mut **tx)
+    .bind(execution_ids)
+    .bind(attempt_ids)
+    .bind(attempt_nos)
+    .bind(completed_flags)
+    .bind(error_messages)
+    .execute(db)
     .await?;
 
-    sqlx::query(
-        r#"
-        UPDATE executions
-        SET status = 'failed'::execution_status,
-            current_attempt_no = $2,
-            current_attempt_id = $3::uuid,
-            last_error_message = $4,
-            completed_at = now(),
-            updated_at = now()
-        WHERE id = $1::uuid
-        "#,
-    )
-    .bind(execution_id)
-    .bind(attempt_no)
-    .bind(attempt_id)
-    .bind(error_message)
-    .execute(&mut **tx)
-    .await?;
+    let applied = result.rows_affected();
+    let expected = u64::try_from(transitions.len())?;
+    if applied != expected {
+        anyhow::bail!(
+            "terminal transition batch applied {} current executions out of {}; at least one attempt lost authority",
+            applied,
+            expected
+        );
+    }
 
     Ok(())
 }
@@ -505,55 +689,9 @@ pub(crate) async fn process_case_execution(
 
     let setup_started = Instant::now();
 
-    let (execution_id, attempt_id, attempt_no) = {
-        let mut tx = db.begin().await?;
-
-        let (execution_id, current_attempt_no) =
-            upsert_execution_for_case(&mut tx, run_id, run_profile, case, &evaluator_bindings)
-                .await?;
-        let attempt_no = current_attempt_no + 1;
-
-        #[derive(sqlx::FromRow)]
-        struct AttemptIdentity {
-            id: Uuid,
-        }
-
-        let attempt = sqlx::query_as::<_, AttemptIdentity>(
-            r#"
-            INSERT INTO execution_attempts (execution_id, run_id, attempt_no, status, created_at, updated_at)
-            VALUES ($1::uuid, $2::uuid, $3, 'running'::attempt_status, now(), now())
-            RETURNING id
-            "#,
-        )
-        .bind(execution_id)
-        .bind(run_id)
-        .bind(attempt_no)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        let attempt_id = attempt.id;
-
-        sqlx::query(
-            r#"
-            UPDATE executions
-            SET status = 'running'::execution_status,
-                current_attempt_no = $2,
-                current_attempt_id = $3::uuid,
-                last_error_message = NULL,
-                started_at = COALESCE(started_at, now()),
-                updated_at = now()
-            WHERE id = $1::uuid
-            "#,
-        )
-        .bind(execution_id)
-        .bind(attempt_no)
-        .bind(attempt_id)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        (execution_id, attempt.id, attempt_no)
-    };
+    let (execution_id, attempt_id, attempt_no) =
+        allocate_execution_attempt_for_case(db, run_id, run_profile, case, &evaluator_bindings)
+            .await?;
 
     debug!(
         run_id = %run_id,
@@ -572,81 +710,126 @@ pub(crate) async fn process_case_execution(
     )> = async {
         let test_case = make_test_case(case)?;
         let agent_output = make_agent_output(case);
-        let wasm = context.wasm().await?;
 
-        let mut records = Vec::with_capacity(evaluator_bindings.len());
-        let mut result_rows = Vec::with_capacity(evaluator_bindings.len());
+        let mut ordered_records = BTreeMap::new();
+        let mut ordered_rows = BTreeMap::new();
+        let parallelism = EVALUATOR_EXECUTION_PARALLELISM.min(evaluator_bindings.len().max(1));
+        let profile_id = run_profile.profile_id.clone();
+        let profile_version = run_profile.profile_version.clone();
+        let mut next_index = 0usize;
+        let mut tasks = JoinSet::<
+            anyhow::Result<(
+                usize,
+                EvaluatorExecutionRecord,
+                evaluator_results::EvaluatorResultInsertRow,
+            )>,
+        >::new();
 
-        for binding in &evaluator_bindings {
-            let evaluator_entry =
-                evaluator_catalog
+        while next_index < evaluator_bindings.len() || !tasks.is_empty() {
+            while next_index < evaluator_bindings.len() && tasks.len() < parallelism {
+                let index = next_index;
+                next_index += 1;
+
+                let binding = evaluator_bindings[index].clone();
+                let evaluator_entry = evaluator_catalog
                     .get(&binding.evaluator_ref)
+                    .cloned()
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "evaluator '{}' is missing from run evaluator catalog",
                             binding.evaluator_ref
                         )
                     })?;
+                let context = context.clone();
+                let test_case = test_case.clone();
+                let agent_output = agent_output.clone();
+                let profile_id = profile_id.clone();
+                let profile_version = profile_version.clone();
+                tasks.spawn(async move {
+                    let wasm = context.wasm().await?.clone();
+                    let component = get_or_load_component(&context, &binding.evaluator_ref).await?;
 
-            let component = get_or_load_component(context, &binding.evaluator_ref).await?;
+                    let evaluator_input = EvaluatorInput {
+                        run_id: run_id.to_string(),
+                        execution_id: execution_id.to_string(),
+                        attempt_id: attempt_id.to_string(),
+                        case: test_case,
+                        actual: agent_output,
+                        evaluator_config: binding.config.clone(),
+                    };
+                    let output = task::spawn_blocking(move || {
+                        wasm.test_evaluator_component(&component, evaluator_input)
+                    })
+                    .await
+                    .map_err(|err| {
+                        anyhow::anyhow!("evaluator blocking task join failed: {}", err)
+                    })?;
 
-            let output = wasm.test_evaluator_component(
-                &component,
-                EvaluatorInput {
-                    run_id: run_id.to_string(),
-                    execution_id: execution_id.to_string(),
-                    attempt_id: attempt_id.to_string(),
-                    case: test_case.clone(),
-                    actual: agent_output.clone(),
-                    evaluator_config: binding.config.clone(),
-                },
-            );
+                    let (
+                        status,
+                        score_kind,
+                        raw_score,
+                        raw_score_min,
+                        raw_score_max,
+                        normalized_score,
+                        severity,
+                        failure_category,
+                        reason,
+                        evidence,
+                        raw_evaluator_output,
+                    ) = match output {
+                        Ok(evaluator_output) => {
+                            let serialized_output = serde_json::to_value(&evaluator_output)?;
+                            let normalized = evaluator_output.normalize();
 
-            let (
-                status,
-                score_kind,
-                raw_score,
-                raw_score_min,
-                raw_score_max,
-                normalized_score,
-                severity,
-                failure_category,
-                reason,
-                evidence,
-                raw_evaluator_output,
-            ) = match output {
-                Ok(evaluator_output) => {
-                    let serialized_output = serde_json::to_value(&evaluator_output)?;
-                    let normalized = evaluator_output.normalize();
+                            if let Some(primary) = normalized.first() {
+                                let mut reason = primary.reason.clone();
+                                if normalized.len() > 1 {
+                                    let suffix = format!(
+                                        " (worker persisted only the first finding out of {})",
+                                        normalized.len()
+                                    );
+                                    reason = Some(match reason {
+                                        Some(existing) => format!("{}{}", existing, suffix),
+                                        None => {
+                                            format!(
+                                                "multiple evaluator findings returned{}",
+                                                suffix
+                                            )
+                                        }
+                                    });
+                                }
 
-                    if let Some(primary) = normalized.first() {
-                        let mut reason = primary.reason.clone();
-                        if normalized.len() > 1 {
-                            let suffix = format!(
-                                " (worker persisted only the first finding out of {})",
-                                normalized.len()
-                            );
-                            reason = Some(match reason {
-                                Some(existing) => format!("{}{}", existing, suffix),
-                                None => format!("multiple evaluator findings returned{}", suffix),
-                            });
+                                (
+                                    map_evaluation_status(&primary.status).to_string(),
+                                    primary.score_kind.clone(),
+                                    primary.raw_score,
+                                    primary.raw_score_min,
+                                    primary.raw_score_max,
+                                    primary.normalized_score,
+                                    map_severity(&primary.severity).to_string(),
+                                    primary.failure_category.clone(),
+                                    reason,
+                                    primary.evidence.clone(),
+                                    serialized_output,
+                                )
+                            } else {
+                                (
+                                    "error".to_string(),
+                                    "informational".to_string(),
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    "high".to_string(),
+                                    Some("empty_output".to_string()),
+                                    Some("evaluator returned no findings".to_string()),
+                                    json!({}),
+                                    serialized_output,
+                                )
+                            }
                         }
-
-                        (
-                            map_evaluation_status(&primary.status).to_string(),
-                            primary.score_kind.clone(),
-                            primary.raw_score,
-                            primary.raw_score_min,
-                            primary.raw_score_max,
-                            primary.normalized_score,
-                            map_severity(&primary.severity).to_string(),
-                            primary.failure_category.clone(),
-                            reason,
-                            primary.evidence.clone(),
-                            serialized_output,
-                        )
-                    } else {
-                        (
+                        Err(err) => (
                             "error".to_string(),
                             "informational".to_string(),
                             None,
@@ -654,68 +837,69 @@ pub(crate) async fn process_case_execution(
                             None,
                             None,
                             "high".to_string(),
-                            Some("empty_output".to_string()),
-                            Some("evaluator returned no findings".to_string()),
+                            Some("evaluator_runtime_error".to_string()),
+                            Some(err.to_string()),
                             json!({}),
-                            serialized_output,
-                        )
-                    }
-                }
-                Err(err) => (
-                    "error".to_string(),
-                    "informational".to_string(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    "high".to_string(),
-                    Some("evaluator_runtime_error".to_string()),
-                    Some(err.to_string()),
-                    json!({}),
-                    json!({
-                        "error": err.to_string()
-                    }),
-                ),
+                            json!({
+                                "error": err.to_string()
+                            }),
+                        ),
+                    };
+
+                    let row = evaluator_results::EvaluatorResultInsertRow {
+                        run_id,
+                        execution_id,
+                        attempt_id,
+                        evaluator_id: evaluator_entry.evaluator_id,
+                        evaluator_version: evaluator_entry.evaluator_version,
+                        evaluator_profile_id: profile_id,
+                        evaluator_profile_version: profile_version,
+                        evaluator_interface_version: evaluator_entry.evaluator_interface_version,
+                        evaluator_runtime_version: evaluator_entry.evaluator_runtime_version,
+                        dimension: binding.dimension.clone(),
+                        status: status.clone(),
+                        blocking: binding.blocking,
+                        score_kind,
+                        raw_score,
+                        raw_score_min,
+                        raw_score_max,
+                        normalized_score,
+                        weight: binding.weight,
+                        severity,
+                        failure_category: failure_category.clone(),
+                        reason: reason.clone(),
+                        evidence,
+                        raw_evaluator_output,
+                    };
+
+                    let record = EvaluatorExecutionRecord {
+                        evaluator_id: evaluator_entry.evaluator_id,
+                        status,
+                        dimension: binding.dimension,
+                        normalized_score,
+                        blocking: binding.blocking,
+                        failure_category,
+                        reason,
+                    };
+
+                    Ok((index, record, row))
+                });
+            }
+
+            let Some(task_result) = tasks.join_next().await else {
+                continue;
             };
 
-            result_rows.push(evaluator_results::EvaluatorResultInsertRow {
-                run_id,
-                execution_id,
-                attempt_id,
-                evaluator_id: evaluator_entry.evaluator_id,
-                evaluator_version: evaluator_entry.evaluator_version.clone(),
-                evaluator_profile_id: run_profile.profile_id.clone(),
-                evaluator_profile_version: run_profile.profile_version.clone(),
-                evaluator_interface_version: evaluator_entry.evaluator_interface_version.clone(),
-                evaluator_runtime_version: evaluator_entry.evaluator_runtime_version.clone(),
-                dimension: binding.dimension.clone(),
-                status: status.clone(),
-                blocking: binding.blocking,
-                score_kind,
-                raw_score,
-                raw_score_min,
-                raw_score_max,
-                normalized_score,
-                weight: binding.weight,
-                severity,
-                failure_category: failure_category.clone(),
-                reason: reason.clone(),
-                evidence,
-                raw_evaluator_output,
-            });
-
-            records.push(EvaluatorExecutionRecord {
-                evaluator_id: evaluator_entry.evaluator_id,
-                status,
-                dimension: binding.dimension.clone(),
-                normalized_score,
-                blocking: binding.blocking,
-                failure_category,
-                reason,
-            });
+            let (index, record, row) = task_result
+                .map_err(|err| anyhow::anyhow!("evaluator worker task join failed: {}", err))??;
+            ordered_records.insert(index, record);
+            ordered_rows.insert(index, row);
         }
 
-        Ok((records, result_rows))
+        Ok((
+            ordered_records.into_values().collect(),
+            ordered_rows.into_values().collect(),
+        ))
     }
     .await;
 
@@ -723,12 +907,6 @@ pub(crate) async fn process_case_execution(
         Ok((records, result_rows)) => {
             let runtime_ms = runtime_started.elapsed().as_millis() as u64;
             let persistence_started = Instant::now();
-
-            let mut tx = db.begin().await?;
-
-            let inserted_count =
-                evaluator_results::insert_evaluator_results_batch(&mut tx, &result_rows).await?;
-            let replay_conflicts = result_rows.len().saturating_sub(inserted_count as usize);
 
             let overall_status = summarize_overall_status(&records);
 
@@ -778,92 +956,85 @@ pub(crate) async fn process_case_execution(
                 }
             };
 
-            sqlx::query(
-                r#"
-            INSERT INTO execution_aggregates (
-                execution_id,
-                run_id,
-                attempt_id,
-                overall_status,
-                aggregate_score,
-                evaluator_result_count,
-                dimension_scores,
-                blocking_failures,
-                summary,
-                updated_at
-            )
-            VALUES (
-                $1::uuid,
-                $2::uuid,
-                $3::uuid,
-                $4::evaluation_status,
-                $5,
-                $6,
-                $7::jsonb,
-                $8::jsonb,
-                $9::jsonb,
-                now()
-            )
-            ON CONFLICT (execution_id) DO UPDATE
-            SET attempt_id = EXCLUDED.attempt_id,
-                overall_status = EXCLUDED.overall_status,
-                aggregate_score = EXCLUDED.aggregate_score,
-                evaluator_result_count = EXCLUDED.evaluator_result_count,
-                dimension_scores = EXCLUDED.dimension_scores,
-                blocking_failures = EXCLUDED.blocking_failures,
-                summary = EXCLUDED.summary,
-                updated_at = now()
-            "#,
-            )
-            .bind(execution_id)
-            .bind(run_id)
-            .bind(attempt_id)
-            .bind(&overall_status)
-            .bind(aggregate_score)
-            .bind(i32::try_from(records.len())?)
-            .bind(serde_json::Value::Object(dimension_scores))
-            .bind(serde_json::Value::Array(blocking_failures))
-            .bind(json!({
-                "attempt_id": attempt_id,
-                "result_count": records.len(),
-                "overall_status": overall_status,
-            }))
-            .execute(&mut *tx)
-            .await?;
+            let persistence_result: anyhow::Result<(u64, usize)> = async {
+                let mut tx = db.begin().await?;
 
-            sqlx::query(
-                r#"
-            UPDATE execution_attempts
-            SET status = 'completed'::attempt_status,
-                error_message = NULL,
-                completed_at = now(),
-                updated_at = now()
-            WHERE id = $1::uuid
-            "#,
-            )
-            .bind(attempt_id)
-            .execute(&mut *tx)
-            .await?;
+                let inserted_count =
+                    evaluator_results::insert_evaluator_results_batch(&mut tx, &result_rows)
+                        .await?;
+                let replay_conflicts = result_rows.len().saturating_sub(inserted_count as usize);
 
-            sqlx::query(
-                r#"
-            UPDATE executions
-            SET status = 'completed'::execution_status,
-                current_attempt_no = $2,
-                current_attempt_id = $3::uuid,
-                last_error_message = NULL,
-                completed_at = now(),
-                updated_at = now()
-            WHERE id = $1::uuid
-            "#,
-            )
-            .bind(execution_id)
-            .bind(attempt_no)
-            .bind(attempt_id)
-            .execute(&mut *tx)
-            .await?;
+                sqlx::query(
+                    r#"
+                INSERT INTO execution_aggregates (
+                    execution_id,
+                    run_id,
+                    attempt_id,
+                    overall_status,
+                    aggregate_score,
+                    evaluator_result_count,
+                    dimension_scores,
+                    blocking_failures,
+                    summary,
+                    updated_at
+                )
+                VALUES (
+                    $1::uuid,
+                    $2::uuid,
+                    $3::uuid,
+                    $4::evaluation_status,
+                    $5,
+                    $6,
+                    $7::jsonb,
+                    $8::jsonb,
+                    $9::jsonb,
+                    now()
+                )
+                ON CONFLICT (execution_id) DO UPDATE
+                SET attempt_id = EXCLUDED.attempt_id,
+                    overall_status = EXCLUDED.overall_status,
+                    aggregate_score = EXCLUDED.aggregate_score,
+                    evaluator_result_count = EXCLUDED.evaluator_result_count,
+                    dimension_scores = EXCLUDED.dimension_scores,
+                    blocking_failures = EXCLUDED.blocking_failures,
+                    summary = EXCLUDED.summary,
+                    updated_at = now()
+                "#,
+                )
+                .bind(execution_id)
+                .bind(run_id)
+                .bind(attempt_id)
+                .bind(&overall_status)
+                .bind(aggregate_score)
+                .bind(i32::try_from(records.len())?)
+                .bind(serde_json::Value::Object(dimension_scores))
+                .bind(serde_json::Value::Array(blocking_failures))
+                .bind(json!({
+                    "attempt_id": attempt_id,
+                    "result_count": records.len(),
+                    "overall_status": overall_status,
+                }))
+                .execute(&mut *tx)
+                .await?;
 
-            tx.commit().await?;
+                tx.commit().await?;
+
+                Ok((inserted_count, replay_conflicts))
+            }
+            .await;
+
+            let (inserted_count, replay_conflicts) = match persistence_result {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    let failure_message = format!("case execution persistence failed: {}", err);
+                    return Ok(processed_terminal_failure(
+                        execution_id,
+                        attempt_id,
+                        attempt_no,
+                        failure_message,
+                    ));
+                }
+            };
 
             debug!(
                 run_id = %run_id,
@@ -882,21 +1053,23 @@ pub(crate) async fn process_case_execution(
                 execution_id,
                 attempt_id,
                 result_count: records.len(),
+                terminal_transition: ExecutionTerminalTransition {
+                    execution_id,
+                    attempt_id,
+                    attempt_no,
+                    completed: true,
+                    error_message: None,
+                },
             })
         }
         Err(err) => {
             let failure_message = format!("case execution processing failed: {}", err);
-            let mut tx = db.begin().await?;
-            mark_attempt_failed(
-                &mut tx,
+            Ok(processed_terminal_failure(
                 execution_id,
                 attempt_id,
                 attempt_no,
-                &failure_message,
-            )
-            .await?;
-            tx.commit().await?;
-            Err(anyhow::anyhow!(failure_message))
+                failure_message,
+            ))
         }
     }
 }

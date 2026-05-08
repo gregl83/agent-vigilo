@@ -86,7 +86,7 @@ pub(crate) async fn load_chunk_case_batch(
     Ok(rows)
 }
 
-pub(crate) async fn mark_chunk_completed(db: &PgPool, chunk_id: Uuid) -> anyhow::Result<u64> {
+pub(crate) async fn mark_chunk_completed(db: &PgPool, chunk: &RunChunk) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
 		UPDATE run_chunks
@@ -94,16 +94,19 @@ pub(crate) async fn mark_chunk_completed(db: &PgPool, chunk_id: Uuid) -> anyhow:
 			leased_until = NULL,
 			updated_at = now()
 		WHERE id = $1::uuid
+		  AND status = 'leased'
+		  AND leased_until IS NOT DISTINCT FROM $2::timestamptz
 		"#,
     )
-    .bind(chunk_id)
+    .bind(chunk.id)
+    .bind(chunk.leased_until)
     .execute(db)
     .await?;
 
     Ok(result.rows_affected())
 }
 
-pub(crate) async fn release_chunk_as_pending(db: &PgPool, chunk_id: Uuid) -> anyhow::Result<u64> {
+pub(crate) async fn release_chunk_as_pending(db: &PgPool, chunk: &RunChunk) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
 		UPDATE run_chunks
@@ -111,9 +114,12 @@ pub(crate) async fn release_chunk_as_pending(db: &PgPool, chunk_id: Uuid) -> any
 			leased_until = NULL,
 			updated_at = now()
 		WHERE id = $1::uuid
+		  AND status = 'leased'
+		  AND leased_until IS NOT DISTINCT FROM $2::timestamptz
 		"#,
     )
-    .bind(chunk_id)
+    .bind(chunk.id)
+    .bind(chunk.leased_until)
     .execute(db)
     .await?;
 

@@ -338,13 +338,18 @@ async fn run_worker_cycle(
             );
         }
         Err(err) => {
-            chunk_processing::release_chunk_as_pending(db, chunk.id).await?;
-            mq.nack_requeue(message.delivery_tag).await?;
+            let released = chunk_processing::release_chunk_as_pending(db, &chunk).await?;
+            if released > 0 {
+                mq.nack_requeue(message.delivery_tag).await?;
+            } else {
+                mq.ack(message.delivery_tag).await?;
+            }
             warn!(
                 run_id = %chunk.run_id,
                 chunk_id = %chunk.id,
                 error = %err,
-                "failed evaluator warmup; chunk released and message requeued"
+                chunk_released = released > 0,
+                "failed evaluator warmup; handled claimed chunk lease"
             );
             return Ok(());
         }
@@ -359,6 +364,7 @@ async fn run_worker_cycle(
         Ok(cases) => {
             let mut succeeded = 0usize;
             let mut failed = 0usize;
+            let mut terminal_transitions = Vec::with_capacity(cases.len());
 
             for case in &cases {
                 let processing_result = execution_processing::process_case_execution(
@@ -373,15 +379,31 @@ async fn run_worker_cycle(
 
                 match processing_result {
                     Ok(processed) => {
-                        succeeded += 1;
-                        debug!(
-                            run_id = %chunk.run_id,
-                            case_id = %case.case_id,
-                            execution_id = %processed.execution_id,
-                            attempt_id = %processed.attempt_id,
-                            evaluator_result_count = processed.result_count,
-                            "completed execution persistence for case"
-                        );
+                        let completed = processed.terminal_transition.completed;
+                        let failure_message = processed.terminal_transition.error_message.clone();
+                        terminal_transitions.push(processed.terminal_transition);
+
+                        if completed {
+                            succeeded += 1;
+                            debug!(
+                                run_id = %chunk.run_id,
+                                case_id = %case.case_id,
+                                execution_id = %processed.execution_id,
+                                attempt_id = %processed.attempt_id,
+                                evaluator_result_count = processed.result_count,
+                                "completed execution persistence for case"
+                            );
+                        } else {
+                            failed += 1;
+                            warn!(
+                                run_id = %chunk.run_id,
+                                case_id = %case.case_id,
+                                execution_id = %processed.execution_id,
+                                attempt_id = %processed.attempt_id,
+                                error = %failure_message.unwrap_or_else(|| "unknown failure".to_string()),
+                                "case execution completed with terminal failure"
+                            );
+                        }
                     }
                     Err(err) => {
                         failed += 1;
@@ -395,7 +417,39 @@ async fn run_worker_cycle(
                 }
             }
 
-            chunk_processing::mark_chunk_completed(db, chunk.id).await?;
+            if let Err(err) = execution_processing::finalize_execution_terminal_transitions(
+                db,
+                &terminal_transitions,
+            )
+            .await
+            {
+                let released = chunk_processing::release_chunk_as_pending(db, &chunk).await?;
+                if released > 0 {
+                    mq.nack_requeue(message.delivery_tag).await?;
+                } else {
+                    mq.ack(message.delivery_tag).await?;
+                }
+                warn!(
+                    run_id = %chunk.run_id,
+                    chunk_id = %chunk.id,
+                    error = %err,
+                    chunk_released = released > 0,
+                    "failed chunk-level execution terminal transitions; handled claimed chunk lease"
+                );
+                return Ok(());
+            }
+
+            let completed = chunk_processing::mark_chunk_completed(db, &chunk).await?;
+            if completed == 0 {
+                mq.ack(message.delivery_tag).await?;
+                warn!(
+                    run_id = %chunk.run_id,
+                    chunk_id = %chunk.id,
+                    "chunk lease was no longer owned at completion; acknowledged stale message"
+                );
+                return Ok(());
+            }
+
             mq.ack(message.delivery_tag).await?;
             info!(
                 run_id = %chunk.run_id,
@@ -413,18 +467,24 @@ async fn run_worker_cycle(
             Ok(())
         }
         Err(err) => {
-            chunk_processing::release_chunk_as_pending(db, chunk.id).await?;
-            mq.nack_requeue(message.delivery_tag).await?;
+            let released = chunk_processing::release_chunk_as_pending(db, &chunk).await?;
+            if released > 0 {
+                mq.nack_requeue(message.delivery_tag).await?;
+            } else {
+                mq.ack(message.delivery_tag).await?;
+            }
             warn!(
                 run_id = %chunk.run_id,
                 chunk_id = %chunk.id,
                 error = %err,
-                "failed to load chunk case batch; message requeued"
+                chunk_released = released > 0,
+                "failed to load chunk case batch; handled claimed chunk lease"
             );
             debug!(
                 delivery_tag = message.delivery_tag,
                 chunk_id = %chunk.id,
-                "chunk processing failed; message requeued"
+                chunk_released = released > 0,
+                "chunk processing failed; handled claimed chunk lease"
             );
             Ok(())
         }

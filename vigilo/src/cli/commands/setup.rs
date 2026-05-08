@@ -44,7 +44,8 @@ impl Executable for Command {
         migrations::migrate(db, self.migrations_dir).await?;
 
         info!("adding evaluators");
-        // todo - add evaluators
+
+        // todo - add evaluators that exist in repository ./evaluators directory (verify eval or skip)
 
         Ok(())
     }
