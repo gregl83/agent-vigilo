@@ -70,71 +70,67 @@ pub(crate) async fn finalize_claimed_run(
     let finalized = sqlx::query_as::<_, FinalizedRun>(
         r#"
         WITH run_row AS (
-            SELECT id, run_key, expected_execution_count
+            SELECT
+                id,
+                run_key,
+                expected_execution_count,
+                terminal_execution_count,
+                passed_execution_count,
+                failed_execution_count,
+                errored_execution_count
             FROM runs
             WHERE id = $1::uuid
               AND status = 'finalizing'::run_status
             FOR UPDATE
         ),
-        execution_stats AS (
+        terminal_chunk_failure AS (
             SELECT
-                COALESCE(COUNT(*)::int, 0) AS terminal_execution_count,
-                COALESCE(SUM(CASE WHEN overall_status = 'passed'::evaluation_status THEN 1 ELSE 0 END)::int, 0) AS passed_execution_count,
-                COALESCE(SUM(CASE WHEN overall_status = 'failed'::evaluation_status THEN 1 ELSE 0 END)::int, 0) AS failed_execution_count,
-                COALESCE(SUM(CASE WHEN overall_status = 'error'::evaluation_status THEN 1 ELSE 0 END)::int, 0) AS errored_execution_count,
-                AVG(aggregate_score) AS avg_aggregate_score
-            FROM execution_aggregates
-            WHERE run_id = $1::uuid
+                EXISTS (
+                    SELECT 1
+                    FROM run_chunks
+                    WHERE run_id = $1::uuid
+                      AND status IN ('failed', 'cancelled')
+                    LIMIT 1
+                ) AS exists
         ),
-        chunk_stats AS (
+        open_chunk_exists AS (
             SELECT
-                COALESCE(COUNT(*)::int, 0) AS total_chunk_count,
-                COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int, 0) AS completed_chunk_count,
-                COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int, 0) AS failed_chunk_count,
-                COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END)::int, 0) AS cancelled_chunk_count,
-                COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END)::int, 0) AS pending_chunk_count,
-                COALESCE(SUM(CASE WHEN status = 'leased' THEN 1 ELSE 0 END)::int, 0) AS leased_chunk_count
-            FROM run_chunks
-            WHERE run_id = $1::uuid
+                EXISTS (
+                    SELECT 1
+                    FROM run_chunks
+                    WHERE run_id = $1::uuid
+                      AND status IN ('pending', 'leased')
+                    LIMIT 1
+                ) AS exists
         ),
         finalized AS (
             UPDATE runs r
             SET status = 'completed'::run_status,
                 gate_status = CASE
-                    WHEN cs.failed_chunk_count > 0
-                      OR cs.cancelled_chunk_count > 0
-                      OR es.failed_execution_count > 0
-                      OR es.errored_execution_count > 0
-                      OR es.terminal_execution_count < rr.expected_execution_count
+                    WHEN tcf.exists
+                      OR rr.failed_execution_count > 0
+                      OR rr.errored_execution_count > 0
+                      OR rr.terminal_execution_count < rr.expected_execution_count
                     THEN 'fail'::gate_status
                     ELSE 'pass'::gate_status
                 END,
-                terminal_execution_count = es.terminal_execution_count,
-                passed_execution_count = es.passed_execution_count,
-                failed_execution_count = es.failed_execution_count,
-                errored_execution_count = es.errored_execution_count,
                 summary = jsonb_build_object(
                     'expected_execution_count', rr.expected_execution_count,
-                    'terminal_execution_count', es.terminal_execution_count,
-                    'passed_execution_count', es.passed_execution_count,
-                    'failed_execution_count', es.failed_execution_count,
-                    'errored_execution_count', es.errored_execution_count,
-                    'coverage_complete', es.terminal_execution_count >= rr.expected_execution_count,
-                    'total_chunk_count', cs.total_chunk_count,
-                    'completed_chunk_count', cs.completed_chunk_count,
-                    'failed_chunk_count', cs.failed_chunk_count,
-                    'cancelled_chunk_count', cs.cancelled_chunk_count,
-                    'avg_aggregate_score', es.avg_aggregate_score
+                    'terminal_execution_count', rr.terminal_execution_count,
+                    'passed_execution_count', rr.passed_execution_count,
+                    'failed_execution_count', rr.failed_execution_count,
+                    'errored_execution_count', rr.errored_execution_count,
+                    'coverage_complete', rr.terminal_execution_count >= rr.expected_execution_count,
+                    'has_terminal_chunk_failure', tcf.exists
                 ),
                 finalized_at = COALESCE(r.finalized_at, now()),
                 completed_at = COALESCE(r.completed_at, now()),
                 coordinator_leased_until = NULL,
                 coordinator_heartbeat_at = now(),
                 updated_at = now()
-            FROM run_row rr, execution_stats es, chunk_stats cs
+            FROM run_row rr, terminal_chunk_failure tcf, open_chunk_exists oce
             WHERE r.id = rr.id
-              AND cs.pending_chunk_count = 0
-              AND cs.leased_chunk_count = 0
+              AND NOT oce.exists
             RETURNING
                 r.id,
                 r.run_key,

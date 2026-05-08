@@ -439,6 +439,50 @@ async fn allocate_execution_attempt_for_case(
               AND execution_attempts.status = 'running'::attempt_status
             RETURNING execution_attempts.id
         ),
+        reopened_terminal AS (
+            SELECT
+                executions.run_id,
+                execution_aggregates.overall_status
+            FROM upserted
+            JOIN executions
+              ON executions.id = upserted.id
+            LEFT JOIN execution_aggregates
+              ON execution_aggregates.execution_id = executions.id
+             AND execution_aggregates.attempt_id = executions.current_attempt_id
+            WHERE executions.status IN (
+                'completed'::execution_status,
+                'failed'::execution_status,
+                'timed_out'::execution_status,
+                'cancelled'::execution_status
+            )
+        ),
+        reopened_run_delta AS (
+            SELECT
+                run_id,
+                COUNT(*)::int AS terminal_delta,
+                COALESCE(SUM(
+                    CASE WHEN overall_status = 'passed'::evaluation_status THEN 1 ELSE 0 END
+                )::int, 0) AS passed_delta,
+                COALESCE(SUM(
+                    CASE WHEN overall_status = 'failed'::evaluation_status THEN 1 ELSE 0 END
+                )::int, 0) AS failed_delta,
+                COALESCE(SUM(
+                    CASE WHEN overall_status = 'error'::evaluation_status THEN 1 ELSE 0 END
+                )::int, 0) AS errored_delta
+            FROM reopened_terminal
+            GROUP BY run_id
+        ),
+        reopened_run_update AS (
+            UPDATE runs
+            SET terminal_execution_count = GREATEST(runs.terminal_execution_count - reopened_run_delta.terminal_delta, 0),
+                passed_execution_count = GREATEST(runs.passed_execution_count - reopened_run_delta.passed_delta, 0),
+                failed_execution_count = GREATEST(runs.failed_execution_count - reopened_run_delta.failed_delta, 0),
+                errored_execution_count = GREATEST(runs.errored_execution_count - reopened_run_delta.errored_delta, 0),
+                updated_at = now()
+            FROM reopened_run_delta
+            WHERE runs.id = reopened_run_delta.run_id
+            RETURNING runs.id
+        ),
         bumped AS (
             UPDATE executions
             SET status = 'running'::execution_status,
@@ -448,6 +492,8 @@ async fn allocate_execution_attempt_for_case(
                 completed_at = NULL,
                 updated_at = now()
             FROM upserted
+            LEFT JOIN reopened_run_update
+              ON true
             WHERE executions.id = upserted.id
             RETURNING executions.id AS execution_id, executions.current_attempt_no AS attempt_no
         ),
@@ -532,7 +578,7 @@ pub(crate) async fn finalize_execution_terminal_transitions(
         .map(|transition| transition.error_message.clone())
         .collect::<Vec<_>>();
 
-    let result = sqlx::query(
+    let applied = sqlx::query_scalar::<_, i64>(
         r#"
         WITH transition_input AS (
             SELECT *
@@ -566,6 +612,28 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                 FROM authoritative_input
             )
         ),
+        terminal_input AS (
+            SELECT
+                authoritative_input.*,
+                CASE
+                    WHEN authoritative_input.completed THEN execution_aggregates.overall_status
+                    ELSE 'error'::evaluation_status
+                END AS overall_status
+            FROM authoritative_input
+            LEFT JOIN execution_aggregates
+              ON execution_aggregates.execution_id = authoritative_input.execution_id
+             AND execution_aggregates.attempt_id = authoritative_input.attempt_id
+            WHERE NOT authoritative_input.completed
+               OR execution_aggregates.execution_id IS NOT NULL
+        ),
+        terminal_input_check AS (
+            SELECT transition_count.expected_count
+            FROM transition_count, authority_check
+            WHERE transition_count.expected_count = (
+                SELECT COUNT(*)
+                FROM terminal_input
+            )
+        ),
         stale_attempt_update AS (
             UPDATE execution_attempts
             SET status = 'stale'::attempt_status,
@@ -590,25 +658,26 @@ pub(crate) async fn finalize_execution_terminal_transitions(
         attempt_update AS (
             UPDATE execution_attempts
             SET status = CASE
-                    WHEN authoritative_input.completed THEN 'completed'::attempt_status
+                    WHEN terminal_input.completed THEN 'completed'::attempt_status
                     ELSE 'failed_evaluation'::attempt_status
                 END,
                 error_message = CASE
-                    WHEN authoritative_input.completed THEN NULL
-                    ELSE authoritative_input.error_message
+                    WHEN terminal_input.completed THEN NULL
+                    ELSE terminal_input.error_message
                 END,
                 completed_at = now(),
                 updated_at = now()
-            FROM authoritative_input, authority_check
-            WHERE execution_attempts.id = authoritative_input.attempt_id
-              AND execution_attempts.execution_id = authoritative_input.execution_id
+            FROM terminal_input, terminal_input_check
+            WHERE execution_attempts.id = terminal_input.attempt_id
+              AND execution_attempts.execution_id = terminal_input.execution_id
             RETURNING
-                authoritative_input.execution_id,
-                authoritative_input.run_id,
-                authoritative_input.attempt_id,
-                authoritative_input.attempt_no,
-                authoritative_input.completed,
-                authoritative_input.error_message
+                terminal_input.execution_id,
+                terminal_input.run_id,
+                terminal_input.attempt_id,
+                terminal_input.attempt_no,
+                terminal_input.completed,
+                terminal_input.error_message,
+                terminal_input.overall_status
         ),
         failed_aggregate_upsert AS (
             INSERT INTO execution_aggregates (
@@ -654,26 +723,63 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                 summary = EXCLUDED.summary,
                 updated_at = now()
             RETURNING execution_id
+        ),
+        execution_update AS (
+            UPDATE executions
+            SET status = CASE
+                    WHEN attempt_update.completed THEN 'completed'::execution_status
+                    ELSE 'failed'::execution_status
+                END,
+                current_attempt_no = attempt_update.attempt_no,
+                current_attempt_id = attempt_update.attempt_id,
+                last_error_message = CASE
+                    WHEN attempt_update.completed THEN NULL
+                    ELSE attempt_update.error_message
+                END,
+                completed_at = now(),
+                updated_at = now()
+            FROM attempt_update
+            LEFT JOIN failed_aggregate_upsert
+              ON failed_aggregate_upsert.execution_id = attempt_update.execution_id
+            WHERE executions.id = attempt_update.execution_id
+              AND executions.current_attempt_id = attempt_update.attempt_id
+              AND executions.current_attempt_no = attempt_update.attempt_no
+            RETURNING
+                executions.id AS execution_id,
+                executions.run_id,
+                attempt_update.attempt_id,
+                attempt_update.overall_status
+        ),
+        run_counter_delta AS (
+            SELECT
+                execution_update.run_id,
+                COUNT(*)::int AS terminal_delta,
+                COALESCE(SUM(
+                    CASE WHEN execution_update.overall_status = 'passed'::evaluation_status THEN 1 ELSE 0 END
+                )::int, 0) AS passed_delta,
+                COALESCE(SUM(
+                    CASE WHEN execution_update.overall_status = 'failed'::evaluation_status THEN 1 ELSE 0 END
+                )::int, 0) AS failed_delta,
+                COALESCE(SUM(
+                    CASE WHEN execution_update.overall_status = 'error'::evaluation_status THEN 1 ELSE 0 END
+                )::int, 0) AS errored_delta
+            FROM execution_update
+            GROUP BY execution_update.run_id
+        ),
+        run_counter_update AS (
+            UPDATE runs
+            SET terminal_execution_count = runs.terminal_execution_count + run_counter_delta.terminal_delta,
+                passed_execution_count = runs.passed_execution_count + run_counter_delta.passed_delta,
+                failed_execution_count = runs.failed_execution_count + run_counter_delta.failed_delta,
+                errored_execution_count = runs.errored_execution_count + run_counter_delta.errored_delta,
+                updated_at = now()
+            FROM run_counter_delta
+            WHERE runs.id = run_counter_delta.run_id
+            RETURNING runs.id
         )
-        UPDATE executions
-        SET status = CASE
-                WHEN attempt_update.completed THEN 'completed'::execution_status
-                ELSE 'failed'::execution_status
-            END,
-            current_attempt_no = attempt_update.attempt_no,
-            current_attempt_id = attempt_update.attempt_id,
-            last_error_message = CASE
-                WHEN attempt_update.completed THEN NULL
-                ELSE attempt_update.error_message
-            END,
-            completed_at = now(),
-            updated_at = now()
-        FROM attempt_update
-        LEFT JOIN failed_aggregate_upsert
-          ON failed_aggregate_upsert.execution_id = attempt_update.execution_id
-        WHERE executions.id = attempt_update.execution_id
-          AND executions.current_attempt_id = attempt_update.attempt_id
-          AND executions.current_attempt_no = attempt_update.attempt_no
+        SELECT
+            (SELECT COUNT(*)::bigint FROM execution_update)
+            + ((SELECT COUNT(*)::bigint FROM run_counter_update) * 0)
         "#,
     )
     .bind(execution_ids)
@@ -681,14 +787,13 @@ pub(crate) async fn finalize_execution_terminal_transitions(
     .bind(attempt_nos)
     .bind(completed_flags)
     .bind(error_messages)
-    .execute(db)
+    .fetch_one(db)
     .await?;
 
-    let applied = result.rows_affected();
     let expected = u64::try_from(transitions.len())?;
-    if applied != expected {
+    if u64::try_from(applied)? != expected {
         anyhow::bail!(
-            "terminal transition batch applied {} current executions out of {}; at least one attempt lost authority",
+            "terminal transition batch applied {} current executions out of {}; at least one attempt lost authority or completed without an aggregate",
             applied,
             expected
         );

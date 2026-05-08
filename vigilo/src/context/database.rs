@@ -7,6 +7,7 @@ use tracing::debug;
 
 pub struct Context {
     pub(crate) uri: String,
+    pub(crate) max_connections: u32,
     pub(crate) cell: OnceCell<PgPool>,
 }
 
@@ -17,7 +18,7 @@ impl Context {
                 debug!("initializing postgres database connection");
 
                 PgPoolOptions::new()
-                    .max_connections(5)
+                    .max_connections(self.max_connections)
                     .connect(&self.uri)
                     .await
                     .map_err(|e| anyhow::anyhow!("database connection failed: {}", e))

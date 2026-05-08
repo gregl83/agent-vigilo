@@ -29,6 +29,10 @@ pub(crate) struct App {
     #[arg(long, env = "DATABASE_URL")]
     pub database_url: String,
 
+    /// Maximum Postgres connections for this process
+    #[arg(long, env = "DATABASE_MAX_CONNECTIONS", default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=256))]
+    pub database_max_connections: u32,
+
     /// Messaging URL (connection string)
     #[arg(long, env = "MESSAGING_URL")]
     pub messaging_url: String,

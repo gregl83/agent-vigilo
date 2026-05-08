@@ -18,10 +18,16 @@ struct ContextInner {
 pub(crate) struct Context(Arc<ContextInner>);
 
 impl Context {
-    pub fn new(db_uri: String, mq_uri: String, wasm_config: wasm::Config) -> Self {
+    pub fn new(
+        db_uri: String,
+        db_max_connections: u32,
+        mq_uri: String,
+        wasm_config: wasm::Config,
+    ) -> Self {
         Self(Arc::new(ContextInner {
             db: database::Context {
                 uri: db_uri,
+                max_connections: db_max_connections,
                 cell: Default::default(),
             },
             mq: messaging::Context {
