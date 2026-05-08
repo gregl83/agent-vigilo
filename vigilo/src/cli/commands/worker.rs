@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    time::Duration,
-};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use clap::{
@@ -19,15 +16,16 @@ use uuid::Uuid;
 use super::Executable;
 use crate::{
     context::Context,
-    contracts::run::RunProfile,
     db::{
         tables::{
             evaluators,
             runs,
         },
-        workflows::chunk_processing,
+        workflows::{
+            chunk_processing,
+            execution_processing,
+        },
     },
-    models::evaluator::EvaluatorState,
     runtime::ServiceRunner,
 };
 
@@ -57,12 +55,6 @@ impl EvaluatorLoaderService {
         Self { context }
     }
 
-    async fn invalidate(&self, evaluator_ref: &str) -> anyhow::Result<()> {
-        let cache = self.context.reg().await?;
-        cache.invalidate(evaluator_ref).await;
-        Ok(())
-    }
-
     async fn get_or_load(
         &self,
         evaluator_ref: &str,
@@ -89,7 +81,7 @@ impl EvaluatorLoaderService {
             )
         })?;
 
-        if !is_runnable_evaluator_state(&evaluator_record.state) {
+        if !execution_processing::is_runnable_evaluator_state(&evaluator_record.state) {
             anyhow::bail!(
                 "evaluator '{}' is not runnable in state '{:?}'",
                 evaluator_ref,
@@ -131,35 +123,10 @@ impl EvaluatorLoaderService {
             .await?
             .ok_or_else(|| anyhow::anyhow!("run '{}' not found during evaluator warmup", run_id))?;
 
-        let evaluator_refs = evaluator_refs_from_snapshot(&run.config_snapshot)?;
+        let evaluator_refs =
+            execution_processing::evaluator_refs_from_snapshot(&run.config_snapshot)?;
         self.warm_refs(&evaluator_refs).await
     }
-}
-
-fn evaluator_refs_from_snapshot(snapshot: &serde_json::Value) -> anyhow::Result<Vec<String>> {
-    let profile_value = snapshot
-        .get("profile")
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("run snapshot is missing 'profile' payload"))?;
-
-    let profile: RunProfile = serde_json::from_value(profile_value)
-        .map_err(|err| anyhow::anyhow!("run snapshot profile is invalid: {}", err))?;
-
-    let mut unique_refs = BTreeSet::new();
-    for group in profile.case_groups {
-        for binding in group.evaluators {
-            unique_refs.insert(binding.evaluator_ref);
-        }
-    }
-
-    Ok(unique_refs.into_iter().collect())
-}
-
-fn is_runnable_evaluator_state(state: &EvaluatorState) -> bool {
-    matches!(
-        state,
-        EvaluatorState::Active | EvaluatorState::Deprecated | EvaluatorState::Yanked
-    )
 }
 
 #[derive(Debug, Subcommand)]
@@ -301,16 +268,60 @@ async fn run_worker_cycle(context: Context) -> anyhow::Result<()> {
         }
     }
 
+    let run = runs::select_run_by_id(db, chunk.run_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("run '{}' missing while processing chunk", chunk.run_id))?;
+    let run_profile = execution_processing::run_profile_from_snapshot(&run.config_snapshot)?;
+
     let batch_result = chunk_processing::load_chunk_case_batch(db, &chunk).await;
     match batch_result {
         Ok(cases) => {
+            let mut succeeded = 0usize;
+            let mut failed = 0usize;
+
+            for case in &cases {
+                let processing_result = execution_processing::process_case_execution(
+                    &context,
+                    db,
+                    chunk.run_id,
+                    &run_profile,
+                    case,
+                )
+                .await;
+
+                match processing_result {
+                    Ok(processed) => {
+                        succeeded += 1;
+                        debug!(
+                            run_id = %chunk.run_id,
+                            case_id = %case.case_id,
+                            execution_id = %processed.execution_id,
+                            attempt_id = %processed.attempt_id,
+                            evaluator_result_count = processed.result_count,
+                            "completed execution persistence for case"
+                        );
+                    }
+                    Err(err) => {
+                        failed += 1;
+                        warn!(
+                            run_id = %chunk.run_id,
+                            case_id = %case.case_id,
+                            error = %err,
+                            "failed processing case execution; recorded as failed when possible"
+                        );
+                    }
+                }
+            }
+
             chunk_processing::mark_chunk_completed(db, chunk.id).await?;
             mq.ack(message.delivery_tag).await?;
             info!(
                 run_id = %chunk.run_id,
                 chunk_id = %chunk.id,
                 case_count = cases.len(),
-                "loaded case batch from queue chunk"
+                cases_succeeded = succeeded,
+                cases_failed = failed,
+                "processed case batch from queue chunk"
             );
             debug!(
                 delivery_tag = message.delivery_tag,
