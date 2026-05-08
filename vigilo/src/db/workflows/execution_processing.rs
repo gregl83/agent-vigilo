@@ -425,6 +425,20 @@ async fn allocate_execution_attempt_for_case(
                 updated_at = now()
             RETURNING id
         ),
+        superseded_attempts AS (
+            UPDATE execution_attempts
+            SET status = 'stale'::attempt_status,
+                error_message = COALESCE(
+                    execution_attempts.error_message,
+                    'attempt superseded by a newer worker attempt'
+                ),
+                completed_at = COALESCE(execution_attempts.completed_at, now()),
+                updated_at = now()
+            FROM upserted
+            WHERE execution_attempts.execution_id = upserted.id
+              AND execution_attempts.status = 'running'::attempt_status
+            RETURNING execution_attempts.id
+        ),
         bumped AS (
             UPDATE executions
             SET status = 'running'::execution_status,
@@ -535,7 +549,9 @@ pub(crate) async fn finalize_execution_terminal_transitions(
             FROM transition_input
         ),
         authoritative_input AS (
-            SELECT transition_input.*
+            SELECT
+                transition_input.*,
+                executions.run_id
             FROM transition_input
             JOIN executions
               ON executions.id = transition_input.execution_id
@@ -588,10 +604,56 @@ pub(crate) async fn finalize_execution_terminal_transitions(
               AND execution_attempts.execution_id = authoritative_input.execution_id
             RETURNING
                 authoritative_input.execution_id,
+                authoritative_input.run_id,
                 authoritative_input.attempt_id,
                 authoritative_input.attempt_no,
                 authoritative_input.completed,
                 authoritative_input.error_message
+        ),
+        failed_aggregate_upsert AS (
+            INSERT INTO execution_aggregates (
+                execution_id,
+                run_id,
+                attempt_id,
+                overall_status,
+                aggregate_score,
+                evaluator_result_count,
+                dimension_scores,
+                blocking_failures,
+                summary,
+                updated_at
+            )
+            SELECT
+                attempt_update.execution_id,
+                attempt_update.run_id,
+                attempt_update.attempt_id,
+                'error'::evaluation_status,
+                NULL,
+                0,
+                '{}'::jsonb,
+                jsonb_build_array(jsonb_build_object(
+                    'status', 'error',
+                    'reason', attempt_update.error_message
+                )),
+                jsonb_build_object(
+                    'attempt_id', attempt_update.attempt_id,
+                    'result_count', 0,
+                    'overall_status', 'error',
+                    'error_message', attempt_update.error_message
+                ),
+                now()
+            FROM attempt_update
+            WHERE NOT attempt_update.completed
+            ON CONFLICT (execution_id) DO UPDATE
+            SET attempt_id = EXCLUDED.attempt_id,
+                overall_status = EXCLUDED.overall_status,
+                aggregate_score = EXCLUDED.aggregate_score,
+                evaluator_result_count = EXCLUDED.evaluator_result_count,
+                dimension_scores = EXCLUDED.dimension_scores,
+                blocking_failures = EXCLUDED.blocking_failures,
+                summary = EXCLUDED.summary,
+                updated_at = now()
+            RETURNING execution_id
         )
         UPDATE executions
         SET status = CASE
@@ -607,6 +669,8 @@ pub(crate) async fn finalize_execution_terminal_transitions(
             completed_at = now(),
             updated_at = now()
         FROM attempt_update
+        LEFT JOIN failed_aggregate_upsert
+          ON failed_aggregate_upsert.execution_id = attempt_update.execution_id
         WHERE executions.id = attempt_update.execution_id
           AND executions.current_attempt_id = attempt_update.attempt_id
           AND executions.current_attempt_no = attempt_update.attempt_no
@@ -958,6 +1022,26 @@ pub(crate) async fn process_case_execution(
 
             let persistence_result: anyhow::Result<(u64, usize)> = async {
                 let mut tx = db.begin().await?;
+
+                let current_attempt = sqlx::query_scalar::<_, i32>(
+                    r#"
+                    SELECT 1
+                    FROM executions
+                    WHERE id = $1::uuid
+                      AND current_attempt_id = $2::uuid
+                      AND current_attempt_no = $3
+                    FOR UPDATE
+                    "#,
+                )
+                .bind(execution_id)
+                .bind(attempt_id)
+                .bind(attempt_no)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+                if current_attempt.is_none() {
+                    anyhow::bail!("attempt lost authority before aggregate persistence");
+                }
 
                 let inserted_count =
                     evaluator_results::insert_evaluator_results_batch(&mut tx, &result_rows)
