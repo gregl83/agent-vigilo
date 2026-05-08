@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    collections::BTreeSet,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use clap::{
@@ -16,7 +19,15 @@ use uuid::Uuid;
 use super::Executable;
 use crate::{
     context::Context,
-    db::workflows::chunk_processing,
+    contracts::run::RunProfile,
+    db::{
+        tables::{
+            evaluators,
+            runs,
+        },
+        workflows::chunk_processing,
+    },
+    models::evaluator::EvaluatorState,
     runtime::ServiceRunner,
 };
 
@@ -27,6 +38,128 @@ const CHUNK_LEASE_SECONDS: i32 = 60;
 struct ChunkReadyMessage {
     run_id: Uuid,
     chunk_id: Uuid,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct WarmupStats {
+    requested: usize,
+    cache_hits: usize,
+    loaded: usize,
+}
+
+#[derive(Clone)]
+struct EvaluatorLoaderService {
+    context: Context,
+}
+
+impl EvaluatorLoaderService {
+    fn new(context: Context) -> Self {
+        Self { context }
+    }
+
+    async fn invalidate(&self, evaluator_ref: &str) -> anyhow::Result<()> {
+        let cache = self.context.reg().await?;
+        cache.invalidate(evaluator_ref).await;
+        Ok(())
+    }
+
+    async fn get_or_load(
+        &self,
+        evaluator_ref: &str,
+    ) -> anyhow::Result<wasmtime::component::Component> {
+        let cache = self.context.reg().await?;
+        if let Some(component) = cache.get(evaluator_ref).await {
+            return Ok(component);
+        }
+
+        let identity =
+            crate::contracts::evaluator_ref::parse_fully_qualified_evaluator(evaluator_ref)?;
+        let db = self.context.db().await?;
+        let evaluator_record = evaluators::select_evaluator(
+            db,
+            &identity.namespace,
+            &identity.name,
+            &identity.version,
+        )
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "evaluator '{}' was not found in registry during worker warmup",
+                evaluator_ref
+            )
+        })?;
+
+        if !is_runnable_evaluator_state(&evaluator_record.state) {
+            anyhow::bail!(
+                "evaluator '{}' is not runnable in state '{:?}'",
+                evaluator_ref,
+                evaluator_record.state
+            );
+        }
+
+        let wasm = self.context.wasm().await?;
+        let component = wasm.compile_component(&evaluator_record.wasm_bytes)?;
+        cache
+            .insert(evaluator_ref.to_string(), component.clone())
+            .await;
+        Ok(component)
+    }
+
+    async fn warm_refs(&self, evaluator_refs: &[String]) -> anyhow::Result<WarmupStats> {
+        let mut stats = WarmupStats {
+            requested: evaluator_refs.len(),
+            ..WarmupStats::default()
+        };
+
+        let cache = self.context.reg().await?;
+        for evaluator_ref in evaluator_refs {
+            if cache.get(evaluator_ref).await.is_some() {
+                stats.cache_hits += 1;
+                continue;
+            }
+
+            self.get_or_load(evaluator_ref).await?;
+            stats.loaded += 1;
+        }
+
+        Ok(stats)
+    }
+
+    async fn warm_run_evaluators(&self, run_id: Uuid) -> anyhow::Result<WarmupStats> {
+        let db = self.context.db().await?;
+        let run = runs::select_run_by_id(db, run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("run '{}' not found during evaluator warmup", run_id))?;
+
+        let evaluator_refs = evaluator_refs_from_snapshot(&run.config_snapshot)?;
+        self.warm_refs(&evaluator_refs).await
+    }
+}
+
+fn evaluator_refs_from_snapshot(snapshot: &serde_json::Value) -> anyhow::Result<Vec<String>> {
+    let profile_value = snapshot
+        .get("profile")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("run snapshot is missing 'profile' payload"))?;
+
+    let profile: RunProfile = serde_json::from_value(profile_value)
+        .map_err(|err| anyhow::anyhow!("run snapshot profile is invalid: {}", err))?;
+
+    let mut unique_refs = BTreeSet::new();
+    for group in profile.case_groups {
+        for binding in group.evaluators {
+            unique_refs.insert(binding.evaluator_ref);
+        }
+    }
+
+    Ok(unique_refs.into_iter().collect())
+}
+
+fn is_runnable_evaluator_state(state: &EvaluatorState) -> bool {
+    matches!(
+        state,
+        EvaluatorState::Active | EvaluatorState::Deprecated | EvaluatorState::Yanked
+    )
 }
 
 #[derive(Debug, Subcommand)]
@@ -76,6 +209,8 @@ async fn handle_once(context: Context) -> anyhow::Result<()> {
 }
 
 async fn run_worker_cycle(context: Context) -> anyhow::Result<()> {
+    let evaluator_loader = EvaluatorLoaderService::new(context.clone());
+
     debug!("starting worker cycle pre-flight");
 
     debug!("acquiring database context");
@@ -142,6 +277,29 @@ async fn run_worker_cycle(context: Context) -> anyhow::Result<()> {
         ordinal_end = chunk.ordinal_end,
         "claimed chunk for processing"
     );
+
+    match evaluator_loader.warm_run_evaluators(chunk.run_id).await {
+        Ok(stats) => {
+            debug!(
+                run_id = %chunk.run_id,
+                requested = stats.requested,
+                cache_hits = stats.cache_hits,
+                loaded = stats.loaded,
+                "completed evaluator warmup for run"
+            );
+        }
+        Err(err) => {
+            chunk_processing::release_chunk_as_pending(db, chunk.id).await?;
+            mq.nack_requeue(message.delivery_tag).await?;
+            warn!(
+                run_id = %chunk.run_id,
+                chunk_id = %chunk.id,
+                error = %err,
+                "failed evaluator warmup; chunk released and message requeued"
+            );
+            return Ok(());
+        }
+    }
 
     let batch_result = chunk_processing::load_chunk_case_batch(db, &chunk).await;
     match batch_result {

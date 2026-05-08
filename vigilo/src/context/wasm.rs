@@ -898,6 +898,11 @@ impl Wasm {
         })
     }
 
+    /// Compile evaluator wasm bytes into a component for registry caching.
+    pub fn compile_component(&self, wasm_bytes: &[u8]) -> anyhow::Result<component::Component> {
+        Ok(component::Component::new(&self.engine, wasm_bytes)?)
+    }
+
     /// Run evaluator in test mode.
     pub fn test_evaluator(
         &self,
