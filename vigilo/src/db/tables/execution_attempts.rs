@@ -1,3 +1,9 @@
+//! Execution attempt table access.
+//!
+//! Attempts represent worker-owned tries for an execution. Workflow code owns
+//! authoritative attempt transitions; this module provides direct row helpers
+//! for simple CRUD-style access.
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -7,6 +13,7 @@ use crate::models::execution_attempt::{
     ExecutionAttemptPatch,
 };
 
+/// Inserts a new execution attempt row.
 pub(crate) async fn insert_execution_attempt(
     db: &PgPool,
     draft: &ExecutionAttemptDraft,
@@ -55,6 +62,7 @@ pub(crate) async fn insert_execution_attempt(
     Ok(attempt)
 }
 
+/// Finds an execution attempt by primary key.
 pub(crate) async fn select_execution_attempt_by_id(
     db: &PgPool,
     id: Uuid,
@@ -95,6 +103,7 @@ pub(crate) async fn select_execution_attempt_by_id(
     Ok(attempt)
 }
 
+/// Lists attempts for an execution in attempt order.
 pub(crate) async fn list_execution_attempts_by_execution_id(
     db: &PgPool,
     execution_id: Uuid,
@@ -136,6 +145,7 @@ pub(crate) async fn list_execution_attempts_by_execution_id(
     Ok(attempts)
 }
 
+/// Updates the status and error message for an execution attempt.
 pub(crate) async fn update_execution_attempt_status(
     db: &PgPool,
     id: Uuid,
@@ -182,6 +192,7 @@ pub(crate) async fn update_execution_attempt_status(
     Ok(attempt)
 }
 
+/// Deletes an execution attempt by primary key.
 pub(crate) async fn delete_execution_attempt_by_id(db: &PgPool, id: Uuid) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"

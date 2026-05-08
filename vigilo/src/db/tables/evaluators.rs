@@ -1,3 +1,10 @@
+//! Evaluator registry table access.
+//!
+//! Evaluator rows store published WASM artifacts, identity metadata, runtime
+//! compatibility fields, and lifecycle state. Runtime paths use the narrower
+//! metadata projection to avoid loading WASM bytes when only identity and state
+//! checks are needed.
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -9,6 +16,7 @@ use crate::models::evaluator::{
     EvaluatorSummary,
 };
 
+/// Minimal evaluator metadata needed to bind a run profile to executable code.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct EvaluatorRuntimeMetadata {
     pub(crate) namespace: String,
@@ -20,6 +28,10 @@ pub(crate) struct EvaluatorRuntimeMetadata {
     pub(crate) runtime_version: String,
 }
 
+/// Loads runtime metadata for a batch of fully qualified evaluator identities.
+///
+/// Identities are passed as `(namespace, name, version)` tuples and resolved in
+/// one query so run creation and execution do not perform per-evaluator lookups.
 pub(crate) async fn select_evaluator_runtime_metadata_by_identities(
     db: &PgPool,
     identities: &[(String, String, String)],
@@ -62,6 +74,7 @@ pub(crate) async fn select_evaluator_runtime_metadata_by_identities(
     Ok(rows)
 }
 
+/// Inserts a newly published evaluator artifact.
 pub(crate) async fn insert_evaluator(
     db: &PgPool,
     draft: &EvaluatorDraft,
@@ -105,6 +118,7 @@ pub(crate) async fn insert_evaluator(
     Ok(evaluator)
 }
 
+/// Finds an evaluator by its database id.
 pub(crate) async fn select_evaluator_by_id(
     db: &PgPool,
     id: Uuid,
@@ -127,6 +141,7 @@ pub(crate) async fn select_evaluator_by_id(
     Ok(evaluator)
 }
 
+/// Finds the most recently created evaluator for a namespace/name pair.
 pub(crate) async fn select_latest_evaluator_by_name(
     db: &PgPool,
     namespace: &str,
@@ -153,6 +168,7 @@ pub(crate) async fn select_latest_evaluator_by_name(
     Ok(evaluator)
 }
 
+/// Finds an evaluator by namespace, name, and version.
 pub(crate) async fn select_evaluator(
     db: &PgPool,
     namespace: &str,
@@ -180,6 +196,7 @@ pub(crate) async fn select_evaluator(
     Ok(evaluator)
 }
 
+/// Lists evaluators in a namespace for management and discovery views.
 pub(crate) async fn list_evaluators(
     db: &PgPool,
     namespace: &str,
@@ -203,6 +220,7 @@ pub(crate) async fn list_evaluators(
     Ok(evaluators)
 }
 
+/// Searches evaluator summaries in a namespace using a bounded text match.
 pub(crate) async fn search_evaluator_summaries(
     db: &PgPool,
     namespace: &str,
@@ -243,6 +261,7 @@ pub(crate) async fn search_evaluator_summaries(
     Ok(evaluators)
 }
 
+/// Updates an evaluator lifecycle state unless it has already been removed.
 pub(crate) async fn update_evaluator_state(
     db: &PgPool,
     namespace: &str,

@@ -1,8 +1,16 @@
+//! Chunk leasing and case loading workflow helpers.
+//!
+//! Workers use this module to claim a run chunk, load the corresponding dataset
+//! case rows, and then either complete or release the chunk. Lease fields are
+//! checked on completion/release so stale workers cannot overwrite a newer
+//! lease holder.
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::models::run_chunk::RunChunk;
 
+/// Dataset case row materialized for worker-side execution.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, sqlx::FromRow)]
 pub(crate) struct WorkerCaseBatchItem {
     pub(crate) case_id: String,
@@ -16,6 +24,10 @@ pub(crate) struct WorkerCaseBatchItem {
     pub(crate) metadata: serde_json::Value,
 }
 
+/// Claims a pending or expired chunk for processing.
+///
+/// Returns `None` when another worker already owns the current lease or the
+/// chunk is no longer processable.
 pub(crate) async fn claim_chunk_for_processing(
     db: &PgPool,
     chunk_id: Uuid,
@@ -53,6 +65,7 @@ pub(crate) async fn claim_chunk_for_processing(
     Ok(chunk)
 }
 
+/// Loads the dataset cases covered by a claimed chunk's ordinal range.
 pub(crate) async fn load_chunk_case_batch(
     db: &PgPool,
     chunk: &RunChunk,
@@ -86,6 +99,7 @@ pub(crate) async fn load_chunk_case_batch(
     Ok(rows)
 }
 
+/// Marks a leased chunk complete if the caller still owns the same lease.
 pub(crate) async fn mark_chunk_completed(db: &PgPool, chunk: &RunChunk) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
@@ -106,6 +120,7 @@ pub(crate) async fn mark_chunk_completed(db: &PgPool, chunk: &RunChunk) -> anyho
     Ok(result.rows_affected())
 }
 
+/// Releases a leased chunk back to pending if the caller still owns the lease.
 pub(crate) async fn release_chunk_as_pending(db: &PgPool, chunk: &RunChunk) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"

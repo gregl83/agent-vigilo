@@ -1,13 +1,21 @@
+//! Run dispatch workflow helpers.
+//!
+//! Coordinators use this module to claim pending runs, emit the run-started
+//! event, and ensure chunk-ready events exist. The claim query uses row locking
+//! so multiple coordinators can safely dispatch runs concurrently.
+
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Minimal run projection returned when a coordinator claims dispatch work.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct ClaimedRun {
     pub(crate) id: Uuid,
     pub(crate) run_key: String,
 }
 
+/// Claims the oldest pending run whose coordinator lease is open or expired.
 pub(crate) async fn claim_next_pending_run(
     db: &PgPool,
     coordinator_id: &str,
@@ -45,6 +53,9 @@ pub(crate) async fn claim_next_pending_run(
     Ok(claimed)
 }
 
+/// Backfills missing chunk-ready events for a run.
+///
+/// The outbox dedupe key makes this idempotent across coordinator retries.
 pub(crate) async fn enqueue_missing_chunk_ready_events(
     db: &PgPool,
     run_id: Uuid,
@@ -71,6 +82,7 @@ pub(crate) async fn enqueue_missing_chunk_ready_events(
     Ok(result.rows_affected())
 }
 
+/// Enqueues the idempotent `run.started` event for a run.
 pub(crate) async fn enqueue_run_started_event(db: &PgPool, run_id: Uuid) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"

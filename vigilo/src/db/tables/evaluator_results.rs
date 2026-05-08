@@ -1,3 +1,9 @@
+//! Evaluator result table access.
+//!
+//! Evaluator results are the per-evaluator evidence rows for a single execution
+//! attempt. The batch insert path is used by execution processing and is kept
+//! chunked so large runs do not build oversized SQL statements.
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -9,6 +15,10 @@ use crate::models::evaluator_result::{
 
 const EVALUATOR_RESULTS_BATCH_CHUNK_SIZE: usize = 500;
 
+/// Row shape used by the batch insert path.
+///
+/// This mirrors the persisted evaluator result columns and keeps execution
+/// processing from depending on the broader model draft type.
 #[derive(Debug, Clone)]
 pub(crate) struct EvaluatorResultInsertRow {
     pub(crate) run_id: Uuid,
@@ -36,6 +46,10 @@ pub(crate) struct EvaluatorResultInsertRow {
     pub(crate) raw_evaluator_output: serde_json::Value,
 }
 
+/// Inserts evaluator result rows for an attempt in bounded batches.
+///
+/// Conflicts on `(attempt_id, evaluator_id)` are ignored to keep retries
+/// idempotent when the same authoritative attempt is observed again.
 pub(crate) async fn insert_evaluator_results_batch(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     rows: &[EvaluatorResultInsertRow],
@@ -117,6 +131,7 @@ pub(crate) async fn insert_evaluator_results_batch(
     Ok(total_rows_affected)
 }
 
+/// Inserts one evaluator result row and returns the persisted model.
 pub(crate) async fn insert_evaluator_result(
     db: &PgPool,
     draft: &EvaluatorResultDraft,
@@ -211,6 +226,7 @@ pub(crate) async fn insert_evaluator_result(
     Ok(result)
 }
 
+/// Finds an evaluator result by primary key.
 pub(crate) async fn select_evaluator_result_by_id(
     db: &PgPool,
     id: Uuid,
@@ -254,6 +270,7 @@ pub(crate) async fn select_evaluator_result_by_id(
     Ok(result)
 }
 
+/// Lists all evaluator results written for an execution attempt.
 pub(crate) async fn list_evaluator_results_by_attempt_id(
     db: &PgPool,
     attempt_id: Uuid,
@@ -298,6 +315,7 @@ pub(crate) async fn list_evaluator_results_by_attempt_id(
     Ok(results)
 }
 
+/// Updates the human-readable failure reason fields for an evaluator result.
 pub(crate) async fn update_evaluator_result_reason(
     db: &PgPool,
     id: Uuid,
@@ -346,6 +364,7 @@ pub(crate) async fn update_evaluator_result_reason(
     Ok(result)
 }
 
+/// Deletes an evaluator result by primary key.
 pub(crate) async fn delete_evaluator_result_by_id(db: &PgPool, id: Uuid) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"

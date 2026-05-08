@@ -1,3 +1,10 @@
+//! Run creation persistence workflow helpers.
+//!
+//! These helpers write the immutable dataset snapshot, run row, run chunks, and
+//! initial outbox events inside the caller's transaction. Bulk paths are
+//! intentionally chunked to keep statement size and bind counts bounded for
+//! large datasets.
+
 use serde_json::json;
 use sqlx::{
     Postgres,
@@ -17,6 +24,7 @@ const DATASET_MEMBERSHIP_INSERT_CHUNK_SIZE: usize = 2_000;
 const RUN_CHUNK_INSERT_CHUNK_SIZE: usize = 2_000;
 const CHUNK_EVENT_INSERT_CHUNK_SIZE: usize = 1_000;
 
+/// Inserts case blob rows, ignoring already-known content hashes.
 pub(crate) async fn bulk_insert_case_blobs(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     case_blobs: &[CaseBlobDraft],
@@ -47,6 +55,10 @@ pub(crate) async fn bulk_insert_case_blobs(
     Ok(())
 }
 
+/// Creates or verifies a dataset version identity.
+///
+/// Existing dataset version ids must refer to the same dataset and version
+/// value; otherwise run creation fails to preserve immutable dataset identity.
 pub(crate) async fn upsert_dataset_version(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     dataset_version_id: &str,
@@ -82,6 +94,10 @@ pub(crate) async fn upsert_dataset_version(
     Ok(())
 }
 
+/// Inserts dataset membership rows for a versioned dataset.
+///
+/// Existing memberships must match ordinal and case hash exactly. A mismatch is
+/// treated as an immutable dataset version conflict.
 pub(crate) async fn bulk_insert_dataset_membership(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     dataset_version_id: &str,
@@ -127,6 +143,7 @@ pub(crate) async fn bulk_insert_dataset_membership(
     Ok(())
 }
 
+/// Inserts the run row using the caller-provided id.
 pub(crate) async fn insert_run_create(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     run_id: Uuid,
@@ -200,6 +217,7 @@ pub(crate) async fn insert_run_create(
     Ok(())
 }
 
+/// Inserts pending chunk rows for the run.
 pub(crate) async fn bulk_insert_run_chunks(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     run_id: Uuid,
@@ -231,6 +249,7 @@ pub(crate) async fn bulk_insert_run_chunks(
     Ok(())
 }
 
+/// Enqueues idempotent `run.chunk.ready` events for pending chunks.
 pub(crate) async fn bulk_enqueue_chunk_events(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     run_id: Uuid,

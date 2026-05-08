@@ -1,3 +1,9 @@
+//! Outbox event table access.
+//!
+//! The outbox table is used for durable, idempotent event publication. Claiming
+//! publishable events uses `FOR UPDATE SKIP LOCKED` so multiple publishers can
+//! work concurrently without taking the same event.
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -7,6 +13,7 @@ use crate::models::outbox_event::{
     OutboxEventPatch,
 };
 
+/// Inserts one outbox event.
 pub(crate) async fn insert_outbox_event(
     db: &PgPool,
     draft: &OutboxEventDraft,
@@ -42,6 +49,7 @@ pub(crate) async fn insert_outbox_event(
     Ok(event)
 }
 
+/// Finds an outbox event by primary key.
 pub(crate) async fn select_outbox_event_by_id(
     db: &PgPool,
     id: Uuid,
@@ -72,6 +80,7 @@ pub(crate) async fn select_outbox_event_by_id(
     Ok(event)
 }
 
+/// Lists outbox events with a given status.
 pub(crate) async fn list_outbox_events_by_status(
     db: &PgPool,
     status: &str,
@@ -106,6 +115,10 @@ pub(crate) async fn list_outbox_events_by_status(
     Ok(events)
 }
 
+/// Claims pending outbox events by pushing their availability into the future.
+///
+/// The returned rows are the caller's publish lease. If publishing fails, use
+/// `reschedule_outbox_event` to make the event available for retry.
 pub(crate) async fn claim_publishable_outbox_events(
     db: &PgPool,
     limit: i64,
@@ -150,6 +163,7 @@ pub(crate) async fn claim_publishable_outbox_events(
     Ok(events)
 }
 
+/// Marks an outbox event as successfully published.
 pub(crate) async fn mark_outbox_event_published(db: &PgPool, id: Uuid) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
@@ -168,6 +182,7 @@ pub(crate) async fn mark_outbox_event_published(db: &PgPool, id: Uuid) -> anyhow
     Ok(result.rows_affected())
 }
 
+/// Reschedules a failed publish attempt for later retry.
 pub(crate) async fn reschedule_outbox_event(
     db: &PgPool,
     id: Uuid,
@@ -193,6 +208,7 @@ pub(crate) async fn reschedule_outbox_event(
     Ok(result.rows_affected())
 }
 
+/// Updates outbox status fields directly.
 pub(crate) async fn update_outbox_event_status(
     db: &PgPool,
     id: Uuid,
@@ -230,6 +246,7 @@ pub(crate) async fn update_outbox_event_status(
     Ok(event)
 }
 
+/// Deletes an outbox event by primary key.
 pub(crate) async fn delete_outbox_event_by_id(db: &PgPool, id: Uuid) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"

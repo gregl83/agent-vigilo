@@ -1,3 +1,9 @@
+//! Execution table access.
+//!
+//! Executions bind a run to a dataset case and track the current authoritative
+//! attempt. Complex attempt allocation and terminal transitions live in
+//! workflow code so these helpers stay narrow and predictable.
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -7,6 +13,7 @@ use crate::models::execution::{
     ExecutionPatch,
 };
 
+/// Inserts a new execution row.
 pub(crate) async fn insert_execution(
     db: &PgPool,
     draft: &ExecutionDraft,
@@ -54,6 +61,7 @@ pub(crate) async fn insert_execution(
     Ok(execution)
 }
 
+/// Finds an execution by primary key.
 pub(crate) async fn select_execution_by_id(
     db: &PgPool,
     id: Uuid,
@@ -92,6 +100,7 @@ pub(crate) async fn select_execution_by_id(
     Ok(execution)
 }
 
+/// Lists executions for a run in creation order.
 pub(crate) async fn list_executions_by_run_id(
     db: &PgPool,
     run_id: Uuid,
@@ -131,6 +140,7 @@ pub(crate) async fn list_executions_by_run_id(
     Ok(executions)
 }
 
+/// Updates status and current-attempt fields for an execution.
 pub(crate) async fn update_execution_status(
     db: &PgPool,
     id: Uuid,
@@ -179,6 +189,7 @@ pub(crate) async fn update_execution_status(
     Ok(execution)
 }
 
+/// Deletes an execution by primary key.
 pub(crate) async fn delete_execution_by_id(db: &PgPool, id: Uuid) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"

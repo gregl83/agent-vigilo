@@ -1,12 +1,20 @@
+//! Run finalization workflow helpers.
+//!
+//! Finalization is coordinator-owned and guarded by leases. The workflow uses
+//! cached run counters plus indexed chunk existence checks so large runs can
+//! finalize without scanning every execution aggregate or chunk row.
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Minimal run projection returned when a coordinator claims finalization.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct ClaimedRunForFinalization {
     pub(crate) id: Uuid,
     pub(crate) run_key: String,
 }
 
+/// Run projection returned after final gate status is persisted.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct FinalizedRun {
     pub(crate) id: Uuid,
@@ -18,6 +26,7 @@ pub(crate) struct FinalizedRun {
     pub(crate) errored_execution_count: i32,
 }
 
+/// Claims a run whose chunks are all terminal and whose finalization lease is open.
 pub(crate) async fn claim_next_finalizable_run(
     db: &PgPool,
     coordinator_id: &str,
@@ -63,6 +72,10 @@ pub(crate) async fn claim_next_finalizable_run(
     Ok(claimed)
 }
 
+/// Finalizes a claimed run and enqueues the idempotent `run.completed` event.
+///
+/// Returns `None` if the run is no longer in `finalizing` state or if open
+/// chunks appeared after claim time.
 pub(crate) async fn finalize_claimed_run(
     db: &PgPool,
     run_id: Uuid,

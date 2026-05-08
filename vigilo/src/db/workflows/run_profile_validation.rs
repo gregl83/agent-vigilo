@@ -1,3 +1,10 @@
+//! Run profile executability validation.
+//!
+//! This workflow checks that a proposed run profile can execute against a
+//! dataset before run creation persists any work. It validates evaluator refs,
+//! published evaluator state, and case-to-group matching so failures are caught
+//! before chunks are dispatched.
+
 use std::collections::HashMap;
 
 use sqlx::PgPool;
@@ -15,6 +22,7 @@ use crate::{
     models::evaluator::EvaluatorState,
 };
 
+/// Counts produced by a successful profile executability check.
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct ProfileExecutabilitySummary {
     pub(crate) expected_execution_count: usize,
@@ -23,6 +31,11 @@ pub(crate) struct ProfileExecutabilitySummary {
     pub(crate) runnable_evaluator_ref_count: usize,
 }
 
+/// Validates that a profile can execute every dataset case with runnable evaluators.
+///
+/// The function reports all discovered profile/dataset issues in one error so
+/// callers can fix invalid refs, missing evaluators, and unmatched cases
+/// together.
 pub(crate) async fn validate_profile_executability(
     db: &PgPool,
     profile: &RunProfile,

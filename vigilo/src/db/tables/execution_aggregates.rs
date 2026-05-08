@@ -1,3 +1,9 @@
+//! Execution aggregate table access.
+//!
+//! Aggregate rows summarize the evaluator results for the current authoritative
+//! attempt of an execution. Workflows use these rows to update cached run
+//! counters and to decide final gate status without rescanning raw results.
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -7,6 +13,7 @@ use crate::models::execution_aggregate::{
     ExecutionAggregatePatch,
 };
 
+/// Inserts the aggregate summary for an execution.
 pub(crate) async fn insert_execution_aggregate(
     db: &PgPool,
     draft: &ExecutionAggregateDraft,
@@ -44,6 +51,7 @@ pub(crate) async fn insert_execution_aggregate(
     Ok(aggregate)
 }
 
+/// Finds an aggregate by execution id.
 pub(crate) async fn select_execution_aggregate_by_execution_id(
     db: &PgPool,
     execution_id: Uuid,
@@ -73,6 +81,7 @@ pub(crate) async fn select_execution_aggregate_by_execution_id(
     Ok(aggregate)
 }
 
+/// Lists aggregate summaries for a run.
 pub(crate) async fn list_execution_aggregates_by_run_id(
     db: &PgPool,
     run_id: Uuid,
@@ -103,6 +112,7 @@ pub(crate) async fn list_execution_aggregates_by_run_id(
     Ok(aggregates)
 }
 
+/// Updates the aggregate status and score fields for an execution.
 pub(crate) async fn update_execution_aggregate(
     db: &PgPool,
     execution_id: Uuid,
@@ -140,6 +150,7 @@ pub(crate) async fn update_execution_aggregate(
     Ok(aggregate)
 }
 
+/// Deletes an aggregate by execution id.
 pub(crate) async fn delete_execution_aggregate_by_execution_id(
     db: &PgPool,
     execution_id: Uuid,

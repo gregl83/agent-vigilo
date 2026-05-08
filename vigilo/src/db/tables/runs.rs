@@ -1,3 +1,9 @@
+//! Run table access.
+//!
+//! Runs are the top-level evaluation jobs. The table stores run identity,
+//! configuration snapshots, coordinator lease fields, cached terminal counters,
+//! and final gate status. Multi-step run state changes live in workflows.
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -7,6 +13,7 @@ use crate::models::run::{
     RunPatch,
 };
 
+/// Inserts a new run and assigns a time-sortable database id.
 pub(crate) async fn insert_run(db: &PgPool, draft: &RunDraft) -> anyhow::Result<Run> {
     let run = sqlx::query_as::<_, Run>(
         r#"
@@ -76,6 +83,7 @@ pub(crate) async fn insert_run(db: &PgPool, draft: &RunDraft) -> anyhow::Result<
     Ok(run)
 }
 
+/// Finds a run by primary key.
 pub(crate) async fn select_run_by_id(db: &PgPool, id: Uuid) -> anyhow::Result<Option<Run>> {
     let run = sqlx::query_as::<_, Run>(
         r#"
@@ -116,6 +124,7 @@ pub(crate) async fn select_run_by_id(db: &PgPool, id: Uuid) -> anyhow::Result<Op
     Ok(run)
 }
 
+/// Finds a run by stable run key.
 pub(crate) async fn select_run_by_key(db: &PgPool, run_key: &str) -> anyhow::Result<Option<Run>> {
     let run = sqlx::query_as::<_, Run>(
         r#"
@@ -156,6 +165,7 @@ pub(crate) async fn select_run_by_key(db: &PgPool, run_key: &str) -> anyhow::Res
     Ok(run)
 }
 
+/// Lists runs for management views using limit/offset pagination.
 pub(crate) async fn list_runs(db: &PgPool, limit: i64, offset: i64) -> anyhow::Result<Vec<Run>> {
     let runs = sqlx::query_as::<_, Run>(
         r#"
@@ -198,6 +208,7 @@ pub(crate) async fn list_runs(db: &PgPool, limit: i64, offset: i64) -> anyhow::R
     Ok(runs)
 }
 
+/// Updates high-level run status, gate status, and error message.
 pub(crate) async fn update_run_status(
     db: &PgPool,
     id: Uuid,
@@ -249,6 +260,7 @@ pub(crate) async fn update_run_status(
     Ok(run)
 }
 
+/// Deletes a run by primary key.
 pub(crate) async fn delete_run_by_id(db: &PgPool, id: Uuid) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"

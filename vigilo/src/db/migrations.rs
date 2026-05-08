@@ -1,3 +1,9 @@
+//! Schema migration runner.
+//!
+//! The runtime uses this module to apply the SQL migrations in order while
+//! logging skipped and newly applied versions. All schema shape remains in the
+//! migration files; this module only coordinates sqlx migration execution.
+
 use std::{
     collections::HashSet,
     path::PathBuf,
@@ -16,6 +22,11 @@ use tracing::{
     info,
 };
 
+/// Applies all migrations from `migrations_dir` that are not already recorded.
+///
+/// The function acquires a database connection, ensures sqlx's migration table
+/// exists, checks applied versions, and applies each missing migration with
+/// per-migration logging.
 pub(crate) async fn migrate(db: &PgPool, migrations_dir: PathBuf) -> anyhow::Result<()> {
     let migrator = Migrator::new(migrations_dir.as_path()).await?;
 

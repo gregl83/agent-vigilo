@@ -1,3 +1,11 @@
+//! Execution processing workflow.
+//!
+//! This module owns the worker-side path from a leased dataset case to persisted
+//! evaluator results, execution aggregate, terminal execution transition, and
+//! cached run counters. It also owns evaluator runtime lookup and single-flight
+//! component loading so concurrent workers do not repeatedly compile the same
+//! evaluator artifact.
+
 use std::{
     collections::{
         BTreeMap,
@@ -51,6 +59,7 @@ struct EvaluatorExecutionRecord {
     reason: Option<String>,
 }
 
+/// Runtime metadata needed to execute one evaluator binding for a run.
 #[derive(Debug, Clone)]
 pub(crate) struct RunEvaluatorCatalogEntry {
     pub(crate) evaluator_id: Uuid,
@@ -59,10 +68,15 @@ pub(crate) struct RunEvaluatorCatalogEntry {
     pub(crate) evaluator_runtime_version: Option<String>,
 }
 
+/// Lookup table keyed by fully qualified evaluator ref.
 pub(crate) type RunEvaluatorCatalog = BTreeMap<String, RunEvaluatorCatalogEntry>;
 
 const EVALUATOR_EXECUTION_PARALLELISM: usize = 8;
 
+/// Terminal state transition to apply after evaluator processing finishes.
+///
+/// The attempt id and attempt number are authority tokens. A transition only
+/// applies if the execution still points at the same current attempt.
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutionTerminalTransition {
     pub(crate) execution_id: Uuid,
@@ -72,6 +86,7 @@ pub(crate) struct ExecutionTerminalTransition {
     pub(crate) error_message: Option<String>,
 }
 
+/// Result of processing a single case execution.
 #[derive(Debug)]
 pub(crate) struct ProcessedExecution {
     pub(crate) execution_id: Uuid,
@@ -100,6 +115,7 @@ fn processed_terminal_failure(
     }
 }
 
+/// Extracts unique evaluator refs from a serialized run config snapshot.
 pub(crate) fn evaluator_refs_from_snapshot(
     snapshot: &serde_json::Value,
 ) -> anyhow::Result<Vec<String>> {
@@ -107,6 +123,7 @@ pub(crate) fn evaluator_refs_from_snapshot(
     evaluator_refs_from_profile(&profile)
 }
 
+/// Extracts unique evaluator refs from a run profile.
 pub(crate) fn evaluator_refs_from_profile(profile: &RunProfile) -> anyhow::Result<Vec<String>> {
     let mut unique_refs = BTreeSet::new();
     for group in &profile.case_groups {
@@ -118,6 +135,10 @@ pub(crate) fn evaluator_refs_from_profile(profile: &RunProfile) -> anyhow::Resul
     Ok(unique_refs.into_iter().collect())
 }
 
+/// Builds the evaluator runtime catalog for a run profile in one database round trip.
+///
+/// The catalog validates that every referenced evaluator exists and is in a
+/// runnable state before workers begin processing cases.
 pub(crate) async fn build_run_evaluator_catalog(
     db: &PgPool,
     profile: &RunProfile,
@@ -186,6 +207,10 @@ pub(crate) async fn build_run_evaluator_catalog(
     Ok(catalog)
 }
 
+/// Loads or returns a cached Wasmtime component for a fully qualified evaluator ref.
+///
+/// Component compilation is single-flight through the registry cache, so
+/// concurrent requests for the same evaluator share one load/compile operation.
 pub(crate) async fn get_or_load_component(
     context: &Context,
     evaluator_ref: &str,
@@ -235,6 +260,7 @@ pub(crate) async fn get_or_load_component(
     Ok(component)
 }
 
+/// Parses the run profile payload stored inside a run config snapshot.
 pub(crate) fn run_profile_from_snapshot(
     snapshot: &serde_json::Value,
 ) -> anyhow::Result<RunProfile> {
@@ -549,6 +575,11 @@ async fn allocate_execution_attempt_for_case(
     Ok((row.execution_id, row.attempt_id, row.attempt_no))
 }
 
+/// Applies terminal execution transitions as one authoritative batch.
+///
+/// The batch updates attempts, executions, and cached run counters together.
+/// If any transition no longer owns the current attempt, the entire batch is
+/// rejected so stale workers cannot corrupt run-level counters.
 pub(crate) async fn finalize_execution_terminal_transitions(
     db: &PgPool,
     transitions: &[ExecutionTerminalTransition],
@@ -840,6 +871,11 @@ fn map_severity(severity: &Severity) -> &'static str {
     }
 }
 
+/// Processes one dataset case through all matching evaluator bindings.
+///
+/// The function allocates an authoritative attempt, runs evaluators with bounded
+/// parallelism, persists result rows and the aggregate in one transaction, and
+/// returns a terminal transition for the caller to batch-apply.
 pub(crate) async fn process_case_execution(
     context: &Context,
     db: &PgPool,
@@ -1263,6 +1299,7 @@ pub(crate) async fn process_case_execution(
     }
 }
 
+/// Returns whether an evaluator lifecycle state is executable by workers.
 pub(crate) fn is_runnable_evaluator_state(state: &EvaluatorState) -> bool {
     matches!(
         state,
