@@ -263,7 +263,7 @@ case_groups:
     applies_to:
       task_type: classification
     evaluators:
-      - ref: core/json-schema@1.0.0
+      - ref: core/json-schema:1.0.0
         dimension: format
         blocking: true
         weight: 1.0
@@ -283,7 +283,7 @@ case_groups:
         assert_eq!(profile.case_groups.len(), 1);
         assert_eq!(
             profile.case_groups[0].evaluators[0].evaluator_ref,
-            "core/json-schema@1.0.0"
+            "core/json-schema:1.0.0"
         );
     }
 

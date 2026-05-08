@@ -181,4 +181,3 @@ pub(crate) async fn finalize_claimed_run(
 
     Ok(finalized)
 }
-

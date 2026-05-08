@@ -20,7 +20,7 @@ case_groups:
       task_type: classification
 
     evaluators:
-      - ref: core/json-schema@1.0.0
+      - ref: core/json-schema:1.0.0
         dimension: format
         blocking: true
         weight: 1.0
@@ -32,7 +32,7 @@ case_groups:
               label:
                 type: string
 
-      - ref: core/exact-label-match@1.0.0
+      - ref: core/exact-label-match:1.0.0
         dimension: correctness
         blocking: false
         weight: 1.0
@@ -58,7 +58,7 @@ case_groups:
       task_type: tool_use
 
     evaluators:
-      - ref: core/tool-call-schema@1.0.0
+      - ref: core/tool-call-schema:1.0.0
         dimension: format
         blocking: true
         weight: 1.0
@@ -66,7 +66,7 @@ case_groups:
           expected_path: "$.expected.tool_calls"
           actual_path: "$.actual.tool_calls"
 
-      - ref: core/tool-call-match@1.0.0
+      - ref: core/tool-call-match:1.0.0
         dimension: tool_use
         blocking: true
         weight: 1.0
@@ -92,14 +92,14 @@ case_groups:
       tags_any: [safety]
 
     evaluators:
-      - ref: core/refusal-policy@1.0.0
+      - ref: core/refusal-policy:1.0.0
         dimension: safety
         blocking: true
         weight: 1.0
         config:
           expected_path: "$.expected.final_response"
 
-      - ref: core/helpful-alternative@1.0.0
+      - ref: core/helpful-alternative:1.0.0
         dimension: quality
         blocking: false
         weight: 0.4
@@ -122,7 +122,7 @@ case_groups:
       task_type: image_generation
 
     evaluators:
-      - ref: vision/prompt-adherence@1.0.0
+      - ref: vision/prompt-adherence:1.0.0
         dimension: quality
         blocking: false
         weight: 0.6
@@ -130,7 +130,7 @@ case_groups:
           required_concepts_path: "$.expected.required_concepts"
           prohibited_concepts_path: "$.expected.prohibited_concepts"
 
-      - ref: vision/image-safety@1.0.0
+      - ref: vision/image-safety:1.0.0
         dimension: safety
         blocking: true
         weight: 1.0
@@ -153,7 +153,7 @@ case_groups:
       task_type: price_prediction
 
     evaluators:
-      - ref: core/absolute-error@1.0.0
+      - ref: core/absolute-error:1.0.0
         dimension: correctness
         blocking: false
         weight: 0.7
@@ -162,7 +162,7 @@ case_groups:
           actual_path: "$.actual.structured.value"
           max_error: 100.0
 
-      - ref: core/within-tolerance@1.0.0
+      - ref: core/within-tolerance:1.0.0
         dimension: correctness
         blocking: true
         weight: 0.3

@@ -94,14 +94,20 @@ async fn run_worker_cycle(context: Context) -> anyhow::Result<()> {
         return Ok(());
     };
 
-    debug!(delivery_tag = message.delivery_tag, "consumed worker message");
+    debug!(
+        delivery_tag = message.delivery_tag,
+        "consumed worker message"
+    );
 
     let payload = match serde_json::from_value::<ChunkReadyMessage>(message.payload.clone()) {
         Ok(payload) => payload,
         Err(err) => {
             mq.ack(message.delivery_tag).await?;
             warn!(error = %err, "dropping invalid chunk-ready message payload");
-            debug!(delivery_tag = message.delivery_tag, "invalid message acknowledged and dropped");
+            debug!(
+                delivery_tag = message.delivery_tag,
+                "invalid message acknowledged and dropped"
+            );
             return Ok(());
         }
     };
@@ -122,7 +128,10 @@ async fn run_worker_cycle(context: Context) -> anyhow::Result<()> {
             run_id = %payload.run_id,
             "chunk not claimable; acknowledging message"
         );
-        debug!(delivery_tag = message.delivery_tag, "unclaimable chunk message acknowledged");
+        debug!(
+            delivery_tag = message.delivery_tag,
+            "unclaimable chunk message acknowledged"
+        );
         return Ok(());
     };
 

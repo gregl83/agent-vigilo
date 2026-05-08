@@ -27,7 +27,10 @@ use crate::{
         RunDataset,
         RunProfile,
     },
-    db::workflows::run_create,
+    db::workflows::{
+        run_create,
+        run_profile_validation,
+    },
     models::{
         case_blob::CaseBlobDraft,
         dataset_version_case::DatasetVersionCaseDraft,
@@ -242,6 +245,13 @@ async fn handle_create(
         anyhow::bail!("dataset must include at least one case");
     }
 
+    let executability = run_profile_validation::validate_profile_executability(
+        db,
+        &parsed.profile,
+        &parsed.dataset,
+    )
+    .await?;
+
     let (case_blobs, dataset_cases) = build_case_plans(&parsed.dataset)?;
     let dataset_version_id = compute_dataset_version_id(&parsed.dataset, &dataset_cases)?;
     let profile_hash = hash_json(&profile_payload)?;
@@ -272,6 +282,7 @@ async fn handle_create(
         "profile_hash": profile_hash,
         "aggregation_policy_hash": aggregation_policy_hash,
         "chunk_size": chunk_size,
+        "executability": executability,
     });
 
     let run_draft = RunDraft {
@@ -333,6 +344,8 @@ async fn handle_create(
             "case_count": dataset_cases.len(),
             "chunk_count": chunks.len(),
             "chunk_size": chunk_size,
+            "expected_evaluator_executions": executability.expected_evaluator_execution_count,
+            "resolved_evaluator_refs": executability.runnable_evaluator_ref_count,
         }
     });
 
@@ -347,8 +360,15 @@ async fn handle_test(
     dataset: Option<String>,
     dataset_file: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    let db = context.db().await?;
     let out = context.out().await?;
     let parsed = load_run_inputs(profile, profile_file, dataset, dataset_file)?;
+    let executability = run_profile_validation::validate_profile_executability(
+        db,
+        &parsed.profile,
+        &parsed.dataset,
+    )
+    .await?;
 
     let payload = json!({
         "data": {
@@ -358,6 +378,7 @@ async fn handle_test(
         "meta": {
             "profile_case_groups": parsed.profile.case_groups.len(),
             "dataset_cases": parsed.dataset.cases.len(),
+            "executability": executability,
             "sources": {
                 "profile": if parsed.profile_payload.is_object() || parsed.profile_payload.is_array() { "structured" } else { "scalar" },
                 "dataset": if parsed.dataset_payload.is_object() || parsed.dataset_payload.is_array() { "structured" } else { "scalar" },

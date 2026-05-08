@@ -97,7 +97,7 @@ case_groups:
 
 ```yaml
 evaluators:
-  - ref: core/json-schema@1.0.0
+  - ref: core/json-schema:1.0.0
     dimension: format
     blocking: true
     weight: 1.0
@@ -106,7 +106,7 @@ evaluators:
         type: object
 ```
 
-- `ref` (string): evaluator reference as provided in profile payload.
+- `ref` (string): fully qualified evaluator identifier `<namespace>/<name>:<version>`.
 - `dimension` (string)
 - `blocking` (bool)
 - `weight` (f64)

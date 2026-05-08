@@ -92,7 +92,10 @@ async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow
     let mq = context.mq().await?;
     debug!(coordinator_id, "messaging context ready");
 
-    debug!(coordinator_id, "attempting to claim pending run for dispatch");
+    debug!(
+        coordinator_id,
+        "attempting to claim pending run for dispatch"
+    );
 
     if let Some(run) =
         run_dispatch::claim_next_pending_run(db, coordinator_id, COORDINATOR_LEASE_SECONDS).await?
@@ -134,7 +137,10 @@ async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow
             debug!(run_id = %run.id, "claimed finalizable run but no finalization update was applied");
         }
     } else {
-        debug!(coordinator_id, "no finalizable runs available for this cycle");
+        debug!(
+            coordinator_id,
+            "no finalizable runs available for this cycle"
+        );
     }
 
     debug!(coordinator_id, "starting outbox publish pass");
