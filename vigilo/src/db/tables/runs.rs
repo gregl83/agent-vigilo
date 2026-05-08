@@ -124,6 +124,28 @@ pub(crate) async fn select_run_by_id(db: &PgPool, id: Uuid) -> anyhow::Result<Op
     Ok(run)
 }
 
+/// Finds only the run profile payload from a run's config snapshot.
+///
+/// Worker hot paths use this instead of loading the full run row because the
+/// full snapshot can include the entire dataset payload.
+pub(crate) async fn select_run_profile_snapshot_by_id(
+    db: &PgPool,
+    id: Uuid,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let profile = sqlx::query_scalar::<_, Option<serde_json::Value>>(
+        r#"
+        SELECT config_snapshot->'profile' AS profile_snapshot
+        FROM runs
+        WHERE id = $1::uuid
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(profile.flatten())
+}
+
 /// Finds a run by stable run key.
 pub(crate) async fn select_run_by_key(db: &PgPool, run_key: &str) -> anyhow::Result<Option<Run>> {
     let run = sqlx::query_as::<_, Run>(

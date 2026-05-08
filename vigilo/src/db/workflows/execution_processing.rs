@@ -15,7 +15,11 @@ use std::{
 };
 
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{
+    PgPool,
+    Postgres,
+    QueryBuilder,
+};
 use tokio::task::{
     self,
     JoinSet,
@@ -95,6 +99,41 @@ pub(crate) struct ProcessedExecution {
     pub(crate) terminal_transition: ExecutionTerminalTransition,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct AttemptAllocation {
+    case_id: String,
+    execution_id: Uuid,
+    attempt_id: Uuid,
+    attempt_no: i32,
+}
+
+#[derive(Debug)]
+struct CompletedExecutionPersistence {
+    execution_id: Uuid,
+    attempt_id: Uuid,
+    attempt_no: i32,
+    result_rows: Vec<evaluator_results::EvaluatorResultInsertRow>,
+    overall_status: String,
+    aggregate_score: Option<f64>,
+    evaluator_result_count: i32,
+    dimension_scores: serde_json::Value,
+    blocking_failures: serde_json::Value,
+    summary: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct CaseExecutionOutcome {
+    processed: ProcessedExecution,
+    persistence: Option<CompletedExecutionPersistence>,
+}
+
+#[derive(Debug, Default)]
+struct BatchPersistenceStats {
+    evaluator_results_attempted: usize,
+    evaluator_results_inserted: u64,
+    evaluator_result_conflicts: usize,
+}
+
 fn processed_terminal_failure(
     execution_id: Uuid,
     attempt_id: Uuid,
@@ -113,14 +152,6 @@ fn processed_terminal_failure(
             error_message: Some(error_message),
         },
     }
-}
-
-/// Extracts unique evaluator refs from a serialized run config snapshot.
-pub(crate) fn evaluator_refs_from_snapshot(
-    snapshot: &serde_json::Value,
-) -> anyhow::Result<Vec<String>> {
-    let profile = run_profile_from_snapshot(snapshot)?;
-    evaluator_refs_from_profile(&profile)
 }
 
 /// Extracts unique evaluator refs from a run profile.
@@ -260,21 +291,6 @@ pub(crate) async fn get_or_load_component(
     Ok(component)
 }
 
-/// Parses the run profile payload stored inside a run config snapshot.
-pub(crate) fn run_profile_from_snapshot(
-    snapshot: &serde_json::Value,
-) -> anyhow::Result<RunProfile> {
-    let profile_value = snapshot
-        .get("profile")
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("run snapshot is missing 'profile' payload"))?;
-
-    let profile: RunProfile = serde_json::from_value(profile_value)
-        .map_err(|err| anyhow::anyhow!("run snapshot profile is invalid: {}", err))?;
-
-    Ok(profile)
-}
-
 fn tags_from_case_row(tags: &serde_json::Value) -> Vec<String> {
     tags.as_array()
         .into_iter()
@@ -381,26 +397,80 @@ fn make_agent_output(case: &chunk_processing::WorkerCaseBatchItem) -> AgentOutpu
     }
 }
 
-async fn allocate_execution_attempt_for_case(
+async fn allocate_execution_attempts_for_cases(
     db: &PgPool,
     run_id: Uuid,
     run_profile: &RunProfile,
-    case: &chunk_processing::WorkerCaseBatchItem,
-    evaluator_bindings: &[EvaluatorBinding],
-) -> anyhow::Result<(Uuid, Uuid, i32)> {
-    #[derive(sqlx::FromRow)]
-    struct AttemptAllocation {
-        execution_id: Uuid,
-        attempt_id: Uuid,
-        attempt_no: i32,
+    cases: &[chunk_processing::WorkerCaseBatchItem],
+    evaluator_bindings_by_case: &[Vec<EvaluatorBinding>],
+) -> anyhow::Result<Vec<AttemptAllocation>> {
+    if cases.is_empty() {
+        return Ok(Vec::new());
     }
 
-    let evaluator_manifest = serde_json::to_value(evaluator_bindings)?;
-    let mut tx = db.begin().await?;
+    if cases.len() != evaluator_bindings_by_case.len() {
+        anyhow::bail!(
+            "case batch has {} cases but {} evaluator binding sets",
+            cases.len(),
+            evaluator_bindings_by_case.len()
+        );
+    }
 
-    let row = sqlx::query_as::<_, AttemptAllocation>(
+    struct AllocationInput<'a> {
+        case: &'a chunk_processing::WorkerCaseBatchItem,
+        evaluator_manifest: serde_json::Value,
+        expected_evaluator_count: i32,
+        input_ordinal: i32,
+    }
+
+    let inputs = cases
+        .iter()
+        .zip(evaluator_bindings_by_case)
+        .enumerate()
+        .map(|(index, (case, evaluator_bindings))| {
+            Ok(AllocationInput {
+                case,
+                evaluator_manifest: serde_json::to_value(evaluator_bindings)?,
+                expected_evaluator_count: i32::try_from(evaluator_bindings.len())?,
+                input_ordinal: i32::try_from(index)?,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let mut query_builder = QueryBuilder::<Postgres>::new(
         r#"
-        WITH upserted AS (
+        WITH input (
+            case_id,
+            case_hash,
+            task_type,
+            tags,
+            input_payload,
+            expected_output,
+            case_metadata,
+            evaluator_manifest,
+            expected_evaluator_count,
+            input_ordinal
+        ) AS (
+        "#,
+    );
+
+    query_builder.push_values(inputs.iter(), |mut b, row| {
+        b.push_bind(&row.case.case_id)
+            .push_bind(&row.case.case_hash)
+            .push_bind(&row.case.task_type)
+            .push_bind(&row.case.tags)
+            .push_bind(&row.case.input_payload)
+            .push_bind(&row.case.expected_output)
+            .push_bind(&row.case.metadata)
+            .push_bind(&row.evaluator_manifest)
+            .push_bind(row.expected_evaluator_count)
+            .push_bind(row.input_ordinal);
+    });
+
+    query_builder.push(
+        r#"
+        ),
+        upserted AS (
             INSERT INTO executions (
                 run_id,
                 case_id,
@@ -419,24 +489,33 @@ async fn allocate_execution_attempt_for_case(
                 started_at,
                 updated_at
             )
-            VALUES (
-                $1::uuid,
-                $2,
-                $3,
+            SELECT
+                "#,
+    );
+    query_builder.push_bind(run_id);
+    query_builder.push(
+        r#"::uuid,
+                input.case_id,
+                input.case_hash,
                 'default',
-                $4,
-                $5::jsonb,
-                $6::jsonb,
-                $7::jsonb,
-                $8::jsonb,
-                $9,
-                $10,
-                $11::jsonb,
-                $12,
+                input.task_type,
+                input.tags::jsonb,
+                input.input_payload::jsonb,
+                input.expected_output::jsonb,
+                input.case_metadata::jsonb,
+                "#,
+    );
+    query_builder.push_bind(&run_profile.profile_id);
+    query_builder.push(",");
+    query_builder.push_bind(&run_profile.profile_version);
+    query_builder.push(
+        r#",
+                input.evaluator_manifest::jsonb,
+                input.expected_evaluator_count,
                 'pending'::execution_status,
                 NULL,
                 now()
-            )
+            FROM input
             ON CONFLICT (run_id, case_id) DO UPDATE
             SET case_hash = EXCLUDED.case_hash,
                 task_type = EXCLUDED.task_type,
@@ -449,7 +528,7 @@ async fn allocate_execution_attempt_for_case(
                 evaluator_manifest = EXCLUDED.evaluator_manifest,
                 expected_evaluator_count = EXCLUDED.expected_evaluator_count,
                 updated_at = now()
-            RETURNING id
+            RETURNING id, case_id
         ),
         superseded_attempts AS (
             UPDATE execution_attempts
@@ -535,7 +614,11 @@ async fn allocate_execution_attempt_for_case(
             )
             SELECT
                 bumped.execution_id,
-                $1::uuid,
+                "#,
+    );
+    query_builder.push_bind(run_id);
+    query_builder.push(
+        r#"::uuid,
                 bumped.attempt_no,
                 'running'::attempt_status,
                 now(),
@@ -551,28 +634,34 @@ async fn allocate_execution_attempt_for_case(
             WHERE executions.id = inserted_attempt.execution_id
             RETURNING executions.id
         )
-        SELECT execution_id, attempt_id, attempt_no
+        SELECT
+            input.case_id,
+            inserted_attempt.execution_id,
+            inserted_attempt.attempt_id,
+            inserted_attempt.attempt_no
         FROM inserted_attempt
+        JOIN upserted
+          ON upserted.id = inserted_attempt.execution_id
+        JOIN input
+          ON input.case_id = upserted.case_id
+        ORDER BY input.input_ordinal
         "#,
-    )
-    .bind(run_id)
-    .bind(&case.case_id)
-    .bind(&case.case_hash)
-    .bind(&case.task_type)
-    .bind(&case.tags)
-    .bind(&case.input_payload)
-    .bind(&case.expected_output)
-    .bind(&case.metadata)
-    .bind(&run_profile.profile_id)
-    .bind(&run_profile.profile_version)
-    .bind(&evaluator_manifest)
-    .bind(i32::try_from(evaluator_bindings.len())?)
-    .fetch_one(&mut *tx)
-    .await?;
+    );
 
-    tx.commit().await?;
+    let allocations = query_builder
+        .build_query_as::<AttemptAllocation>()
+        .fetch_all(db)
+        .await?;
 
-    Ok((row.execution_id, row.attempt_id, row.attempt_no))
+    if allocations.len() != cases.len() {
+        anyhow::bail!(
+            "allocated {} execution attempts for {} cases",
+            allocations.len(),
+            cases.len()
+        );
+    }
+
+    Ok(allocations)
 }
 
 /// Applies terminal execution transitions as one authoritative batch.
@@ -871,43 +960,19 @@ fn map_severity(severity: &Severity) -> &'static str {
     }
 }
 
-/// Processes one dataset case through all matching evaluator bindings.
-///
-/// The function allocates an authoritative attempt, runs evaluators with bounded
-/// parallelism, persists result rows and the aggregate in one transaction, and
-/// returns a terminal transition for the caller to batch-apply.
-pub(crate) async fn process_case_execution(
+async fn evaluate_case_execution(
     context: &Context,
-    db: &PgPool,
     run_id: Uuid,
     run_profile: &RunProfile,
     evaluator_catalog: &RunEvaluatorCatalog,
     case: &chunk_processing::WorkerCaseBatchItem,
-) -> anyhow::Result<ProcessedExecution> {
-    let evaluator_bindings = evaluator_bindings_for_case(run_profile, case);
-    if evaluator_bindings.is_empty() {
-        anyhow::bail!(
-            "case '{}' did not match any evaluator bindings in run profile",
-            case.case_id
-        );
-    }
-
-    let setup_started = Instant::now();
-
-    let (execution_id, attempt_id, attempt_no) =
-        allocate_execution_attempt_for_case(db, run_id, run_profile, case, &evaluator_bindings)
-            .await?;
-
-    debug!(
-        run_id = %run_id,
-        case_id = %case.case_id,
-        execution_id = %execution_id,
-        attempt_id = %attempt_id,
-        setup_ms = setup_started.elapsed().as_millis() as u64,
-        "initialized execution attempt"
-    );
-
+    evaluator_bindings: &[EvaluatorBinding],
+    allocation: &AttemptAllocation,
+) -> CaseExecutionOutcome {
     let runtime_started = Instant::now();
+    let execution_id = allocation.execution_id;
+    let attempt_id = allocation.attempt_id;
+    let attempt_no = allocation.attempt_no;
 
     let evaluation_result: anyhow::Result<(
         Vec<EvaluatorExecutionRecord>,
@@ -1111,8 +1176,6 @@ pub(crate) async fn process_case_execution(
     match evaluation_result {
         Ok((records, result_rows)) => {
             let runtime_ms = runtime_started.elapsed().as_millis() as u64;
-            let persistence_started = Instant::now();
-
             let overall_status = summarize_overall_status(&records);
 
             let mut by_dimension: BTreeMap<String, (f64, usize)> = BTreeMap::new();
@@ -1161,105 +1224,27 @@ pub(crate) async fn process_case_execution(
                 }
             };
 
-            let persistence_result: anyhow::Result<(u64, usize)> = async {
-                let mut tx = db.begin().await?;
-
-                let current_attempt = sqlx::query_scalar::<_, i32>(
-                    r#"
-                    SELECT 1
-                    FROM executions
-                    WHERE id = $1::uuid
-                      AND current_attempt_id = $2::uuid
-                      AND current_attempt_no = $3
-                    FOR UPDATE
-                    "#,
-                )
-                .bind(execution_id)
-                .bind(attempt_id)
-                .bind(attempt_no)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-                if current_attempt.is_none() {
-                    anyhow::bail!("attempt lost authority before aggregate persistence");
-                }
-
-                let inserted_count =
-                    evaluator_results::insert_evaluator_results_batch(&mut tx, &result_rows)
-                        .await?;
-                let replay_conflicts = result_rows.len().saturating_sub(inserted_count as usize);
-
-                sqlx::query(
-                    r#"
-                INSERT INTO execution_aggregates (
-                    execution_id,
-                    run_id,
-                    attempt_id,
-                    overall_status,
-                    aggregate_score,
-                    evaluator_result_count,
-                    dimension_scores,
-                    blocking_failures,
-                    summary,
-                    updated_at
-                )
-                VALUES (
-                    $1::uuid,
-                    $2::uuid,
-                    $3::uuid,
-                    $4::evaluation_status,
-                    $5,
-                    $6,
-                    $7::jsonb,
-                    $8::jsonb,
-                    $9::jsonb,
-                    now()
-                )
-                ON CONFLICT (execution_id) DO UPDATE
-                SET attempt_id = EXCLUDED.attempt_id,
-                    overall_status = EXCLUDED.overall_status,
-                    aggregate_score = EXCLUDED.aggregate_score,
-                    evaluator_result_count = EXCLUDED.evaluator_result_count,
-                    dimension_scores = EXCLUDED.dimension_scores,
-                    blocking_failures = EXCLUDED.blocking_failures,
-                    summary = EXCLUDED.summary,
-                    updated_at = now()
-                "#,
-                )
-                .bind(execution_id)
-                .bind(run_id)
-                .bind(attempt_id)
-                .bind(&overall_status)
-                .bind(aggregate_score)
-                .bind(i32::try_from(records.len())?)
-                .bind(serde_json::Value::Object(dimension_scores))
-                .bind(serde_json::Value::Array(blocking_failures))
-                .bind(json!({
-                    "attempt_id": attempt_id,
-                    "result_count": records.len(),
-                    "overall_status": overall_status,
-                }))
-                .execute(&mut *tx)
-                .await?;
-
-                tx.commit().await?;
-
-                Ok((inserted_count, replay_conflicts))
-            }
-            .await;
-
-            let (inserted_count, replay_conflicts) = match persistence_result {
-                Ok(outcome) => outcome,
+            let evaluator_result_count = match i32::try_from(records.len()) {
+                Ok(count) => count,
                 Err(err) => {
-                    let failure_message = format!("case execution persistence failed: {}", err);
-                    return Ok(processed_terminal_failure(
-                        execution_id,
-                        attempt_id,
-                        attempt_no,
-                        failure_message,
-                    ));
+                    let failure_message = format!("case execution result count overflow: {}", err);
+                    return CaseExecutionOutcome {
+                        processed: processed_terminal_failure(
+                            execution_id,
+                            attempt_id,
+                            attempt_no,
+                            failure_message,
+                        ),
+                        persistence: None,
+                    };
                 }
             };
+
+            let summary = json!({
+                "attempt_id": attempt_id,
+                "result_count": records.len(),
+                "overall_status": overall_status,
+            });
 
             debug!(
                 run_id = %run_id,
@@ -1267,14 +1252,11 @@ pub(crate) async fn process_case_execution(
                 execution_id = %execution_id,
                 attempt_id = %attempt_id,
                 evaluator_results_attempted = result_rows.len(),
-                evaluator_results_inserted = inserted_count,
-                evaluator_result_conflicts = replay_conflicts,
                 runtime_ms,
-                persistence_ms = persistence_started.elapsed().as_millis() as u64,
-                "completed case execution persistence"
+                "completed case evaluator execution"
             );
 
-            Ok(ProcessedExecution {
+            let processed = ProcessedExecution {
                 execution_id,
                 attempt_id,
                 result_count: records.len(),
@@ -1285,18 +1267,250 @@ pub(crate) async fn process_case_execution(
                     completed: true,
                     error_message: None,
                 },
-            })
+            };
+
+            CaseExecutionOutcome {
+                processed,
+                persistence: Some(CompletedExecutionPersistence {
+                    execution_id,
+                    attempt_id,
+                    attempt_no,
+                    result_rows,
+                    overall_status,
+                    aggregate_score,
+                    evaluator_result_count,
+                    dimension_scores: serde_json::Value::Object(dimension_scores),
+                    blocking_failures: serde_json::Value::Array(blocking_failures),
+                    summary,
+                }),
+            }
         }
         Err(err) => {
             let failure_message = format!("case execution processing failed: {}", err);
-            Ok(processed_terminal_failure(
-                execution_id,
-                attempt_id,
-                attempt_no,
-                failure_message,
-            ))
+            CaseExecutionOutcome {
+                processed: processed_terminal_failure(
+                    execution_id,
+                    attempt_id,
+                    attempt_no,
+                    failure_message,
+                ),
+                persistence: None,
+            }
         }
     }
+}
+
+async fn persist_completed_execution_results_batch(
+    db: &PgPool,
+    run_id: Uuid,
+    completed: &[CompletedExecutionPersistence],
+) -> anyhow::Result<BatchPersistenceStats> {
+    if completed.is_empty() {
+        return Ok(BatchPersistenceStats::default());
+    }
+
+    let mut tx = db.begin().await?;
+
+    let mut authority_query = QueryBuilder::<Postgres>::new(
+        r#"
+        WITH input (
+            execution_id,
+            attempt_id,
+            attempt_no
+        ) AS (
+        "#,
+    );
+    authority_query.push_values(completed, |mut b, row| {
+        b.push_bind(row.execution_id)
+            .push_bind(row.attempt_id)
+            .push_bind(row.attempt_no);
+    });
+    authority_query.push(
+        r#"
+        ),
+        locked AS (
+            SELECT executions.id
+            FROM executions
+            JOIN input
+              ON input.execution_id = executions.id
+            WHERE executions.current_attempt_id = input.attempt_id
+              AND executions.current_attempt_no = input.attempt_no
+            FOR UPDATE OF executions
+        )
+        SELECT COUNT(*)::bigint
+        FROM locked
+        "#,
+    );
+
+    let current_attempt_count = authority_query
+        .build_query_scalar::<i64>()
+        .fetch_one(&mut *tx)
+        .await?;
+    if usize::try_from(current_attempt_count)? != completed.len() {
+        anyhow::bail!(
+            "aggregate persistence batch locked {} current executions out of {}; at least one attempt lost authority",
+            current_attempt_count,
+            completed.len()
+        );
+    }
+
+    let result_rows = completed
+        .iter()
+        .flat_map(|row| row.result_rows.iter().cloned())
+        .collect::<Vec<_>>();
+    let evaluator_results_inserted =
+        evaluator_results::insert_evaluator_results_batch(&mut tx, &result_rows).await?;
+
+    let mut aggregate_query = QueryBuilder::<Postgres>::new(
+        r#"
+        INSERT INTO execution_aggregates (
+            execution_id,
+            run_id,
+            attempt_id,
+            overall_status,
+            aggregate_score,
+            evaluator_result_count,
+            dimension_scores,
+            blocking_failures,
+            summary
+        )
+        "#,
+    );
+    aggregate_query.push_values(completed, |mut b, row| {
+        b.push_bind(row.execution_id)
+            .push_bind(run_id)
+            .push_bind(row.attempt_id)
+            .push_bind(&row.overall_status)
+            .push_unseparated("::evaluation_status")
+            .push_bind(row.aggregate_score)
+            .push_bind(row.evaluator_result_count)
+            .push_bind(&row.dimension_scores)
+            .push_bind(&row.blocking_failures)
+            .push_bind(&row.summary)
+            .push_unseparated("::jsonb");
+    });
+    aggregate_query.push(
+        r#"
+        ON CONFLICT (execution_id) DO UPDATE
+        SET attempt_id = EXCLUDED.attempt_id,
+            overall_status = EXCLUDED.overall_status,
+            aggregate_score = EXCLUDED.aggregate_score,
+            evaluator_result_count = EXCLUDED.evaluator_result_count,
+            dimension_scores = EXCLUDED.dimension_scores,
+            blocking_failures = EXCLUDED.blocking_failures,
+            summary = EXCLUDED.summary,
+            updated_at = now()
+        "#,
+    );
+    aggregate_query.build().execute(&mut *tx).await?;
+
+    tx.commit().await?;
+
+    let evaluator_results_attempted = result_rows.len();
+    Ok(BatchPersistenceStats {
+        evaluator_results_attempted,
+        evaluator_results_inserted,
+        evaluator_result_conflicts: evaluator_results_attempted
+            .saturating_sub(evaluator_results_inserted as usize),
+    })
+}
+
+/// Processes a chunk-sized batch of dataset cases.
+///
+/// The function allocates authoritative attempts in one statement, runs each
+/// case's evaluators with bounded per-case parallelism, and persists all
+/// completed case results in one chunk-level transaction. Terminal execution
+/// transitions are returned for the caller to batch-apply after persistence.
+pub(crate) async fn process_case_batch_execution(
+    context: &Context,
+    db: &PgPool,
+    run_id: Uuid,
+    run_profile: &RunProfile,
+    evaluator_catalog: &RunEvaluatorCatalog,
+    cases: &[chunk_processing::WorkerCaseBatchItem],
+) -> anyhow::Result<Vec<ProcessedExecution>> {
+    if cases.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let setup_started = Instant::now();
+    let evaluator_bindings_by_case = cases
+        .iter()
+        .map(|case| {
+            let evaluator_bindings = evaluator_bindings_for_case(run_profile, case);
+            if evaluator_bindings.is_empty() {
+                anyhow::bail!(
+                    "case '{}' did not match any evaluator bindings in run profile",
+                    case.case_id
+                );
+            }
+            Ok(evaluator_bindings)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let allocations = allocate_execution_attempts_for_cases(
+        db,
+        run_id,
+        run_profile,
+        cases,
+        &evaluator_bindings_by_case,
+    )
+    .await?;
+
+    debug!(
+        run_id = %run_id,
+        case_count = cases.len(),
+        setup_ms = setup_started.elapsed().as_millis() as u64,
+        "initialized execution attempts for case batch"
+    );
+
+    let mut processed = Vec::with_capacity(cases.len());
+    let mut completed = Vec::new();
+    for ((case, evaluator_bindings), allocation) in cases
+        .iter()
+        .zip(evaluator_bindings_by_case.iter())
+        .zip(allocations.iter())
+    {
+        if allocation.case_id != case.case_id {
+            anyhow::bail!(
+                "attempt allocation returned case '{}' while processing case '{}'",
+                allocation.case_id,
+                case.case_id
+            );
+        }
+
+        let outcome = evaluate_case_execution(
+            context,
+            run_id,
+            run_profile,
+            evaluator_catalog,
+            case,
+            evaluator_bindings,
+            allocation,
+        )
+        .await;
+
+        if let Some(persistence) = outcome.persistence {
+            completed.push(persistence);
+        }
+        processed.push(outcome.processed);
+    }
+
+    let persistence_started = Instant::now();
+    let persistence_stats =
+        persist_completed_execution_results_batch(db, run_id, &completed).await?;
+    debug!(
+        run_id = %run_id,
+        case_count = cases.len(),
+        completed_case_count = completed.len(),
+        evaluator_results_attempted = persistence_stats.evaluator_results_attempted,
+        evaluator_results_inserted = persistence_stats.evaluator_results_inserted,
+        evaluator_result_conflicts = persistence_stats.evaluator_result_conflicts,
+        persistence_ms = persistence_started.elapsed().as_millis() as u64,
+        "persisted completed case results for batch"
+    );
+
+    Ok(processed)
 }
 
 /// Returns whether an evaluator lifecycle state is executable by workers.

@@ -30,6 +30,7 @@ use uuid::Uuid;
 use super::Executable;
 use crate::{
     context::Context,
+    contracts::run::RunProfile,
     db::{
         tables::runs,
         workflows::{
@@ -42,9 +43,16 @@ use crate::{
 
 const WORKER_TICK_SECONDS: u64 = 5;
 const CHUNK_LEASE_SECONDS: i32 = 60;
-const RUN_CATALOG_CACHE_MAX_ENTRIES: u64 = 1024;
-const RUN_CATALOG_CACHE_TTI_SECONDS: u64 = 900;
+const RUN_CONTEXT_CACHE_MAX_ENTRIES: u64 = 1024;
+const RUN_CONTEXT_CACHE_TTI_SECONDS: u64 = 900;
 const WARMUP_PARALLELISM: usize = 8;
+
+#[derive(Debug)]
+struct WorkerRunContext {
+    profile: RunProfile,
+    evaluator_refs: Vec<String>,
+    evaluator_catalog: execution_processing::RunEvaluatorCatalog,
+}
 
 #[derive(Debug, Deserialize)]
 /// Queue payload that signals a run chunk is ready for processing.
@@ -69,7 +77,7 @@ struct WarmupStats {
 /// Wasmtime components.
 struct EvaluatorLoaderService {
     context: Context,
-    run_catalog_cache: Arc<Cache<Uuid, Arc<execution_processing::RunEvaluatorCatalog>>>,
+    run_context_cache: Arc<Cache<Uuid, Arc<WorkerRunContext>>>,
 }
 
 impl EvaluatorLoaderService {
@@ -77,10 +85,10 @@ impl EvaluatorLoaderService {
     fn new(context: Context) -> Self {
         Self {
             context,
-            run_catalog_cache: Arc::new(
+            run_context_cache: Arc::new(
                 Cache::builder()
-                    .max_capacity(RUN_CATALOG_CACHE_MAX_ENTRIES)
-                    .time_to_idle(Duration::from_secs(RUN_CATALOG_CACHE_TTI_SECONDS))
+                    .max_capacity(RUN_CONTEXT_CACHE_MAX_ENTRIES)
+                    .time_to_idle(Duration::from_secs(RUN_CONTEXT_CACHE_TTI_SECONDS))
                     .build(),
             ),
         }
@@ -154,37 +162,50 @@ impl EvaluatorLoaderService {
         Ok(stats)
     }
 
-    /// Returns a run-scoped evaluator catalog, using cache when available.
-    async fn get_or_build_run_evaluator_catalog(
+    /// Returns run-scoped profile and evaluator metadata, using cache when available.
+    async fn get_or_build_run_context(
         &self,
         run_id: Uuid,
-        profile: &crate::contracts::run::RunProfile,
-    ) -> anyhow::Result<Arc<execution_processing::RunEvaluatorCatalog>> {
+    ) -> anyhow::Result<Arc<WorkerRunContext>> {
         let context = self.context.clone();
-        let profile = profile.clone();
 
-        let catalog_result = self
-            .run_catalog_cache
+        let context_result = self
+            .run_context_cache
             .try_get_with::<_, anyhow::Error>(run_id, async move {
                 let db = context.db().await?;
-                Ok(Arc::new(
-                    execution_processing::build_run_evaluator_catalog(db, &profile).await?,
-                ))
+                let Some(profile_snapshot) =
+                    runs::select_run_profile_snapshot_by_id(db, run_id).await?
+                else {
+                    anyhow::bail!("run '{}' missing profile snapshot", run_id);
+                };
+                let profile: RunProfile =
+                    serde_json::from_value(profile_snapshot).map_err(|err| {
+                        anyhow::anyhow!("run '{}' profile is invalid: {}", run_id, err)
+                    })?;
+                let evaluator_refs = execution_processing::evaluator_refs_from_profile(&profile)?;
+                let evaluator_catalog =
+                    execution_processing::build_run_evaluator_catalog(db, &profile).await?;
+
+                Ok(Arc::new(WorkerRunContext {
+                    profile,
+                    evaluator_refs,
+                    evaluator_catalog,
+                }))
             })
             .await;
 
-        let catalog = match catalog_result {
-            Ok(catalog) => catalog,
+        let context = match context_result {
+            Ok(context) => context,
             Err(err) => {
                 return Err(anyhow::anyhow!(
-                    "run catalog load failed for run '{}' (single-flight): {}",
+                    "run context load failed for run '{}' (single-flight): {}",
                     run_id,
                     err
                 ));
             }
         };
 
-        Ok(catalog)
+        Ok(context)
     }
 }
 
@@ -248,7 +269,7 @@ async fn handle_once(context: Context) -> anyhow::Result<()> {
 /// 1. consume queue message
 /// 2. parse payload and claim chunk lease
 /// 3. warm evaluator components from run profile
-/// 4. load chunk case batch and process each case
+/// 4. load and process the chunk case batch
 /// 5. ack on success, nack+requeue on recoverable failures
 async fn run_worker_cycle(
     context: Context,
@@ -321,13 +342,14 @@ async fn run_worker_cycle(
         "claimed chunk for processing"
     );
 
-    let run = runs::select_run_by_id(db, chunk.run_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("run '{}' missing while processing chunk", chunk.run_id))?;
-    let run_profile = execution_processing::run_profile_from_snapshot(&run.config_snapshot)?;
-    let evaluator_refs = execution_processing::evaluator_refs_from_profile(&run_profile)?;
+    let run_context = evaluator_loader
+        .get_or_build_run_context(chunk.run_id)
+        .await?;
 
-    match evaluator_loader.warm_refs(&evaluator_refs).await {
+    match evaluator_loader
+        .warm_refs(&run_context.evaluator_refs)
+        .await
+    {
         Ok(stats) => {
             debug!(
                 run_id = %chunk.run_id,
@@ -355,65 +377,65 @@ async fn run_worker_cycle(
         }
     }
 
-    let evaluator_catalog = evaluator_loader
-        .get_or_build_run_evaluator_catalog(chunk.run_id, &run_profile)
-        .await?;
-
     let batch_result = chunk_processing::load_chunk_case_batch(db, &chunk).await;
     match batch_result {
         Ok(cases) => {
             let mut succeeded = 0usize;
             let mut failed = 0usize;
-            let mut terminal_transitions = Vec::with_capacity(cases.len());
 
-            for case in &cases {
-                let processing_result = execution_processing::process_case_execution(
-                    &context,
-                    db,
-                    chunk.run_id,
-                    &run_profile,
-                    evaluator_catalog.as_ref(),
-                    case,
-                )
-                .await;
-
-                match processing_result {
-                    Ok(processed) => {
-                        let completed = processed.terminal_transition.completed;
-                        let failure_message = processed.terminal_transition.error_message.clone();
-                        terminal_transitions.push(processed.terminal_transition);
-
-                        if completed {
-                            succeeded += 1;
-                            debug!(
-                                run_id = %chunk.run_id,
-                                case_id = %case.case_id,
-                                execution_id = %processed.execution_id,
-                                attempt_id = %processed.attempt_id,
-                                evaluator_result_count = processed.result_count,
-                                "completed execution persistence for case"
-                            );
-                        } else {
-                            failed += 1;
-                            warn!(
-                                run_id = %chunk.run_id,
-                                case_id = %case.case_id,
-                                execution_id = %processed.execution_id,
-                                attempt_id = %processed.attempt_id,
-                                error = %failure_message.unwrap_or_else(|| "unknown failure".to_string()),
-                                "case execution completed with terminal failure"
-                            );
-                        }
+            let processed = match execution_processing::process_case_batch_execution(
+                &context,
+                db,
+                chunk.run_id,
+                &run_context.profile,
+                &run_context.evaluator_catalog,
+                &cases,
+            )
+            .await
+            {
+                Ok(processed) => processed,
+                Err(err) => {
+                    let released = chunk_processing::release_chunk_as_pending(db, &chunk).await?;
+                    if released > 0 {
+                        mq.nack_requeue(message.delivery_tag).await?;
+                    } else {
+                        mq.ack(message.delivery_tag).await?;
                     }
-                    Err(err) => {
-                        failed += 1;
-                        warn!(
-                            run_id = %chunk.run_id,
-                            case_id = %case.case_id,
-                            error = %err,
-                            "failed processing case execution; recorded as failed when possible"
-                        );
-                    }
+                    warn!(
+                        run_id = %chunk.run_id,
+                        chunk_id = %chunk.id,
+                        error = %err,
+                        chunk_released = released > 0,
+                        "failed chunk case processing; handled claimed chunk lease"
+                    );
+                    return Ok(());
+                }
+            };
+
+            let mut terminal_transitions = Vec::with_capacity(processed.len());
+            for processed in processed {
+                let completed = processed.terminal_transition.completed;
+                let failure_message = processed.terminal_transition.error_message.clone();
+                terminal_transitions.push(processed.terminal_transition);
+
+                if completed {
+                    succeeded += 1;
+                    debug!(
+                        run_id = %chunk.run_id,
+                        execution_id = %processed.execution_id,
+                        attempt_id = %processed.attempt_id,
+                        evaluator_result_count = processed.result_count,
+                        "completed execution persistence for case"
+                    );
+                } else {
+                    failed += 1;
+                    warn!(
+                        run_id = %chunk.run_id,
+                        execution_id = %processed.execution_id,
+                        attempt_id = %processed.attempt_id,
+                        error = %failure_message.unwrap_or_else(|| "unknown failure".to_string()),
+                        "case execution completed with terminal failure"
+                    );
                 }
             }
 

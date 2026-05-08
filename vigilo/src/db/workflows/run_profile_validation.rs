@@ -11,7 +11,10 @@ use sqlx::PgPool;
 
 use crate::{
     contracts::{
-        evaluator_ref::parse_fully_qualified_evaluator,
+        evaluator_ref::{
+            EvaluatorIdentity,
+            parse_fully_qualified_evaluator,
+        },
         run::{
             DatasetCase,
             RunDataset,
@@ -42,6 +45,7 @@ pub(crate) async fn validate_profile_executability(
     dataset: &RunDataset,
 ) -> anyhow::Result<ProfileExecutabilitySummary> {
     let mut runnable_by_ref: HashMap<String, bool> = HashMap::new();
+    let mut parsed_refs: Vec<(String, String, EvaluatorIdentity)> = Vec::new();
     let mut issues = Vec::new();
 
     for group in &profile.case_groups {
@@ -62,34 +66,55 @@ pub(crate) async fn validate_profile_executability(
                 }
             };
 
-            let maybe_evaluator = evaluators::select_evaluator(
-                db,
-                &identity.namespace,
-                &identity.name,
-                &identity.version,
-            )
-            .await?;
-
-            let Some(evaluator_record) = maybe_evaluator else {
-                issues.push(format!(
-                    "case_group '{}' references unpublished evaluator '{}'; publish it before run create/test",
-                    group.id, binding.evaluator_ref
-                ));
-                runnable_by_ref.insert(binding.evaluator_ref.clone(), false);
-                continue;
-            };
-
-            if !is_runnable_state(&evaluator_record.state) {
-                issues.push(format!(
-                    "case_group '{}' references evaluator '{}' in non-runnable state '{:?}'",
-                    group.id, binding.evaluator_ref, evaluator_record.state
-                ));
-                runnable_by_ref.insert(binding.evaluator_ref.clone(), false);
-                continue;
-            }
-
-            runnable_by_ref.insert(binding.evaluator_ref.clone(), true);
+            runnable_by_ref.insert(binding.evaluator_ref.clone(), false);
+            parsed_refs.push((group.id.clone(), binding.evaluator_ref.clone(), identity));
         }
+    }
+
+    let identities = parsed_refs
+        .iter()
+        .map(|(_, _, identity)| {
+            (
+                identity.namespace.clone(),
+                identity.name.clone(),
+                identity.version.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let fetched =
+        evaluators::select_evaluator_runtime_metadata_by_identities(db, &identities).await?;
+    let fetched_by_identity = fetched
+        .into_iter()
+        .map(|row| {
+            let key = (row.namespace.clone(), row.name.clone(), row.version.clone());
+            (key, row)
+        })
+        .collect::<HashMap<_, _>>();
+
+    for (group_id, evaluator_ref, identity) in parsed_refs {
+        let key = (
+            identity.namespace.clone(),
+            identity.name.clone(),
+            identity.version.clone(),
+        );
+
+        let Some(evaluator_record) = fetched_by_identity.get(&key) else {
+            issues.push(format!(
+                "case_group '{}' references unpublished evaluator '{}'; publish it before run create/test",
+                group_id, evaluator_ref
+            ));
+            continue;
+        };
+
+        if !is_runnable_state(&evaluator_record.state) {
+            issues.push(format!(
+                "case_group '{}' references evaluator '{}' in non-runnable state '{:?}'",
+                group_id, evaluator_ref, evaluator_record.state
+            ));
+            continue;
+        }
+
+        runnable_by_ref.insert(evaluator_ref, true);
     }
 
     let mut expected_evaluator_execution_count = 0usize;
