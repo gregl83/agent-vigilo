@@ -26,6 +26,14 @@ This file applies to evaluator crates under `evaluators/`.
 - Validate with `vigilo evaluators test` using `--input` or `--input-file`.
 - If contract shape changes, bump evaluator version before republishing.
 
+## Rustfmt and Toolchain
+
+- Evaluator crates follow the repository toolchain baseline: `stable` by default.
+- Formatting still requires nightly rustfmt because root `rustfmt.toml` uses unstable options.
+- Format evaluator changes with nightly rustfmt (for example from repo root): `cargo +nightly fmt --all`.
+- Keep evaluator build/test flows on stable unless a task explicitly requires otherwise.
+- Do not change rustfmt settings just to force stable-only formatting unless explicitly requested.
+
 ## Reference
 
 - Example crate: `evaluators/sentiment-basic-en`

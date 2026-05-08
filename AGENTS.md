@@ -21,6 +21,14 @@ This repository supports AI-assisted development, but generated changes must fol
 - Use `evaluators/sentiment-basic-en/README.md` as the primary single-evaluator reference.
 - Keep examples small, runnable, and versioned.
 
+## Rustfmt and Toolchain
+
+- The repository default toolchain is `stable` (see `rust-toolchain.toml`).
+- `rustfmt.toml` enables unstable rustfmt options (`unstable_features`, import grouping/granularity/layout).
+- Use nightly rustfmt when formatting: `cargo +nightly fmt --all`.
+- Keep build/test commands on stable unless a task explicitly requires otherwise.
+- Do not remove or downgrade rustfmt settings to avoid nightly usage unless explicitly requested.
+
 ## Change Hygiene
 
 - Make focused commits by concern (contracts, runtime, docs, examples).
