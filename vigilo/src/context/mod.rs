@@ -23,6 +23,7 @@ impl Context {
         db_max_connections: u32,
         mq_uri: String,
         wasm_config: wasm::Config,
+        output_format: output::OutputFormat,
     ) -> Self {
         Self(Arc::new(ContextInner {
             db: database::Context {
@@ -36,6 +37,7 @@ impl Context {
             },
             out: output::Context {
                 cell: Default::default(),
+                format: output_format,
             },
             reg: registry::Context {
                 cell: Default::default(),

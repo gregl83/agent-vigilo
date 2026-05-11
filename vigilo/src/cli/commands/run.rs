@@ -404,7 +404,7 @@ async fn handle_create(
         }
     });
 
-    out.write_line(serde_json::to_string_pretty(&payload)?)?;
+    out.write_value(&payload)?;
     Ok(())
 }
 
@@ -445,7 +445,7 @@ async fn handle_test(
         }
     });
 
-    out.write_line(serde_json::to_string_pretty(&payload)?)?;
+    out.write_value(&payload)?;
     Ok(())
 }
 
@@ -648,7 +648,7 @@ async fn handle_results(context: Context, run_id: String) -> anyhow::Result<()> 
     let summary = select_run_results_summary(db, run_id).await?;
     let payload = run_results_payload(&run, &summary);
 
-    out.write_line(serde_json::to_string_pretty(&payload)?)?;
+    out.write_value(&payload)?;
     Ok(())
 }
 
@@ -681,9 +681,7 @@ async fn handle_watch(
         let snapshot = RunWatchSnapshotKey::from(&run);
 
         if last_snapshot.as_ref() != Some(&snapshot) || terminal {
-            out.write_line(serde_json::to_string_pretty(&run_watch_payload(
-                &run, terminal,
-            ))?)?;
+            out.write_value(&run_watch_payload(&run, terminal))?;
             out.flush()?;
             last_snapshot = Some(snapshot);
         }
@@ -946,6 +944,7 @@ mod tests {
     use crate::{
         context::{
             Context,
+            output::OutputFormat,
             wasm,
         },
         models::run::Run,
@@ -1097,6 +1096,7 @@ mod tests {
             1,
             "not-used".to_string(),
             wasm::Config::default(),
+            OutputFormat::Json,
         );
 
         let err = handle_watch(context, "not-a-run-id".to_string(), 1, Some(1), true)

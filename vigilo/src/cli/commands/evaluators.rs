@@ -231,7 +231,7 @@ impl Executable for SubCommand {
                     }
                 };
 
-                out.write_line(serde_json::to_string_pretty(&payload)?)?;
+                out.write_value(&payload)?;
 
                 Ok(())
             }
@@ -262,7 +262,7 @@ impl Executable for SubCommand {
                     },
                 });
 
-                out.write_line(serde_json::to_string_pretty(&payload)?)?;
+                out.write_value(&payload)?;
 
                 Ok(())
             }
@@ -332,7 +332,7 @@ impl Executable for SubCommand {
                     }
                 });
 
-                out.write_line(serde_json::to_string_pretty(&payload)?)?;
+                out.write_value(&payload)?;
 
                 Ok(())
             }

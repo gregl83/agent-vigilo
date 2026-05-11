@@ -10,7 +10,10 @@ mod args;
 mod commands;
 use commands::Command;
 
-use super::context::Context;
+use super::context::{
+    Context,
+    output::OutputFormat,
+};
 
 #[async_trait]
 pub(super) trait Executable {
@@ -22,7 +25,8 @@ pub(super) trait Executable {
     name = "agent-vigilo",
     version = crate_version!(),
     about = crate_description!(),
-    long_about = None
+    long_about = None,
+    after_help = "Agent tip: use `-q -f toon` for compact structured output in AI agent and LLM tool-call workflows. Use `-f json` when exact JSON parsing is required."
 )]
 pub(crate) struct App {
     /// Database URL (connection string)
@@ -44,6 +48,19 @@ pub(crate) struct App {
     /// Increase log verbosity (-v for DEBUG, -vv for TRACE)
     #[arg(global = true, short, long, action = ArgAction::Count)]
     pub verbose: u8,
+
+    /// Output encoding for stdout payloads; agents should prefer `-q -f toon` for compact inspection
+    #[arg(
+        global = true,
+        short = 'f',
+        long = "output-format",
+        alias = "format",
+        env = "VIGILO_OUTPUT_FORMAT",
+        value_name = "FORMAT",
+        default_value_t = OutputFormat::Json,
+        value_enum
+    )]
+    pub output_format: OutputFormat,
 
     #[command(subcommand)]
     pub command: Command,

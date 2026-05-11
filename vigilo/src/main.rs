@@ -69,6 +69,7 @@ async fn main() -> ExitCode {
                 app.database_max_connections,
                 app.messaging_url.clone(),
                 wasm_config,
+                app.output_format,
             );
 
             match app.exec(context).await {
