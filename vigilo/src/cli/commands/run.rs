@@ -536,6 +536,15 @@ fn run_watch_payload(run: &Run, terminal: bool) -> Value {
     })
 }
 
+async fn select_existing_run_for_watch(db: &sqlx::PgPool, run_id: Uuid) -> anyhow::Result<Run> {
+    runs::select_run_by_id(db, run_id).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "run '{}' was not found; watch only waits for runs that already exist",
+            run_id
+        )
+    })
+}
+
 async fn handle_watch(
     context: Context,
     run_id: String,
@@ -543,17 +552,15 @@ async fn handle_watch(
     timeout_seconds: Option<u64>,
     fail_on_gate: bool,
 ) -> anyhow::Result<()> {
+    let run_id = parse_run_id(&run_id)?;
     let db = context.db().await?;
     let out = context.out().await?;
-    let run_id = parse_run_id(&run_id)?;
     let interval = Duration::from_secs(interval_seconds);
     let deadline = timeout_seconds.map(|seconds| Instant::now() + Duration::from_secs(seconds));
     let mut last_snapshot = None;
+    let mut run = select_existing_run_for_watch(db, run_id).await?;
 
     loop {
-        let run = runs::select_run_by_id(db, run_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("run '{}' was not found", run_id))?;
         let terminal = is_terminal_run_status(&run.status);
         let snapshot = RunWatchSnapshotKey::from(&run);
 
@@ -594,6 +601,7 @@ async fn handle_watch(
         };
 
         sleep(sleep_for).await;
+        run = select_existing_run_for_watch(db, run_id).await?;
     }
 }
 
@@ -808,6 +816,7 @@ mod tests {
     use super::{
         build_chunks,
         canonical_json,
+        handle_watch,
         is_terminal_run_status,
         parse_run_id,
         parse_structured_payload,
@@ -816,7 +825,13 @@ mod tests {
         run_terminal_failure_reason,
         run_watch_payload,
     };
-    use crate::models::run::Run;
+    use crate::{
+        context::{
+            Context,
+            wasm,
+        },
+        models::run::Run,
+    };
 
     #[test]
     fn read_inline_or_file_prefers_inline() {
@@ -923,6 +938,22 @@ mod tests {
     fn parse_run_id_rejects_non_uuid_values() {
         assert!(parse_run_id(&Uuid::now_v7().to_string()).is_ok());
         assert!(parse_run_id("not-a-run-id").is_err());
+    }
+
+    #[tokio::test]
+    async fn watch_rejects_malformed_run_id_before_database_initialization() {
+        let context = Context::new(
+            "not-a-postgres-url".to_string(),
+            1,
+            "not-used".to_string(),
+            wasm::Config::default(),
+        );
+
+        let err = handle_watch(context, "not-a-run-id".to_string(), 1, Some(1), true)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().starts_with("invalid run_id"));
     }
 
     #[test]
