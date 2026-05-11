@@ -25,7 +25,7 @@ use crate::{
         run_dispatch,
         run_finalize,
     },
-    outbox::publisher::{
+    outbox::{
         MqEventPublisher,
         OutboxPublisherConfig,
         publish_pending_events,
