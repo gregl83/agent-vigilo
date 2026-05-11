@@ -1,3 +1,12 @@
+//! Durable outbox publication.
+//!
+//! Database workflows insert events into `outbox_events` in the same
+//! transaction as state changes. The coordinator calls this module after each
+//! orchestration pass to claim a bounded batch, publish each event to the
+//! message broker, and either mark it published or reschedule it for retry.
+//! This keeps database state and external message delivery loosely coupled
+//! without losing events when a process exits between commit and publish.
+
 use async_trait::async_trait;
 use sqlx::PgPool;
 use tracing::error;
@@ -8,6 +17,11 @@ use crate::{
     mq,
 };
 
+/// Runtime knobs for one outbox publishing pass.
+///
+/// `batch_size` bounds coordinator work per cycle, `lease_seconds` prevents
+/// other coordinators from claiming the same events immediately, and
+/// `retry_delay_seconds` controls when a failed publish becomes eligible again.
 #[derive(Debug, Clone)]
 pub(crate) struct OutboxPublisherConfig {
     pub(crate) batch_size: i64,
@@ -25,6 +39,10 @@ impl Default for OutboxPublisherConfig {
     }
 }
 
+/// Counts produced by a single publish pass.
+///
+/// `claimed` is the number of events leased from the database. `published` and
+/// `failed` describe the outcomes for those claimed events.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct OutboxPublishStats {
     pub(crate) claimed: usize,
@@ -32,16 +50,23 @@ pub(crate) struct OutboxPublishStats {
     pub(crate) failed: usize,
 }
 
+/// Transport boundary for publishing outbox events.
+///
+/// Keeping this as a trait lets the coordinator publish to RabbitMQ in
+/// production while tests or future transports can supply a different
+/// implementation without changing claim/reschedule behavior.
 #[async_trait]
 pub(crate) trait EventPublisher: Send + Sync {
     async fn publish(&self, event: &OutboxEvent) -> anyhow::Result<()>;
 }
 
+/// RabbitMQ-backed event publisher.
 pub(crate) struct MqEventPublisher<'a> {
     client: &'a mq::Client,
 }
 
 impl<'a> MqEventPublisher<'a> {
+    /// Wraps the shared message-queue client without taking ownership.
     pub(crate) fn new(client: &'a mq::Client) -> Self {
         Self { client }
     }
@@ -56,6 +81,11 @@ impl EventPublisher for MqEventPublisher<'_> {
     }
 }
 
+/// Claims and publishes a bounded batch of pending outbox events.
+///
+/// Each claimed event is published independently. Successful publishes are
+/// marked `published`; failures are logged and rescheduled so a later
+/// coordinator pass can retry them.
 pub(crate) async fn publish_pending_events(
     db: &PgPool,
     publisher: &dyn EventPublisher,

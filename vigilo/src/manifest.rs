@@ -1,3 +1,10 @@
+//! Evaluator crate manifest loading.
+//!
+//! Evaluator packages carry a `Vigilo.toml` manifest next to their crate. This
+//! module parses that manifest into the fields needed by CLI publishing and
+//! evaluator build flows: package metadata, the WIT contract reference, and
+//! named build profiles.
+
 use std::{
     collections::HashMap,
     fs,
@@ -7,6 +14,10 @@ use std::{
 use anyhow::anyhow;
 use serde::Deserialize;
 
+/// Package metadata from `Vigilo.toml`.
+///
+/// `manifest` is the evaluator manifest file path relative to the crate root.
+/// Optional fields are carried through for registry/search metadata.
 #[derive(Deserialize)]
 pub(crate) struct Package {
     pub manifest: String,
@@ -16,8 +27,10 @@ pub(crate) struct Package {
     pub metadata: Option<toml::Value>,
 }
 
+/// Build artifact configuration for a named profile.
 #[derive(Deserialize)]
 pub(crate) struct Profile {
+    /// Path to the compiled WebAssembly component for this profile.
     pub wasm: String,
 }
 
@@ -25,6 +38,11 @@ fn default_false() -> bool {
     false
 }
 
+/// WIT contract reference declared by an evaluator crate.
+///
+/// These fields identify which interface/world the evaluator implements.
+/// `strict` defaults to false so older manifests remain loadable while newer
+/// manifests can opt into stricter contract checks.
 #[derive(Deserialize)]
 pub(crate) struct Wit {
     pub path: String,
@@ -36,6 +54,7 @@ pub(crate) struct Wit {
     pub strict: bool,
 }
 
+/// Parsed `Vigilo.toml` file.
 #[derive(Deserialize)]
 pub(crate) struct Manifest {
     pub package: Package,
@@ -44,6 +63,7 @@ pub(crate) struct Manifest {
 }
 
 impl Manifest {
+    /// Returns a named profile or reports a manifest-scoped error.
     pub fn get_profile(&self, profile_name: &str) -> anyhow::Result<&Profile> {
         self.profile
             .get(profile_name)
@@ -51,6 +71,7 @@ impl Manifest {
     }
 }
 
+/// Reads and parses `Vigilo.toml` from an evaluator crate directory.
 pub(crate) fn read_manifest(crate_path: &PathBuf) -> anyhow::Result<Manifest> {
     let content = fs::read_to_string(crate_path.join("Vigilo.toml"))?;
     let manifest: Manifest = toml::from_str(&content)?;

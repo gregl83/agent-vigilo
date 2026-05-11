@@ -1,3 +1,10 @@
+//! RabbitMQ client wrapper used by coordinators and workers.
+//!
+//! The client lazily opens one connection and one channel per process context,
+//! declares the durable topic exchange on first use, and provides the small set
+//! of operations the runtime needs: publish JSON events, fetch one worker
+//! message, and acknowledge or requeue deliveries.
+
 use lapin::{
     BasicProperties,
     Channel,
@@ -19,6 +26,10 @@ use serde_json::Value;
 use tokio::sync::OnceCell;
 use tracing::debug;
 
+/// RabbitMQ connection and routing configuration.
+///
+/// The exchange is a durable topic exchange used for all runtime events. The
+/// worker queue receives `run.chunk.ready` events consumed by worker commands.
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
     pub(crate) uri: String,
@@ -27,6 +38,7 @@ pub(crate) struct Config {
 }
 
 impl Config {
+    /// Builds default queue/exchange names around a caller-provided broker URI.
     pub(crate) fn new(uri: String) -> Self {
         Self {
             uri,
@@ -36,11 +48,19 @@ impl Config {
     }
 }
 
+/// A JSON message fetched from the worker queue.
+///
+/// The `delivery_tag` must be passed back to `ack` or `nack_requeue` after the
+/// caller has processed the payload.
 pub(crate) struct ConsumedMessage {
     pub(crate) delivery_tag: u64,
     pub(crate) payload: Value,
 }
 
+/// Lazily initialized RabbitMQ connection and channel.
+///
+/// The client owns connection setup and broker declarations so command code can
+/// work in terms of application events instead of `lapin` primitives.
 pub(crate) struct Client {
     config: Config,
     connection: OnceCell<Connection>,
@@ -48,6 +68,7 @@ pub(crate) struct Client {
 }
 
 impl Client {
+    /// Creates a client shell; no network connection is opened until first use.
     pub(crate) fn new(config: Config) -> Self {
         Self {
             config,
@@ -56,6 +77,7 @@ impl Client {
         }
     }
 
+    /// Returns the process-local RabbitMQ connection, opening it if needed.
     async fn connection(&self) -> anyhow::Result<&Connection> {
         self.connection
             .get_or_try_init(|| async {
@@ -67,6 +89,7 @@ impl Client {
             .await
     }
 
+    /// Returns the process-local channel and ensures the topic exchange exists.
     async fn channel(&self) -> anyhow::Result<&Channel> {
         self.channel
             .get_or_try_init(|| async {
@@ -99,6 +122,7 @@ impl Client {
             .await
     }
 
+    /// Publishes a JSON payload to the configured topic exchange.
     pub(crate) async fn publish_json(
         &self,
         routing_key: &str,
@@ -124,6 +148,11 @@ impl Client {
         Ok(())
     }
 
+    /// Fetches one available worker message without creating a long-lived consumer.
+    ///
+    /// Workers currently poll with `basic_get`, which keeps the command model
+    /// simple for one-shot and looped worker modes. The queue binding is
+    /// idempotently declared before each fetch.
     pub(crate) async fn consume_worker_message(&self) -> anyhow::Result<Option<ConsumedMessage>> {
         let channel = self.channel().await?;
 
@@ -171,6 +200,7 @@ impl Client {
         }))
     }
 
+    /// Acknowledges successful processing of one delivery.
     pub(crate) async fn ack(&self, delivery_tag: u64) -> anyhow::Result<()> {
         let channel = self.channel().await?;
         channel
@@ -180,6 +210,7 @@ impl Client {
         Ok(())
     }
 
+    /// Rejects one delivery and asks RabbitMQ to make it available again.
     pub(crate) async fn nack_requeue(&self, delivery_tag: u64) -> anyhow::Result<()> {
         let channel = self.channel().await?;
         channel
