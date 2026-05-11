@@ -469,6 +469,18 @@ async fn allocate_execution_attempts_for_cases(
     query_builder.push(
         r#"
         ),
+        run_guard AS (
+            SELECT id
+            FROM runs
+            WHERE id =
+        "#,
+    );
+    query_builder.push_bind(run_id);
+    query_builder.push(
+        r#"::uuid
+              AND status = 'running'::run_status
+            FOR UPDATE
+        ),
         upserted AS (
             INSERT INTO executions (
                 run_id,
@@ -515,6 +527,8 @@ async fn allocate_execution_attempts_for_cases(
                 NULL,
                 now()
             FROM input
+            JOIN run_guard
+              ON true
             ON CONFLICT (run_id, case_id) DO UPDATE
             SET case_hash = EXCLUDED.case_hash,
                 task_type = EXCLUDED.task_type,
@@ -670,6 +684,13 @@ pub(crate) async fn finalize_execution_terminal_transitions(
             SELECT COUNT(*) AS expected_count
             FROM transition_input
         ),
+        run_guard AS (
+            SELECT id
+            FROM runs
+            WHERE id = $6::uuid
+              AND status = 'running'::run_status
+            FOR UPDATE
+        ),
         authoritative_input AS (
             SELECT
                 transition_input.*,
@@ -680,6 +701,8 @@ pub(crate) async fn finalize_execution_terminal_transitions(
              AND executions.id = transition_input.execution_id
              AND executions.current_attempt_id = transition_input.attempt_id
              AND executions.current_attempt_no = transition_input.attempt_no
+            JOIN run_guard
+              ON run_guard.id = executions.run_id
         ),
         authority_check AS (
             SELECT transition_count.expected_count
@@ -1263,20 +1286,28 @@ async fn persist_completed_execution_results_batch(
     authority_query.push(
         r#"
         ),
-        locked AS (
-            SELECT executions.id
-            FROM executions
-            JOIN input
-              ON executions.run_id =
+        run_guard AS (
+            SELECT id
+            FROM runs
+            WHERE id =
         "#,
     );
     authority_query.push_bind(run_id);
     authority_query.push(
         r#"::uuid
-             AND input.execution_id = executions.id
-            WHERE executions.current_attempt_id = input.attempt_id
-              AND executions.current_attempt_no = input.attempt_no
-            FOR UPDATE OF executions
+              AND status = 'running'::run_status
+            FOR UPDATE
+        ),
+        locked AS (
+            SELECT executions.id
+        FROM run_guard
+        JOIN executions
+          ON executions.run_id = run_guard.id
+        JOIN input
+          ON input.execution_id = executions.id
+        WHERE executions.current_attempt_id = input.attempt_id
+          AND executions.current_attempt_no = input.attempt_no
+        FOR UPDATE OF executions
         )
         SELECT COUNT(*)::bigint
         FROM locked

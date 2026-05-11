@@ -41,6 +41,7 @@ use crate::{
     db::{
         tables::runs,
         workflows::{
+            run_cancel,
             run_create,
             run_profile_validation,
         },
@@ -652,6 +653,47 @@ async fn handle_results(context: Context, run_id: String) -> anyhow::Result<()> 
     Ok(())
 }
 
+fn run_cancel_payload(outcome: &run_cancel::CancelRunOutcome) -> Value {
+    json!({
+        "data": {
+            "run_id": outcome.run.id,
+            "run_key": outcome.run.run_key,
+            "status": outcome.run.status,
+            "gate_status": outcome.run.gate_status,
+            "expected_execution_count": outcome.run.expected_execution_count,
+            "terminal_execution_count": outcome.run.terminal_execution_count,
+            "passed_execution_count": outcome.run.passed_execution_count,
+            "failed_execution_count": outcome.run.failed_execution_count,
+            "errored_execution_count": outcome.run.errored_execution_count,
+            "summary": outcome.run.summary,
+            "error_message": outcome.run.error_message,
+            "completed_at": outcome.run.completed_at,
+            "updated_at": outcome.run.updated_at,
+        },
+        "meta": {
+            "cancelled": outcome.cancelled,
+            "already_cancelled": outcome.already_cancelled,
+            "terminal": true,
+            "chunks_cancelled": outcome.chunks_cancelled,
+            "executions_cancelled": outcome.executions_cancelled,
+            "attempts_cancelled": outcome.attempts_cancelled,
+            "outbox_events_enqueued": outcome.outbox_events_enqueued,
+        }
+    })
+}
+
+async fn handle_cancel(context: Context, run_id: String) -> anyhow::Result<()> {
+    let run_id = parse_run_id(&run_id)?;
+    let db = context.db().await?;
+    let out = context.out().await?;
+    let outcome = run_cancel::cancel_run(db, run_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("run '{}' was not found", run_id))?;
+
+    out.write_value(&run_cancel_payload(&outcome))?;
+    Ok(())
+}
+
 async fn select_existing_run_for_watch(db: &sqlx::PgPool, run_id: Uuid) -> anyhow::Result<Run> {
     runs::select_run_by_id(db, run_id).await?.ok_or_else(|| {
         anyhow::anyhow!(
@@ -722,8 +764,8 @@ async fn handle_watch(
 #[derive(Debug, Subcommand)]
 /// Run command operations.
 ///
-/// `Create`, `Test`, `Watch`, and `Results` are implemented. Operational
-/// commands (`Status`, `Cancel`, `Export`) are reserved and currently return
+/// `Create`, `Test`, `Watch`, `Cancel`, and `Results` are implemented.
+/// Operational commands (`Status`, `Export`) are reserved and currently return
 /// explicit not-implemented errors.
 pub(crate) enum SubCommand {
     /// Create a run from profile + dataset inputs
@@ -879,7 +921,7 @@ impl Executable for Command {
             }
             Some(SubCommand::Cancel { run_id }) => {
                 info!("cancelling run {}", run_id);
-                anyhow::bail!("run cancel is not implemented yet")
+                handle_cancel(context, run_id).await
             }
             Some(SubCommand::Results { run_id }) => {
                 info!("fetching results for run {}", run_id);
@@ -936,6 +978,7 @@ mod tests {
         parse_run_id,
         parse_structured_payload,
         read_inline_or_file,
+        run_cancel_payload,
         run_gate_failure_reason,
         run_results_payload,
         run_terminal_failure_reason,
@@ -1087,6 +1130,28 @@ mod tests {
             payload["data"]["results"]["status_counts"]["failed"],
             json!(3)
         );
+    }
+
+    #[test]
+    fn run_cancel_payload_reports_terminal_cancel_state() {
+        let run = run_with_status("cancelled", "fail");
+        let outcome = crate::db::workflows::run_cancel::CancelRunOutcome {
+            run,
+            cancelled: true,
+            already_cancelled: false,
+            chunks_cancelled: 3,
+            executions_cancelled: 2,
+            attempts_cancelled: 1,
+            outbox_events_enqueued: 1,
+        };
+        let payload = run_cancel_payload(&outcome);
+
+        assert_eq!(payload["data"]["status"], json!("cancelled"));
+        assert_eq!(payload["data"]["gate_status"], json!("fail"));
+        assert_eq!(payload["meta"]["terminal"], json!(true));
+        assert_eq!(payload["meta"]["cancelled"], json!(true));
+        assert_eq!(payload["meta"]["chunks_cancelled"], json!(3));
+        assert_eq!(payload["meta"]["outbox_events_enqueued"], json!(1));
     }
 
     #[tokio::test]
