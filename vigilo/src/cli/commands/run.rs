@@ -1,8 +1,8 @@
 //! Run management commands.
 //!
-//! This module owns CLI flows for creating, validating, and (eventually)
-//! observing/canceling/exporting runs. It translates profile+dataset inputs
-//! into normalized persistence drafts and run orchestration metadata.
+//! This module owns CLI flows for creating, validating, and watching runs. It
+//! translates profile+dataset inputs into normalized persistence drafts and run
+//! orchestration metadata.
 
 use std::{
     collections::BTreeMap,
@@ -20,6 +20,11 @@ use serde_json::{
     Value,
     json,
 };
+use tokio::time::{
+    Duration,
+    Instant,
+    sleep,
+};
 use tracing::info;
 use uuid::Uuid;
 
@@ -33,19 +38,28 @@ use crate::{
         RunDataset,
         RunProfile,
     },
-    db::workflows::{
-        run_create,
-        run_profile_validation,
+    db::{
+        tables::runs,
+        workflows::{
+            run_create,
+            run_profile_validation,
+        },
     },
     models::{
         case_blob::CaseBlobDraft,
         dataset_version_case::DatasetVersionCaseDraft,
-        run::RunDraft,
+        run::{
+            Run,
+            RunDraft,
+        },
         run_chunk::RunChunkDraft,
     },
 };
 
 const DEFAULT_CHUNK_SIZE: usize = 100;
+const DEFAULT_WATCH_INTERVAL_SECONDS: u64 = 5;
+const MAX_WATCH_INTERVAL_SECONDS: u64 = 3_600;
+const MAX_WATCH_TIMEOUT_SECONDS: u64 = 604_800;
 
 /// Parsed and typed run inputs loaded from CLI sources.
 ///
@@ -435,11 +449,159 @@ async fn handle_test(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunWatchSnapshotKey {
+    status: String,
+    gate_status: String,
+    expected_execution_count: i32,
+    terminal_execution_count: i32,
+    passed_execution_count: i32,
+    failed_execution_count: i32,
+    errored_execution_count: i32,
+}
+
+impl From<&Run> for RunWatchSnapshotKey {
+    fn from(run: &Run) -> Self {
+        Self {
+            status: run.status.clone(),
+            gate_status: run.gate_status.clone(),
+            expected_execution_count: run.expected_execution_count,
+            terminal_execution_count: run.terminal_execution_count,
+            passed_execution_count: run.passed_execution_count,
+            failed_execution_count: run.failed_execution_count,
+            errored_execution_count: run.errored_execution_count,
+        }
+    }
+}
+
+fn parse_run_id(raw: &str) -> anyhow::Result<Uuid> {
+    Uuid::parse_str(raw).map_err(|err| anyhow::anyhow!("invalid run_id '{}': {}", raw, err))
+}
+
+fn is_terminal_run_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled")
+}
+
+fn run_terminal_failure_reason(run: &Run) -> Option<String> {
+    match run.status.as_str() {
+        "failed" => Some(format!(
+            "run '{}' failed before producing a passing gate",
+            run.id
+        )),
+        "cancelled" => Some(format!(
+            "run '{}' was cancelled before producing a passing gate",
+            run.id
+        )),
+        _ => None,
+    }
+}
+
+fn run_gate_failure_reason(run: &Run) -> Option<String> {
+    match (run.status.as_str(), run.gate_status.as_str()) {
+        ("completed", "pass") => None,
+        ("completed", "fail") => Some(format!("run '{}' completed with gate_status=fail", run.id)),
+        ("completed", other) => Some(format!(
+            "run '{}' completed with unexpected gate_status={}",
+            run.id, other
+        )),
+        _ => None,
+    }
+}
+
+fn run_watch_payload(run: &Run, terminal: bool) -> Value {
+    json!({
+        "data": {
+            "run_id": run.id,
+            "run_key": run.run_key,
+            "status": run.status,
+            "gate_status": run.gate_status,
+            "expected_execution_count": run.expected_execution_count,
+            "terminal_execution_count": run.terminal_execution_count,
+            "passed_execution_count": run.passed_execution_count,
+            "failed_execution_count": run.failed_execution_count,
+            "errored_execution_count": run.errored_execution_count,
+            "summary": run.summary,
+            "error_message": run.error_message,
+            "created_at": run.created_at,
+            "started_at": run.started_at,
+            "dispatched_at": run.dispatched_at,
+            "finalized_at": run.finalized_at,
+            "completed_at": run.completed_at,
+            "updated_at": run.updated_at,
+        },
+        "meta": {
+            "terminal": terminal,
+            "gate_passed": run.status == "completed" && run.gate_status == "pass",
+        }
+    })
+}
+
+async fn handle_watch(
+    context: Context,
+    run_id: String,
+    interval_seconds: u64,
+    timeout_seconds: Option<u64>,
+    fail_on_gate: bool,
+) -> anyhow::Result<()> {
+    let db = context.db().await?;
+    let out = context.out().await?;
+    let run_id = parse_run_id(&run_id)?;
+    let interval = Duration::from_secs(interval_seconds);
+    let deadline = timeout_seconds.map(|seconds| Instant::now() + Duration::from_secs(seconds));
+    let mut last_snapshot = None;
+
+    loop {
+        let run = runs::select_run_by_id(db, run_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("run '{}' was not found", run_id))?;
+        let terminal = is_terminal_run_status(&run.status);
+        let snapshot = RunWatchSnapshotKey::from(&run);
+
+        if last_snapshot.as_ref() != Some(&snapshot) || terminal {
+            out.write_line(serde_json::to_string_pretty(&run_watch_payload(
+                &run, terminal,
+            ))?)?;
+            out.flush()?;
+            last_snapshot = Some(snapshot);
+        }
+
+        if terminal {
+            if let Some(reason) = run_terminal_failure_reason(&run) {
+                anyhow::bail!(reason);
+            }
+
+            if fail_on_gate {
+                if let Some(reason) = run_gate_failure_reason(&run) {
+                    anyhow::bail!(reason);
+                }
+            }
+            return Ok(());
+        }
+
+        let sleep_for = if let Some(deadline) = deadline {
+            let now = Instant::now();
+            if now >= deadline {
+                anyhow::bail!(
+                    "timed out watching run '{}' before terminal status; last status={}",
+                    run_id,
+                    run.status
+                );
+            }
+
+            deadline.saturating_duration_since(now).min(interval)
+        } else {
+            interval
+        };
+
+        sleep(sleep_for).await;
+    }
+}
+
 #[derive(Debug, Subcommand)]
 /// Run command operations.
 ///
-/// `Create` and `Test` are implemented. Operational commands (`Watch`,
-/// `Status`, `Cancel`, `Results`, `Export`) are reserved and currently return
+/// `Create`, `Test`, and `Watch` are implemented. Operational commands
+/// (`Status`, `Cancel`, `Results`, `Export`) are reserved and currently return
 /// explicit not-implemented errors.
 pub(crate) enum SubCommand {
     /// Create a run from profile + dataset inputs
@@ -528,6 +690,18 @@ pub(crate) enum SubCommand {
     Watch {
         /// Run identifier to watch
         run_id: String,
+
+        /// Polling interval in seconds
+        #[arg(long, default_value_t = DEFAULT_WATCH_INTERVAL_SECONDS, value_parser = clap::value_parser!(u64).range(1..=MAX_WATCH_INTERVAL_SECONDS))]
+        interval_seconds: u64,
+
+        /// Maximum seconds to wait before failing
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=MAX_WATCH_TIMEOUT_SECONDS))]
+        timeout_seconds: Option<u64>,
+
+        /// Return success for terminal failed gates; useful for observation-only watches
+        #[arg(long, default_value_t = false)]
+        no_fail_on_gate: bool,
     },
 
     /// Show run status snapshot
@@ -593,9 +767,21 @@ impl Executable for Command {
                 info!("exporting run {}", run_id);
                 anyhow::bail!("run export is not implemented yet")
             }
-            Some(SubCommand::Watch { run_id }) => {
+            Some(SubCommand::Watch {
+                run_id,
+                interval_seconds,
+                timeout_seconds,
+                no_fail_on_gate,
+            }) => {
                 info!("watching run {}", run_id);
-                anyhow::bail!("run watch is not implemented yet")
+                handle_watch(
+                    context,
+                    run_id,
+                    interval_seconds,
+                    timeout_seconds,
+                    !no_fail_on_gate,
+                )
+                .await
             }
             Some(SubCommand::Test {
                 profile,
@@ -615,14 +801,22 @@ impl Executable for Command {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
     use serde_json::json;
+    use uuid::Uuid;
 
     use super::{
         build_chunks,
         canonical_json,
+        is_terminal_run_status,
+        parse_run_id,
         parse_structured_payload,
         read_inline_or_file,
+        run_gate_failure_reason,
+        run_terminal_failure_reason,
+        run_watch_payload,
     };
+    use crate::models::run::Run;
 
     #[test]
     fn read_inline_or_file_prefers_inline() {
@@ -655,5 +849,89 @@ mod tests {
         assert_eq!(chunks[0].ordinal_end, 100);
         assert_eq!(chunks[2].ordinal_start, 200);
         assert_eq!(chunks[2].ordinal_end, 205);
+    }
+
+    fn run_with_status(status: &str, gate_status: &str) -> Run {
+        let now = Utc::now();
+        Run {
+            id: Uuid::now_v7(),
+            run_key: "run-key".to_string(),
+            name: None,
+            description: None,
+            dataset_id: Uuid::now_v7(),
+            dataset_version: "v1".to_string(),
+            evaluation_profile_id: "profile".to_string(),
+            evaluation_profile_version: "v1".to_string(),
+            aggregation_policy_id: "policy".to_string(),
+            aggregation_policy_version: "v1".to_string(),
+            agent_provider: "provider".to_string(),
+            agent_name: "agent".to_string(),
+            agent_version: None,
+            prompt_config_id: "prompt".to_string(),
+            prompt_config_version: "v1".to_string(),
+            config_snapshot: json!({}),
+            status: status.to_string(),
+            gate_status: gate_status.to_string(),
+            coordinator_id: None,
+            coordinator_leased_until: None,
+            coordinator_heartbeat_at: None,
+            expected_execution_count: 1,
+            terminal_execution_count: 1,
+            passed_execution_count: if gate_status == "pass" { 1 } else { 0 },
+            failed_execution_count: if gate_status == "fail" { 1 } else { 0 },
+            errored_execution_count: 0,
+            summary: json!({}),
+            error_message: None,
+            created_at: now,
+            started_at: Some(now),
+            dispatched_at: Some(now),
+            finalized_at: Some(now),
+            completed_at: Some(now),
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn terminal_run_statuses_are_gating_boundaries() {
+        assert!(is_terminal_run_status("completed"));
+        assert!(is_terminal_run_status("failed"));
+        assert!(is_terminal_run_status("cancelled"));
+        assert!(!is_terminal_run_status("pending"));
+        assert!(!is_terminal_run_status("running"));
+        assert!(!is_terminal_run_status("finalizing"));
+    }
+
+    #[test]
+    fn gate_failure_reason_only_allows_completed_pass() {
+        assert!(run_gate_failure_reason(&run_with_status("completed", "pass")).is_none());
+        assert!(run_gate_failure_reason(&run_with_status("completed", "fail")).is_some());
+        assert!(run_gate_failure_reason(&run_with_status("completed", "unknown")).is_some());
+        assert!(run_gate_failure_reason(&run_with_status("failed", "unknown")).is_none());
+        assert!(run_gate_failure_reason(&run_with_status("cancelled", "unknown")).is_none());
+        assert!(run_gate_failure_reason(&run_with_status("running", "unknown")).is_none());
+    }
+
+    #[test]
+    fn terminal_failure_reason_flags_failed_and_cancelled_runs() {
+        assert!(run_terminal_failure_reason(&run_with_status("completed", "pass")).is_none());
+        assert!(run_terminal_failure_reason(&run_with_status("completed", "fail")).is_none());
+        assert!(run_terminal_failure_reason(&run_with_status("failed", "unknown")).is_some());
+        assert!(run_terminal_failure_reason(&run_with_status("cancelled", "unknown")).is_some());
+    }
+
+    #[test]
+    fn parse_run_id_rejects_non_uuid_values() {
+        assert!(parse_run_id(&Uuid::now_v7().to_string()).is_ok());
+        assert!(parse_run_id("not-a-run-id").is_err());
+    }
+
+    #[test]
+    fn run_watch_payload_marks_completed_pass_as_gate_passed() {
+        let run = run_with_status("completed", "pass");
+        let payload = run_watch_payload(&run, true);
+
+        assert_eq!(payload["data"]["run_id"], json!(run.id));
+        assert_eq!(payload["meta"]["terminal"], json!(true));
+        assert_eq!(payload["meta"]["gate_passed"], json!(true));
     }
 }
