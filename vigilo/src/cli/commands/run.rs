@@ -536,6 +536,122 @@ fn run_watch_payload(run: &Run, terminal: bool) -> Value {
     })
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct RunResultsSummary {
+    execution_count: i64,
+    aggregate_count: i64,
+    passed_execution_count: i64,
+    failed_execution_count: i64,
+    error_execution_count: i64,
+    skipped_execution_count: i64,
+    missing_aggregate_count: i64,
+    evaluator_result_count: i64,
+    blocking_failure_count: i64,
+    average_score: Option<f64>,
+    min_score: Option<f64>,
+    max_score: Option<f64>,
+}
+
+async fn select_existing_run(db: &sqlx::PgPool, run_id: Uuid) -> anyhow::Result<Run> {
+    runs::select_run_by_id(db, run_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("run '{}' was not found", run_id))
+}
+
+async fn select_run_results_summary(
+    db: &sqlx::PgPool,
+    run_id: Uuid,
+) -> anyhow::Result<RunResultsSummary> {
+    let summary = sqlx::query_as::<_, RunResultsSummary>(
+        r#"
+        SELECT
+            COUNT(e.id)::bigint AS execution_count,
+            COUNT(ea.execution_id)::bigint AS aggregate_count,
+            COUNT(*) FILTER (WHERE ea.overall_status = 'passed'::evaluation_status)::bigint AS passed_execution_count,
+            COUNT(*) FILTER (WHERE ea.overall_status = 'failed'::evaluation_status)::bigint AS failed_execution_count,
+            COUNT(*) FILTER (WHERE ea.overall_status = 'error'::evaluation_status)::bigint AS error_execution_count,
+            COUNT(*) FILTER (WHERE ea.overall_status = 'skipped'::evaluation_status)::bigint AS skipped_execution_count,
+            COUNT(e.id) FILTER (WHERE ea.execution_id IS NULL)::bigint AS missing_aggregate_count,
+            COALESCE(SUM(ea.evaluator_result_count), 0)::bigint AS evaluator_result_count,
+            COALESCE(SUM(
+                CASE
+                    WHEN ea.blocking_failures IS NULL THEN 0
+                    ELSE jsonb_array_length(ea.blocking_failures)
+                END
+            ), 0)::bigint AS blocking_failure_count,
+            AVG(ea.aggregate_score) AS average_score,
+            MIN(ea.aggregate_score) AS min_score,
+            MAX(ea.aggregate_score) AS max_score
+        FROM executions e
+        LEFT JOIN execution_aggregates ea
+          ON ea.run_id = e.run_id
+         AND ea.execution_id = e.id
+        WHERE e.run_id = $1::uuid
+        "#,
+    )
+    .bind(run_id)
+    .fetch_one(db)
+    .await?;
+
+    Ok(summary)
+}
+
+fn run_results_payload(run: &Run, summary: &RunResultsSummary) -> Value {
+    json!({
+        "data": {
+            "run": {
+                "run_id": run.id,
+                "run_key": run.run_key,
+                "status": run.status,
+                "gate_status": run.gate_status,
+                "expected_execution_count": run.expected_execution_count,
+                "terminal_execution_count": run.terminal_execution_count,
+                "passed_execution_count": run.passed_execution_count,
+                "failed_execution_count": run.failed_execution_count,
+                "errored_execution_count": run.errored_execution_count,
+                "summary": run.summary,
+                "error_message": run.error_message,
+                "created_at": run.created_at,
+                "completed_at": run.completed_at,
+                "updated_at": run.updated_at,
+            },
+            "results": {
+                "execution_count": summary.execution_count,
+                "aggregate_count": summary.aggregate_count,
+                "missing_aggregate_count": summary.missing_aggregate_count,
+                "status_counts": {
+                    "passed": summary.passed_execution_count,
+                    "failed": summary.failed_execution_count,
+                    "error": summary.error_execution_count,
+                    "skipped": summary.skipped_execution_count,
+                },
+                "score": {
+                    "average": summary.average_score,
+                    "min": summary.min_score,
+                    "max": summary.max_score,
+                },
+                "evaluator_result_count": summary.evaluator_result_count,
+                "blocking_failure_count": summary.blocking_failure_count,
+            },
+        },
+        "meta": {
+            "summary_only": true,
+        }
+    })
+}
+
+async fn handle_results(context: Context, run_id: String) -> anyhow::Result<()> {
+    let run_id = parse_run_id(&run_id)?;
+    let db = context.db().await?;
+    let out = context.out().await?;
+    let run = select_existing_run(db, run_id).await?;
+    let summary = select_run_results_summary(db, run_id).await?;
+    let payload = run_results_payload(&run, &summary);
+
+    out.write_line(serde_json::to_string_pretty(&payload)?)?;
+    Ok(())
+}
+
 async fn select_existing_run_for_watch(db: &sqlx::PgPool, run_id: Uuid) -> anyhow::Result<Run> {
     runs::select_run_by_id(db, run_id).await?.ok_or_else(|| {
         anyhow::anyhow!(
@@ -608,8 +724,8 @@ async fn handle_watch(
 #[derive(Debug, Subcommand)]
 /// Run command operations.
 ///
-/// `Create`, `Test`, and `Watch` are implemented. Operational commands
-/// (`Status`, `Cancel`, `Results`, `Export`) are reserved and currently return
+/// `Create`, `Test`, `Watch`, and `Results` are implemented. Operational
+/// commands (`Status`, `Cancel`, `Export`) are reserved and currently return
 /// explicit not-implemented errors.
 pub(crate) enum SubCommand {
     /// Create a run from profile + dataset inputs
@@ -769,7 +885,7 @@ impl Executable for Command {
             }
             Some(SubCommand::Results { run_id }) => {
                 info!("fetching results for run {}", run_id);
-                anyhow::bail!("run results is not implemented yet")
+                handle_results(context, run_id).await
             }
             Some(SubCommand::Export { run_id }) => {
                 info!("exporting run {}", run_id);
@@ -814,6 +930,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
+        RunResultsSummary,
         build_chunks,
         canonical_json,
         handle_watch,
@@ -822,6 +939,7 @@ mod tests {
         parse_structured_payload,
         read_inline_or_file,
         run_gate_failure_reason,
+        run_results_payload,
         run_terminal_failure_reason,
         run_watch_payload,
     };
@@ -938,6 +1056,38 @@ mod tests {
     fn parse_run_id_rejects_non_uuid_values() {
         assert!(parse_run_id(&Uuid::now_v7().to_string()).is_ok());
         assert!(parse_run_id("not-a-run-id").is_err());
+    }
+
+    #[test]
+    fn run_results_payload_is_summary_only() {
+        let run = run_with_status("completed", "fail");
+        let summary = RunResultsSummary {
+            execution_count: 10,
+            aggregate_count: 8,
+            passed_execution_count: 5,
+            failed_execution_count: 3,
+            error_execution_count: 0,
+            skipped_execution_count: 0,
+            missing_aggregate_count: 2,
+            evaluator_result_count: 24,
+            blocking_failure_count: 3,
+            average_score: Some(0.72),
+            min_score: Some(0.2),
+            max_score: Some(1.0),
+        };
+        let payload = run_results_payload(&run, &summary);
+
+        assert_eq!(payload["meta"]["summary_only"], json!(true));
+        assert!(payload["data"]["executions"].is_null());
+        assert_eq!(payload["data"]["results"]["execution_count"], json!(10));
+        assert_eq!(
+            payload["data"]["results"]["missing_aggregate_count"],
+            json!(2)
+        );
+        assert_eq!(
+            payload["data"]["results"]["status_counts"]["failed"],
+            json!(3)
+        );
     }
 
     #[tokio::test]
