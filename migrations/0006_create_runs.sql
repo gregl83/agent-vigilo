@@ -28,7 +28,7 @@ CREATE TABLE runs (
     prompt_config_id TEXT NOT NULL,
     prompt_config_version TEXT NOT NULL,
 
-    -- frozen config snapshot for reproducibility
+    -- compact config snapshot for reproducibility
     config_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
 
     -- orchestration state
@@ -40,7 +40,7 @@ CREATE TABLE runs (
     coordinator_leased_until TIMESTAMPTZ,
     coordinator_heartbeat_at TIMESTAMPTZ,
 
-    -- counts cached for reporting; source of truth is execution state
+    -- counts materialized during finalization; source of truth is execution state
     expected_execution_count INTEGER NOT NULL DEFAULT 0 CHECK (expected_execution_count >= 0),
     terminal_execution_count INTEGER NOT NULL DEFAULT 0 CHECK (terminal_execution_count >= 0),
     passed_execution_count INTEGER NOT NULL DEFAULT 0 CHECK (passed_execution_count >= 0),
@@ -135,7 +135,7 @@ COMMENT ON COLUMN runs.prompt_config_version IS
     'Version of the agent configuration used for this run. Ensures reproducibility across prompt and configuration changes.';
 
 COMMENT ON COLUMN runs.config_snapshot IS
-    'Frozen configuration snapshot capturing all relevant run inputs (dataset, profile, agent configuration) to ensure reproducibility and auditability.';
+    'Compact frozen configuration snapshot capturing profile and durable dataset references needed for reproducibility and auditability.';
 
 COMMENT ON COLUMN runs.status IS
     'Lifecycle state of the run. Tracks orchestration progress from creation through execution, finalization, and completion. See run_status enum for details.';
@@ -156,16 +156,16 @@ COMMENT ON COLUMN runs.expected_execution_count IS
     'Total number of executions generated for this run. Used to determine completeness.';
 
 COMMENT ON COLUMN runs.terminal_execution_count IS
-    'Number of executions that have reached a terminal state.';
+    'Number of executions that reached a terminal state, materialized when the run is finalized.';
 
 COMMENT ON COLUMN runs.passed_execution_count IS
-    'Number of executions that completed successfully according to aggregation policy.';
+    'Number of finalized executions that passed according to aggregation policy.';
 
 COMMENT ON COLUMN runs.failed_execution_count IS
-    'Number of executions that failed according to aggregation policy.';
+    'Number of finalized executions that failed according to aggregation policy.';
 
 COMMENT ON COLUMN runs.errored_execution_count IS
-    'Number of executions that encountered system or evaluation errors.';
+    'Number of finalized executions that encountered system or evaluation errors.';
 
 COMMENT ON COLUMN runs.summary IS
     'Aggregated run-level summary including metrics, scores, and dimension breakdowns derived from execution aggregates.';

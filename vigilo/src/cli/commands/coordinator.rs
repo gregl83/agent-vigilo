@@ -1,7 +1,7 @@
 //! Coordinator process command.
 //!
 //! The coordinator drives run-level orchestration:
-//! - dispatches pending runs into chunk-ready events
+//! - atomically dispatches pending runs into chunk-ready events
 //! - finalizes runs whose chunks/executions are terminal
 //! - publishes outbox events to messaging
 
@@ -103,7 +103,7 @@ async fn handle_once(context: Context) -> anyhow::Result<()> {
 /// Executes one full coordinator cycle.
 ///
 /// The cycle is intentionally ordered to keep run progression deterministic:
-/// 1. claim/dispatch one pending run
+/// 1. atomically claim/dispatch one pending run
 /// 2. claim/finalize one finalizable run
 /// 3. publish a bounded batch of pending outbox events
 async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow::Result<()> {
@@ -123,17 +123,16 @@ async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow
     );
 
     if let Some(run) =
-        run_dispatch::claim_next_pending_run(db, coordinator_id, COORDINATOR_LEASE_SECONDS).await?
+        run_dispatch::dispatch_next_pending_run(db, coordinator_id, COORDINATOR_LEASE_SECONDS)
+            .await?
     {
         debug!(run_id = %run.id, run_key = %run.run_key, "claimed pending run");
-        let chunk_events = run_dispatch::enqueue_missing_chunk_ready_events(db, run.id).await?;
-        let started_events = run_dispatch::enqueue_run_started_event(db, run.id).await?;
 
         info!(
             run_id = %run.id,
             run_key = %run.run_key,
-            chunk_events_enqueued = chunk_events,
-            run_started_events_enqueued = started_events,
+            chunk_events_enqueued = run.chunk_events_enqueued,
+            run_started_events_enqueued = run.run_started_events_enqueued,
             "claimed run and prepared dispatch events"
         );
     } else {

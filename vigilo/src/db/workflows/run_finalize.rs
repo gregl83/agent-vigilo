@@ -1,8 +1,8 @@
 //! Run finalization workflow helpers.
 //!
-//! Finalization is coordinator-owned and guarded by leases. The workflow uses
-//! cached run counters plus indexed chunk existence checks so large runs can
-//! finalize without scanning every execution aggregate or chunk row.
+//! Finalization is coordinator-owned and guarded by leases. Workers write
+//! execution and aggregate state without updating the shared run row; this
+//! workflow rolls execution counts up once when all chunks are terminal.
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -86,15 +86,46 @@ pub(crate) async fn finalize_claimed_run(
             SELECT
                 id,
                 run_key,
-                expected_execution_count,
-                terminal_execution_count,
-                passed_execution_count,
-                failed_execution_count,
-                errored_execution_count
+                expected_execution_count
             FROM runs
             WHERE id = $1::uuid
               AND status = 'finalizing'::run_status
             FOR UPDATE
+        ),
+        execution_counts AS (
+            SELECT
+                rr.id AS run_id,
+                COUNT(executions.id)::int AS terminal_execution_count,
+                COALESCE(SUM(
+                    CASE WHEN execution_aggregates.overall_status = 'passed'::evaluation_status THEN 1 ELSE 0 END
+                )::int, 0) AS passed_execution_count,
+                COALESCE(SUM(
+                    CASE WHEN execution_aggregates.overall_status = 'failed'::evaluation_status THEN 1 ELSE 0 END
+                )::int, 0) AS failed_execution_count,
+                COALESCE(SUM(
+                    CASE WHEN execution_aggregates.overall_status = 'error'::evaluation_status THEN 1 ELSE 0 END
+                )::int, 0) AS errored_execution_count,
+                COALESCE(SUM(
+                    CASE
+                        WHEN executions.id IS NOT NULL
+                         AND execution_aggregates.execution_id IS NULL
+                        THEN 1
+                        ELSE 0
+                    END
+                )::int, 0) AS missing_aggregate_count
+            FROM run_row rr
+            LEFT JOIN executions
+              ON executions.run_id = rr.id
+             AND executions.status IN (
+                 'completed'::execution_status,
+                 'failed'::execution_status,
+                 'timed_out'::execution_status,
+                 'cancelled'::execution_status
+             )
+            LEFT JOIN execution_aggregates
+              ON execution_aggregates.execution_id = executions.id
+             AND execution_aggregates.attempt_id = executions.current_attempt_id
+            GROUP BY rr.id
         ),
         terminal_chunk_failure AS (
             SELECT
@@ -121,19 +152,25 @@ pub(crate) async fn finalize_claimed_run(
             SET status = 'completed'::run_status,
                 gate_status = CASE
                     WHEN tcf.exists
-                      OR rr.failed_execution_count > 0
-                      OR rr.errored_execution_count > 0
-                      OR rr.terminal_execution_count < rr.expected_execution_count
+                      OR ec.failed_execution_count > 0
+                      OR ec.errored_execution_count > 0
+                      OR ec.terminal_execution_count < rr.expected_execution_count
+                      OR ec.missing_aggregate_count > 0
                     THEN 'fail'::gate_status
                     ELSE 'pass'::gate_status
                 END,
+                terminal_execution_count = ec.terminal_execution_count,
+                passed_execution_count = ec.passed_execution_count,
+                failed_execution_count = ec.failed_execution_count,
+                errored_execution_count = ec.errored_execution_count,
                 summary = jsonb_build_object(
                     'expected_execution_count', rr.expected_execution_count,
-                    'terminal_execution_count', rr.terminal_execution_count,
-                    'passed_execution_count', rr.passed_execution_count,
-                    'failed_execution_count', rr.failed_execution_count,
-                    'errored_execution_count', rr.errored_execution_count,
-                    'coverage_complete', rr.terminal_execution_count >= rr.expected_execution_count,
+                    'terminal_execution_count', ec.terminal_execution_count,
+                    'passed_execution_count', ec.passed_execution_count,
+                    'failed_execution_count', ec.failed_execution_count,
+                    'errored_execution_count', ec.errored_execution_count,
+                    'missing_aggregate_count', ec.missing_aggregate_count,
+                    'coverage_complete', ec.terminal_execution_count >= rr.expected_execution_count,
                     'has_terminal_chunk_failure', tcf.exists
                 ),
                 finalized_at = COALESCE(r.finalized_at, now()),
@@ -141,8 +178,9 @@ pub(crate) async fn finalize_claimed_run(
                 coordinator_leased_until = NULL,
                 coordinator_heartbeat_at = now(),
                 updated_at = now()
-            FROM run_row rr, terminal_chunk_failure tcf, open_chunk_exists oce
+            FROM run_row rr, execution_counts ec, terminal_chunk_failure tcf, open_chunk_exists oce
             WHERE r.id = rr.id
+              AND ec.run_id = rr.id
               AND NOT oce.exists
             RETURNING
                 r.id,

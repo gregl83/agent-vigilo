@@ -1,8 +1,8 @@
 //! Execution aggregate table access.
 //!
 //! Aggregate rows summarize the evaluator results for the current authoritative
-//! attempt of an execution. Workflows use these rows to update cached run
-//! counters and to decide final gate status without rescanning raw results.
+//! attempt of an execution. Finalization uses these rows to materialize run
+//! counters and decide final gate status without rescanning raw results.
 
 use sqlx::PgPool;
 use uuid::Uuid;

@@ -49,8 +49,8 @@ const DEFAULT_CHUNK_SIZE: usize = 100;
 
 /// Parsed and typed run inputs loaded from CLI sources.
 ///
-/// Keeps both raw payloads (for snapshots) and typed contracts (for validation
-/// and planning) to avoid re-parsing the same input content.
+/// Keeps canonical payloads for hashing/snapshot fields plus typed contracts
+/// for validation and planning, avoiding repeated parse work.
 struct ParsedRunInputs {
     profile_payload: Value,
     dataset_payload: Value,
@@ -257,8 +257,9 @@ fn load_run_inputs(
 
 /// Implements `vigilo run create`.
 ///
-/// This flow validates executability, creates case/dataset/run drafts, inserts
-/// all required rows in one transaction, and emits a machine-readable summary.
+/// This flow validates executability, creates case/dataset/run drafts, stores
+/// durable run work in one transaction, and emits a machine-readable summary.
+/// Coordinators publish chunk-ready events after they mark the run running.
 async fn handle_create(
     context: Context,
     profile: Option<String>,
@@ -287,6 +288,7 @@ async fn handle_create(
     let (case_blobs, dataset_cases) = build_case_plans(&parsed.dataset)?;
     let dataset_version_id = compute_dataset_version_id(&parsed.dataset, &dataset_cases)?;
     let profile_hash = hash_json(&profile_payload)?;
+    let dataset_hash = hash_json(&dataset_payload)?;
     let aggregation_policy_hash = compute_aggregation_policy_hash(&parsed.profile)?;
     let profile_version_id = format!(
         "{}/{}",
@@ -298,7 +300,7 @@ async fn handle_create(
     let run_id = Uuid::now_v7();
     let run_key = run_id.to_string();
 
-    let legacy_dataset_id = parsed
+    let run_dataset_id = parsed
         .dataset
         .dataset_id
         .clone()
@@ -308,10 +310,17 @@ async fn handle_create(
 
     let snapshot = json!({
         "profile": profile_payload,
-        "dataset": dataset_payload,
+        "dataset_ref": {
+            "dataset_id": parsed.dataset.dataset_id,
+            "dataset_version": parsed.dataset.dataset_version,
+            "dataset_version_id": dataset_version_id,
+            "dataset_hash": dataset_hash,
+            "case_count": dataset_cases.len(),
+        },
         "dataset_version_id": dataset_version_id,
         "profile_version_id": profile_version_id,
         "profile_hash": profile_hash,
+        "dataset_hash": dataset_hash,
         "aggregation_policy_hash": aggregation_policy_hash,
         "chunk_size": chunk_size,
         "executability": executability,
@@ -321,7 +330,7 @@ async fn handle_create(
         run_key: run_key.clone(),
         name: None,
         description: None,
-        dataset_id: legacy_dataset_id,
+        dataset_id: run_dataset_id,
         dataset_version: parsed
             .dataset
             .dataset_version
@@ -358,7 +367,6 @@ async fn handle_create(
         .await?;
     run_create::insert_run_create(&mut tx, run_id, &run_draft).await?;
     run_create::bulk_insert_run_chunks(&mut tx, run_id, &dataset_version_id, &chunks).await?;
-    run_create::bulk_enqueue_chunk_events(&mut tx, run_id, &chunks).await?;
 
     tx.commit().await?;
 
@@ -369,6 +377,7 @@ async fn handle_create(
             "dataset_version_id": dataset_version_id,
             "profile_version_id": profile_version_id,
             "profile_hash": profile_hash,
+            "dataset_hash": dataset_hash,
             "aggregation_policy_hash": aggregation_policy_hash,
             "status": "pending",
         },
@@ -555,8 +564,8 @@ pub(crate) struct Command {
 
 #[async_trait]
 impl Executable for Command {
-    /// Dispatches run subcommands and emits explicit TODO errors for reserved
-    /// subcommands that are not implemented yet.
+    /// Dispatches run subcommands and reports reserved subcommands that are not
+    /// implemented yet.
     async fn exec(self, context: Context) -> anyhow::Result<()> {
         match self.command {
             Some(SubCommand::Create {
@@ -570,38 +579,22 @@ impl Executable for Command {
             }
             Some(SubCommand::Status { run_id }) => {
                 info!("fetching status for run {}", run_id);
-
-                // TODO: Query run + execution aggregate state from persistence.
-                // TODO: Return machine-readable status payload.
                 anyhow::bail!("run status is not implemented yet")
             }
             Some(SubCommand::Cancel { run_id }) => {
                 info!("cancelling run {}", run_id);
-
-                // TODO: Transition run to cancelled if still non-terminal.
-                // TODO: Mark in-flight executions/attempts for cooperative stop.
                 anyhow::bail!("run cancel is not implemented yet")
             }
             Some(SubCommand::Results { run_id }) => {
                 info!("fetching results for run {}", run_id);
-
-                // TODO: Read execution aggregates and evaluator summaries.
-                // TODO: Emit machine-readable results payload.
                 anyhow::bail!("run results is not implemented yet")
             }
             Some(SubCommand::Export { run_id }) => {
                 info!("exporting run {}", run_id);
-
-                // TODO: Support export format selection and output destinations.
-                // TODO: Stream run results/evidence into export artifact.
                 anyhow::bail!("run export is not implemented yet")
             }
             Some(SubCommand::Watch { run_id }) => {
                 info!("watching run {}", run_id);
-
-                // TODO: Poll run/execution state changes with backoff until terminal state.
-                // TODO: Stream incremental progress snapshots to output context.
-                // TODO: Add optional follow mode and structured event output.
                 anyhow::bail!("run watch is not implemented yet")
             }
             Some(SubCommand::Test {

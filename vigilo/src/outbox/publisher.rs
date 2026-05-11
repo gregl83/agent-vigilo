@@ -1,9 +1,6 @@
 use async_trait::async_trait;
 use sqlx::PgPool;
-use tracing::{
-    error,
-    info,
-};
+use tracing::error;
 
 use crate::{
     db::tables::outbox_events,
@@ -40,9 +37,6 @@ pub(crate) trait EventPublisher: Send + Sync {
     async fn publish(&self, event: &OutboxEvent) -> anyhow::Result<()>;
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct LoggingEventPublisher;
-
 pub(crate) struct MqEventPublisher<'a> {
     client: &'a mq::Client,
 }
@@ -50,23 +44,6 @@ pub(crate) struct MqEventPublisher<'a> {
 impl<'a> MqEventPublisher<'a> {
     pub(crate) fn new(client: &'a mq::Client) -> Self {
         Self { client }
-    }
-}
-
-#[async_trait]
-impl EventPublisher for LoggingEventPublisher {
-    async fn publish(&self, event: &OutboxEvent) -> anyhow::Result<()> {
-        // Temporary publisher for coordinator-owned outbox dispatch; replace with MQ adapter later.
-        info!(
-            event_id = %event.id,
-            event_type = %event.event_type,
-            aggregate_type = %event.aggregate_type,
-            aggregate_id = %event.aggregate_id,
-            payload = %event.payload,
-            "published outbox event"
-        );
-
-        Ok(())
     }
 }
 

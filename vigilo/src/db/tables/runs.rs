@@ -1,8 +1,9 @@
 //! Run table access.
 //!
 //! Runs are the top-level evaluation jobs. The table stores run identity,
-//! configuration snapshots, coordinator lease fields, cached terminal counters,
-//! and final gate status. Multi-step run state changes live in workflows.
+//! compact configuration snapshots, coordinator lease fields, finalization
+//! counters, and final gate status. Multi-step run state changes live in
+//! workflows.
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -126,8 +127,7 @@ pub(crate) async fn select_run_by_id(db: &PgPool, id: Uuid) -> anyhow::Result<Op
 
 /// Finds only the run profile payload from a run's config snapshot.
 ///
-/// Worker hot paths use this instead of loading the full run row because the
-/// full snapshot can include the entire dataset payload.
+/// Worker hot paths use this instead of loading unrelated run metadata.
 pub(crate) async fn select_run_profile_snapshot_by_id(
     db: &PgPool,
     id: Uuid,

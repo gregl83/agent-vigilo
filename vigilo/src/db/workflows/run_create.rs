@@ -1,11 +1,11 @@
 //! Run creation persistence workflow helpers.
 //!
-//! These helpers write the immutable dataset snapshot, run row, run chunks, and
-//! initial outbox events inside the caller's transaction. Bulk paths are
-//! intentionally chunked to keep statement size and bind counts bounded for
-//! large datasets.
+//! These helpers write immutable dataset content, dataset membership, the run
+//! row, and pending run chunks inside the caller's transaction. Dispatch owns
+//! chunk-ready event creation so workers cannot process a run before a
+//! coordinator marks it running. Bulk paths are chunked to keep statement size
+//! and bind counts bounded for large datasets.
 
-use serde_json::json;
 use sqlx::{
     Postgres,
     QueryBuilder,
@@ -22,7 +22,6 @@ use crate::models::{
 const CASE_BLOB_INSERT_CHUNK_SIZE: usize = 500;
 const DATASET_MEMBERSHIP_INSERT_CHUNK_SIZE: usize = 2_000;
 const RUN_CHUNK_INSERT_CHUNK_SIZE: usize = 2_000;
-const CHUNK_EVENT_INSERT_CHUNK_SIZE: usize = 1_000;
 
 /// Inserts case blob rows, ignoring already-known content hashes.
 pub(crate) async fn bulk_insert_case_blobs(
@@ -94,10 +93,11 @@ pub(crate) async fn upsert_dataset_version(
     Ok(())
 }
 
-/// Inserts dataset membership rows for a versioned dataset.
+/// Inserts or verifies dataset membership rows for a versioned dataset.
 ///
-/// Existing memberships must match ordinal and case hash exactly. A mismatch is
-/// treated as an immutable dataset version conflict.
+/// Existing rows are left untouched to avoid rewriting shared dataset versions
+/// for every model run. A follow-up validation query checks that all requested
+/// memberships exist with the expected ordinal and case hash.
 pub(crate) async fn bulk_insert_dataset_membership(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     dataset_version_id: &str,
@@ -107,7 +107,6 @@ pub(crate) async fn bulk_insert_dataset_membership(
         return Ok(());
     }
 
-    let mut total_rows_affected = 0u64;
     for chunk in cases.chunks(DATASET_MEMBERSHIP_INSERT_CHUNK_SIZE) {
         let mut query_builder = QueryBuilder::<Postgres>::new(
             "INSERT INTO dataset_version_cases (dataset_version_id, case_id, case_ordinal, case_hash) ",
@@ -120,24 +119,50 @@ pub(crate) async fn bulk_insert_dataset_membership(
                 .push_bind(&row.case_hash);
         });
 
-        query_builder.push(
-            " ON CONFLICT (dataset_version_id, case_id) DO UPDATE \
-             SET case_ordinal = EXCLUDED.case_ordinal, case_hash = EXCLUDED.case_hash \
-             WHERE dataset_version_cases.case_ordinal = EXCLUDED.case_ordinal \
-               AND dataset_version_cases.case_hash = EXCLUDED.case_hash",
+        query_builder.push(" ON CONFLICT DO NOTHING");
+        query_builder.build().execute(tx.as_mut()).await?;
+
+        let mut validation_query = QueryBuilder::<Postgres>::new(
+            r#"
+            WITH input (case_id, case_ordinal, case_hash) AS (
+            "#,
+        );
+        validation_query.push_values(chunk, |mut b, row| {
+            b.push_bind(&row.case_id)
+                .push_bind(row.case_ordinal)
+                .push_bind(&row.case_hash);
+        });
+        validation_query.push(
+            r#"
+            )
+            SELECT input.case_id
+            FROM input
+            LEFT JOIN dataset_version_cases dvc
+              ON dvc.dataset_version_id =
+            "#,
+        );
+        validation_query.push_bind(dataset_version_id);
+        validation_query.push(
+            r#"
+             AND dvc.case_id = input.case_id
+            WHERE dvc.case_id IS NULL
+               OR dvc.case_ordinal <> input.case_ordinal
+               OR dvc.case_hash <> input.case_hash
+            LIMIT 1
+            "#,
         );
 
-        total_rows_affected += query_builder
-            .build()
-            .execute(tx.as_mut())
-            .await?
-            .rows_affected();
-    }
-    if total_rows_affected != cases.len() as u64 {
-        anyhow::bail!(
-            "dataset_version_id '{}' already exists with different membership; dataset versions are immutable",
-            dataset_version_id
-        );
+        let mismatch = validation_query
+            .build_query_scalar::<String>()
+            .fetch_optional(tx.as_mut())
+            .await?;
+        if let Some(case_id) = mismatch {
+            anyhow::bail!(
+                "dataset_version_id '{}' already exists with different membership near case '{}'; dataset versions are immutable",
+                dataset_version_id,
+                case_id
+            );
+        }
     }
 
     Ok(())
@@ -218,6 +243,9 @@ pub(crate) async fn insert_run_create(
 }
 
 /// Inserts pending chunk rows for the run.
+///
+/// Chunk-ready outbox events are created by dispatch after the run is marked
+/// running.
 pub(crate) async fn bulk_insert_run_chunks(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     run_id: Uuid,
@@ -243,39 +271,6 @@ pub(crate) async fn bulk_insert_run_chunks(
                 .push_bind("pending");
         });
 
-        query_builder.build().execute(tx.as_mut()).await?;
-    }
-
-    Ok(())
-}
-
-/// Enqueues idempotent `run.chunk.ready` events for pending chunks.
-pub(crate) async fn bulk_enqueue_chunk_events(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
-    run_id: Uuid,
-    chunks: &[RunChunkDraft],
-) -> anyhow::Result<()> {
-    if chunks.is_empty() {
-        return Ok(());
-    }
-
-    for chunk_batch in chunks.chunks(CHUNK_EVENT_INSERT_CHUNK_SIZE) {
-        let mut query_builder = QueryBuilder::<Postgres>::new(
-            "INSERT INTO outbox_events (event_type, aggregate_type, aggregate_id, dedupe_key, payload) ",
-        );
-
-        query_builder.push_values(chunk_batch, |mut b, chunk| {
-            b.push_bind("run.chunk.ready")
-                .push_bind("run")
-                .push_bind(run_id)
-                .push_bind(format!("run:{}:chunk:{}:ready", run_id, chunk.chunk_id))
-                .push_bind(json!({
-                    "run_id": run_id,
-                    "chunk_id": chunk.chunk_id,
-                }));
-        });
-
-        query_builder.push(" ON CONFLICT (dedupe_key) DO NOTHING");
         query_builder.build().execute(tx.as_mut()).await?;
     }
 

@@ -23,7 +23,7 @@ CREATE INDEX idx_execution_aggregates_run_id ON execution_aggregates(run_id);
 CREATE INDEX idx_execution_aggregates_overall_status ON execution_aggregates(overall_status);
 
 COMMENT ON TABLE execution_aggregates IS
-    'Stores the current authoritative aggregate result for an execution attempt. Derived from append-only evaluator results and used for execution- and run-level summaries, scoring, and gate decisions.';
+    'Stores the current authoritative aggregate result for an execution attempt. Derived from append-only evaluator results and used for execution summaries, final run counter rollups, scoring, and gate decisions.';
 
 COMMENT ON COLUMN execution_aggregates.execution_id IS
     'Reference to the execution this aggregate summarizes. One authoritative aggregate exists per execution.';

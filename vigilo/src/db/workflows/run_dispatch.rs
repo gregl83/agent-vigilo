@@ -1,27 +1,33 @@
 //! Run dispatch workflow helpers.
 //!
-//! Coordinators use this module to claim pending runs, emit the run-started
-//! event, and ensure chunk-ready events exist. The claim query uses row locking
-//! so multiple coordinators can safely dispatch runs concurrently.
+//! Coordinators use this module to atomically claim pending runs, mark them
+//! running, and enqueue the outbox events that make chunks visible to workers.
+//! The claim query uses row locking so multiple coordinators can safely dispatch
+//! runs concurrently.
 
-use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Minimal run projection returned when a coordinator claims dispatch work.
+/// Run projection returned after a coordinator dispatches a pending run.
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub(crate) struct ClaimedRun {
+pub(crate) struct DispatchedRun {
     pub(crate) id: Uuid,
     pub(crate) run_key: String,
+    pub(crate) chunk_events_enqueued: i64,
+    pub(crate) run_started_events_enqueued: i64,
 }
 
-/// Claims the oldest pending run whose coordinator lease is open or expired.
-pub(crate) async fn claim_next_pending_run(
+/// Claims and dispatches the oldest pending run whose coordinator lease is open.
+///
+/// Chunk-ready events are inserted in the same statement that marks the run
+/// running. This prevents workers from claiming chunks before dispatch has
+/// established run ownership.
+pub(crate) async fn dispatch_next_pending_run(
     db: &PgPool,
     coordinator_id: &str,
     lease_seconds: i32,
-) -> anyhow::Result<Option<ClaimedRun>> {
-    let claimed = sqlx::query_as::<_, ClaimedRun>(
+) -> anyhow::Result<Option<DispatchedRun>> {
+    let dispatched = sqlx::query_as::<_, DispatchedRun>(
         r#"
         WITH candidate AS (
             SELECT id
@@ -31,18 +37,53 @@ pub(crate) async fn claim_next_pending_run(
             ORDER BY created_at ASC
             FOR UPDATE SKIP LOCKED
             LIMIT 1
+        ),
+        claimed AS (
+            UPDATE runs AS r
+            SET status = 'running'::run_status,
+                coordinator_id = $1,
+                coordinator_leased_until = now() + ($2::int * interval '1 second'),
+                coordinator_heartbeat_at = now(),
+                started_at = COALESCE(r.started_at, now()),
+                dispatched_at = COALESCE(r.dispatched_at, now()),
+                updated_at = now()
+            FROM candidate
+            WHERE r.id = candidate.id
+            RETURNING r.id, r.run_key
+        ),
+        chunk_events AS (
+            INSERT INTO outbox_events (event_type, aggregate_type, aggregate_id, dedupe_key, payload)
+            SELECT
+                'run.chunk.ready',
+                'run',
+                rc.run_id,
+                format('run:%s:chunk:%s:ready', rc.run_id, rc.id),
+                jsonb_build_object('run_id', rc.run_id, 'chunk_id', rc.id)
+            FROM run_chunks rc
+            JOIN claimed
+              ON claimed.id = rc.run_id
+            WHERE rc.status = 'pending'
+            ON CONFLICT (dedupe_key) DO NOTHING
+            RETURNING id
+        ),
+        started_event AS (
+            INSERT INTO outbox_events (event_type, aggregate_type, aggregate_id, dedupe_key, payload)
+            SELECT
+                'run.started',
+                'run',
+                claimed.id,
+                format('run:%s:started', claimed.id),
+                jsonb_build_object('run_id', claimed.id)
+            FROM claimed
+            ON CONFLICT (dedupe_key) DO NOTHING
+            RETURNING id
         )
-        UPDATE runs AS r
-        SET status = 'running'::run_status,
-            coordinator_id = $1,
-            coordinator_leased_until = now() + ($2::int * interval '1 second'),
-            coordinator_heartbeat_at = now(),
-            started_at = COALESCE(r.started_at, now()),
-            dispatched_at = COALESCE(r.dispatched_at, now()),
-            updated_at = now()
-        FROM candidate
-        WHERE r.id = candidate.id
-        RETURNING r.id, r.run_key
+        SELECT
+            claimed.id,
+            claimed.run_key,
+            (SELECT COUNT(*)::bigint FROM chunk_events) AS chunk_events_enqueued,
+            (SELECT COUNT(*)::bigint FROM started_event) AS run_started_events_enqueued
+        FROM claimed
         "#,
     )
     .bind(coordinator_id)
@@ -50,57 +91,5 @@ pub(crate) async fn claim_next_pending_run(
     .fetch_optional(db)
     .await?;
 
-    Ok(claimed)
-}
-
-/// Backfills missing chunk-ready events for a run.
-///
-/// The outbox dedupe key makes this idempotent across coordinator retries.
-pub(crate) async fn enqueue_missing_chunk_ready_events(
-    db: &PgPool,
-    run_id: Uuid,
-) -> anyhow::Result<u64> {
-    let result = sqlx::query(
-        r#"
-        INSERT INTO outbox_events (event_type, aggregate_type, aggregate_id, dedupe_key, payload)
-        SELECT
-            'run.chunk.ready',
-            'run',
-            rc.run_id,
-            format('run:%s:chunk:%s:ready', rc.run_id, rc.id),
-            jsonb_build_object('run_id', rc.run_id, 'chunk_id', rc.id)
-        FROM run_chunks rc
-        WHERE rc.run_id = $1::uuid
-          AND rc.status = 'pending'
-        ON CONFLICT (dedupe_key) DO NOTHING
-        "#,
-    )
-    .bind(run_id)
-    .execute(db)
-    .await?;
-
-    Ok(result.rows_affected())
-}
-
-/// Enqueues the idempotent `run.started` event for a run.
-pub(crate) async fn enqueue_run_started_event(db: &PgPool, run_id: Uuid) -> anyhow::Result<u64> {
-    let result = sqlx::query(
-        r#"
-        INSERT INTO outbox_events (event_type, aggregate_type, aggregate_id, dedupe_key, payload)
-        VALUES (
-            'run.started',
-            'run',
-            $1::uuid,
-            format('run:%s:started', $1::uuid),
-            $2::jsonb
-        )
-        ON CONFLICT (dedupe_key) DO NOTHING
-        "#,
-    )
-    .bind(run_id)
-    .bind(json!({ "run_id": run_id }))
-    .execute(db)
-    .await?;
-
-    Ok(result.rows_affected())
+    Ok(dispatched)
 }

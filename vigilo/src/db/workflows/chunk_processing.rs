@@ -24,10 +24,10 @@ pub(crate) struct WorkerCaseBatchItem {
     pub(crate) metadata: serde_json::Value,
 }
 
-/// Claims a pending or expired chunk for processing.
+/// Claims a pending or expired chunk for a running run.
 ///
 /// Returns `None` when another worker already owns the current lease or the
-/// chunk is no longer processable.
+/// chunk's run is not currently processable.
 pub(crate) async fn claim_chunk_for_processing(
     db: &PgPool,
     chunk_id: Uuid,
@@ -43,6 +43,12 @@ pub(crate) async fn claim_chunk_for_processing(
 		  AND (
 			status = 'pending'
 			OR (status = 'leased' AND leased_until < now())
+		  )
+		  AND EXISTS (
+			SELECT 1
+			FROM runs
+			WHERE runs.id = run_chunks.run_id
+			  AND runs.status = 'running'::run_status
 		  )
 		RETURNING
 			id,

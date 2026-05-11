@@ -1,10 +1,9 @@
 //! Execution processing workflow.
 //!
 //! This module owns the worker-side path from a leased dataset case to persisted
-//! evaluator results, execution aggregate, terminal execution transition, and
-//! cached run counters. It also owns evaluator runtime lookup and single-flight
-//! component loading so concurrent workers do not repeatedly compile the same
-//! evaluator artifact.
+//! evaluator results, execution aggregate, and terminal execution transition.
+//! It also owns evaluator runtime lookup and single-flight component loading so
+//! concurrent workers do not repeatedly compile the same evaluator artifact.
 
 use std::{
     collections::{
@@ -544,50 +543,6 @@ async fn allocate_execution_attempts_for_cases(
               AND execution_attempts.status = 'running'::attempt_status
             RETURNING execution_attempts.id
         ),
-        reopened_terminal AS (
-            SELECT
-                executions.run_id,
-                execution_aggregates.overall_status
-            FROM upserted
-            JOIN executions
-              ON executions.id = upserted.id
-            LEFT JOIN execution_aggregates
-              ON execution_aggregates.execution_id = executions.id
-             AND execution_aggregates.attempt_id = executions.current_attempt_id
-            WHERE executions.status IN (
-                'completed'::execution_status,
-                'failed'::execution_status,
-                'timed_out'::execution_status,
-                'cancelled'::execution_status
-            )
-        ),
-        reopened_run_delta AS (
-            SELECT
-                run_id,
-                COUNT(*)::int AS terminal_delta,
-                COALESCE(SUM(
-                    CASE WHEN overall_status = 'passed'::evaluation_status THEN 1 ELSE 0 END
-                )::int, 0) AS passed_delta,
-                COALESCE(SUM(
-                    CASE WHEN overall_status = 'failed'::evaluation_status THEN 1 ELSE 0 END
-                )::int, 0) AS failed_delta,
-                COALESCE(SUM(
-                    CASE WHEN overall_status = 'error'::evaluation_status THEN 1 ELSE 0 END
-                )::int, 0) AS errored_delta
-            FROM reopened_terminal
-            GROUP BY run_id
-        ),
-        reopened_run_update AS (
-            UPDATE runs
-            SET terminal_execution_count = GREATEST(runs.terminal_execution_count - reopened_run_delta.terminal_delta, 0),
-                passed_execution_count = GREATEST(runs.passed_execution_count - reopened_run_delta.passed_delta, 0),
-                failed_execution_count = GREATEST(runs.failed_execution_count - reopened_run_delta.failed_delta, 0),
-                errored_execution_count = GREATEST(runs.errored_execution_count - reopened_run_delta.errored_delta, 0),
-                updated_at = now()
-            FROM reopened_run_delta
-            WHERE runs.id = reopened_run_delta.run_id
-            RETURNING runs.id
-        ),
         bumped AS (
             UPDATE executions
             SET status = 'running'::execution_status,
@@ -597,8 +552,6 @@ async fn allocate_execution_attempts_for_cases(
                 completed_at = NULL,
                 updated_at = now()
             FROM upserted
-            LEFT JOIN reopened_run_update
-              ON true
             WHERE executions.id = upserted.id
             RETURNING executions.id AS execution_id, executions.current_attempt_no AS attempt_no
         ),
@@ -666,9 +619,9 @@ async fn allocate_execution_attempts_for_cases(
 
 /// Applies terminal execution transitions as one authoritative batch.
 ///
-/// The batch updates attempts, executions, and cached run counters together.
-/// If any transition no longer owns the current attempt, the entire batch is
-/// rejected so stale workers cannot corrupt run-level counters.
+/// The batch updates attempts and executions together. If any transition no
+/// longer owns the current attempt, the entire batch is rejected so stale
+/// workers cannot mark executions terminal.
 pub(crate) async fn finalize_execution_terminal_transitions(
     db: &PgPool,
     transitions: &[ExecutionTerminalTransition],
@@ -869,37 +822,9 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                 executions.run_id,
                 attempt_update.attempt_id,
                 attempt_update.overall_status
-        ),
-        run_counter_delta AS (
-            SELECT
-                execution_update.run_id,
-                COUNT(*)::int AS terminal_delta,
-                COALESCE(SUM(
-                    CASE WHEN execution_update.overall_status = 'passed'::evaluation_status THEN 1 ELSE 0 END
-                )::int, 0) AS passed_delta,
-                COALESCE(SUM(
-                    CASE WHEN execution_update.overall_status = 'failed'::evaluation_status THEN 1 ELSE 0 END
-                )::int, 0) AS failed_delta,
-                COALESCE(SUM(
-                    CASE WHEN execution_update.overall_status = 'error'::evaluation_status THEN 1 ELSE 0 END
-                )::int, 0) AS errored_delta
-            FROM execution_update
-            GROUP BY execution_update.run_id
-        ),
-        run_counter_update AS (
-            UPDATE runs
-            SET terminal_execution_count = runs.terminal_execution_count + run_counter_delta.terminal_delta,
-                passed_execution_count = runs.passed_execution_count + run_counter_delta.passed_delta,
-                failed_execution_count = runs.failed_execution_count + run_counter_delta.failed_delta,
-                errored_execution_count = runs.errored_execution_count + run_counter_delta.errored_delta,
-                updated_at = now()
-            FROM run_counter_delta
-            WHERE runs.id = run_counter_delta.run_id
-            RETURNING runs.id
         )
         SELECT
             (SELECT COUNT(*)::bigint FROM execution_update)
-            + ((SELECT COUNT(*)::bigint FROM run_counter_update) * 0)
         "#,
     )
     .bind(execution_ids)

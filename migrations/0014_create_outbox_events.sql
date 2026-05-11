@@ -5,7 +5,7 @@ CREATE TABLE outbox_events (
     aggregate_type TEXT NOT NULL,
     aggregate_id UUID NOT NULL,
 
-    -- useful for RunCompleted dedupe, etc.
+    -- useful for run.completed dedupe, etc.
     dedupe_key TEXT NOT NULL UNIQUE,
 
     payload JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -32,7 +32,7 @@ COMMENT ON COLUMN outbox_events.id IS
     'Unique identifier for the outbox event record.';
 
 COMMENT ON COLUMN outbox_events.event_type IS
-    'Type of event being emitted (e.g., RunCompleted). Used by consumers to interpret the payload.';
+    'Type of event being emitted (e.g., run.completed). Used by consumers to interpret the payload.';
 
 COMMENT ON COLUMN outbox_events.aggregate_type IS
     'Type of aggregate that produced the event (e.g., run). Used for routing and grouping.';
