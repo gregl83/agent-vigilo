@@ -61,9 +61,10 @@ pub(crate) async fn insert_execution(
     Ok(execution)
 }
 
-/// Finds an execution by primary key.
+/// Finds an execution by run-local primary key.
 pub(crate) async fn select_execution_by_id(
     db: &PgPool,
+    run_id: Uuid,
     id: Uuid,
 ) -> anyhow::Result<Option<Execution>> {
     let execution = sqlx::query_as::<_, Execution>(
@@ -90,9 +91,11 @@ pub(crate) async fn select_execution_by_id(
             completed_at,
             updated_at
         FROM executions
-        WHERE id = $1::uuid
+        WHERE run_id = $1::uuid
+          AND id = $2::uuid
         "#,
     )
+    .bind(run_id)
     .bind(id)
     .fetch_optional(db)
     .await?;
@@ -143,18 +146,20 @@ pub(crate) async fn list_executions_by_run_id(
 /// Updates status and current-attempt fields for an execution.
 pub(crate) async fn update_execution_status(
     db: &PgPool,
+    run_id: Uuid,
     id: Uuid,
     patch: &ExecutionPatch,
 ) -> anyhow::Result<Option<Execution>> {
     let execution = sqlx::query_as::<_, Execution>(
         r#"
         UPDATE executions
-        SET status = $2::execution_status,
-            current_attempt_no = $3,
-            current_attempt_id = $4::uuid,
-            last_error_message = $5,
+        SET status = $3::execution_status,
+            current_attempt_no = $4,
+            current_attempt_id = $5::uuid,
+            last_error_message = $6,
             updated_at = now()
-        WHERE id = $1::uuid
+        WHERE run_id = $1::uuid
+          AND id = $2::uuid
         RETURNING
             id,
             run_id,
@@ -178,6 +183,7 @@ pub(crate) async fn update_execution_status(
             updated_at
         "#,
     )
+    .bind(run_id)
     .bind(id)
     .bind(&patch.status)
     .bind(&patch.current_attempt_no)
@@ -189,14 +195,20 @@ pub(crate) async fn update_execution_status(
     Ok(execution)
 }
 
-/// Deletes an execution by primary key.
-pub(crate) async fn delete_execution_by_id(db: &PgPool, id: Uuid) -> anyhow::Result<u64> {
+/// Deletes an execution by run-local primary key.
+pub(crate) async fn delete_execution_by_id(
+    db: &PgPool,
+    run_id: Uuid,
+    id: Uuid,
+) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
         DELETE FROM executions
-        WHERE id = $1::uuid
+        WHERE run_id = $1::uuid
+          AND id = $2::uuid
         "#,
     )
+    .bind(run_id)
     .bind(id)
     .execute(db)
     .await?;

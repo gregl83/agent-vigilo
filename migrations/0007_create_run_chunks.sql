@@ -1,5 +1,5 @@
 CREATE TABLE run_chunks (
-    id UUID PRIMARY KEY,
+    id UUID NOT NULL,
     run_id UUID NOT NULL,
     dataset_version_id TEXT NOT NULL,
     profile_group_id TEXT NOT NULL,
@@ -13,15 +13,29 @@ CREATE TABLE run_chunks (
     CONSTRAINT fk_run_chunks_run_dataset
         FOREIGN KEY (run_id, dataset_version_id)
         REFERENCES runs(id, dataset_version_id)
-        ON DELETE CASCADE
-);
+        ON DELETE CASCADE,
 
-CREATE INDEX idx_run_chunks_run_status ON run_chunks(run_id, status);
+    CONSTRAINT pk_run_chunks PRIMARY KEY (run_id, id)
+) PARTITION BY HASH (run_id);
 
-CREATE INDEX idx_run_chunks_status_leased_until ON run_chunks(status, leased_until);
+DO $$
+DECLARE
+    partition_index INTEGER;
+BEGIN
+    FOR partition_index IN 0..31 LOOP
+        EXECUTE format(
+            'CREATE TABLE %I PARTITION OF run_chunks FOR VALUES WITH (MODULUS 32, REMAINDER %s)',
+            'run_chunks_p' || lpad(partition_index::text, 2, '0'),
+            partition_index
+        );
+    END LOOP;
+END $$;
+
+CREATE INDEX idx_run_chunks_run_status_leased_until
+    ON run_chunks(run_id, status, leased_until);
 
 COMMENT ON TABLE run_chunks IS
-    'Chunk-level scheduling units for run processing. Workers lease chunks and process dataset ordinals in bounded ranges.';
+    'Chunk-level scheduling units for run processing, hash partitioned by run_id for run-local worker scheduling.';
 
 COMMENT ON COLUMN run_chunks.id IS
     'Unique chunk identifier used in work dispatch and worker claiming.';

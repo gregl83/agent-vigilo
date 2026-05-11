@@ -1,5 +1,5 @@
 CREATE TABLE executions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
     run_id UUID NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
 
     -- stable identity of the dataset case within a run
@@ -34,19 +34,31 @@ CREATE TABLE executions (
     completed_at TIMESTAMPTZ,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
+    CONSTRAINT pk_executions PRIMARY KEY (run_id, id),
     CONSTRAINT uq_execution_run_case UNIQUE (run_id, case_id)
-);
+) PARTITION BY HASH (run_id);
 
-CREATE INDEX idx_executions_run_id ON executions(run_id);
+DO $$
+DECLARE
+    partition_index INTEGER;
+BEGIN
+    FOR partition_index IN 0..31 LOOP
+        EXECUTE format(
+            'CREATE TABLE %I PARTITION OF executions FOR VALUES WITH (MODULUS 32, REMAINDER %s)',
+            'executions_p' || lpad(partition_index::text, 2, '0'),
+            partition_index
+        );
+    END LOOP;
+END $$;
 
 CREATE INDEX idx_executions_run_status ON executions(run_id, status);
 
-CREATE INDEX idx_executions_current_attempt_id ON executions(current_attempt_id);
+CREATE INDEX idx_executions_run_current_attempt_id ON executions(run_id, current_attempt_id);
 
 CREATE INDEX idx_executions_run_case_hash ON executions(run_id, case_hash);
 
 COMMENT ON TABLE executions IS
-    'Represents a single evaluation of a dataset case against the target system. Each execution is part of a run and may have multiple attempts due to retries or failures.';
+    'Represents a single evaluation of a dataset case against the target system. Each execution is part of a run, may have multiple attempts due to retries or failures, and is hash partitioned by run_id.';
 
 COMMENT ON COLUMN executions.id IS
     'Unique identifier for the execution.';

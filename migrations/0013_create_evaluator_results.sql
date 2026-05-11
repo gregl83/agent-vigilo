@@ -1,9 +1,9 @@
 CREATE TABLE evaluator_results (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
 
     run_id UUID NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-    execution_id UUID NOT NULL REFERENCES executions(id) ON DELETE CASCADE,
-    attempt_id UUID NOT NULL REFERENCES execution_attempts(id) ON DELETE CASCADE,
+    execution_id UUID NOT NULL,
+    attempt_id UUID NOT NULL,
 
     evaluator_id TEXT NOT NULL,
     evaluator_version TEXT NOT NULL,
@@ -34,28 +34,47 @@ CREATE TABLE evaluator_results (
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
+    CONSTRAINT pk_evaluator_results PRIMARY KEY (run_id, id),
+    CONSTRAINT fk_evaluator_results_execution
+        FOREIGN KEY (run_id, execution_id)
+        REFERENCES executions(run_id, id)
+        ON DELETE CASCADE,
+    CONSTRAINT fk_evaluator_results_attempt
+        FOREIGN KEY (run_id, attempt_id)
+        REFERENCES execution_attempts(run_id, id)
+        ON DELETE CASCADE,
     CONSTRAINT chk_normalized_score_range
        CHECK (normalized_score IS NULL OR (normalized_score >= 0.0 AND normalized_score <= 1.0)),
 
-    CONSTRAINT uq_attempt_evaluator UNIQUE (attempt_id, evaluator_id)
-);
+    CONSTRAINT uq_attempt_evaluator UNIQUE (run_id, attempt_id, evaluator_id)
+) PARTITION BY HASH (run_id);
 
-CREATE INDEX idx_evaluator_results_run_id ON evaluator_results(run_id);
+DO $$
+DECLARE
+    partition_index INTEGER;
+BEGIN
+    FOR partition_index IN 0..31 LOOP
+        EXECUTE format(
+            'CREATE TABLE %I PARTITION OF evaluator_results FOR VALUES WITH (MODULUS 32, REMAINDER %s)',
+            'evaluator_results_p' || lpad(partition_index::text, 2, '0'),
+            partition_index
+        );
+    END LOOP;
+END $$;
 
-CREATE INDEX idx_evaluator_results_execution_id ON evaluator_results(execution_id);
+CREATE INDEX idx_evaluator_results_run_execution_id ON evaluator_results(run_id, execution_id);
 
-CREATE INDEX idx_evaluator_results_attempt_id ON evaluator_results(attempt_id);
+CREATE INDEX idx_evaluator_results_run_dimension ON evaluator_results(run_id, dimension);
 
-CREATE INDEX idx_evaluator_results_dimension ON evaluator_results(dimension);
+CREATE INDEX idx_evaluator_results_run_status ON evaluator_results(run_id, status);
 
-CREATE INDEX idx_evaluator_results_status ON evaluator_results(status);
+CREATE INDEX idx_evaluator_results_run_failure_category
+    ON evaluator_results(run_id, failure_category);
 
-CREATE INDEX idx_evaluator_results_failure_category ON evaluator_results(failure_category);
-
-CREATE INDEX idx_evaluator_results_evaluator_id ON evaluator_results(evaluator_id);
+CREATE INDEX idx_evaluator_results_run_evaluator_id ON evaluator_results(run_id, evaluator_id);
 
 COMMENT ON TABLE evaluator_results IS
-    'Append-only records representing the outcome of individual evaluators applied to execution attempts. These rows form the canonical evidence used for aggregation, scoring, and policy decisions.';
+    'Append-only records representing the outcome of individual evaluators applied to execution attempts. These rows are hash partitioned by run_id and form the canonical evidence used for aggregation, scoring, and policy decisions.';
 
 COMMENT ON COLUMN evaluator_results.id IS
     'Unique identifier for the evaluator result record.';

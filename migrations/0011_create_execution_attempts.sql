@@ -1,6 +1,6 @@
 CREATE TABLE execution_attempts (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    execution_id UUID NOT NULL REFERENCES executions(id) ON DELETE CASCADE,
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    execution_id UUID NOT NULL,
     run_id UUID NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
 
     attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
@@ -37,22 +37,36 @@ CREATE TABLE execution_attempts (
     completed_at TIMESTAMPTZ,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-    CONSTRAINT uq_execution_attempt_no UNIQUE (execution_id, attempt_no)
-);
+    CONSTRAINT pk_execution_attempts PRIMARY KEY (run_id, id),
+    CONSTRAINT fk_execution_attempts_execution
+        FOREIGN KEY (run_id, execution_id)
+        REFERENCES executions(run_id, id)
+        ON DELETE CASCADE,
+    CONSTRAINT uq_execution_attempt_no UNIQUE (run_id, execution_id, attempt_no)
+) PARTITION BY HASH (run_id);
 
-CREATE INDEX idx_execution_attempts_run_id ON execution_attempts(run_id);
-
-CREATE INDEX idx_execution_attempts_execution_id ON execution_attempts(execution_id);
+DO $$
+DECLARE
+    partition_index INTEGER;
+BEGIN
+    FOR partition_index IN 0..31 LOOP
+        EXECUTE format(
+            'CREATE TABLE %I PARTITION OF execution_attempts FOR VALUES WITH (MODULUS 32, REMAINDER %s)',
+            'execution_attempts_p' || lpad(partition_index::text, 2, '0'),
+            partition_index
+        );
+    END LOOP;
+END $$;
 
 CREATE INDEX idx_execution_attempts_status ON execution_attempts(status);
 
-CREATE INDEX idx_execution_attempts_lease ON execution_attempts(leased_until)
+CREATE INDEX idx_execution_attempts_run_lease ON execution_attempts(run_id, leased_until)
     WHERE status = 'running';
 
 CREATE INDEX idx_execution_attempts_run_status ON execution_attempts(run_id, status);
 
 COMMENT ON TABLE execution_attempts IS
-    'Represents a single worker attempt to process an execution. Multiple attempts may exist due to retries, failures, or lease expiration. Only the most recent non-stale attempt is considered authoritative.';
+    'Represents a single worker attempt to process an execution. Multiple attempts may exist due to retries, failures, or lease expiration. Only the most recent non-stale attempt is considered authoritative. Rows are hash partitioned by run_id.';
 
 COMMENT ON COLUMN execution_attempts.id IS
     'Unique identifier for the attempt.';

@@ -527,7 +527,7 @@ async fn allocate_execution_attempts_for_cases(
                 evaluator_manifest = EXCLUDED.evaluator_manifest,
                 expected_evaluator_count = EXCLUDED.expected_evaluator_count,
                 updated_at = now()
-            RETURNING id, case_id
+            RETURNING id, case_id, run_id
         ),
         superseded_attempts AS (
             UPDATE execution_attempts
@@ -539,7 +539,8 @@ async fn allocate_execution_attempts_for_cases(
                 completed_at = COALESCE(execution_attempts.completed_at, now()),
                 updated_at = now()
             FROM upserted
-            WHERE execution_attempts.execution_id = upserted.id
+            WHERE execution_attempts.run_id = upserted.run_id
+              AND execution_attempts.execution_id = upserted.id
               AND execution_attempts.status = 'running'::attempt_status
             RETURNING execution_attempts.id
         ),
@@ -552,8 +553,12 @@ async fn allocate_execution_attempts_for_cases(
                 completed_at = NULL,
                 updated_at = now()
             FROM upserted
-            WHERE executions.id = upserted.id
-            RETURNING executions.id AS execution_id, executions.current_attempt_no AS attempt_no
+            WHERE executions.run_id = upserted.run_id
+              AND executions.id = upserted.id
+            RETURNING
+                executions.id AS execution_id,
+                executions.run_id,
+                executions.current_attempt_no AS attempt_no
         ),
         inserted_attempt AS (
             INSERT INTO execution_attempts (
@@ -567,24 +572,21 @@ async fn allocate_execution_attempts_for_cases(
             )
             SELECT
                 bumped.execution_id,
-                "#,
-    );
-    query_builder.push_bind(run_id);
-    query_builder.push(
-        r#"::uuid,
+                bumped.run_id,
                 bumped.attempt_no,
                 'running'::attempt_status,
                 now(),
                 now(),
                 now()
             FROM bumped
-            RETURNING id AS attempt_id, execution_id, attempt_no
+            RETURNING id AS attempt_id, execution_id, run_id, attempt_no
         ),
         updated_execution AS (
             UPDATE executions
             SET current_attempt_id = inserted_attempt.attempt_id
             FROM inserted_attempt
-            WHERE executions.id = inserted_attempt.execution_id
+            WHERE executions.run_id = inserted_attempt.run_id
+              AND executions.id = inserted_attempt.execution_id
             RETURNING executions.id
         )
         SELECT
@@ -624,6 +626,7 @@ async fn allocate_execution_attempts_for_cases(
 /// workers cannot mark executions terminal.
 pub(crate) async fn finalize_execution_terminal_transitions(
     db: &PgPool,
+    run_id: Uuid,
     transitions: &[ExecutionTerminalTransition],
 ) -> anyhow::Result<()> {
     if transitions.is_empty() {
@@ -673,7 +676,8 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                 executions.run_id
             FROM transition_input
             JOIN executions
-              ON executions.id = transition_input.execution_id
+              ON executions.run_id = $6::uuid
+             AND executions.id = transition_input.execution_id
              AND executions.current_attempt_id = transition_input.attempt_id
              AND executions.current_attempt_no = transition_input.attempt_no
         ),
@@ -694,7 +698,8 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                 END AS overall_status
             FROM authoritative_input
             LEFT JOIN execution_aggregates
-              ON execution_aggregates.execution_id = authoritative_input.execution_id
+              ON execution_aggregates.run_id = $6::uuid
+             AND execution_aggregates.execution_id = authoritative_input.execution_id
              AND execution_aggregates.attempt_id = authoritative_input.attempt_id
             WHERE NOT authoritative_input.completed
                OR execution_aggregates.execution_id IS NOT NULL
@@ -718,8 +723,10 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                 updated_at = now()
             FROM transition_input
             JOIN executions
-              ON executions.id = transition_input.execution_id
-            WHERE execution_attempts.id = transition_input.attempt_id
+              ON executions.run_id = $6::uuid
+             AND executions.id = transition_input.execution_id
+            WHERE execution_attempts.run_id = $6::uuid
+              AND execution_attempts.id = transition_input.attempt_id
               AND execution_attempts.execution_id = transition_input.execution_id
               AND execution_attempts.status = 'running'::attempt_status
               AND (
@@ -741,7 +748,8 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                 completed_at = now(),
                 updated_at = now()
             FROM terminal_input, terminal_input_check
-            WHERE execution_attempts.id = terminal_input.attempt_id
+            WHERE execution_attempts.run_id = $6::uuid
+              AND execution_attempts.id = terminal_input.attempt_id
               AND execution_attempts.execution_id = terminal_input.execution_id
             RETURNING
                 terminal_input.execution_id,
@@ -786,7 +794,7 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                 now()
             FROM attempt_update
             WHERE NOT attempt_update.completed
-            ON CONFLICT (execution_id) DO UPDATE
+            ON CONFLICT (run_id, execution_id) DO UPDATE
             SET attempt_id = EXCLUDED.attempt_id,
                 overall_status = EXCLUDED.overall_status,
                 aggregate_score = EXCLUDED.aggregate_score,
@@ -814,7 +822,8 @@ pub(crate) async fn finalize_execution_terminal_transitions(
             FROM attempt_update
             LEFT JOIN failed_aggregate_upsert
               ON failed_aggregate_upsert.execution_id = attempt_update.execution_id
-            WHERE executions.id = attempt_update.execution_id
+            WHERE executions.run_id = $6::uuid
+              AND executions.id = attempt_update.execution_id
               AND executions.current_attempt_id = attempt_update.attempt_id
               AND executions.current_attempt_no = attempt_update.attempt_no
             RETURNING
@@ -832,6 +841,7 @@ pub(crate) async fn finalize_execution_terminal_transitions(
     .bind(attempt_nos)
     .bind(completed_flags)
     .bind(error_messages)
+    .bind(run_id)
     .fetch_one(db)
     .await?;
 
@@ -1257,7 +1267,13 @@ async fn persist_completed_execution_results_batch(
             SELECT executions.id
             FROM executions
             JOIN input
-              ON input.execution_id = executions.id
+              ON executions.run_id =
+        "#,
+    );
+    authority_query.push_bind(run_id);
+    authority_query.push(
+        r#"::uuid
+             AND input.execution_id = executions.id
             WHERE executions.current_attempt_id = input.attempt_id
               AND executions.current_attempt_no = input.attempt_no
             FOR UPDATE OF executions
@@ -1316,7 +1332,7 @@ async fn persist_completed_execution_results_batch(
     });
     aggregate_query.push(
         r#"
-        ON CONFLICT (execution_id) DO UPDATE
+        ON CONFLICT (run_id, execution_id) DO UPDATE
         SET attempt_id = EXCLUDED.attempt_id,
             overall_status = EXCLUDED.overall_status,
             aggregate_score = EXCLUDED.aggregate_score,

@@ -30,6 +30,7 @@ pub(crate) struct WorkerCaseBatchItem {
 /// chunk's run is not currently processable.
 pub(crate) async fn claim_chunk_for_processing(
     db: &PgPool,
+    run_id: Uuid,
     chunk_id: Uuid,
     lease_seconds: i32,
 ) -> anyhow::Result<Option<RunChunk>> {
@@ -39,7 +40,8 @@ pub(crate) async fn claim_chunk_for_processing(
 		SET status = 'leased',
 			leased_until = now() + ($2::int * interval '1 second'),
 			updated_at = now()
-		WHERE id = $1::uuid
+		WHERE run_id = $1::uuid
+		  AND id = $2::uuid
 		  AND (
 			status = 'pending'
 			OR (status = 'leased' AND leased_until < now())
@@ -63,6 +65,7 @@ pub(crate) async fn claim_chunk_for_processing(
 			updated_at
 		"#,
     )
+    .bind(run_id)
     .bind(chunk_id)
     .bind(lease_seconds)
     .fetch_optional(db)
@@ -113,11 +116,13 @@ pub(crate) async fn mark_chunk_completed(db: &PgPool, chunk: &RunChunk) -> anyho
 		SET status = 'completed',
 			leased_until = NULL,
 			updated_at = now()
-		WHERE id = $1::uuid
+		WHERE run_id = $1::uuid
+		  AND id = $2::uuid
 		  AND status = 'leased'
-		  AND leased_until IS NOT DISTINCT FROM $2::timestamptz
+		  AND leased_until IS NOT DISTINCT FROM $3::timestamptz
 		"#,
     )
+    .bind(chunk.run_id)
     .bind(chunk.id)
     .bind(chunk.leased_until)
     .execute(db)
@@ -134,11 +139,13 @@ pub(crate) async fn release_chunk_as_pending(db: &PgPool, chunk: &RunChunk) -> a
 		SET status = 'pending',
 			leased_until = NULL,
 			updated_at = now()
-		WHERE id = $1::uuid
+		WHERE run_id = $1::uuid
+		  AND id = $2::uuid
 		  AND status = 'leased'
-		  AND leased_until IS NOT DISTINCT FROM $2::timestamptz
+		  AND leased_until IS NOT DISTINCT FROM $3::timestamptz
 		"#,
     )
+    .bind(chunk.run_id)
     .bind(chunk.id)
     .bind(chunk.leased_until)
     .execute(db)

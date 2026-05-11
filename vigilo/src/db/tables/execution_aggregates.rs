@@ -51,9 +51,10 @@ pub(crate) async fn insert_execution_aggregate(
     Ok(aggregate)
 }
 
-/// Finds an aggregate by execution id.
+/// Finds an aggregate by run-local execution id.
 pub(crate) async fn select_execution_aggregate_by_execution_id(
     db: &PgPool,
+    run_id: Uuid,
     execution_id: Uuid,
 ) -> anyhow::Result<Option<ExecutionAggregate>> {
     let aggregate = sqlx::query_as::<_, ExecutionAggregate>(
@@ -71,9 +72,11 @@ pub(crate) async fn select_execution_aggregate_by_execution_id(
             created_at,
             updated_at
         FROM execution_aggregates
-        WHERE execution_id = $1::uuid
+        WHERE run_id = $1::uuid
+          AND execution_id = $2::uuid
         "#,
     )
+    .bind(run_id)
     .bind(execution_id)
     .fetch_optional(db)
     .await?;
@@ -115,17 +118,19 @@ pub(crate) async fn list_execution_aggregates_by_run_id(
 /// Updates the aggregate status and score fields for an execution.
 pub(crate) async fn update_execution_aggregate(
     db: &PgPool,
+    run_id: Uuid,
     execution_id: Uuid,
     patch: &ExecutionAggregatePatch,
 ) -> anyhow::Result<Option<ExecutionAggregate>> {
     let aggregate = sqlx::query_as::<_, ExecutionAggregate>(
         r#"
         UPDATE execution_aggregates
-        SET overall_status = $2::evaluation_status,
-            aggregate_score = $3,
-            evaluator_result_count = $4,
+        SET overall_status = $3::evaluation_status,
+            aggregate_score = $4,
+            evaluator_result_count = $5,
             updated_at = now()
-        WHERE execution_id = $1::uuid
+        WHERE run_id = $1::uuid
+          AND execution_id = $2::uuid
         RETURNING
             execution_id,
             run_id,
@@ -140,6 +145,7 @@ pub(crate) async fn update_execution_aggregate(
             updated_at
         "#,
     )
+    .bind(run_id)
     .bind(execution_id)
     .bind(&patch.overall_status)
     .bind(patch.aggregate_score)
@@ -150,17 +156,20 @@ pub(crate) async fn update_execution_aggregate(
     Ok(aggregate)
 }
 
-/// Deletes an aggregate by execution id.
+/// Deletes an aggregate by run-local execution id.
 pub(crate) async fn delete_execution_aggregate_by_execution_id(
     db: &PgPool,
+    run_id: Uuid,
     execution_id: Uuid,
 ) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
         DELETE FROM execution_aggregates
-        WHERE execution_id = $1::uuid
+        WHERE run_id = $1::uuid
+          AND execution_id = $2::uuid
         "#,
     )
+    .bind(run_id)
     .bind(execution_id)
     .execute(db)
     .await?;

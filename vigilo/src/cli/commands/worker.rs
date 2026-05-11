@@ -317,9 +317,13 @@ async fn run_worker_cycle(
         "parsed chunk-ready message payload"
     );
 
-    let Some(chunk) =
-        chunk_processing::claim_chunk_for_processing(db, payload.chunk_id, CHUNK_LEASE_SECONDS)
-            .await?
+    let Some(chunk) = chunk_processing::claim_chunk_for_processing(
+        db,
+        payload.run_id,
+        payload.chunk_id,
+        CHUNK_LEASE_SECONDS,
+    )
+    .await?
     else {
         mq.ack(message.delivery_tag).await?;
         info!(
@@ -441,6 +445,7 @@ async fn run_worker_cycle(
 
             if let Err(err) = execution_processing::finalize_execution_terminal_transitions(
                 db,
+                chunk.run_id,
                 &terminal_transitions,
             )
             .await

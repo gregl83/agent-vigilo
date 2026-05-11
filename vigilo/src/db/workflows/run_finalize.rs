@@ -123,7 +123,8 @@ pub(crate) async fn finalize_claimed_run(
                  'cancelled'::execution_status
              )
             LEFT JOIN execution_aggregates
-              ON execution_aggregates.execution_id = executions.id
+              ON execution_aggregates.run_id = rr.id
+             AND execution_aggregates.execution_id = executions.id
              AND execution_aggregates.attempt_id = executions.current_attempt_id
             GROUP BY rr.id
         ),

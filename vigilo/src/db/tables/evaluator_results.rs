@@ -48,7 +48,7 @@ pub(crate) struct EvaluatorResultInsertRow {
 
 /// Inserts evaluator result rows for an attempt in bounded batches.
 ///
-/// Conflicts on `(attempt_id, evaluator_id)` are ignored to keep retries
+/// Conflicts on `(run_id, attempt_id, evaluator_id)` are ignored to keep retries
 /// idempotent when the same authoritative attempt is observed again.
 pub(crate) async fn insert_evaluator_results_batch(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -120,7 +120,7 @@ pub(crate) async fn insert_evaluator_results_batch(
 
         qb.push(
             r#"
-            ON CONFLICT (attempt_id, evaluator_id) DO NOTHING
+            ON CONFLICT (run_id, attempt_id, evaluator_id) DO NOTHING
             "#,
         );
 
@@ -226,9 +226,10 @@ pub(crate) async fn insert_evaluator_result(
     Ok(result)
 }
 
-/// Finds an evaluator result by primary key.
+/// Finds an evaluator result by run-local primary key.
 pub(crate) async fn select_evaluator_result_by_id(
     db: &PgPool,
+    run_id: Uuid,
     id: Uuid,
 ) -> anyhow::Result<Option<EvaluatorResult>> {
     let result = sqlx::query_as::<_, EvaluatorResult>(
@@ -260,9 +261,11 @@ pub(crate) async fn select_evaluator_result_by_id(
             raw_evaluator_output,
             created_at
         FROM evaluator_results
-        WHERE id = $1::uuid
+        WHERE run_id = $1::uuid
+          AND id = $2::uuid
         "#,
     )
+    .bind(run_id)
     .bind(id)
     .fetch_optional(db)
     .await?;
@@ -273,6 +276,7 @@ pub(crate) async fn select_evaluator_result_by_id(
 /// Lists all evaluator results written for an execution attempt.
 pub(crate) async fn list_evaluator_results_by_attempt_id(
     db: &PgPool,
+    run_id: Uuid,
     attempt_id: Uuid,
 ) -> anyhow::Result<Vec<EvaluatorResult>> {
     let results = sqlx::query_as::<_, EvaluatorResult>(
@@ -304,10 +308,12 @@ pub(crate) async fn list_evaluator_results_by_attempt_id(
             raw_evaluator_output,
             created_at
         FROM evaluator_results
-        WHERE attempt_id = $1::uuid
+        WHERE run_id = $1::uuid
+          AND attempt_id = $2::uuid
         ORDER BY created_at ASC
         "#,
     )
+    .bind(run_id)
     .bind(attempt_id)
     .fetch_all(db)
     .await?;
@@ -318,15 +324,17 @@ pub(crate) async fn list_evaluator_results_by_attempt_id(
 /// Updates the human-readable failure reason fields for an evaluator result.
 pub(crate) async fn update_evaluator_result_reason(
     db: &PgPool,
+    run_id: Uuid,
     id: Uuid,
     patch: &EvaluatorResultPatch,
 ) -> anyhow::Result<Option<EvaluatorResult>> {
     let result = sqlx::query_as::<_, EvaluatorResult>(
         r#"
         UPDATE evaluator_results
-        SET reason = $2,
-            failure_category = $3
-        WHERE id = $1::uuid
+        SET reason = $3,
+            failure_category = $4
+        WHERE run_id = $1::uuid
+          AND id = $2::uuid
         RETURNING
             id,
             run_id,
@@ -355,6 +363,7 @@ pub(crate) async fn update_evaluator_result_reason(
             created_at
         "#,
     )
+    .bind(run_id)
     .bind(id)
     .bind(&patch.reason)
     .bind(&patch.failure_category)
@@ -364,14 +373,20 @@ pub(crate) async fn update_evaluator_result_reason(
     Ok(result)
 }
 
-/// Deletes an evaluator result by primary key.
-pub(crate) async fn delete_evaluator_result_by_id(db: &PgPool, id: Uuid) -> anyhow::Result<u64> {
+/// Deletes an evaluator result by run-local primary key.
+pub(crate) async fn delete_evaluator_result_by_id(
+    db: &PgPool,
+    run_id: Uuid,
+    id: Uuid,
+) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
         DELETE FROM evaluator_results
-        WHERE id = $1::uuid
+        WHERE run_id = $1::uuid
+          AND id = $2::uuid
         "#,
     )
+    .bind(run_id)
     .bind(id)
     .execute(db)
     .await?;
