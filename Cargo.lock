@@ -3825,6 +3825,7 @@ dependencies = [
  "cargo_toml",
  "chrono",
  "clap",
+ "futures-util",
  "lapin",
  "moka",
  "serde",

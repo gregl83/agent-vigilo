@@ -13,9 +13,11 @@ use lapin::{
     ExchangeKind,
     options::{
         BasicAckOptions,
+        BasicConsumeOptions,
         BasicGetOptions,
         BasicNackOptions,
         BasicPublishOptions,
+        BasicQosOptions,
         ExchangeDeclareOptions,
         QueueBindOptions,
         QueueDeclareOptions,
@@ -25,6 +27,7 @@ use lapin::{
 use serde_json::Value;
 use tokio::sync::OnceCell;
 use tracing::debug;
+use uuid::Uuid;
 
 /// RabbitMQ connection and routing configuration.
 ///
@@ -65,6 +68,7 @@ pub(crate) struct Client {
     config: Config,
     connection: OnceCell<Connection>,
     channel: OnceCell<Channel>,
+    worker_topology_ready: OnceCell<()>,
 }
 
 impl Client {
@@ -74,7 +78,47 @@ impl Client {
             config,
             connection: OnceCell::new(),
             channel: OnceCell::new(),
+            worker_topology_ready: OnceCell::new(),
         }
+    }
+
+    /// Ensures the worker queue and binding exist.
+    async fn ensure_worker_topology(&self) -> anyhow::Result<()> {
+        self.worker_topology_ready
+            .get_or_try_init(|| async {
+                let channel = self.channel().await?;
+
+                channel
+                    .queue_declare(
+                        &self.config.worker_queue,
+                        QueueDeclareOptions {
+                            passive: false,
+                            durable: true,
+                            exclusive: false,
+                            auto_delete: false,
+                            nowait: false,
+                        },
+                        FieldTable::default(),
+                    )
+                    .await
+                    .map_err(|err| anyhow::anyhow!("rabbitmq queue declaration failed: {}", err))?;
+
+                channel
+                    .queue_bind(
+                        &self.config.worker_queue,
+                        &self.config.exchange,
+                        "run.chunk.ready",
+                        QueueBindOptions::default(),
+                        FieldTable::default(),
+                    )
+                    .await
+                    .map_err(|err| anyhow::anyhow!("rabbitmq queue binding failed: {}", err))?;
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
     }
 
     /// Returns the process-local RabbitMQ connection, opening it if needed.
@@ -151,36 +195,10 @@ impl Client {
     /// Fetches one available worker message without creating a long-lived consumer.
     ///
     /// Workers currently poll with `basic_get`, which keeps the command model
-    /// simple for one-shot and looped worker modes. The queue binding is
-    /// idempotently declared before each fetch.
+    /// simple for one-shot worker mode.
     pub(crate) async fn consume_worker_message(&self) -> anyhow::Result<Option<ConsumedMessage>> {
+        self.ensure_worker_topology().await?;
         let channel = self.channel().await?;
-
-        channel
-            .queue_declare(
-                &self.config.worker_queue,
-                QueueDeclareOptions {
-                    passive: false,
-                    durable: true,
-                    exclusive: false,
-                    auto_delete: false,
-                    nowait: false,
-                },
-                FieldTable::default(),
-            )
-            .await
-            .map_err(|err| anyhow::anyhow!("rabbitmq queue declaration failed: {}", err))?;
-
-        channel
-            .queue_bind(
-                &self.config.worker_queue,
-                &self.config.exchange,
-                "run.chunk.ready",
-                QueueBindOptions::default(),
-                FieldTable::default(),
-            )
-            .await
-            .map_err(|err| anyhow::anyhow!("rabbitmq queue binding failed: {}", err))?;
 
         let maybe_delivery = channel
             .basic_get(&self.config.worker_queue, BasicGetOptions::default())
@@ -198,6 +216,32 @@ impl Client {
             delivery_tag: delivery.delivery_tag,
             payload,
         }))
+    }
+
+    /// Creates a long-lived consumer stream for worker messages using `basic_consume`.
+    pub(crate) async fn consume_worker_stream(
+        &self,
+        consumer_tag_prefix: &str,
+        prefetch: u16,
+    ) -> anyhow::Result<lapin::Consumer> {
+        self.ensure_worker_topology().await?;
+
+        let channel = self.channel().await?;
+        channel
+            .basic_qos(prefetch, BasicQosOptions { global: false })
+            .await
+            .map_err(|err| anyhow::anyhow!("rabbitmq qos configuration failed: {}", err))?;
+
+        let consumer_tag = format!("{}-{}", consumer_tag_prefix, Uuid::now_v7());
+        channel
+            .basic_consume(
+                &self.config.worker_queue,
+                &consumer_tag,
+                BasicConsumeOptions::default(),
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("rabbitmq consumer creation failed: {}", err))
     }
 
     /// Acknowledges successful processing of one delivery.

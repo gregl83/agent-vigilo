@@ -17,6 +17,7 @@ use clap::{
     Args,
     Subcommand,
 };
+use futures_util::StreamExt;
 use moka::future::Cache;
 use serde::Deserialize;
 use tokio::task::JoinSet;
@@ -41,14 +42,11 @@ use crate::{
     runtime::ServiceRunner,
 };
 
-const WORKER_TICK_SECONDS: u64 = 5;
 const CHUNK_LEASE_SECONDS: i32 = 60;
 const RUN_CONTEXT_CACHE_MAX_ENTRIES: u64 = 1024;
 const RUN_CONTEXT_CACHE_TTI_SECONDS: u64 = 900;
 const WARMUP_PARALLELISM: usize = 8;
-const WORKER_MAX_MESSAGES_PER_DRAIN: usize = 8;
-const WORKER_EMPTY_BACKOFF_INITIAL_MS: u64 = 100;
-const WORKER_EMPTY_BACKOFF_MAX_SECONDS: u64 = WORKER_TICK_SECONDS;
+const WORKER_STREAM_PREFETCH: u16 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerCycleOutcome {
@@ -261,32 +259,35 @@ async fn handle_start(context: Context) -> anyhow::Result<()> {
             let context = context.clone();
             let evaluator_loader = evaluator_loader.clone();
             async move {
-                let mut empty_backoff = Duration::from_millis(WORKER_EMPTY_BACKOFF_INITIAL_MS);
-
-                loop {
-                    if shutdown.is_cancelled() {
-                        return Ok(());
-                    }
-
-                    let processed = run_worker_drain_pass(
-                        context.clone(),
-                        &evaluator_loader,
-                        WORKER_MAX_MESSAGES_PER_DRAIN,
-                    )
+                let mq = context.mq().await?;
+                let mut consumer = mq
+                    .consume_worker_stream("vigilo-worker", WORKER_STREAM_PREFETCH)
                     .await?;
 
-                    if processed > 0 {
-                        empty_backoff = Duration::from_millis(WORKER_EMPTY_BACKOFF_INITIAL_MS);
-                        continue;
-                    }
-
+                loop {
                     tokio::select! {
                         _ = shutdown.cancelled() => return Ok(()),
-                        _ = tokio::time::sleep(empty_backoff) => {}
-                    }
+                        delivery = consumer.next() => {
+                            let Some(delivery_result) = delivery else {
+                                warn!("worker consumer stream closed; reopening consumer");
+                                consumer = mq
+                                    .consume_worker_stream("vigilo-worker", WORKER_STREAM_PREFETCH)
+                                    .await?;
+                                continue;
+                            };
 
-                    empty_backoff = (empty_backoff * 2)
-                        .min(Duration::from_secs(WORKER_EMPTY_BACKOFF_MAX_SECONDS));
+                            let delivery = delivery_result
+                                .map_err(|err| anyhow::anyhow!("worker consumer delivery failed: {}", err))?;
+                            let payload = serde_json::from_slice::<serde_json::Value>(&delivery.data)
+                                .map_err(|err| anyhow::anyhow!("failed to deserialize message payload: {}", err))?;
+
+                            let message = crate::mq::ConsumedMessage {
+                                delivery_tag: delivery.delivery_tag,
+                                payload,
+                            };
+                            run_worker_message(context.clone(), &evaluator_loader, message).await?;
+                        }
+                    }
                 }
             }
         })
@@ -333,9 +334,6 @@ async fn run_worker_cycle(
 ) -> anyhow::Result<WorkerCycleOutcome> {
     debug!("starting worker cycle pre-flight");
 
-    debug!("acquiring database context");
-    let db = context.db().await?;
-    debug!("database context ready");
 
     debug!("acquiring messaging context");
     let mq = context.mq().await?;
@@ -347,6 +345,17 @@ async fn run_worker_cycle(
         debug!("no worker messages available");
         return Ok(WorkerCycleOutcome::Empty);
     };
+
+    run_worker_message(context, evaluator_loader, message).await
+}
+
+async fn run_worker_message(
+    context: Context,
+    evaluator_loader: &EvaluatorLoaderService,
+    message: crate::mq::ConsumedMessage,
+) -> anyhow::Result<WorkerCycleOutcome> {
+    let db = context.db().await?;
+    let mq = context.mq().await?;
 
     debug!(
         delivery_tag = message.delivery_tag,
