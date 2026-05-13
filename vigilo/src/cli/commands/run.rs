@@ -967,6 +967,17 @@ async fn handle_results(context: Context, run_id: String) -> anyhow::Result<()> 
     Ok(())
 }
 
+async fn handle_status(context: Context, run_id: String) -> anyhow::Result<()> {
+    let run_id = parse_run_id(&run_id)?;
+    let db = context.db().await?;
+    let out = context.out().await?;
+    let run = select_existing_run(db, run_id).await?;
+    let payload = run_watch_payload(&run, is_terminal_run_status(&run.status));
+
+    out.write_value(&payload)?;
+    Ok(())
+}
+
 async fn handle_export(
     context: Context,
     run_id: String,
@@ -1244,9 +1255,8 @@ async fn handle_watch(
 #[derive(Debug, Subcommand)]
 /// Run command operations.
 ///
-/// `Create`, `Test`, `Watch`, `Cancel`, and `Results` are implemented.
-/// Operational commands (`Status`, `Export`) are reserved and currently return
-/// explicit not-implemented errors.
+/// `Create`, `Test`, `Watch`, `Status`, `Cancel`, `Results`, and `Export` are
+/// implemented.
 pub(crate) enum SubCommand {
     /// Create a run from profile + dataset inputs
     Create {
@@ -1405,7 +1415,7 @@ impl Executable for Command {
             }
             Some(SubCommand::Status { run_id }) => {
                 info!("fetching status for run {}", run_id);
-                anyhow::bail!("run status is not implemented yet")
+                handle_status(context, run_id).await
             }
             Some(SubCommand::Cancel { run_id }) => {
                 info!("cancelling run {}", run_id);
@@ -1468,6 +1478,7 @@ mod tests {
         build_chunks,
         canonical_json,
         handle_export,
+        handle_status,
         handle_watch,
         is_terminal_run_status,
         parse_run_id,
@@ -1845,6 +1856,23 @@ mod tests {
         )
         .await
         .unwrap_err();
+
+        assert!(err.to_string().starts_with("invalid run_id"));
+    }
+
+    #[tokio::test]
+    async fn status_rejects_malformed_run_id_before_database_initialization() {
+        let context = Context::new(
+            "not-a-postgres-url".to_string(),
+            1,
+            "not-used".to_string(),
+            wasm::Config::default(),
+            OutputFormat::Json,
+        );
+
+        let err = handle_status(context, "not-a-run-id".to_string())
+            .await
+            .unwrap_err();
 
         assert!(err.to_string().starts_with("invalid run_id"));
     }
