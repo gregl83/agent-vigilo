@@ -38,7 +38,7 @@ pub(crate) async fn claim_chunk_for_processing(
         r#"
 		UPDATE run_chunks
 		SET status = 'leased',
-			leased_until = now() + ($2::int * interval '1 second'),
+			leased_until = now() + ($3::int * interval '1 second'),
 			updated_at = now()
 		WHERE run_id = $1::uuid
 		  AND id = $2::uuid
