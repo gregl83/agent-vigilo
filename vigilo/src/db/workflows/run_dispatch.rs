@@ -24,7 +24,7 @@ pub(crate) struct DispatchedRun {
 /// established run ownership.
 pub(crate) async fn dispatch_next_pending_run(
     db: &PgPool,
-    coordinator_id: &str,
+    coordinator_id: Uuid,
     lease_seconds: i32,
 ) -> anyhow::Result<Option<DispatchedRun>> {
     let dispatched = sqlx::query_as::<_, DispatchedRun>(

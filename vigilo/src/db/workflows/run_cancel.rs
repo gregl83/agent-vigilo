@@ -43,7 +43,7 @@ async fn select_run_in_tx(
         r#"
         SELECT
             id, run_key, name, description,
-            dataset_id::uuid as dataset_id, dataset_version,
+            dataset_id, dataset_version,
             evaluation_profile_id, evaluation_profile_version,
             aggregation_policy_id, aggregation_policy_version,
             agent_provider, agent_name, agent_version,
@@ -51,7 +51,7 @@ async fn select_run_in_tx(
             config_snapshot,
             status::text as status,
             gate_status::text as gate_status,
-            coordinator_id::uuid as coordinator_id,
+            coordinator_id,
             coordinator_leased_until,
             coordinator_heartbeat_at,
             expected_execution_count,
@@ -238,7 +238,7 @@ async fn update_run_cancelled(
         WHERE r.id = $1::uuid
         RETURNING
             r.id, r.run_key, r.name, r.description,
-            r.dataset_id::uuid as dataset_id, r.dataset_version,
+            r.dataset_id, r.dataset_version,
             r.evaluation_profile_id, r.evaluation_profile_version,
             r.aggregation_policy_id, r.aggregation_policy_version,
             r.agent_provider, r.agent_name, r.agent_version,
@@ -246,7 +246,7 @@ async fn update_run_cancelled(
             r.config_snapshot,
             r.status::text as status,
             r.gate_status::text as gate_status,
-            r.coordinator_id::uuid as coordinator_id,
+            r.coordinator_id,
             r.coordinator_leased_until,
             r.coordinator_heartbeat_at,
             r.expected_execution_count,

@@ -31,9 +31,9 @@ pub(crate) async fn insert_execution_attempt(
             run_id,
             attempt_no,
             status::text as status,
-            worker_id::uuid as worker_id,
+            worker_id,
             worker_host,
-            queue_message_id::uuid as queue_message_id,
+            queue_message_id,
             leased_until::text as leased_until,
             heartbeat_at::text as heartbeat_at,
             request_artifact_uri,
@@ -53,9 +53,9 @@ pub(crate) async fn insert_execution_attempt(
     .bind(draft.execution_id)
     .bind(draft.run_id)
     .bind(draft.attempt_no)
-    .bind(draft.worker_id.map(|v| v.to_string()))
+    .bind(draft.worker_id)
     .bind(&draft.worker_host)
-    .bind(draft.queue_message_id.map(|v| v.to_string()))
+    .bind(draft.queue_message_id)
     .fetch_one(db)
     .await?;
 
@@ -76,9 +76,9 @@ pub(crate) async fn select_execution_attempt_by_id(
             run_id,
             attempt_no,
             status::text as status,
-            worker_id::uuid as worker_id,
+            worker_id,
             worker_host,
-            queue_message_id::uuid as queue_message_id,
+            queue_message_id,
             leased_until::text as leased_until,
             heartbeat_at::text as heartbeat_at,
             request_artifact_uri,
@@ -120,9 +120,9 @@ pub(crate) async fn list_execution_attempts_by_execution_id(
             run_id,
             attempt_no,
             status::text as status,
-            worker_id::uuid as worker_id,
+            worker_id,
             worker_host,
-            queue_message_id::uuid as queue_message_id,
+            queue_message_id,
             leased_until::text as leased_until,
             heartbeat_at::text as heartbeat_at,
             request_artifact_uri,
@@ -164,9 +164,9 @@ pub(crate) async fn list_execution_attempts_by_run_id(
             run_id,
             attempt_no,
             status::text as status,
-            worker_id::uuid as worker_id,
+            worker_id,
             worker_host,
-            queue_message_id::uuid as queue_message_id,
+            queue_message_id,
             leased_until::text as leased_until,
             heartbeat_at::text as heartbeat_at,
             request_artifact_uri,
@@ -214,9 +214,9 @@ pub(crate) async fn update_execution_attempt_status(
             run_id,
             attempt_no,
             status::text as status,
-            worker_id::uuid as worker_id,
+            worker_id,
             worker_host,
-            queue_message_id::uuid as queue_message_id,
+            queue_message_id,
             leased_until::text as leased_until,
             heartbeat_at::text as heartbeat_at,
             request_artifact_uri,

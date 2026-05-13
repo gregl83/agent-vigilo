@@ -10,8 +10,8 @@ CREATE TABLE runs (
     description TEXT,
 
     -- what is being evaluated
-    dataset_id TEXT NOT NULL,
-    dataset_version_id TEXT NOT NULL REFERENCES dataset_versions(dataset_version_id),
+    dataset_id UUID NOT NULL,
+    dataset_version_id UUID NOT NULL REFERENCES dataset_versions(dataset_version_id),
     dataset_version TEXT NOT NULL,
     evaluation_profile_id TEXT NOT NULL,
     evaluation_profile_version TEXT NOT NULL,
@@ -36,7 +36,7 @@ CREATE TABLE runs (
     gate_status gate_status NOT NULL DEFAULT 'unknown',
 
     -- optional run-scoped coordinator ownership
-    coordinator_id TEXT,
+    coordinator_id UUID,
     coordinator_leased_until TIMESTAMPTZ,
     coordinator_heartbeat_at TIMESTAMPTZ,
 

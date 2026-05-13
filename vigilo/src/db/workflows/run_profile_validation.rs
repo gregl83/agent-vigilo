@@ -226,6 +226,8 @@ fn is_runnable_state(state: &EvaluatorState) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use uuid::Uuid;
+
     use crate::{
         contracts::run::{
             AggregationSettings,
@@ -277,7 +279,7 @@ mod tests {
     fn matching_groups_use_case_group_override_when_present() {
         let profile = profile();
         let case = DatasetCase {
-            id: "c1".to_string(),
+            id: Uuid::parse_str("018f1111-1111-7111-8111-111111111201").unwrap(),
             task_type: "different".to_string(),
             case_group: Some("classification".to_string()),
             input: serde_json::Value::Null,
@@ -296,7 +298,7 @@ mod tests {
     fn matching_groups_apply_task_type_and_tags() {
         let profile = profile();
         let case = DatasetCase {
-            id: "c2".to_string(),
+            id: Uuid::parse_str("018f1111-1111-7111-8111-111111111202").unwrap(),
             task_type: "classification".to_string(),
             case_group: None,
             input: serde_json::Value::Null,

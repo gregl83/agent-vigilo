@@ -3,7 +3,7 @@ CREATE TABLE executions (
     run_id UUID NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
 
     -- stable identity of the dataset case within a run
-    case_id TEXT NOT NULL,
+    case_id UUID NOT NULL,
     case_hash TEXT NOT NULL,
     profile_group_id TEXT NOT NULL,
 

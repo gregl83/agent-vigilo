@@ -1,6 +1,6 @@
 CREATE TABLE dataset_version_cases (
-    dataset_version_id TEXT NOT NULL REFERENCES dataset_versions(dataset_version_id),
-    case_id TEXT NOT NULL,
+    dataset_version_id UUID NOT NULL REFERENCES dataset_versions(dataset_version_id),
+    case_id UUID NOT NULL,
     case_ordinal INTEGER NOT NULL CHECK (case_ordinal >= 0),
     case_hash TEXT NOT NULL REFERENCES case_blobs(case_hash),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),

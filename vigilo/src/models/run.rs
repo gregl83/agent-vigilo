@@ -24,11 +24,11 @@ pub(crate) struct RunDraft {
     /// Optional run description.
     pub(crate) description: Option<String>,
     /// Dataset id being evaluated.
-    pub(crate) dataset_id: String,
+    pub(crate) dataset_id: Uuid,
     /// Dataset version label from the run contract.
     pub(crate) dataset_version: String,
     /// Stable internal dataset-version id.
-    pub(crate) dataset_version_id: String,
+    pub(crate) dataset_version_id: Uuid,
     /// Evaluation profile id used for the run.
     pub(crate) evaluation_profile_id: String,
     /// Evaluation profile version used for the run.

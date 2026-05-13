@@ -94,7 +94,7 @@ pub(crate) async fn insert_evaluator_results_batch(
             b.push_bind(row.run_id)
                 .push_bind(row.execution_id)
                 .push_bind(row.attempt_id)
-                .push_bind(row.evaluator_id.to_string())
+                .push_bind(row.evaluator_id)
                 .push_bind(&row.evaluator_version)
                 .push_bind(&row.evaluator_profile_id)
                 .push_bind(&row.evaluator_profile_version)
@@ -176,7 +176,7 @@ pub(crate) async fn insert_evaluator_result(
             run_id,
             execution_id,
             attempt_id,
-            evaluator_id::uuid as evaluator_id,
+            evaluator_id,
             evaluator_version,
             evaluator_profile_id,
             evaluator_profile_version,
@@ -202,7 +202,7 @@ pub(crate) async fn insert_evaluator_result(
     .bind(draft.run_id)
     .bind(draft.execution_id)
     .bind(draft.attempt_id)
-    .bind(draft.evaluator_id.to_string())
+    .bind(draft.evaluator_id)
     .bind(&draft.evaluator_version)
     .bind(&draft.evaluator_profile_id)
     .bind(&draft.evaluator_profile_version)
@@ -239,7 +239,7 @@ pub(crate) async fn select_evaluator_result_by_id(
             run_id,
             execution_id,
             attempt_id,
-            evaluator_id::uuid as evaluator_id,
+            evaluator_id,
             evaluator_version,
             evaluator_profile_id,
             evaluator_profile_version,
@@ -286,7 +286,7 @@ pub(crate) async fn list_evaluator_results_by_attempt_id(
             run_id,
             execution_id,
             attempt_id,
-            evaluator_id::uuid as evaluator_id,
+            evaluator_id,
             evaluator_version,
             evaluator_profile_id,
             evaluator_profile_version,
@@ -333,7 +333,7 @@ pub(crate) async fn list_evaluator_results_by_run_id(
             run_id,
             execution_id,
             attempt_id,
-            evaluator_id::uuid as evaluator_id,
+            evaluator_id,
             evaluator_version,
             evaluator_profile_id,
             evaluator_profile_version,
@@ -385,7 +385,7 @@ pub(crate) async fn update_evaluator_result_reason(
             run_id,
             execution_id,
             attempt_id,
-            evaluator_id::uuid as evaluator_id,
+            evaluator_id,
             evaluator_version,
             evaluator_profile_id,
             evaluator_profile_version,

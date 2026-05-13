@@ -13,7 +13,7 @@ use crate::models::run_chunk::RunChunk;
 /// Dataset case row materialized for worker-side execution.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, sqlx::FromRow)]
 pub(crate) struct WorkerCaseBatchItem {
-    pub(crate) case_id: String,
+    pub(crate) case_id: Uuid,
     pub(crate) case_hash: String,
     pub(crate) case_ordinal: i32,
     pub(crate) task_type: String,
@@ -99,7 +99,7 @@ pub(crate) async fn load_chunk_case_batch(
 		ORDER BY cvc.case_ordinal
 		"#,
     )
-    .bind(&chunk.dataset_version_id)
+    .bind(chunk.dataset_version_id)
     .bind(chunk.ordinal_start)
     .bind(chunk.ordinal_end)
     .fetch_all(db)

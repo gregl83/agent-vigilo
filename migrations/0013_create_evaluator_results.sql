@@ -5,7 +5,7 @@ CREATE TABLE evaluator_results (
     execution_id UUID NOT NULL,
     attempt_id UUID NOT NULL,
 
-    evaluator_id TEXT NOT NULL,
+    evaluator_id UUID NOT NULL,
     evaluator_version TEXT NOT NULL,
     evaluator_profile_id TEXT NOT NULL,
     evaluator_profile_version TEXT NOT NULL,

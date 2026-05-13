@@ -137,6 +137,21 @@ fn hash_json(value: &Value) -> anyhow::Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+/// Builds a deterministic UUID from canonical JSON bytes.
+fn uuid_from_json(value: &Value) -> anyhow::Result<Uuid> {
+    let bytes = serde_json::to_vec(value)?;
+    let mut hasher = Hasher::new();
+    hasher.update(&bytes);
+    let hash = hasher.finalize();
+
+    let mut uuid_bytes = [0u8; 16];
+    uuid_bytes.copy_from_slice(&hash.as_bytes()[..16]);
+    uuid_bytes[6] = (uuid_bytes[6] & 0x0f) | 0x80;
+    uuid_bytes[8] = (uuid_bytes[8] & 0x3f) | 0x80;
+
+    Ok(Uuid::from_bytes(uuid_bytes))
+}
+
 /// Sorts tags lexicographically for deterministic storage and hashing.
 fn canonical_tags(tags: &[String]) -> Value {
     let mut ordered = tags.to_vec();
@@ -197,7 +212,7 @@ fn build_case_plans(
 fn compute_dataset_version_id(
     dataset: &RunDataset,
     dataset_cases: &[DatasetVersionCaseDraft],
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Uuid> {
     let membership = dataset_cases
         .iter()
         .map(|c| {
@@ -209,7 +224,7 @@ fn compute_dataset_version_id(
         })
         .collect::<Vec<_>>();
 
-    hash_json(&json!({
+    uuid_from_json(&json!({
         "dataset_id": dataset.dataset_id,
         "dataset_version": dataset.dataset_version,
         "membership": membership,
@@ -322,14 +337,6 @@ async fn handle_create(
     let run_id = Uuid::now_v7();
     let run_key = run_id.to_string();
 
-    let run_dataset_id = parsed
-        .dataset
-        .dataset_id
-        .clone()
-        .and_then(|raw| Uuid::parse_str(&raw).ok())
-        .unwrap_or_else(Uuid::now_v7)
-        .to_string();
-
     let snapshot = json!({
         "profile": profile_payload,
         "dataset_ref": {
@@ -352,13 +359,13 @@ async fn handle_create(
         run_key: run_key.clone(),
         name: None,
         description: None,
-        dataset_id: run_dataset_id,
+        dataset_id: parsed.dataset.dataset_id,
         dataset_version: parsed
             .dataset
             .dataset_version
             .clone()
-            .unwrap_or_else(|| dataset_version_id.clone()),
-        dataset_version_id: dataset_version_id.clone(),
+            .unwrap_or_else(|| dataset_version_id.to_string()),
+        dataset_version_id,
         evaluation_profile_id: parsed.profile.profile_id.clone(),
         evaluation_profile_version: parsed.profile.profile_version.clone(),
         profile_version_id: profile_version_id.clone(),
@@ -380,15 +387,14 @@ async fn handle_create(
     run_create::bulk_insert_case_blobs(&mut tx, &case_blobs).await?;
     run_create::upsert_dataset_version(
         &mut tx,
-        &dataset_version_id,
-        &run_draft.dataset_id,
+        dataset_version_id,
+        run_draft.dataset_id,
         &run_draft.dataset_version,
     )
     .await?;
-    run_create::bulk_insert_dataset_membership(&mut tx, &dataset_version_id, &dataset_cases)
-        .await?;
+    run_create::bulk_insert_dataset_membership(&mut tx, dataset_version_id, &dataset_cases).await?;
     run_create::insert_run_create(&mut tx, run_id, &run_draft).await?;
-    run_create::bulk_insert_run_chunks(&mut tx, run_id, &dataset_version_id, &chunks).await?;
+    run_create::bulk_insert_run_chunks(&mut tx, run_id, dataset_version_id, &chunks).await?;
 
     tx.commit().await?;
 
@@ -673,7 +679,7 @@ async fn select_execution_batch_by_run_id(
         SELECT
             id,
             run_id,
-            case_id::uuid as case_id,
+            case_id,
             task_type,
             tags,
             input_payload,
@@ -734,9 +740,9 @@ async fn select_run_export_batch_for_executions(
             run_id,
             attempt_no,
             status::text as status,
-            worker_id::uuid as worker_id,
+            worker_id,
             worker_host,
-            queue_message_id::uuid as queue_message_id,
+            queue_message_id,
             leased_until::text as leased_until,
             heartbeat_at::text as heartbeat_at,
             request_artifact_uri,
@@ -802,7 +808,7 @@ async fn select_run_export_batch_for_executions(
                 run_id,
                 execution_id,
                 attempt_id,
-                evaluator_id::uuid as evaluator_id,
+                evaluator_id,
                 evaluator_version,
                 evaluator_profile_id,
                 evaluator_profile_version,

@@ -100,7 +100,7 @@ pub(crate) struct ProcessedExecution {
 
 #[derive(Debug, sqlx::FromRow)]
 struct AttemptAllocation {
-    case_id: String,
+    case_id: Uuid,
     execution_id: Uuid,
     attempt_id: Uuid,
     attempt_no: i32,
@@ -366,7 +366,7 @@ fn evaluator_bindings_for_case(
 
 fn make_test_case(case: &chunk_processing::WorkerCaseBatchItem) -> anyhow::Result<TestCase> {
     Ok(TestCase {
-        id: case.case_id.clone(),
+        id: case.case_id.to_string(),
         task_type: case.task_type.clone(),
         case_group: None,
         input: case.input_payload.clone(),

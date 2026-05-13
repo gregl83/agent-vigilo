@@ -1,6 +1,6 @@
 CREATE TABLE dataset_versions (
-    dataset_version_id TEXT PRIMARY KEY,
-    dataset_id TEXT NOT NULL,
+    dataset_version_id UUID PRIMARY KEY,
+    dataset_id UUID NOT NULL,
     dataset_version TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -23,4 +23,3 @@ COMMENT ON COLUMN dataset_versions.created_at IS
 
 COMMENT ON COLUMN dataset_versions.updated_at IS
     'Timestamp of the last dataset version identity update.';
-

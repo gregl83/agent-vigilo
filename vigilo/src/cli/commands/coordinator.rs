@@ -83,13 +83,12 @@ impl Executable for Command {
 /// Starts the long-running coordinator loop.
 async fn handle_start(context: Context) -> anyhow::Result<()> {
     // One logical coordinator id is reused across loop iterations.
-    let coordinator_id = Uuid::now_v7().to_string();
+    let coordinator_id = Uuid::now_v7();
     ServiceRunner::new("coordinator")
         .tick_interval(Duration::from_secs(COORDINATOR_TICK_SECONDS))
         .run_loop(move || {
             let context = context.clone();
-            let coordinator_id = coordinator_id.clone();
-            async move { run_coordinator_cycle(context, &coordinator_id).await }
+            async move { run_coordinator_cycle(context, coordinator_id).await }
         })
         .await
 }
@@ -98,8 +97,8 @@ async fn handle_start(context: Context) -> anyhow::Result<()> {
 ///
 /// Useful for cron-like orchestration or local debugging.
 async fn handle_once(context: Context) -> anyhow::Result<()> {
-    let coordinator_id = Uuid::now_v7().to_string();
-    run_coordinator_cycle(context, &coordinator_id).await
+    let coordinator_id = Uuid::now_v7();
+    run_coordinator_cycle(context, coordinator_id).await
 }
 
 /// Executes one full coordinator cycle.
@@ -108,21 +107,21 @@ async fn handle_once(context: Context) -> anyhow::Result<()> {
 /// 1. atomically claim/dispatch pending runs (bounded batch)
 /// 2. claim/finalize finalizable runs (bounded batch)
 /// 3. publish a bounded batch of pending outbox events
-async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow::Result<()> {
-    debug!(coordinator_id, "starting coordinator cycle pre-flight");
+async fn run_coordinator_cycle(context: Context, coordinator_id: Uuid) -> anyhow::Result<()> {
+    debug!(coordinator_id = %coordinator_id, "starting coordinator cycle pre-flight");
 
-    debug!(coordinator_id, "acquiring database context");
+    debug!(coordinator_id = %coordinator_id, "acquiring database context");
     let db = context.db().await?;
-    debug!(coordinator_id, "database context ready");
+    debug!(coordinator_id = %coordinator_id, "database context ready");
 
-    debug!(coordinator_id, "acquiring messaging context");
+    debug!(coordinator_id = %coordinator_id, "acquiring messaging context");
     let mq = context.mq().await?;
-    debug!(coordinator_id, "messaging context ready");
+    debug!(coordinator_id = %coordinator_id, "messaging context ready");
 
     let dispatch_count = drain_dispatch_batch(db, coordinator_id).await?;
     let finalized_count = drain_finalize_batch(db, coordinator_id).await?;
 
-    debug!(coordinator_id, "starting outbox publish pass");
+    debug!(coordinator_id = %coordinator_id, "starting outbox publish pass");
     let publisher = MqEventPublisher::new(mq);
     let outbox_config = OutboxPublisherConfig {
         batch_size: OUTBOX_BATCH_SIZE,
@@ -139,13 +138,13 @@ async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow
         "completed outbox publish cycle"
     );
 
-    debug!(coordinator_id, "coordinator cycle complete");
+    debug!(coordinator_id = %coordinator_id, "coordinator cycle complete");
 
     Ok(())
 }
 
-async fn drain_dispatch_batch(db: &sqlx::PgPool, coordinator_id: &str) -> anyhow::Result<usize> {
-    debug!(coordinator_id, "draining pending runs for dispatch");
+async fn drain_dispatch_batch(db: &sqlx::PgPool, coordinator_id: Uuid) -> anyhow::Result<usize> {
+    debug!(coordinator_id = %coordinator_id, "draining pending runs for dispatch");
 
     let mut dispatched = 0usize;
     for _ in 0..COORDINATOR_MAX_DISPATCH_PER_CYCLE {
@@ -171,7 +170,7 @@ async fn drain_dispatch_batch(db: &sqlx::PgPool, coordinator_id: &str) -> anyhow
         info!("no pending runs available for coordinator cycle");
     } else {
         info!(
-            coordinator_id,
+            coordinator_id = %coordinator_id,
             runs_dispatched = dispatched,
             "completed coordinator dispatch drain pass"
         );
@@ -180,8 +179,8 @@ async fn drain_dispatch_batch(db: &sqlx::PgPool, coordinator_id: &str) -> anyhow
     Ok(dispatched)
 }
 
-async fn drain_finalize_batch(db: &sqlx::PgPool, coordinator_id: &str) -> anyhow::Result<usize> {
-    debug!(coordinator_id, "draining finalizable runs");
+async fn drain_finalize_batch(db: &sqlx::PgPool, coordinator_id: Uuid) -> anyhow::Result<usize> {
+    debug!(coordinator_id = %coordinator_id, "draining finalizable runs");
 
     let mut finalized = 0usize;
     for _ in 0..COORDINATOR_MAX_FINALIZE_PER_CYCLE {
@@ -212,12 +211,12 @@ async fn drain_finalize_batch(db: &sqlx::PgPool, coordinator_id: &str) -> anyhow
 
     if finalized == 0 {
         debug!(
-            coordinator_id,
+            coordinator_id = %coordinator_id,
             "no finalizable runs available for this cycle"
         );
     } else {
         info!(
-            coordinator_id,
+            coordinator_id = %coordinator_id,
             runs_finalized = finalized,
             "completed coordinator finalization drain pass"
         );

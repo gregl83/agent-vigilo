@@ -60,8 +60,8 @@ pub(crate) async fn bulk_insert_case_blobs(
 /// value; otherwise run creation fails to preserve immutable dataset identity.
 pub(crate) async fn upsert_dataset_version(
     tx: &mut sqlx::Transaction<'_, Postgres>,
-    dataset_version_id: &str,
-    dataset_id: &str,
+    dataset_version_id: Uuid,
+    dataset_id: Uuid,
     dataset_version: &str,
 ) -> anyhow::Result<()> {
     let rows_affected = sqlx::query(
@@ -100,7 +100,7 @@ pub(crate) async fn upsert_dataset_version(
 /// memberships exist with the expected ordinal and case hash.
 pub(crate) async fn bulk_insert_dataset_membership(
     tx: &mut sqlx::Transaction<'_, Postgres>,
-    dataset_version_id: &str,
+    dataset_version_id: Uuid,
     cases: &[DatasetVersionCaseDraft],
 ) -> anyhow::Result<()> {
     if cases.is_empty() {
@@ -114,7 +114,7 @@ pub(crate) async fn bulk_insert_dataset_membership(
 
         query_builder.push_values(chunk, |mut b, row| {
             b.push_bind(dataset_version_id)
-                .push_bind(&row.case_id)
+                .push_bind(row.case_id)
                 .push_bind(row.case_ordinal)
                 .push_bind(&row.case_hash);
         });
@@ -128,7 +128,7 @@ pub(crate) async fn bulk_insert_dataset_membership(
             "#,
         );
         validation_query.push_values(chunk, |mut b, row| {
-            b.push_bind(&row.case_id)
+            b.push_bind(row.case_id)
                 .push_bind(row.case_ordinal)
                 .push_bind(&row.case_hash);
         });
@@ -153,7 +153,7 @@ pub(crate) async fn bulk_insert_dataset_membership(
         );
 
         let mismatch = validation_query
-            .build_query_scalar::<String>()
+            .build_query_scalar::<Uuid>()
             .fetch_optional(tx.as_mut())
             .await?;
         if let Some(case_id) = mismatch {
@@ -220,7 +220,7 @@ pub(crate) async fn insert_run_create(
     )
     .bind(run_id)
     .bind(&draft.run_key)
-    .bind(&draft.dataset_id)
+    .bind(draft.dataset_id)
     .bind(&draft.dataset_version)
     .bind(&draft.evaluation_profile_id)
     .bind(&draft.evaluation_profile_version)
@@ -232,7 +232,7 @@ pub(crate) async fn insert_run_create(
     .bind(&draft.prompt_config_version)
     .bind(&draft.config_snapshot)
     .bind(draft.expected_execution_count)
-    .bind(&draft.dataset_version_id)
+    .bind(draft.dataset_version_id)
     .bind(&draft.profile_version_id)
     .bind(&draft.profile_hash)
     .bind(&draft.aggregation_policy_hash)
@@ -249,7 +249,7 @@ pub(crate) async fn insert_run_create(
 pub(crate) async fn bulk_insert_run_chunks(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     run_id: Uuid,
-    dataset_version_id: &str,
+    dataset_version_id: Uuid,
     chunks: &[RunChunkDraft],
 ) -> anyhow::Result<()> {
     if chunks.is_empty() {

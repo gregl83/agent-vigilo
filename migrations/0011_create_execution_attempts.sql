@@ -6,9 +6,9 @@ CREATE TABLE execution_attempts (
     attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
     status attempt_status NOT NULL DEFAULT 'pending',
 
-    worker_id TEXT,
+    worker_id UUID,
     worker_host TEXT,
-    queue_message_id TEXT,
+    queue_message_id UUID,
 
     -- lease/heartbeat for distributed recovery
     leased_until TIMESTAMPTZ,

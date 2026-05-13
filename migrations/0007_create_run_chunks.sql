@@ -1,7 +1,7 @@
 CREATE TABLE run_chunks (
     id UUID NOT NULL,
     run_id UUID NOT NULL,
-    dataset_version_id TEXT NOT NULL,
+    dataset_version_id UUID NOT NULL,
     profile_group_id TEXT NOT NULL,
     ordinal_start INTEGER NOT NULL CHECK (ordinal_start >= 0),
     ordinal_end INTEGER NOT NULL CHECK (ordinal_end > ordinal_start),

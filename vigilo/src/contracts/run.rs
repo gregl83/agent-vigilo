@@ -11,6 +11,7 @@ use serde::{
     Serialize,
 };
 use serde_json::Value;
+use uuid::Uuid;
 
 fn default_json_object() -> Value {
     Value::Object(Default::default())
@@ -192,9 +193,8 @@ pub(crate) enum AggregationMethod {
 /// Dataset envelope used by `vigilo run test`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RunDataset {
-    /// Optional stable dataset identifier.
-    #[serde(default)]
-    pub(crate) dataset_id: Option<String>,
+    /// Stable dataset identifier.
+    pub(crate) dataset_id: Uuid,
 
     /// Optional dataset version string.
     #[serde(default)]
@@ -209,7 +209,7 @@ pub(crate) struct RunDataset {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DatasetCase {
     /// Stable case identifier in dataset.
-    pub(crate) id: String,
+    pub(crate) id: Uuid,
 
     /// Task type used for profile `applies_to` matching.
     pub(crate) task_type: String,
@@ -290,10 +290,10 @@ case_groups:
     #[test]
     fn parse_dataset_yaml() {
         let raw = r#"
-dataset_id: sample-dataset
+dataset_id: 018f1111-1111-7111-8111-111111111111
 dataset_version: 1.0.0
 cases:
-  - id: sentiment_001
+  - id: 018f1111-1111-7111-8111-111111111101
     task_type: classification
     case_group: classification
     input:
@@ -306,8 +306,15 @@ cases:
 "#;
 
         let dataset: RunDataset = serde_yaml::from_str(raw).unwrap();
-        assert_eq!(dataset.dataset_id.as_deref(), Some("sample-dataset"));
+        assert_eq!(
+            dataset.dataset_id,
+            Uuid::parse_str("018f1111-1111-7111-8111-111111111111").unwrap()
+        );
         assert_eq!(dataset.cases.len(), 1);
+        assert_eq!(
+            dataset.cases[0].id,
+            Uuid::parse_str("018f1111-1111-7111-8111-111111111101").unwrap()
+        );
         assert_eq!(dataset.cases[0].task_type, "classification");
     }
 }

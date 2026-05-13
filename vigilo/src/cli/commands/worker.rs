@@ -334,7 +334,6 @@ async fn run_worker_cycle(
 ) -> anyhow::Result<WorkerCycleOutcome> {
     debug!("starting worker cycle pre-flight");
 
-
     debug!("acquiring messaging context");
     let mq = context.mq().await?;
     debug!("messaging context ready");

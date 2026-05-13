@@ -31,7 +31,7 @@ pub(crate) async fn insert_run(db: &PgPool, draft: &RunDraft) -> anyhow::Result<
         VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb, $21)
         RETURNING
             id, run_key, name, description,
-            dataset_id::uuid as dataset_id, dataset_version,
+            dataset_id, dataset_version,
             evaluation_profile_id, evaluation_profile_version,
             aggregation_policy_id, aggregation_policy_version,
             agent_provider, agent_name, agent_version,
@@ -39,7 +39,7 @@ pub(crate) async fn insert_run(db: &PgPool, draft: &RunDraft) -> anyhow::Result<
             config_snapshot,
             status::text as status,
             gate_status::text as gate_status,
-            coordinator_id::uuid as coordinator_id,
+            coordinator_id,
             coordinator_leased_until,
             coordinator_heartbeat_at,
             expected_execution_count,
@@ -61,9 +61,9 @@ pub(crate) async fn insert_run(db: &PgPool, draft: &RunDraft) -> anyhow::Result<
     .bind(&draft.run_key)
     .bind(&draft.name)
     .bind(&draft.description)
-    .bind(&draft.dataset_id)
+    .bind(draft.dataset_id)
     .bind(&draft.dataset_version)
-    .bind(&draft.dataset_version_id)
+    .bind(draft.dataset_version_id)
     .bind(&draft.evaluation_profile_id)
     .bind(&draft.evaluation_profile_version)
     .bind(&draft.profile_version_id)
@@ -90,7 +90,7 @@ pub(crate) async fn select_run_by_id(db: &PgPool, id: Uuid) -> anyhow::Result<Op
         r#"
         SELECT
             id, run_key, name, description,
-            dataset_id::uuid as dataset_id, dataset_version,
+            dataset_id, dataset_version,
             evaluation_profile_id, evaluation_profile_version,
             aggregation_policy_id, aggregation_policy_version,
             agent_provider, agent_name, agent_version,
@@ -98,7 +98,7 @@ pub(crate) async fn select_run_by_id(db: &PgPool, id: Uuid) -> anyhow::Result<Op
             config_snapshot,
             status::text as status,
             gate_status::text as gate_status,
-            coordinator_id::uuid as coordinator_id,
+            coordinator_id,
             coordinator_leased_until,
             coordinator_heartbeat_at,
             expected_execution_count,
@@ -152,7 +152,7 @@ pub(crate) async fn select_run_by_key(db: &PgPool, run_key: &str) -> anyhow::Res
         r#"
         SELECT
             id, run_key, name, description,
-            dataset_id::uuid as dataset_id, dataset_version,
+            dataset_id, dataset_version,
             evaluation_profile_id, evaluation_profile_version,
             aggregation_policy_id, aggregation_policy_version,
             agent_provider, agent_name, agent_version,
@@ -160,7 +160,7 @@ pub(crate) async fn select_run_by_key(db: &PgPool, run_key: &str) -> anyhow::Res
             config_snapshot,
             status::text as status,
             gate_status::text as gate_status,
-            coordinator_id::uuid as coordinator_id,
+            coordinator_id,
             coordinator_leased_until,
             coordinator_heartbeat_at,
             expected_execution_count,
@@ -193,7 +193,7 @@ pub(crate) async fn list_runs(db: &PgPool, limit: i64, offset: i64) -> anyhow::R
         r#"
         SELECT
             id, run_key, name, description,
-            dataset_id::uuid as dataset_id, dataset_version,
+            dataset_id, dataset_version,
             evaluation_profile_id, evaluation_profile_version,
             aggregation_policy_id, aggregation_policy_version,
             agent_provider, agent_name, agent_version,
@@ -201,7 +201,7 @@ pub(crate) async fn list_runs(db: &PgPool, limit: i64, offset: i64) -> anyhow::R
             config_snapshot,
             status::text as status,
             gate_status::text as gate_status,
-            coordinator_id::uuid as coordinator_id,
+            coordinator_id,
             coordinator_leased_until,
             coordinator_heartbeat_at,
             expected_execution_count,
@@ -246,7 +246,7 @@ pub(crate) async fn update_run_status(
         WHERE id = $1::uuid
         RETURNING
             id, run_key, name, description,
-            dataset_id::uuid as dataset_id, dataset_version,
+            dataset_id, dataset_version,
             evaluation_profile_id, evaluation_profile_version,
             aggregation_policy_id, aggregation_policy_version,
             agent_provider, agent_name, agent_version,
@@ -254,7 +254,7 @@ pub(crate) async fn update_run_status(
             config_snapshot,
             status::text as status,
             gate_status::text as gate_status,
-            coordinator_id::uuid as coordinator_id,
+            coordinator_id,
             coordinator_leased_until,
             coordinator_heartbeat_at,
             expected_execution_count,

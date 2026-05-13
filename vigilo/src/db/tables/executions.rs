@@ -25,11 +25,11 @@ pub(crate) async fn insert_execution(
             evaluation_profile_id, evaluation_profile_version,
             expected_evaluator_count
         )
-        VALUES ($1::uuid, $2::text, $3, $4, $5, $6)
+        VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6)
         RETURNING
             id,
             run_id,
-            case_id::uuid as case_id,
+            case_id,
             task_type,
             tags,
             input_payload,
@@ -50,7 +50,7 @@ pub(crate) async fn insert_execution(
         "#,
     )
     .bind(draft.run_id)
-    .bind(draft.case_id.to_string())
+    .bind(draft.case_id)
     .bind(&draft.task_type)
     .bind(&draft.evaluation_profile_id)
     .bind(&draft.evaluation_profile_version)
@@ -72,7 +72,7 @@ pub(crate) async fn select_execution_by_id(
         SELECT
             id,
             run_id,
-            case_id::uuid as case_id,
+            case_id,
             task_type,
             tags,
             input_payload,
@@ -113,7 +113,7 @@ pub(crate) async fn list_executions_by_run_id(
         SELECT
             id,
             run_id,
-            case_id::uuid as case_id,
+            case_id,
             task_type,
             tags,
             input_payload,
@@ -163,7 +163,7 @@ pub(crate) async fn update_execution_status(
         RETURNING
             id,
             run_id,
-            case_id::uuid as case_id,
+            case_id,
             task_type,
             tags,
             input_payload,

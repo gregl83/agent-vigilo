@@ -1,7 +1,7 @@
-dataset_id: mixed-agent-sample
+dataset_id: 018f1111-1111-7111-8111-111111111111
 dataset_version: 1.0.0
 cases:
-  - id: sentiment_001
+  - id: 018f1111-1111-7111-8111-111111111101
     task_type: classification
     case_group: classification
     input:
@@ -12,7 +12,7 @@ cases:
     metadata:
       source: synthetic
 
-  - id: tool_use_001
+  - id: 018f1111-1111-7111-8111-111111111102
     task_type: tool_use
     case_group: tool_use
     input:

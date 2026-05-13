@@ -35,7 +35,7 @@ pub(crate) struct RunChunk {
     /// Run partition key and parent run id.
     pub(crate) run_id: Uuid,
     /// Dataset version whose cases are covered by this chunk.
-    pub(crate) dataset_version_id: String,
+    pub(crate) dataset_version_id: Uuid,
     /// Evaluation profile group applied to cases in this chunk.
     pub(crate) profile_group_id: String,
     /// Inclusive start ordinal in the dataset version.

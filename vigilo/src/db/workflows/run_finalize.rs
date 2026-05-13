@@ -29,7 +29,7 @@ pub(crate) struct FinalizedRun {
 /// Claims a run whose chunks are all terminal and whose finalization lease is open.
 pub(crate) async fn claim_next_finalizable_run(
     db: &PgPool,
-    coordinator_id: &str,
+    coordinator_id: Uuid,
     lease_seconds: i32,
 ) -> anyhow::Result<Option<ClaimedRunForFinalization>> {
     let claimed = sqlx::query_as::<_, ClaimedRunForFinalization>(
