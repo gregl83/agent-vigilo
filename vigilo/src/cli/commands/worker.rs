@@ -46,6 +46,15 @@ const CHUNK_LEASE_SECONDS: i32 = 60;
 const RUN_CONTEXT_CACHE_MAX_ENTRIES: u64 = 1024;
 const RUN_CONTEXT_CACHE_TTI_SECONDS: u64 = 900;
 const WARMUP_PARALLELISM: usize = 8;
+const WORKER_MAX_MESSAGES_PER_DRAIN: usize = 8;
+const WORKER_EMPTY_BACKOFF_INITIAL_MS: u64 = 100;
+const WORKER_EMPTY_BACKOFF_MAX_SECONDS: u64 = WORKER_TICK_SECONDS;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerCycleOutcome {
+    Processed,
+    Empty,
+}
 
 #[derive(Debug)]
 struct WorkerRunContext {
@@ -248,11 +257,38 @@ impl Executable for Command {
 async fn handle_start(context: Context) -> anyhow::Result<()> {
     let evaluator_loader = EvaluatorLoaderService::new(context.clone());
     ServiceRunner::new("worker")
-        .tick_interval(Duration::from_secs(WORKER_TICK_SECONDS))
-        .run_loop(move || {
+        .run(move |shutdown| {
             let context = context.clone();
             let evaluator_loader = evaluator_loader.clone();
-            async move { run_worker_cycle(context, &evaluator_loader).await }
+            async move {
+                let mut empty_backoff = Duration::from_millis(WORKER_EMPTY_BACKOFF_INITIAL_MS);
+
+                loop {
+                    if shutdown.is_cancelled() {
+                        return Ok(());
+                    }
+
+                    let processed = run_worker_drain_pass(
+                        context.clone(),
+                        &evaluator_loader,
+                        WORKER_MAX_MESSAGES_PER_DRAIN,
+                    )
+                    .await?;
+
+                    if processed > 0 {
+                        empty_backoff = Duration::from_millis(WORKER_EMPTY_BACKOFF_INITIAL_MS);
+                        continue;
+                    }
+
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return Ok(()),
+                        _ = tokio::time::sleep(empty_backoff) => {}
+                    }
+
+                    empty_backoff = (empty_backoff * 2)
+                        .min(Duration::from_secs(WORKER_EMPTY_BACKOFF_MAX_SECONDS));
+                }
+            }
         })
         .await
 }
@@ -260,7 +296,8 @@ async fn handle_start(context: Context) -> anyhow::Result<()> {
 /// Processes one worker cycle and exits.
 async fn handle_once(context: Context) -> anyhow::Result<()> {
     let evaluator_loader = EvaluatorLoaderService::new(context.clone());
-    run_worker_cycle(context, &evaluator_loader).await
+    run_worker_drain_pass(context, &evaluator_loader, 1).await?;
+    Ok(())
 }
 
 /// Executes a single worker cycle.
@@ -271,10 +308,29 @@ async fn handle_once(context: Context) -> anyhow::Result<()> {
 /// 3. warm evaluator components from run profile
 /// 4. load and process the chunk case batch
 /// 5. ack on success, nack+requeue on recoverable failures
+async fn run_worker_drain_pass(
+    context: Context,
+    evaluator_loader: &EvaluatorLoaderService,
+    max_messages: usize,
+) -> anyhow::Result<usize> {
+    let mut processed = 0usize;
+
+    for _ in 0..max_messages {
+        match run_worker_cycle(context.clone(), evaluator_loader).await? {
+            WorkerCycleOutcome::Processed => {
+                processed += 1;
+            }
+            WorkerCycleOutcome::Empty => break,
+        }
+    }
+
+    Ok(processed)
+}
+
 async fn run_worker_cycle(
     context: Context,
     evaluator_loader: &EvaluatorLoaderService,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<WorkerCycleOutcome> {
     debug!("starting worker cycle pre-flight");
 
     debug!("acquiring database context");
@@ -288,9 +344,8 @@ async fn run_worker_cycle(
     debug!("attempting to consume worker message");
 
     let Some(message) = mq.consume_worker_message().await? else {
-        info!("no worker messages available");
-        debug!("worker cycle complete with no message");
-        return Ok(());
+        debug!("no worker messages available");
+        return Ok(WorkerCycleOutcome::Empty);
     };
 
     debug!(
@@ -307,7 +362,7 @@ async fn run_worker_cycle(
                 delivery_tag = message.delivery_tag,
                 "invalid message acknowledged and dropped"
             );
-            return Ok(());
+            return Ok(WorkerCycleOutcome::Processed);
         }
     };
 
@@ -335,7 +390,7 @@ async fn run_worker_cycle(
             delivery_tag = message.delivery_tag,
             "unclaimable chunk message acknowledged"
         );
-        return Ok(());
+        return Ok(WorkerCycleOutcome::Processed);
     };
 
     debug!(
@@ -377,7 +432,7 @@ async fn run_worker_cycle(
                 chunk_released = released > 0,
                 "failed evaluator warmup; handled claimed chunk lease"
             );
-            return Ok(());
+            return Ok(WorkerCycleOutcome::Processed);
         }
     }
 
@@ -412,7 +467,7 @@ async fn run_worker_cycle(
                         chunk_released = released > 0,
                         "failed chunk case processing; handled claimed chunk lease"
                     );
-                    return Ok(());
+                    return Ok(WorkerCycleOutcome::Processed);
                 }
             };
 
@@ -463,7 +518,7 @@ async fn run_worker_cycle(
                     chunk_released = released > 0,
                     "failed chunk-level execution terminal transitions; handled claimed chunk lease"
                 );
-                return Ok(());
+                return Ok(WorkerCycleOutcome::Processed);
             }
 
             let completed = chunk_processing::mark_chunk_completed(db, &chunk).await?;
@@ -474,7 +529,7 @@ async fn run_worker_cycle(
                     chunk_id = %chunk.id,
                     "chunk lease was no longer owned at completion; acknowledged stale message"
                 );
-                return Ok(());
+                return Ok(WorkerCycleOutcome::Processed);
             }
 
             mq.ack(message.delivery_tag).await?;
@@ -491,7 +546,7 @@ async fn run_worker_cycle(
                 chunk_id = %chunk.id,
                 "chunk processing complete; message acknowledged"
             );
-            Ok(())
+            Ok(WorkerCycleOutcome::Processed)
         }
         Err(err) => {
             let released = chunk_processing::release_chunk_as_pending(db, &chunk).await?;
@@ -513,7 +568,7 @@ async fn run_worker_cycle(
                 chunk_released = released > 0,
                 "chunk processing failed; handled claimed chunk lease"
             );
-            Ok(())
+            Ok(WorkerCycleOutcome::Processed)
         }
     }
 }
