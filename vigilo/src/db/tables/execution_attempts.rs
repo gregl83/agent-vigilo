@@ -151,6 +151,48 @@ pub(crate) async fn list_execution_attempts_by_execution_id(
     Ok(attempts)
 }
 
+/// Lists all attempts for a run ordered by execution and attempt number.
+pub(crate) async fn list_execution_attempts_by_run_id(
+    db: &PgPool,
+    run_id: Uuid,
+) -> anyhow::Result<Vec<ExecutionAttempt>> {
+    let attempts = sqlx::query_as::<_, ExecutionAttempt>(
+        r#"
+        SELECT
+            id,
+            execution_id,
+            run_id,
+            attempt_no,
+            status::text as status,
+            worker_id::uuid as worker_id,
+            worker_host,
+            queue_message_id::uuid as queue_message_id,
+            leased_until::text as leased_until,
+            heartbeat_at::text as heartbeat_at,
+            request_artifact_uri,
+            response_artifact_uri,
+            agent_latency_ms,
+            evaluator_latency_ms,
+            total_latency_ms,
+            token_usage,
+            outcome_summary,
+            error_message,
+            created_at,
+            started_at,
+            completed_at,
+            updated_at
+        FROM execution_attempts
+        WHERE run_id = $1::uuid
+        ORDER BY execution_id ASC, attempt_no ASC
+        "#,
+    )
+    .bind(run_id)
+    .fetch_all(db)
+    .await?;
+
+    Ok(attempts)
+}
+
 /// Updates the status and error message for an execution attempt.
 pub(crate) async fn update_execution_attempt_status(
     db: &PgPool,

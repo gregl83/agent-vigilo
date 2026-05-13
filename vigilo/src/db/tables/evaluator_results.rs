@@ -321,6 +321,51 @@ pub(crate) async fn list_evaluator_results_by_attempt_id(
     Ok(results)
 }
 
+/// Lists all evaluator results for a run ordered by execution and attempt.
+pub(crate) async fn list_evaluator_results_by_run_id(
+    db: &PgPool,
+    run_id: Uuid,
+) -> anyhow::Result<Vec<EvaluatorResult>> {
+    let results = sqlx::query_as::<_, EvaluatorResult>(
+        r#"
+        SELECT
+            id,
+            run_id,
+            execution_id,
+            attempt_id,
+            evaluator_id::uuid as evaluator_id,
+            evaluator_version,
+            evaluator_profile_id,
+            evaluator_profile_version,
+            evaluator_interface_version,
+            evaluator_runtime_version,
+            dimension,
+            status::text as status,
+            blocking,
+            score_kind,
+            raw_score,
+            raw_score_min,
+            raw_score_max,
+            normalized_score,
+            weight,
+            severity::text as severity,
+            failure_category,
+            reason,
+            evidence,
+            raw_evaluator_output,
+            created_at
+        FROM evaluator_results
+        WHERE run_id = $1::uuid
+        ORDER BY execution_id ASC, attempt_id ASC, created_at ASC
+        "#,
+    )
+    .bind(run_id)
+    .fetch_all(db)
+    .await?;
+
+    Ok(results)
+}
+
 /// Updates the human-readable failure reason fields for an evaluator result.
 pub(crate) async fn update_evaluator_result_reason(
     db: &PgPool,
