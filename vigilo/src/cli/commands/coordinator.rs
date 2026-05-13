@@ -35,6 +35,8 @@ use crate::{
 
 const COORDINATOR_TICK_SECONDS: u64 = 5;
 const COORDINATOR_LEASE_SECONDS: i32 = 60;
+const COORDINATOR_MAX_DISPATCH_PER_CYCLE: usize = 64;
+const COORDINATOR_MAX_FINALIZE_PER_CYCLE: usize = 64;
 const OUTBOX_BATCH_SIZE: i64 = 32;
 const OUTBOX_LEASE_SECONDS: i32 = 30;
 const OUTBOX_RETRY_DELAY_SECONDS: i32 = 10;
@@ -103,8 +105,8 @@ async fn handle_once(context: Context) -> anyhow::Result<()> {
 /// Executes one full coordinator cycle.
 ///
 /// The cycle is intentionally ordered to keep run progression deterministic:
-/// 1. atomically claim/dispatch one pending run
-/// 2. claim/finalize one finalizable run
+/// 1. atomically claim/dispatch pending runs (bounded batch)
+/// 2. claim/finalize finalizable runs (bounded batch)
 /// 3. publish a bounded batch of pending outbox events
 async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow::Result<()> {
     debug!(coordinator_id, "starting coordinator cycle pre-flight");
@@ -117,55 +119,8 @@ async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow
     let mq = context.mq().await?;
     debug!(coordinator_id, "messaging context ready");
 
-    debug!(
-        coordinator_id,
-        "attempting to claim pending run for dispatch"
-    );
-
-    if let Some(run) =
-        run_dispatch::dispatch_next_pending_run(db, coordinator_id, COORDINATOR_LEASE_SECONDS)
-            .await?
-    {
-        debug!(run_id = %run.id, run_key = %run.run_key, "claimed pending run");
-
-        info!(
-            run_id = %run.id,
-            run_key = %run.run_key,
-            chunk_events_enqueued = run.chunk_events_enqueued,
-            run_started_events_enqueued = run.run_started_events_enqueued,
-            "claimed run and prepared dispatch events"
-        );
-    } else {
-        info!("no pending runs available for coordinator cycle");
-    }
-
-    debug!(coordinator_id, "attempting to claim finalizable run");
-
-    if let Some(run) =
-        run_finalize::claim_next_finalizable_run(db, coordinator_id, COORDINATOR_LEASE_SECONDS)
-            .await?
-    {
-        debug!(run_id = %run.id, run_key = %run.run_key, "claimed run for finalization");
-        if let Some(finalized) = run_finalize::finalize_claimed_run(db, run.id).await? {
-            info!(
-                run_id = %finalized.id,
-                run_key = %finalized.run_key,
-                gate_status = %finalized.gate_status,
-                terminal_execution_count = finalized.terminal_execution_count,
-                passed_execution_count = finalized.passed_execution_count,
-                failed_execution_count = finalized.failed_execution_count,
-                errored_execution_count = finalized.errored_execution_count,
-                "finalized run and enqueued completion event"
-            );
-        } else {
-            debug!(run_id = %run.id, "claimed finalizable run but no finalization update was applied");
-        }
-    } else {
-        debug!(
-            coordinator_id,
-            "no finalizable runs available for this cycle"
-        );
-    }
+    let dispatch_count = drain_dispatch_batch(db, coordinator_id).await?;
+    let finalized_count = drain_finalize_batch(db, coordinator_id).await?;
 
     debug!(coordinator_id, "starting outbox publish pass");
     let publisher = MqEventPublisher::new(mq);
@@ -176,6 +131,8 @@ async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow
     };
     let publish_stats = publish_pending_events(db, &publisher, &outbox_config).await?;
     info!(
+        runs_dispatched = dispatch_count,
+        runs_finalized = finalized_count,
         outbox_events_claimed = publish_stats.claimed,
         outbox_events_published = publish_stats.published,
         outbox_events_failed = publish_stats.failed,
@@ -185,4 +142,86 @@ async fn run_coordinator_cycle(context: Context, coordinator_id: &str) -> anyhow
     debug!(coordinator_id, "coordinator cycle complete");
 
     Ok(())
+}
+
+async fn drain_dispatch_batch(db: &sqlx::PgPool, coordinator_id: &str) -> anyhow::Result<usize> {
+    debug!(coordinator_id, "draining pending runs for dispatch");
+
+    let mut dispatched = 0usize;
+    for _ in 0..COORDINATOR_MAX_DISPATCH_PER_CYCLE {
+        let Some(run) =
+            run_dispatch::dispatch_next_pending_run(db, coordinator_id, COORDINATOR_LEASE_SECONDS)
+                .await?
+        else {
+            break;
+        };
+
+        dispatched += 1;
+        debug!(run_id = %run.id, run_key = %run.run_key, "claimed pending run");
+        info!(
+            run_id = %run.id,
+            run_key = %run.run_key,
+            chunk_events_enqueued = run.chunk_events_enqueued,
+            run_started_events_enqueued = run.run_started_events_enqueued,
+            "claimed run and prepared dispatch events"
+        );
+    }
+
+    if dispatched == 0 {
+        info!("no pending runs available for coordinator cycle");
+    } else {
+        info!(
+            coordinator_id,
+            runs_dispatched = dispatched,
+            "completed coordinator dispatch drain pass"
+        );
+    }
+
+    Ok(dispatched)
+}
+
+async fn drain_finalize_batch(db: &sqlx::PgPool, coordinator_id: &str) -> anyhow::Result<usize> {
+    debug!(coordinator_id, "draining finalizable runs");
+
+    let mut finalized = 0usize;
+    for _ in 0..COORDINATOR_MAX_FINALIZE_PER_CYCLE {
+        let Some(run) =
+            run_finalize::claim_next_finalizable_run(db, coordinator_id, COORDINATOR_LEASE_SECONDS)
+                .await?
+        else {
+            break;
+        };
+
+        debug!(run_id = %run.id, run_key = %run.run_key, "claimed run for finalization");
+        if let Some(done) = run_finalize::finalize_claimed_run(db, run.id).await? {
+            finalized += 1;
+            info!(
+                run_id = %done.id,
+                run_key = %done.run_key,
+                gate_status = %done.gate_status,
+                terminal_execution_count = done.terminal_execution_count,
+                passed_execution_count = done.passed_execution_count,
+                failed_execution_count = done.failed_execution_count,
+                errored_execution_count = done.errored_execution_count,
+                "finalized run and enqueued completion event"
+            );
+        } else {
+            debug!(run_id = %run.id, "claimed finalizable run but no finalization update was applied");
+        }
+    }
+
+    if finalized == 0 {
+        debug!(
+            coordinator_id,
+            "no finalizable runs available for this cycle"
+        );
+    } else {
+        info!(
+            coordinator_id,
+            runs_finalized = finalized,
+            "completed coordinator finalization drain pass"
+        );
+    }
+
+    Ok(finalized)
 }
