@@ -48,6 +48,29 @@ pub(crate) async fn validate_profile_executability(
     let mut parsed_refs: Vec<(String, String, EvaluatorIdentity)> = Vec::new();
     let mut issues = Vec::new();
 
+    if profile.agent.provider.trim().is_empty() {
+        issues.push("agent.provider must not be empty".to_string());
+    }
+
+    if profile.agent.name.trim().is_empty() {
+        issues.push("agent.name must not be empty".to_string());
+    }
+
+    if let Err(err) = reqwest::Url::parse(&profile.agent.http.url) {
+        issues.push(format!("agent.http.url is invalid: {}", err));
+    }
+
+    if let Err(err) = profile.agent.http.method.parse::<reqwest::Method>() {
+        issues.push(format!(
+            "agent.http.method '{}' is invalid: {}",
+            profile.agent.http.method, err
+        ));
+    }
+
+    if profile.agent.http.timeout_secs == Some(0) {
+        issues.push("agent.http.timeout_secs must be greater than zero".to_string());
+    }
+
     for group in &profile.case_groups {
         for binding in &group.evaluators {
             if runnable_by_ref.contains_key(&binding.evaluator_ref) {
@@ -230,6 +253,8 @@ mod tests {
 
     use crate::{
         contracts::run::{
+            AgentHttpConfig,
+            AgentProfile,
             AggregationSettings,
             AppliesTo,
             CaseGroupProfile,
@@ -258,6 +283,21 @@ mod tests {
                 mode: PersistenceMode::Full,
                 persist_raw_outputs: PersistRawOutputsMode::All,
                 persist_evaluator_evidence: true,
+            },
+            agent: AgentProfile {
+                provider: "example".to_string(),
+                name: "test-agent".to_string(),
+                version: Some("1.0.0".to_string()),
+                model: Some("test-model".to_string()),
+                prompt_config_id: Some("test-prompt".to_string()),
+                prompt_config_version: Some("1.0.0".to_string()),
+                http: AgentHttpConfig {
+                    url: "http://127.0.0.1:8787/v1/agent/invoke".to_string(),
+                    method: "POST".to_string(),
+                    headers: Default::default(),
+                    timeout_secs: Some(30),
+                },
+                config: serde_json::json!({}),
             },
             case_groups: vec![CaseGroupProfile {
                 id: "classification".to_string(),

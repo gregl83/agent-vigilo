@@ -17,6 +17,10 @@ fn default_json_object() -> Value {
     Value::Object(Default::default())
 }
 
+fn default_post_method() -> String {
+    "POST".to_string()
+}
+
 /// Run profile used by `vigilo run test`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RunProfile {
@@ -39,11 +43,66 @@ pub(crate) struct RunProfile {
     /// Persistence behavior controls for run/evaluation artifacts.
     pub(crate) persistence: PersistenceSettings,
 
+    /// Agent target invoked by workers before evaluator execution.
+    pub(crate) agent: AgentProfile,
+
     /// Case-group specific evaluator bindings and aggregation policies.
     ///
     /// Empty by default to allow incremental authoring/validation.
     #[serde(default)]
     pub(crate) case_groups: Vec<CaseGroupProfile>,
+}
+
+/// Agent target configuration attached to this run profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AgentProfile {
+    /// Provider/platform for the evaluated target.
+    pub(crate) provider: String,
+
+    /// Logical agent or model name under evaluation.
+    pub(crate) name: String,
+
+    /// Optional version/deployment identifier for the evaluated target.
+    #[serde(default)]
+    pub(crate) version: Option<String>,
+
+    /// Optional provider-specific model identifier used by the target.
+    #[serde(default)]
+    pub(crate) model: Option<String>,
+
+    /// Prompt/config identity associated with the agent call.
+    #[serde(default)]
+    pub(crate) prompt_config_id: Option<String>,
+
+    /// Prompt/config version associated with the agent call.
+    #[serde(default)]
+    pub(crate) prompt_config_version: Option<String>,
+
+    /// HTTP invocation configuration used by workers.
+    pub(crate) http: AgentHttpConfig,
+
+    /// Agent-specific unstructured configuration passed in invocation metadata.
+    #[serde(default = "default_json_object")]
+    pub(crate) config: Value,
+}
+
+/// HTTP settings workers use to invoke the configured agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AgentHttpConfig {
+    /// Absolute URI for the agent invocation endpoint.
+    pub(crate) url: String,
+
+    /// HTTP method used for invocation. Defaults to `POST`.
+    #[serde(default = "default_post_method")]
+    pub(crate) method: String,
+
+    /// Static headers to attach to every invocation.
+    #[serde(default)]
+    pub(crate) headers: BTreeMap<String, String>,
+
+    /// Optional per-request timeout override. Falls back to profile defaults.
+    #[serde(default)]
+    pub(crate) timeout_secs: Option<u32>,
 }
 
 /// Default execution policy for run processing.
@@ -257,6 +316,17 @@ persistence:
   mode: full
   persist_raw_outputs: failures_only
   persist_evaluator_evidence: true
+agent:
+  provider: example
+  name: sentiment-demo-agent
+  version: 1.0.0
+  model: demo-classifier-v1
+  prompt_config_id: sentiment-demo
+  prompt_config_version: 1.0.0
+  http:
+    url: http://127.0.0.1:8787/v1/agent/invoke
+    headers:
+      x-vigilo-example: sentiment
 case_groups:
   - id: classification
     description: Evaluates classification-style cases.
@@ -280,11 +350,62 @@ case_groups:
 
         let profile: RunProfile = serde_yaml::from_str(raw).unwrap();
         assert_eq!(profile.profile_id, "mixed_agent_release");
+        assert_eq!(profile.agent.provider, "example");
+        assert_eq!(profile.agent.name, "sentiment-demo-agent");
+        assert_eq!(profile.agent.model.as_deref(), Some("demo-classifier-v1"));
+        assert_eq!(profile.agent.http.method, "POST");
         assert_eq!(profile.case_groups.len(), 1);
         assert_eq!(
             profile.case_groups[0].evaluators[0].evaluator_ref,
             "core/json-schema:1.0.0"
         );
+    }
+
+    #[test]
+    fn parse_profile_requires_agent() {
+        let raw = r#"
+profile_id: mixed_agent_release
+profile_version: 1.0.0
+description: Release-grade evaluation profile for mixed generative AI agent tasks.
+defaults:
+  max_attempts: 2
+  request_timeout_secs: 60
+  fail_on_any_blocking_failure: true
+  min_execution_score: 0.85
+persistence:
+  mode: full
+  persist_raw_outputs: failures_only
+  persist_evaluator_evidence: true
+case_groups: []
+"#;
+
+        let err = serde_yaml::from_str::<RunProfile>(raw).unwrap_err();
+        assert!(err.to_string().contains("missing field `agent`"));
+    }
+
+    #[test]
+    fn parse_profile_requires_agent_http() {
+        let raw = r#"
+profile_id: mixed_agent_release
+profile_version: 1.0.0
+description: Release-grade evaluation profile for mixed generative AI agent tasks.
+defaults:
+  max_attempts: 2
+  request_timeout_secs: 60
+  fail_on_any_blocking_failure: true
+  min_execution_score: 0.85
+persistence:
+  mode: full
+  persist_raw_outputs: failures_only
+  persist_evaluator_evidence: true
+agent:
+  provider: example
+  name: sentiment-demo-agent
+case_groups: []
+"#;
+
+        let err = serde_yaml::from_str::<RunProfile>(raw).unwrap_err();
+        assert!(err.to_string().contains("missing field `http`"));
     }
 
     #[test]

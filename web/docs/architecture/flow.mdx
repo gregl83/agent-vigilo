@@ -86,6 +86,9 @@ The worker invokes the configured agent target:
 
 - may be a single model call
 - may be a multi-step workflow
+- is invoked through the run profile `agent.http` endpoint
+
+The worker sends run/attempt ids, the agent identity, the case input, and the full case envelope. The response is mapped into the evaluator `actual` envelope before evaluators run.
 
 If the agent call fails:
 

@@ -336,9 +336,11 @@ async fn handle_create(
     let chunks = build_chunks(dataset_cases.len(), chunk_size);
     let run_id = Uuid::now_v7();
     let run_key = run_id.to_string();
+    let agent = &parsed.profile.agent;
 
     let snapshot = json!({
         "profile": profile_payload,
+        "agent": agent,
         "dataset_ref": {
             "dataset_id": parsed.dataset.dataset_id,
             "dataset_version": parsed.dataset.dataset_version,
@@ -373,11 +375,17 @@ async fn handle_create(
         aggregation_policy_id: "profile_case_group_aggregation".to_string(),
         aggregation_policy_version: "v3".to_string(),
         aggregation_policy_hash: aggregation_policy_hash.clone(),
-        agent_provider: "unknown".to_string(),
-        agent_name: "unknown".to_string(),
-        agent_version: None,
-        prompt_config_id: "default".to_string(),
-        prompt_config_version: "v1".to_string(),
+        agent_provider: agent.provider.clone(),
+        agent_name: agent.name.clone(),
+        agent_version: agent.version.clone(),
+        prompt_config_id: agent
+            .prompt_config_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string()),
+        prompt_config_version: agent
+            .prompt_config_version
+            .clone()
+            .unwrap_or_else(|| "v1".to_string()),
         config_snapshot: snapshot,
         expected_execution_count: dataset_cases.len() as i32,
     };

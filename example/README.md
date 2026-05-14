@@ -7,6 +7,8 @@ This example demonstrates the `vigilo run test` input format using file-based pr
 - `profile.yaml`: release-oriented mixed-task evaluation profile
 - `dataset.yaml`: minimal multi-case dataset sample
 
+The profile includes an `agent.http` block. Workers POST a JSON payload with `run_id`, `execution_id`, `attempt_id`, `agent`, `input`, and `case` to that endpoint, then map the response into the evaluator `actual` envelope.
+
 ## Run
 
 ```bash
@@ -17,3 +19,4 @@ Notes:
 
 - Inline options (`--profile` / `--dataset`) are supported for quick experiments.
 - File options are recommended for large, versioned payloads.
+- Point `agent.http.url` at a reachable local agent service before running workers.

@@ -13,6 +13,22 @@ persistence:
   persist_raw_outputs: failures_only
   persist_evaluator_evidence: true
 
+agent:
+  provider: example-http
+  name: mixed-task-demo-agent
+  version: 1.0.0
+  model: demo-agent-model-v1
+  prompt_config_id: mixed-task-demo-agent
+  prompt_config_version: 1.0.0
+  http:
+    method: POST
+    url: http://127.0.0.1:8787/v1/agent/invoke
+    timeout_secs: 30
+    headers:
+      x-vigilo-example: mixed-task-demo
+  config:
+    response_format: agent_output
+
 case_groups:
   - id: classification
     description: Evaluates classification-style cases.

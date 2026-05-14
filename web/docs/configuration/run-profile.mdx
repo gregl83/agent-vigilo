@@ -30,6 +30,11 @@ profile_version: 1.0.0
 description: Release-grade evaluation profile for mixed generative AI agent tasks.
 defaults: {}
 persistence: {}
+agent:
+  provider: example-http
+  name: mixed-task-demo-agent
+  http:
+    url: http://127.0.0.1:8787/v1/agent/invoke
 case_groups: []
 ```
 
@@ -40,6 +45,7 @@ case_groups: []
 - `description` (string): human-readable profile summary.
 - `defaults` (object): run-level behavior defaults.
 - `persistence` (object): persistence policy controls.
+- `agent` (object): required worker-side target invocation configuration.
 - `case_groups` (array): per-task evaluator and aggregation definitions.
 
 ## `defaults`
@@ -69,6 +75,53 @@ persistence:
 - `mode` (enum): `full` | `summary`
 - `persist_raw_outputs` (enum): `all` | `failures_only` | `none`
 - `persist_evaluator_evidence` (bool)
+
+## `agent`
+
+The agent block identifies the target under evaluation and provides the HTTP endpoint workers call before running evaluators.
+
+```yaml
+agent:
+  provider: example-http
+  name: mixed-task-demo-agent
+  version: 1.0.0
+  model: demo-agent-model-v1
+  prompt_config_id: mixed-task-demo-agent
+  prompt_config_version: 1.0.0
+  http:
+    method: POST
+    url: http://127.0.0.1:8787/v1/agent/invoke
+    timeout_secs: 30
+    headers:
+      x-vigilo-example: mixed-task-demo
+  config:
+    response_format: agent_output
+```
+
+- `provider` (string): provider or platform for the evaluated target.
+- `name` (string): logical agent name.
+- `version` (string, optional): deployment or release version.
+- `model` (string, optional): provider-specific model identifier.
+- `prompt_config_id` (string, optional): prompt/config identity persisted with the run.
+- `prompt_config_version` (string, optional): prompt/config version persisted with the run.
+- `http` (object): required worker invocation endpoint.
+- `config` (object, optional): unstructured agent configuration included in invocation metadata.
+
+Workers send a JSON request containing `run_id`, `execution_id`, `attempt_id`, `agent`, `input`, and `case`.
+
+The response may be either plain text or JSON. JSON responses can return the evaluator-ready output directly, or under `actual`/`output`:
+
+```json
+{
+  "actual": {
+    "text": "This seems positive.",
+    "structured": { "label": "positive" },
+    "tool_calls": [],
+    "trace": [],
+    "metadata": { "latency_ms": 42 }
+  }
+}
+```
 
 ## `case_groups`
 

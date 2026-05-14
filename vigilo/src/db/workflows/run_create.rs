@@ -187,6 +187,7 @@ pub(crate) async fn insert_run_create(
             aggregation_policy_version,
             agent_provider,
             agent_name,
+            agent_version,
             prompt_config_id,
             prompt_config_version,
             config_snapshot,
@@ -209,12 +210,13 @@ pub(crate) async fn insert_run_create(
             $10,
             $11,
             $12,
-            $13::jsonb,
-            $14,
+            $13,
+            $14::jsonb,
             $15,
             $16,
             $17,
-            $18
+            $18,
+            $19
         )
         "#,
     )
@@ -228,6 +230,7 @@ pub(crate) async fn insert_run_create(
     .bind(&draft.aggregation_policy_version)
     .bind(&draft.agent_provider)
     .bind(&draft.agent_name)
+    .bind(&draft.agent_version)
     .bind(&draft.prompt_config_id)
     .bind(&draft.prompt_config_version)
     .bind(&draft.config_snapshot)
