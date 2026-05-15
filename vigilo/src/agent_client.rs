@@ -2,6 +2,17 @@
 //!
 //! This module owns request-format adaptation, HTTP transport, and response
 //! normalization into the evaluator `AgentOutput` contract.
+//!
+//! Supported request formats:
+//!
+//! - `vigilo_case`: the default Agent Vigilo request envelope for first-party
+//!   or custom agent endpoints. It includes run/execution/attempt ids, agent
+//!   identity, the case `input`, and non-oracle case metadata. It deliberately
+//!   omits the expected output so agent endpoints cannot see evaluator answers.
+//! - `openai_compatible_chat_completions`: an adapter for OpenAI-compatible
+//!   `/v1/chat/completions` servers such as llama.cpp. It sends `model`,
+//!   `messages`, `stream: false`, and selected generation options from
+//!   `agent.config`.
 
 use std::time::{
     Duration,
@@ -29,7 +40,19 @@ const INVOCATION_SOURCE: &str = "http_agent_client";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentRequestFormat {
+    /// Agent Vigilo's native request envelope for custom agent endpoints.
+    ///
+    /// This is the default when `agent.config.request_format` is absent. The
+    /// payload carries Vigilo execution metadata and case input, but not the
+    /// case's expected output.
     VigiloCase,
+
+    /// OpenAI-compatible Chat Completions payload.
+    ///
+    /// This is intended for endpoints that implement the OpenAI
+    /// `/v1/chat/completions` wire shape, including local llama.cpp server
+    /// instances. The provider is still the configured agent; this name only
+    /// describes the request body format.
     OpenAiCompatibleChatCompletions,
 }
 
@@ -89,6 +112,8 @@ fn build_vigilo_case_request_body(
     run_profile: &RunProfile,
     test_case: &TestCase,
 ) -> Value {
+    // Keep the default request format evaluator-safe: the case envelope mirrors
+    // useful identifying metadata but excludes `expected`.
     json!({
         "run_id": run_id,
         "execution_id": execution_id,
@@ -186,6 +211,9 @@ fn build_openai_compatible_chat_completions_request_body(
     run_profile: &RunProfile,
     test_case: &TestCase,
 ) -> anyhow::Result<Value> {
+    // This adapter intentionally builds only the OpenAI-compatible chat
+    // completions body. Vigilo execution ids and oracle fields are omitted
+    // because generic model servers should not need Vigilo-specific context.
     let model = run_profile
         .agent
         .model
