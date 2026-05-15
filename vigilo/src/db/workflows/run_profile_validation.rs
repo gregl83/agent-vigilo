@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use sqlx::PgPool;
 
 use crate::{
+    agent_client,
     contracts::{
         evaluator_ref::{
             EvaluatorIdentity,
@@ -69,6 +70,10 @@ pub(crate) async fn validate_profile_executability(
 
     if profile.agent.http.timeout_secs == Some(0) {
         issues.push("agent.http.timeout_secs must be greater than zero".to_string());
+    }
+
+    if let Err(err) = agent_client::validate_request_format(profile) {
+        issues.push(err.to_string());
     }
 
     for group in &profile.case_groups {

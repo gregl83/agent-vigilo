@@ -41,6 +41,24 @@ services:
       retries: 5
       start_period: 20s
 
+  agent:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: agent_vigilo_agent
+    command:
+      - -m
+      - /models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../../models:/models:ro
+    networks:
+      - agent_vigilo_network
+    restart: unless-stopped
+
   setup:
     image: rust:latest
     container_name: agent_vigilo_setup
@@ -105,6 +123,8 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      agent:
+        condition: service_started
       setup:
         condition: service_completed_successfully
     networks:

@@ -31,10 +31,13 @@ description: Release-grade evaluation profile for mixed generative AI agent task
 defaults: {}
 persistence: {}
 agent:
-  provider: example-http
-  name: mixed-task-demo-agent
+  provider: llama.cpp
+  name: qwen2.5-0.5b-instruct
+  model: qwen2.5-0.5b-instruct-q4_k_m.gguf
   http:
-    url: http://127.0.0.1:8787/v1/agent/invoke
+    url: http://agent_vigilo_agent:8080/v1/chat/completions
+  config:
+    request_format: openai_compatible_chat_completions
 case_groups: []
 ```
 
@@ -82,20 +85,24 @@ The agent block identifies the target under evaluation and provides the HTTP end
 
 ```yaml
 agent:
-  provider: example-http
-  name: mixed-task-demo-agent
+  provider: llama.cpp
+  name: qwen2.5-0.5b-instruct
   version: 1.0.0
-  model: demo-agent-model-v1
-  prompt_config_id: mixed-task-demo-agent
+  model: qwen2.5-0.5b-instruct-q4_k_m.gguf
+  prompt_config_id: qwen-sentiment-json
   prompt_config_version: 1.0.0
   http:
     method: POST
-    url: http://127.0.0.1:8787/v1/agent/invoke
-    timeout_secs: 30
-    headers:
-      x-vigilo-example: mixed-task-demo
+    url: http://agent_vigilo_agent:8080/v1/chat/completions
+    timeout_secs: 120
   config:
-    response_format: agent_output
+    request_format: openai_compatible_chat_completions
+    temperature: 0.0
+    max_tokens: 96
+    response_format:
+      type: json_object
+    system_prompt: |
+      Return only JSON with this exact shape: {"label":"<label>"}.
 ```
 
 - `provider` (string): provider or platform for the evaluated target.
@@ -105,9 +112,9 @@ agent:
 - `prompt_config_id` (string, optional): prompt/config identity persisted with the run.
 - `prompt_config_version` (string, optional): prompt/config version persisted with the run.
 - `http` (object): required worker invocation endpoint.
-- `config` (object, optional): unstructured agent configuration included in invocation metadata.
+- `config` (object, optional): unstructured agent configuration included in invocation metadata. Set `request_format: openai_compatible_chat_completions` for OpenAI-compatible servers such as llama.cpp.
 
-Workers send a JSON request containing `run_id`, `execution_id`, `attempt_id`, `agent`, `input`, and `case`.
+By default, workers send a Vigilo case request containing `run_id`, `execution_id`, `attempt_id`, `agent`, `input`, and non-oracle case metadata. With `request_format: openai_compatible_chat_completions`, workers send an OpenAI-compatible `model` and `messages` payload.
 
 The response may be either plain text or JSON. JSON responses can return the evaluator-ready output directly, or under `actual`/`output`:
 

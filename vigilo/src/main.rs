@@ -15,6 +15,7 @@ use tracing_subscriber::{
     prelude::*,
 };
 
+mod agent_client;
 mod cli;
 use cli::{
     App,

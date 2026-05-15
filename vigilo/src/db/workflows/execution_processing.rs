@@ -10,16 +10,10 @@ use std::{
         BTreeMap,
         BTreeSet,
     },
-    time::{
-        Duration,
-        Instant,
-    },
+    time::Instant,
 };
 
-use serde_json::{
-    Value,
-    json,
-};
+use serde_json::json;
 use sqlx::{
     PgPool,
     Postgres,
@@ -34,10 +28,10 @@ use uuid::Uuid;
 
 use super::chunk_processing;
 use crate::{
+    agent_client,
     context::Context,
     contracts::{
         evaluator::{
-            AgentOutput,
             EvaluationStatus,
             EvaluatorInput,
             Severity,
@@ -381,223 +375,6 @@ fn make_test_case(case: &chunk_processing::WorkerCaseBatchItem) -> anyhow::Resul
         tags: tags_from_case_row(&case.tags),
         metadata: metadata_from_case_row(&case.metadata)?,
     })
-}
-
-fn agent_invocation_metadata(
-    run_profile: &RunProfile,
-    source: &str,
-    http_status: Option<u16>,
-    latency_ms: u64,
-) -> Value {
-    json!({
-        "source": source,
-        "http_status": http_status,
-        "latency_ms": latency_ms,
-        "agent": {
-            "provider": &run_profile.agent.provider,
-            "name": &run_profile.agent.name,
-            "version": &run_profile.agent.version,
-            "model": &run_profile.agent.model,
-            "config": &run_profile.agent.config,
-        }
-    })
-}
-
-fn attach_agent_invocation_metadata(
-    mut output: AgentOutput,
-    run_profile: &RunProfile,
-    source: &str,
-    http_status: Option<u16>,
-    latency_ms: u64,
-) -> AgentOutput {
-    let invocation = agent_invocation_metadata(run_profile, source, http_status, latency_ms);
-    output.metadata = match output.metadata {
-        Value::Object(mut map) => {
-            map.insert("vigilo_invocation".to_string(), invocation);
-            Value::Object(map)
-        }
-        other => json!({
-            "value": other,
-            "vigilo_invocation": invocation,
-        }),
-    };
-    output
-}
-
-fn build_agent_http_request_body(
-    run_id: Uuid,
-    execution_id: Uuid,
-    attempt_id: Uuid,
-    run_profile: &RunProfile,
-    test_case: &TestCase,
-) -> Value {
-    json!({
-        "run_id": run_id,
-        "execution_id": execution_id,
-        "attempt_id": attempt_id,
-        "agent": {
-            "provider": &run_profile.agent.provider,
-            "name": &run_profile.agent.name,
-            "version": &run_profile.agent.version,
-            "model": &run_profile.agent.model,
-            "config": &run_profile.agent.config,
-        },
-        "input": &test_case.input,
-        "case": test_case,
-    })
-}
-
-fn response_body_excerpt(body: &str) -> String {
-    const MAX_ERROR_BODY_CHARS: usize = 512;
-    body.chars().take(MAX_ERROR_BODY_CHARS).collect()
-}
-
-fn parse_agent_response_body(body: &str) -> anyhow::Result<Value> {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return Ok(json!({}));
-    }
-
-    match serde_json::from_str::<Value>(trimmed) {
-        Ok(value) => Ok(value),
-        Err(err) if trimmed.starts_with('{') || trimmed.starts_with('[') => {
-            anyhow::bail!("agent response body was not valid JSON: {}", err)
-        }
-        Err(_) => Ok(json!({ "text": body })),
-    }
-}
-
-fn string_at(value: &Value, pointer: &str) -> Option<String> {
-    value
-        .pointer(pointer)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn extract_agent_response_text(response_json: &Value, output_value: &Value) -> Option<String> {
-    [
-        string_at(output_value, "/text"),
-        string_at(output_value, "/output_text"),
-        string_at(output_value, "/message/content"),
-        string_at(response_json, "/text"),
-        string_at(response_json, "/output_text"),
-        string_at(response_json, "/message/content"),
-        string_at(response_json, "/choices/0/message/content"),
-    ]
-    .into_iter()
-    .flatten()
-    .find(|text| !text.trim().is_empty())
-}
-
-fn extract_agent_response_structured(output_value: &Value) -> Option<Value> {
-    output_value
-        .get("structured_output")
-        .or_else(|| output_value.get("json"))
-        .cloned()
-}
-
-fn is_empty_object(value: &Value) -> bool {
-    matches!(value, Value::Object(map) if map.is_empty())
-}
-
-fn agent_output_from_response_json(response_json: Value) -> anyhow::Result<AgentOutput> {
-    let output_value = response_json
-        .get("actual")
-        .or_else(|| response_json.get("output"))
-        .cloned()
-        .unwrap_or_else(|| response_json.clone());
-
-    if let Value::String(text) = &output_value {
-        return Ok(AgentOutput {
-            text: Some(text.clone()),
-            structured: None,
-            tool_calls: Vec::new(),
-            trace: Vec::new(),
-            raw: response_json,
-            metadata: json!({}),
-        });
-    }
-
-    let mut output = serde_json::from_value::<AgentOutput>(output_value.clone())
-        .map_err(|err| anyhow::anyhow!("agent response did not match output envelope: {}", err))?;
-
-    if output.text.is_none() {
-        output.text = extract_agent_response_text(&response_json, &output_value);
-    }
-
-    if output.structured.is_none() {
-        output.structured = extract_agent_response_structured(&output_value);
-    }
-
-    if is_empty_object(&output.raw) {
-        output.raw = response_json;
-    }
-
-    Ok(output)
-}
-
-async fn make_agent_output(
-    run_id: Uuid,
-    execution_id: Uuid,
-    attempt_id: Uuid,
-    run_profile: &RunProfile,
-    test_case: &TestCase,
-) -> anyhow::Result<AgentOutput> {
-    let http = &run_profile.agent.http;
-    let timeout_secs = http
-        .timeout_secs
-        .unwrap_or(run_profile.defaults.request_timeout_secs);
-    if timeout_secs == 0 {
-        anyhow::bail!("agent HTTP timeout_secs must be greater than zero");
-    }
-
-    let method = http
-        .method
-        .parse::<reqwest::Method>()
-        .map_err(|err| anyhow::anyhow!("invalid agent HTTP method '{}': {}", http.method, err))?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(u64::from(timeout_secs)))
-        .build()?;
-
-    let request_body =
-        build_agent_http_request_body(run_id, execution_id, attempt_id, run_profile, test_case);
-    let mut request = client.request(method, &http.url).json(&request_body);
-    for (name, value) in &http.headers {
-        request = request.header(name, value);
-    }
-
-    let started = Instant::now();
-    let response = request.send().await.map_err(|err| {
-        anyhow::anyhow!(
-            "agent HTTP request failed for '{}': {}",
-            run_profile.agent.name,
-            err
-        )
-    })?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|err| anyhow::anyhow!("failed to read agent HTTP response body: {}", err))?;
-
-    if !status.is_success() {
-        anyhow::bail!(
-            "agent HTTP request failed with status {}: {}",
-            status.as_u16(),
-            response_body_excerpt(&body)
-        );
-    }
-
-    let response_json = parse_agent_response_body(&body)?;
-    let output = agent_output_from_response_json(response_json)?;
-
-    Ok(attach_agent_invocation_metadata(
-        output,
-        run_profile,
-        "agent_http",
-        Some(status.as_u16()),
-        started.elapsed().as_millis() as u64,
-    ))
 }
 
 async fn allocate_execution_attempts_for_cases(
@@ -1144,7 +921,7 @@ async fn evaluate_case_execution(
     )> = async {
         let test_case = make_test_case(case)?;
         let agent_output =
-            make_agent_output(run_id, execution_id, attempt_id, run_profile, &test_case)
+            agent_client::invoke(run_id, execution_id, attempt_id, run_profile, &test_case)
                 .await
                 .map_err(|err| anyhow::anyhow!("agent invocation failed: {}", err))?;
 
@@ -1705,62 +1482,4 @@ pub(crate) fn is_runnable_evaluator_state(state: &EvaluatorState) -> bool {
         state,
         EvaluatorState::Active | EvaluatorState::Deprecated | EvaluatorState::Yanked
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_agent_response_body_accepts_plain_text() {
-        let value = parse_agent_response_body("plain response").unwrap();
-        assert_eq!(value, json!({ "text": "plain response" }));
-    }
-
-    #[test]
-    fn agent_output_from_response_json_reads_nested_actual() {
-        let output = agent_output_from_response_json(json!({
-            "actual": {
-                "text": "classified positive",
-                "structured": {
-                    "label": "positive"
-                }
-            },
-            "provider_request_id": "req_123"
-        }))
-        .unwrap();
-
-        assert_eq!(output.text.as_deref(), Some("classified positive"));
-        assert_eq!(
-            output
-                .structured
-                .as_ref()
-                .and_then(|value| value.get("label"))
-                .and_then(Value::as_str),
-            Some("positive")
-        );
-        assert_eq!(
-            output
-                .raw
-                .get("provider_request_id")
-                .and_then(Value::as_str),
-            Some("req_123")
-        );
-    }
-
-    #[test]
-    fn agent_output_from_response_json_extracts_common_message_shape() {
-        let output = agent_output_from_response_json(json!({
-            "choices": [
-                {
-                    "message": {
-                        "content": "hello from the model"
-                    }
-                }
-            ]
-        }))
-        .unwrap();
-
-        assert_eq!(output.text.as_deref(), Some("hello from the model"));
-    }
 }
