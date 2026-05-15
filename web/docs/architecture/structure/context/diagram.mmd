@@ -1,0 +1,27 @@
+---
+config:
+  theme: neutral
+  look: handDrawn
+---
+flowchart TD
+    %% styles
+    classDef actor fill:#ebe7f5,color:#5e4b8d,stroke:#5e4b8d,stroke-width:2px
+    classDef person fill:#d4e5f7,color:#08427b,stroke:#08427b,stroke-width:2px
+    classDef system fill:#deebf7,color:#1168bd,stroke:#1168bd,stroke-width:2px
+    classDef external fill:#f9f9f9,color:#666,stroke:#666,stroke-width:2px
+
+    %% actors
+    User(("fa:fa-user <br/> <b>AI Engineer</b> <br/> <small>[Person]</small>")):::person
+    AgentClient(("fa:fa-robot <br/> <b>Agentic Client</b> <br/> <small>[Software System]</small>")):::actor
+    CICD(("fa:fa-gears <br/> <b>CI/CD Runner</b> <br/> <small>[Software System]</small>")):::actor
+
+    %% main system
+    AgentVigilo["fa:fa-diagram-project <br/> <b>Agent Vigilo</b> <br/> <small>[Software System]</small> <br/> <small>Orchestrates distributed evaluation runs</small>"]:::system
+
+    %% external target
+    TargetAgent["fa:fa-brain <br/> <b>Agent / AI Provider</b> <br/> <small>[External System]</small> <br/> <small>The model, agent wrapper, or <br/> API endpoint being evaluated</small>"]:::external
+
+    %% edges
+    User & AgentClient -->|Manages evaluators and <br/> runs using| AgentVigilo
+    CICD -->|Creates runs and <br/> gates deployments via| AgentVigilo
+    AgentVigilo -->|Sends evaluation <br/> case prompts to| TargetAgent

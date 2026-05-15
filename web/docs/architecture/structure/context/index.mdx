@@ -1,0 +1,73 @@
+---
+title: System Structure
+sidebar_position: 1
+---
+
+# System Structure
+
+This section describes the static structure of the Agent Vigilo platform using
+layered architectural views inspired by the C4 model.
+
+The diagrams in this section focus on:
+
+- system boundaries
+- deployable/runtime containers
+- subsystem responsibilities
+- internal component relationships
+
+These diagrams intentionally avoid detailed runtime behavior such as:
+
+- orchestration flow
+- retry semantics
+- failure recovery
+- state transitions
+- event sequencing
+
+Those concerns are documented separately in:
+
+- [Runtime Architecture](../runtime/flow)
+- [Reliability](../reliability/failure-modes)
+- [Messaging](../messaging/overview)
+
+---
+
+## Structural Views
+
+### System Context
+
+Describes external actors and systems interacting with the platform.
+
+- [View Context Diagram](./context)
+
+### Container View
+
+Describes the major deployable/runtime boundaries within the system.
+
+- [View Container Diagram](./containers)
+
+### Component Views
+
+Describes major internal subsystem decompositions.
+
+- [Coordinator Components](./components/coordinator)
+- [Worker Components](./components/worker)
+
+---
+
+## Reading Order
+
+Recommended progression for new contributors:
+
+1. Context
+2. Containers
+3. Components
+
+---
+
+## Scope
+
+These diagrams document conceptual architecture rather than exact
+implementation details.
+
+Minor implementation details may evolve independently from the diagrams
+provided here.
