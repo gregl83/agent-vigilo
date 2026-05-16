@@ -35,6 +35,10 @@ const config: Config = {
     locales: ['en'],
   },
 
+  markdown: {
+    mermaid: true,
+  },
+
   presets: [
     [
       'classic',
@@ -66,6 +70,28 @@ const config: Config = {
         },
       } satisfies Preset.Options,
     ],
+  ],
+
+  themes: ['@docusaurus/theme-mermaid'],
+
+  plugins: [
+    function mermaidSourceLoader() {
+      return {
+        name: 'mermaid-source-loader',
+        configureWebpack() {
+          return {
+            module: {
+              rules: [
+                {
+                  test: /\.mmd$/i,
+                  type: 'asset/source',
+                },
+              ],
+            },
+          };
+        },
+      };
+    },
   ],
 
   themeConfig: {
@@ -115,10 +141,6 @@ const config: Config = {
               href: 'https://stackoverflow.com/questions/tagged/agent-vigilo',
             },
             {
-              label: 'Discord',
-              href: 'https://discordapp.com/invite/docusaurus',
-            },
-            {
               label: 'X',
               href: 'https://x.com/docusaurus',
             },
@@ -138,7 +160,7 @@ const config: Config = {
           ],
         },
       ],
-      copyright: `Copyright © ${new Date().getFullYear()} Agent Vigilo, Inc. Built with Docusaurus.`,
+      copyright: `Copyright © ${new Date().getFullYear()} Agent Vigilo, Inc.`,
     },
     prism: {
       theme: prismThemes.github,

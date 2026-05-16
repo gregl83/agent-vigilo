@@ -28,3 +28,10 @@
   --ifm-color-primary-lightest: #4fddbf;
   --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
 }
+
+.docusaurus-mermaid-container {
+  background-color: white;
+  border-radius: 12px;
+  margin: 24px 0;
+  overflow: visible;
+}
