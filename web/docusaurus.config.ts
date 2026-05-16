@@ -127,7 +127,7 @@ const config: Config = {
             },
             {
               label: 'X',
-              href: 'https://x.com/docusaurus',
+              href: 'https://x.com/agentvigilo',
             },
           ],
         },
