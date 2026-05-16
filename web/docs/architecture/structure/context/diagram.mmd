@@ -16,12 +16,12 @@ flowchart TD
     CICD(("fa:fa-gears <br/> <b>CI/CD Runner</b> <br/> <small>[Software System]</small>")):::actor
 
     %% main system
-    AgentVigilo["fa:fa-diagram-project <br/> <b>Agent Vigilo</b> <br/> <small>[Software System]</small> <br/> <small>Orchestrates distributed evaluation runs</small>"]:::system
+    AgentVigilo["fa:fa-diagram-project <br/> <b>Agent Vigilo</b> <br/> <small>[Software System]</small> <br/> <small>Orchestrates distributed evaluation runs.</small>"]:::system
 
     %% external target
-    TargetAgent["fa:fa-brain <br/> <b>Agent / AI Provider</b> <br/> <small>[External System]</small> <br/> <small>The model, agent wrapper, or <br/> API endpoint being evaluated</small>"]:::external
+    TargetAgent["fa:fa-brain <br/> <b>Agent / AI Provider</b> <br/> <small>[External System]</small> <br/> <small>The model, agent wrapper, or <br/> API endpoint being evaluated.</small>"]:::external
 
     %% edges
-    User & AgentClient -->|Manages evaluators and <br/> runs using| AgentVigilo
+    User & AgentClient -->|"Manages evaluators, runs <br/> and runtime services using"| AgentVigilo
     CICD -->|Creates runs and <br/> gates deployments via| AgentVigilo
     AgentVigilo -->|Sends evaluation <br/> case prompts to| TargetAgent
