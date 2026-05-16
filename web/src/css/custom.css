@@ -34,4 +34,9 @@
   border-radius: 12px;
   margin: 24px 0;
   overflow: visible;
+
+  /* Add these to center the content horizontally */
+  display: flex;
+  justify-content: center;
+  align-items: center;
 }

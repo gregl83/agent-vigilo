@@ -2,6 +2,9 @@
 config:
   theme: neutral
   look: handDrawn
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
 ---
 flowchart TD
     %% styles
@@ -25,3 +28,6 @@ flowchart TD
     User & AgentClient -->|"Manages evaluators, runs <br/> and runtime services using"| AgentVigilo
     CICD -->|Creates runs and <br/> gates deployments via| AgentVigilo
     AgentVigilo -->|Sends evaluation <br/> case prompts to| TargetAgent
+
+    %% links
+    click AgentVigilo "/docs/architecture/structure/containers/agent-vigilo" "Agent Vigilo Containers"

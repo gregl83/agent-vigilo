@@ -30,14 +30,14 @@ flowchart TD
     Queue[("<b>Queue</b> <br/> <small>[Container: RabbitMQ]</small> <br/> <small>Stores and distributes run dataset case batches.</small>")]:::component
 
     %% system boundary
-    subgraph VigiloSystem["[Container] Agent Vigilo"]
+    subgraph VigiloSystem["&nbsp;"]
         Vigilo
         Coordinator
         Worker
         Database
         Queue
     end
-    style VigiloSystem fill:none,stroke:#1168bd,stroke-width:2px
+    style VigiloSystem stroke-dasharray: 5 5,fill:none,stroke:#1168bd,stroke-width:2px
 
     %% external target
     TargetAgent["fa:fa-brain <br/> <b>Agent / AI Provider</b> <br/> <small>[External System]</small> <br/> <small>The model, agent wrapper, or API endpoint being evaluated</small>"]:::external
@@ -53,3 +53,7 @@ flowchart TD
     Queue -->|"Streams run dataset case batches to <br> <small>[JSON/AMQP]</small>"| Worker
     Worker -->|"Reads from <br/> and writes to <br> <small>[SQL/TCP]</small>"| Database
     Worker -->|"Sends case prompts to and receives agent responses from <br> <small>[TEXT/HTTP]</small>"| TargetAgent
+
+    %% links
+    click Coordinator "/docs/architecture/structure/components/coordinator" "Coordinator Components"
+    click Worker "/docs/architecture/structure/components/worker" "Worker Components"
