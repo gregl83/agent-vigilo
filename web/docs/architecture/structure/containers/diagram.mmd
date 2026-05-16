@@ -4,28 +4,38 @@ config:
   look: handDrawn
 ---
 flowchart TD
-%% styles
+    %% styles
     classDef actor fill:#ebe7f5,color:#5e4b8d,stroke:#5e4b8d,stroke-width:2px
     classDef person fill:#d4e5f7,color:#08427b,stroke:#08427b,stroke-width:2px
     classDef system fill:#deebf7,color:#1168bd,stroke:#1168bd,stroke-width:2px
     classDef external fill:#f9f9f9,color:#666,stroke:#666,stroke-width:2px
 
-%% actors
+    %% actors
     User(("fa:fa-user <br/> <b>AI Engineer</b> <br/> <small>[Person]</small>")):::person
     AgentClient(("fa:fa-robot <br/> <b>Agentic Client</b> <br/> <small>[Software System]</small>")):::actor
     CICD(("fa:fa-gears <br/> <b>CI/CD Runner</b> <br/> <small>[Software System]</small>")):::actor
 
-%% components
+
+    %% components
     Vigilo["fa:fa-terminal <br/> <b>Vigilo Command Runtime</b> <br/> <small>[Container: Rust]</small> <br/> <small>Provides evaluator and run management functionality via CLI.</small>"]:::system
     Coordinator["fa:fa-compass <br/> <b>Coordinator</b> <br/> <small>[Container: Rust]</small> <br/> <small>Chunks run cases, publishes work batches, tracks progress, and handles orchestration failures.</small>"]:::system
     Worker["fa:fa-gear <br/> <b>Worker</b> <br/> <small>[Container: Rust]</small> <br/> <small>Consumes work batches, prompts the target agent, runs evaluators, validates output, and persists normalized results.</small>"]:::system
     Database[("<b>Database</b> <br/> <small>[Container: PostgreSQL]</small> <br/> <small>Stores evaluators, datasets, runs, case batches, results, events, and runtime state.</small>")]:::system
     Queue[("<b>Queue</b> <br/> <small>[Container: RabbitMQ]</small> <br/> <small>Stores and distributes run dataset case batches.</small>")]:::system
 
-%% external target
+    %% system boundary
+    subgraph VigiloSystem["[Container] Agent Vigilo"]
+        Vigilo
+        Coordinator
+        Worker
+        Database
+        Queue
+    end
+
+    %% external target
     TargetAgent["fa:fa-brain <br/> <b>Agent / AI Provider</b> <br/> <small>[External System]</small> <br/> <small>The model, agent wrapper, or <br/> API endpoint being evaluated</small>"]:::external
 
-%% edges
+    %% edges
     User & AgentClient -->|"Manages evaluators, runs <br/> and runtime services using"| Vigilo
     CICD -->|Creates runs and <br/> gates deployments via| Vigilo
     Vigilo -->|"Reads from <br/> and writes to <br> <small>[SQL/TCP]</small>"| Database
