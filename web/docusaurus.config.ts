@@ -116,6 +116,10 @@ const config: Config = {
               label: 'Getting Started',
               to: '/docs/guides/getting-started',
             },
+            {
+              label: 'Architecture',
+              to: '/docs/architecture',
+            },
           ],
         },
         {
