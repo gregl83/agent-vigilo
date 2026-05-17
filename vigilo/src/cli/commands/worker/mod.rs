@@ -42,6 +42,9 @@ use crate::{
     runtime::ServiceRunner,
 };
 
+mod once;
+mod start;
+
 const CHUNK_LEASE_SECONDS: i32 = 60;
 const RUN_CONTEXT_CACHE_MAX_ENTRIES: u64 = 1024;
 const RUN_CONTEXT_CACHE_TTI_SECONDS: u64 = 900;
@@ -240,65 +243,15 @@ impl Executable for Command {
         match self.command {
             Some(SubCommand::Start) => {
                 info!("starting worker process");
-                handle_start(context).await
+                start::exec(context).await
             }
             Some(SubCommand::Once) => {
                 info!("running single worker cycle");
-                handle_once(context).await
+                once::exec(context).await
             }
             None => anyhow::bail!("missing worker subcommand; use `vigilo worker start`"),
         }
     }
-}
-
-/// Starts the long-running worker loop.
-async fn handle_start(context: Context) -> anyhow::Result<()> {
-    let evaluator_loader = EvaluatorLoaderService::new(context.clone());
-    ServiceRunner::new("worker")
-        .run(move |shutdown| {
-            let context = context.clone();
-            let evaluator_loader = evaluator_loader.clone();
-            async move {
-                let mq = context.mq().await?;
-                let mut consumer = mq
-                    .consume_worker_stream("vigilo-worker", WORKER_STREAM_PREFETCH)
-                    .await?;
-
-                loop {
-                    tokio::select! {
-                        _ = shutdown.cancelled() => return Ok(()),
-                        delivery = consumer.next() => {
-                            let Some(delivery_result) = delivery else {
-                                warn!("worker consumer stream closed; reopening consumer");
-                                consumer = mq
-                                    .consume_worker_stream("vigilo-worker", WORKER_STREAM_PREFETCH)
-                                    .await?;
-                                continue;
-                            };
-
-                            let delivery = delivery_result
-                                .map_err(|err| anyhow::anyhow!("worker consumer delivery failed: {}", err))?;
-                            let payload = serde_json::from_slice::<serde_json::Value>(&delivery.data)
-                                .map_err(|err| anyhow::anyhow!("failed to deserialize message payload: {}", err))?;
-
-                            let message = crate::mq::ConsumedMessage {
-                                delivery_tag: delivery.delivery_tag,
-                                payload,
-                            };
-                            run_worker_message(context.clone(), &evaluator_loader, message).await?;
-                        }
-                    }
-                }
-            }
-        })
-        .await
-}
-
-/// Processes one worker cycle and exits.
-async fn handle_once(context: Context) -> anyhow::Result<()> {
-    let evaluator_loader = EvaluatorLoaderService::new(context.clone());
-    run_worker_drain_pass(context, &evaluator_loader, 1).await?;
-    Ok(())
 }
 
 /// Executes a single worker cycle.

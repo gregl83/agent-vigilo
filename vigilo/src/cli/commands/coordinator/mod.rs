@@ -33,6 +33,9 @@ use crate::{
     runtime::ServiceRunner,
 };
 
+mod once;
+mod start;
+
 const COORDINATOR_TICK_SECONDS: u64 = 5;
 const COORDINATOR_LEASE_SECONDS: i32 = 60;
 const COORDINATOR_MAX_DISPATCH_PER_CYCLE: usize = 64;
@@ -69,36 +72,15 @@ impl Executable for Command {
         match self.command {
             Some(SubCommand::Start) => {
                 info!("starting coordinator process");
-                handle_start(context).await
+                start::exec(context).await
             }
             Some(SubCommand::Once) => {
                 info!("running single coordinator cycle");
-                handle_once(context).await
+                once::exec(context).await
             }
             None => anyhow::bail!("missing coordinator subcommand; use `vigilo coordinator start`"),
         }
     }
-}
-
-/// Starts the long-running coordinator loop.
-async fn handle_start(context: Context) -> anyhow::Result<()> {
-    // One logical coordinator id is reused across loop iterations.
-    let coordinator_id = Uuid::now_v7();
-    ServiceRunner::new("coordinator")
-        .tick_interval(Duration::from_secs(COORDINATOR_TICK_SECONDS))
-        .run_loop(move || {
-            let context = context.clone();
-            async move { run_coordinator_cycle(context, coordinator_id).await }
-        })
-        .await
-}
-
-/// Runs a single coordinator cycle with a fresh coordinator id.
-///
-/// Useful for cron-like orchestration or local debugging.
-async fn handle_once(context: Context) -> anyhow::Result<()> {
-    let coordinator_id = Uuid::now_v7();
-    run_coordinator_cycle(context, coordinator_id).await
 }
 
 /// Executes one full coordinator cycle.
