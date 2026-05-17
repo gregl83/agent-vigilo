@@ -15,6 +15,18 @@
   --ifm-color-primary-lightest: #3cad6e;
   --ifm-code-font-size: 95%;
   --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+  --diagram-user-fill: #bbf7d0;
+  --diagram-user-stroke: #16a34a;
+  --diagram-user-text: #14532d;
+  --diagram-system-fill: #bfdbfe;
+  --diagram-system-stroke: #2563eb;
+  --diagram-system-text: #1e3a8a;
+  --diagram-component-fill: #bfdbfe;
+  --diagram-component-stroke: #2563eb;
+  --diagram-component-text: #1e3a8a;
+  --diagram-external-fill: #fed7aa;
+  --diagram-external-stroke: #ea580c;
+  --diagram-external-text: #7c2d12;
 }
 
 /* For readability concerns, you should choose a lighter palette in dark mode. */
@@ -27,16 +39,122 @@
   --ifm-color-primary-lighter: #32d8b4;
   --ifm-color-primary-lightest: #4fddbf;
   --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+  --diagram-user-fill: #14532d;
+  --diagram-user-stroke: #4ade80;
+  --diagram-user-text: #f0fdf4;
+  --diagram-system-fill: #1e3a8a;
+  --diagram-system-stroke: #60a5fa;
+  --diagram-system-text: #e0f2fe;
+  --diagram-component-fill: #1e3a8a;
+  --diagram-component-stroke: #60a5fa;
+  --diagram-component-text: #e0f2fe;
+  --diagram-external-fill: #7c2d12;
+  --diagram-external-stroke: #fb923c;
+  --diagram-external-text: #fff7ed;
 }
 
-.docusaurus-mermaid-container {
-  background-color: white;
-  border-radius: 12px;
-  margin: 24px 0;
-  overflow: visible;
+/* Light Mode Background Mask */
+.docusaurus-mermaid-container div.labelBkg {
+  background-color: #ffffff !important; /* Put your exact light mode bg hex here */
+  color: #000000 !important;
+}
+/* Dark Mode Background Mask */
+[data-theme='dark'] .docusaurus-mermaid-container div.labelBkg {
+  background-color: #1b1b1d !important; /* Put your exact dark mode bg hex here */
+  color: #ffffff !important;
+}
 
-  /* Add these to center the content horizontally */
-  display: flex;
-  justify-content: center;
-  align-items: center;
+/* ==================== ACTOR NODE ==================== */
+.docusaurus-mermaid-container .actor :is(rect, circle, polygon, path, .label-container) {
+  fill: var(--diagram-user-fill) !important;
+  stroke: var(--diagram-user-fill) !important;
+}
+.docusaurus-mermaid-container .actor :is(path[stroke-width="1.3"]) {
+  stroke: var(--diagram-user-stroke) !important;
+  stroke-width: 2;
+}
+.docusaurus-mermaid-container .actor :is(.label, foreignObject, span, p, b, i, .fa) {
+  color: var(--diagram-user-text) !important;
+}
+.docusaurus-mermaid-container .actor :is(.label, foreignObject) path {
+  fill: var(--diagram-user-text) !important;
+}
+
+/* ==================== PERSON NODE ==================== */
+.docusaurus-mermaid-container .person :is(rect, circle, polygon, path, .label-container) {
+  fill: var(--diagram-user-fill) !important;
+  stroke: var(--diagram-user-fill) !important;
+}
+.docusaurus-mermaid-container .person :is(path[stroke-width="1.3"]) {
+  stroke: var(--diagram-user-stroke) !important;
+  stroke-width: 2;
+}
+.docusaurus-mermaid-container .person :is(.label, foreignObject, span, p, b, i, .fa) {
+  color: var(--diagram-user-text) !important;
+}
+.docusaurus-mermaid-container .person :is(.label, foreignObject) path {
+  fill: var(--diagram-user-text) !important;
+}
+
+/* ==================== SYSTEM NODE ==================== */
+.docusaurus-mermaid-container .system :is(rect, circle, polygon, path, .label-container) {
+  fill: var(--diagram-system-fill) !important;
+  stroke: var(--diagram-system-fill) !important;
+}
+.docusaurus-mermaid-container .system :is(path[stroke-width="1.3"]) {
+  stroke: var(--diagram-system-stroke) !important;
+}
+.docusaurus-mermaid-container .system :is(.label, foreignObject, span, p, b, i, .fa) {
+  color: var(--diagram-system-text) !important;
+}
+.docusaurus-mermaid-container .system :is(.label, foreignObject) path {
+  fill: var(--diagram-system-text) !important;
+}
+
+/* ==================== COMPONENT NODE ==================== */
+.docusaurus-mermaid-container .component :is(rect, circle, polygon, path, .label-container) {
+  fill: var(--diagram-component-fill) !important;
+  stroke: var(--diagram-component-fill) !important;
+}
+.docusaurus-mermaid-container .component :is(path[stroke-width="1.3"]) {
+  stroke: var(--diagram-component-stroke) !important;
+}
+.docusaurus-mermaid-container .component :is(.label, foreignObject, span, p, b, i, .fa) {
+  color: var(--diagram-component-text) !important;
+}
+.docusaurus-mermaid-container .component :is(.label, foreignObject) path {
+  fill: var(--diagram-component-text) !important;
+}
+
+/* ==================== EXTERNAL NODE ==================== */
+.docusaurus-mermaid-container .external :is(rect, circle, polygon, path, .label-container) {
+  fill: var(--diagram-external-fill) !important;
+  stroke: var(--diagram-external-fill) !important;
+}
+.docusaurus-mermaid-container .external :is(path[stroke-width="1.3"]) {
+  stroke: var(--diagram-external-stroke) !important;
+}
+.docusaurus-mermaid-container .external :is(.label, foreignObject, span, p, b, i, .fa) {
+  color: var(--diagram-external-text) !important;
+}
+.docusaurus-mermaid-container .external :is(.label, foreignObject) path {
+  fill: var(--diagram-external-text) !important;
+}
+
+/* ==================== CLICKABLE NODE ==================== */
+/* 1. Force the pointer cursor on any node configured with a link */
+.docusaurus-mermaid-container .clickable,
+.docusaurus-mermaid-container .clickable * {
+  cursor: pointer !important;
+}
+/* 2. Create a beautiful sketchy "glow" effect on hover */
+.docusaurus-mermaid-container .clickable {
+  transition: transform 0.15s ease-in-out, filter 0.15s ease-in-out;
+}
+.docusaurus-mermaid-container .clickable:hover {
+  /* Subtle lift effect */
+  transform: translateY(-2px);
+
+  /* Creates a sketchy neon/drop-shadow glow using your blue stroke variable */
+  filter: drop-shadow(0px 4px 8px var(--diagram-system-stroke)) !important;
 }
