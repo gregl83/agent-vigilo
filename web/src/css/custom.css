@@ -71,7 +71,7 @@
 }
 .docusaurus-mermaid-container .actor :is(path[stroke-width="1.3"]) {
   stroke: var(--diagram-user-stroke) !important;
-  stroke-width: 2;
+  stroke-width: 2 !important;
 }
 .docusaurus-mermaid-container .actor :is(.label, foreignObject, span, p, b, i, .fa) {
   color: var(--diagram-user-text) !important;
@@ -87,7 +87,7 @@
 }
 .docusaurus-mermaid-container .person :is(path[stroke-width="1.3"]) {
   stroke: var(--diagram-user-stroke) !important;
-  stroke-width: 2;
+  stroke-width: 2 !important;
 }
 .docusaurus-mermaid-container .person :is(.label, foreignObject, span, p, b, i, .fa) {
   color: var(--diagram-user-text) !important;
@@ -99,10 +99,8 @@
 /* ==================== SYSTEM NODE ==================== */
 .docusaurus-mermaid-container .system :is(rect, circle, polygon, path, .label-container) {
   fill: var(--diagram-system-fill) !important;
-  stroke: var(--diagram-system-fill) !important;
-}
-.docusaurus-mermaid-container .system :is(path[stroke-width="1.3"]) {
   stroke: var(--diagram-system-stroke) !important;
+  stroke-width: 2 !important;
 }
 .docusaurus-mermaid-container .system :is(.label, foreignObject, span, p, b, i, .fa) {
   color: var(--diagram-system-text) !important;
@@ -114,10 +112,8 @@
 /* ==================== COMPONENT NODE ==================== */
 .docusaurus-mermaid-container .component :is(rect, circle, polygon, path, .label-container) {
   fill: var(--diagram-component-fill) !important;
-  stroke: var(--diagram-component-fill) !important;
-}
-.docusaurus-mermaid-container .component :is(path[stroke-width="1.3"]) {
   stroke: var(--diagram-component-stroke) !important;
+  stroke-width: 2 !important;
 }
 .docusaurus-mermaid-container .component :is(.label, foreignObject, span, p, b, i, .fa) {
   color: var(--diagram-component-text) !important;
@@ -129,10 +125,8 @@
 /* ==================== EXTERNAL NODE ==================== */
 .docusaurus-mermaid-container .external :is(rect, circle, polygon, path, .label-container) {
   fill: var(--diagram-external-fill) !important;
-  stroke: var(--diagram-external-fill) !important;
-}
-.docusaurus-mermaid-container .external :is(path[stroke-width="1.3"]) {
   stroke: var(--diagram-external-stroke) !important;
+  stroke-width: 2 !important;
 }
 .docusaurus-mermaid-container .external :is(.label, foreignObject, span, p, b, i, .fa) {
   color: var(--diagram-external-text) !important;
