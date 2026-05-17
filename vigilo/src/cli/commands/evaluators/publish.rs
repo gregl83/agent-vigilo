@@ -9,35 +9,11 @@ pub(super) async fn exec(
     info!("publishing evaluator: {}", evaluator_path.display());
 
     let profile = get_manifest_profile(release, profile);
-    let component = context
-        .wasm()
-        .await?
-        .prepare_evaluator(evaluator_path, profile)?;
-
-    let db = context.db().await?;
-    let evaluator = evaluators::insert_evaluator(
-        db,
-        &EvaluatorDraft {
-            namespace: DEFAULT_NAMESPACE.to_string(),
-            name: component.name,
-            version: component.version,
-            content_hash: component.wasm_hash,
-            wasm_bytes: component.wasm_bytes,
-            interface_name: component.interface_name,
-            interface_version: component.interface_version,
-            wit_world: component.wit_world,
-            runtime: component.runtime,
-            runtime_version: component.runtime_version,
-            runtime_fingerprint: component.runtime_fingerprint,
-            description: component.description,
-            tags: component.tags,
-            metadata: component.metadata,
-        },
-    )
-    .await?;
-
+    let outcome =
+        crate::evaluators::publish_vigilo_evaluator(&context, evaluator_path, profile).await?;
+    let evaluator = outcome.evaluator();
     info!(
-        "successfully published evaluator: {}/{}:{}",
+        "finished evaluator publish for {}/{}:{}",
         evaluator.namespace, evaluator.name, evaluator.version,
     );
 

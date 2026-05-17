@@ -28,6 +28,7 @@ use context::{
 };
 mod contracts;
 mod db;
+mod evaluators;
 mod manifest;
 mod models;
 mod mq;

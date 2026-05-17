@@ -34,7 +34,6 @@ use crate::{
     },
     db::tables::evaluators,
     models::evaluator::{
-        EvaluatorDraft,
         EvaluatorPatch,
         EvaluatorState,
     },

@@ -16,6 +16,7 @@ use super::{
 use crate::{
     context::Context,
     db::migrations,
+    evaluators,
 };
 
 #[derive(Debug, Args)]
@@ -27,6 +28,10 @@ pub(crate) struct Command {
     /// Path to migrations source directory
     #[arg(long, default_value = "migrations", value_parser = parse_dir)]
     pub migrations_dir: PathBuf,
+
+    /// Skip built-in evaluator release builds and registry publishing
+    #[arg(long, default_value_t = false)]
+    pub skip_evaluators: bool,
 }
 
 #[async_trait]
@@ -43,9 +48,11 @@ impl Executable for Command {
         info!("running database migrations");
         migrations::migrate(db, self.migrations_dir).await?;
 
-        info!("adding evaluators");
-
-        // todo - add evaluators that exist in repository ./evaluators directory (verify eval or skip)
+        if self.skip_evaluators {
+            info!("skipping built-in evaluator publishing");
+        } else {
+            evaluators::bootstrap_project_evaluators(&context).await?;
+        }
 
         Ok(())
     }

@@ -196,6 +196,32 @@ pub(crate) async fn select_evaluator(
     Ok(evaluator)
 }
 
+/// Finds an evaluator by namespace and content hash.
+pub(crate) async fn select_evaluator_by_content_hash(
+    db: &PgPool,
+    namespace: &str,
+    content_hash: &str,
+) -> anyhow::Result<Option<Evaluator>> {
+    let evaluator = sqlx::query_as::<_, Evaluator>(
+        r#"
+        SELECT
+            id, namespace, name, version, content_hash, wasm_bytes,
+            wasm_size_bytes, interface_name, interface_version,
+            wit_world, runtime, runtime_version, runtime_fingerprint,
+            description, tags, metadata, state, state_reason, created_at, updated_at
+        FROM evaluators
+        WHERE namespace = $1 AND content_hash = $2
+        LIMIT 1
+        "#,
+    )
+    .bind(namespace)
+    .bind(content_hash)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(evaluator)
+}
+
 /// Lists evaluators in a namespace for management and discovery views.
 pub(crate) async fn list_evaluators(
     db: &PgPool,
