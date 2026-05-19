@@ -30,8 +30,51 @@ type ViewportTransform = {
   y: number;
 };
 
+type GesturePoint = {
+  clientX: number;
+  clientY: number;
+  pointerId: number;
+};
+
+type DragGesture = {
+  pointerId: number;
+  startClientX: number;
+  startClientY: number;
+  startPan: {
+    x: number;
+    y: number;
+  };
+};
+
+type PinchGesture = {
+  startDistance: number;
+  startMiddle: {
+    clientX: number;
+    clientY: number;
+  };
+  startPan: {
+    x: number;
+    y: number;
+  };
+  startScale: number;
+};
+
 function clampScale(scale: number): number {
   return Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale));
+}
+
+function getPointerDistance(first: GesturePoint, second: GesturePoint): number {
+  return Math.hypot(
+    second.clientX - first.clientX,
+    second.clientY - first.clientY,
+  );
+}
+
+function getPointerMiddle(first: GesturePoint, second: GesturePoint) {
+  return {
+    clientX: (first.clientX + second.clientX) / 2,
+    clientY: (first.clientY + second.clientY) / 2,
+  };
 }
 
 export default function DiagramViewport({
@@ -148,7 +191,10 @@ export default function DiagramViewport({
 
     const getInitialTransform = (width: number, height: number) => {
       const viewportRect = viewport.getBoundingClientRect();
-      const availableWidth = Math.max(viewportRect.width - viewportPadding * 2, 1);
+      const availableWidth = Math.max(
+        viewportRect.width - viewportPadding * 2,
+        1,
+      );
       const availableHeight = Math.max(
         viewportRect.height - viewportPadding * 2,
         1,
@@ -212,18 +258,9 @@ export default function DiagramViewport({
         animate: false,
         canvas: true,
         cursor: 'grab',
-        excludeClass: 'clickable',
-        handleStartEvent: (event: Event) => {
-          const target = event.target;
-          if (target instanceof Element && target.closest('a, .clickable')) {
-            return;
-          }
-
-          event.preventDefault();
-          event.stopPropagation();
-        },
         maxScale: MAX_SCALE,
         minScale: MIN_SCALE,
+        noBind: true,
         origin: '0 0',
         overflow: 'hidden',
         startScale: initial.scale,
@@ -244,13 +281,208 @@ export default function DiagramViewport({
 
       event.preventDefault();
       const currentScale = panzoomRef.current.getScale();
-      const delta = event.deltaY === 0 && event.deltaX ? event.deltaX : event.deltaY;
+      const delta =
+        event.deltaY === 0 && event.deltaX ? event.deltaX : event.deltaY;
       const wheel = delta < 0 ? 1 : -1;
       const nextScale = currentScale * Math.exp((wheel * ZOOM_STEP) / 3);
       zoomToViewportPoint(nextScale, event);
     };
 
+    const activePointers = new Map<number, GesturePoint>();
+    let dragGesture: DragGesture | null = null;
+    let pinchGesture: PinchGesture | null = null;
+
+    const shouldIgnorePointerTarget = (target: EventTarget | null) =>
+      target instanceof Element && Boolean(target.closest('a, .clickable'));
+
+    const getFirstPointers = () => {
+      const [first, second] = Array.from(activePointers.values());
+      if (!first || !second) {
+        return null;
+      }
+
+      return {first, second};
+    };
+
+    const startDragGesture = (pointer: GesturePoint) => {
+      const panzoom = panzoomRef.current;
+      if (!panzoom) {
+        return;
+      }
+
+      dragGesture = {
+        pointerId: pointer.pointerId,
+        startClientX: pointer.clientX,
+        startClientY: pointer.clientY,
+        startPan: panzoom.getPan(),
+      };
+    };
+
+    const startPinchGesture = () => {
+      const panzoom = panzoomRef.current;
+      const pointers = getFirstPointers();
+      if (!panzoom || !pointers) {
+        pinchGesture = null;
+        return;
+      }
+
+      const distance = getPointerDistance(pointers.first, pointers.second);
+      if (distance === 0) {
+        pinchGesture = null;
+        return;
+      }
+
+      pinchGesture = {
+        startDistance: distance,
+        startMiddle: getPointerMiddle(pointers.first, pointers.second),
+        startPan: panzoom.getPan(),
+        startScale: panzoom.getScale(),
+      };
+    };
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const panzoom = panzoomRef.current;
+      if (!panzoom || shouldIgnorePointerTarget(event.target)) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      if (!viewport.hasPointerCapture(event.pointerId)) {
+        viewport.setPointerCapture(event.pointerId);
+      }
+
+      const pointer = {
+        clientX: event.clientX,
+        clientY: event.clientY,
+        pointerId: event.pointerId,
+      };
+      activePointers.set(event.pointerId, pointer);
+
+      if (activePointers.size >= 2) {
+        dragGesture = null;
+        startPinchGesture();
+        return;
+      }
+
+      pinchGesture = null;
+      startDragGesture(pointer);
+    };
+
+    const handlePointerMove = (event: PointerEvent) => {
+      const pointer = activePointers.get(event.pointerId);
+      const panzoom = panzoomRef.current;
+      if (!pointer || !panzoom) {
+        return;
+      }
+
+      event.preventDefault();
+      activePointers.set(event.pointerId, {
+        clientX: event.clientX,
+        clientY: event.clientY,
+        pointerId: event.pointerId,
+      });
+
+      if (activePointers.size >= 2) {
+        const pointers = getFirstPointers();
+        if (!pointers) {
+          return;
+        }
+
+        if (!pinchGesture) {
+          startPinchGesture();
+        }
+
+        if (!pinchGesture) {
+          return;
+        }
+
+        const currentDistance = getPointerDistance(
+          pointers.first,
+          pointers.second,
+        );
+        if (currentDistance === 0) {
+          return;
+        }
+
+        const rect = viewport.getBoundingClientRect();
+        const currentMiddle = getPointerMiddle(pointers.first, pointers.second);
+        const currentMiddleX = currentMiddle.clientX - rect.left;
+        const currentMiddleY = currentMiddle.clientY - rect.top;
+        const startMiddleX = pinchGesture.startMiddle.clientX - rect.left;
+        const startMiddleY = pinchGesture.startMiddle.clientY - rect.top;
+        const nextScale = clampScale(
+          (pinchGesture.startScale * currentDistance) /
+            pinchGesture.startDistance,
+        );
+
+        panzoom.zoom(nextScale, {
+          animate: false,
+          force: true,
+        });
+        // Keep the diagram point that began under the pinch midpoint
+        // under the current midpoint as the fingers move.
+        panzoom.pan(
+          pinchGesture.startPan.x +
+            currentMiddleX / nextScale -
+            startMiddleX / pinchGesture.startScale,
+          pinchGesture.startPan.y +
+            currentMiddleY / nextScale -
+            startMiddleY / pinchGesture.startScale,
+          {
+            animate: false,
+            force: true,
+          },
+        );
+        return;
+      }
+
+      if (!dragGesture || dragGesture.pointerId !== event.pointerId) {
+        return;
+      }
+
+      const currentScale = panzoom.getScale();
+      panzoom.pan(
+        dragGesture.startPan.x +
+          (event.clientX - dragGesture.startClientX) / currentScale,
+        dragGesture.startPan.y +
+          (event.clientY - dragGesture.startClientY) / currentScale,
+        {
+          animate: false,
+          force: true,
+        },
+      );
+    };
+
+    const handlePointerUp = (event: PointerEvent) => {
+      activePointers.delete(event.pointerId);
+      if (viewport.hasPointerCapture(event.pointerId)) {
+        viewport.releasePointerCapture(event.pointerId);
+      }
+
+      if (activePointers.size >= 2) {
+        startPinchGesture();
+        return;
+      }
+
+      pinchGesture = null;
+      const [remainingPointer] = Array.from(activePointers.values());
+      if (remainingPointer) {
+        startDragGesture(remainingPointer);
+      } else {
+        dragGesture = null;
+      }
+    };
+
     viewport.addEventListener('wheel', handleWheel, {passive: false});
+    viewport.addEventListener('pointerdown', handlePointerDown, {
+      passive: false,
+    });
+    viewport.addEventListener('pointermove', handlePointerMove, {
+      passive: false,
+    });
+    viewport.addEventListener('pointerup', handlePointerUp);
+    viewport.addEventListener('pointercancel', handlePointerUp);
 
     void import('@panzoom/panzoom').then((module) => {
       if (disposed) {
@@ -290,6 +522,10 @@ export default function DiagramViewport({
     return () => {
       disposed = true;
       viewport.removeEventListener('wheel', handleWheel);
+      viewport.removeEventListener('pointerdown', handlePointerDown);
+      viewport.removeEventListener('pointermove', handlePointerMove);
+      viewport.removeEventListener('pointerup', handlePointerUp);
+      viewport.removeEventListener('pointercancel', handlePointerUp);
       observer.disconnect();
       resizeObserver.disconnect();
       destroyPanzoom(false);
