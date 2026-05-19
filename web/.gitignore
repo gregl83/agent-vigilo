@@ -7,6 +7,8 @@
 # Generated files
 .docusaurus
 .cache-loader
+.chrome-diagram-test
+.edge-diagram-test
 
 # Misc
 .DS_Store

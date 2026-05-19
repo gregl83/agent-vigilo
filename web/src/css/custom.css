@@ -64,6 +64,14 @@
   color: #ffffff !important;
 }
 
+.docusaurus-mermaid-container {
+  max-width: 100%;
+}
+
+.docusaurus-mermaid-container > svg {
+  max-width: 100%;
+}
+
 /* ==================== ACTOR NODE ==================== */
 .docusaurus-mermaid-container .actor :is(rect, circle, polygon, path, .label-container) {
   fill: var(--diagram-user-fill) !important;

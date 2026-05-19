@@ -118,7 +118,7 @@ const config: Config = {
             },
             {
               label: 'Architecture',
-              to: '/docs/architecture',
+              to: '/docs/architecture/structure/context/',
             },
           ],
         },
