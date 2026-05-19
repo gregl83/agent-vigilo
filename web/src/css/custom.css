@@ -53,15 +53,14 @@
   --diagram-external-text: #fff7ed;
 }
 
-/* Light Mode Background Mask */
-.docusaurus-mermaid-container div.labelBkg {
-  background-color: #ffffff !important; /* Put your exact light mode bg hex here */
-  color: #000000 !important;
+/* Edge label backgrounds match the surrounding diagram viewer surface. */
+.docusaurus-mermaid-container :is(div.labelBkg, .edgeLabel .labelBkg) {
+  background-color: var(--ifm-background-surface-color) !important;
 }
-/* Dark Mode Background Mask */
-[data-theme='dark'] .docusaurus-mermaid-container div.labelBkg {
-  background-color: #1b1b1d !important; /* Put your exact dark mode bg hex here */
-  color: #ffffff !important;
+
+.docusaurus-mermaid-container :is(rect.labelBkg, .edgeLabel rect) {
+  fill: var(--ifm-background-surface-color) !important;
+  stroke: var(--ifm-background-surface-color) !important;
 }
 
 .docusaurus-mermaid-container {
