@@ -1,0 +1,42 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+flowchart TD
+    Start([vigilo evaluators search])
+
+    Args{CLI arguments valid?}
+    Query{Non-empty text query?}
+
+    FilteredSearch[Search namespace with text match]
+    NamespaceSearch[Search namespace without text filter]
+    Payload[Build data/meta payload]
+
+    Success([Success response])
+
+    ArgsFail([CLI argument error])
+    SearchFail([Database or search error])
+
+    Start --> Args
+
+    Args -- No --> ArgsFail
+    Args -- Yes --> Query
+
+    Query -- Yes --> FilteredSearch
+    Query -- No --> NamespaceSearch
+
+    FilteredSearch --> Payload
+    NamespaceSearch --> Payload
+
+    Payload --> Success
+    FilteredSearch -. Query fails .-> SearchFail
+    NamespaceSearch -. Query fails .-> SearchFail
+
+    class Start command
+    class Success success
+    class Args,Query,FilteredSearch,NamespaceSearch,Payload system
+    class ArgsFail,SearchFail error

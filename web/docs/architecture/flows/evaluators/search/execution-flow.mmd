@@ -1,0 +1,23 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+sequenceDiagram
+    actor User
+    participant Vigilo
+    participant DB as Evaluators DB
+
+    User->>Vigilo: vigilo evaluators search
+    activate Vigilo
+
+    Vigilo->>Vigilo: Resolve namespace, query, and bounded limit
+    Vigilo->>DB: Search evaluator summaries
+    DB-->>Vigilo: Matching summaries, possibly empty
+
+    Vigilo->>Vigilo: Build data/meta payload
+    Vigilo-->>User: Success response
+    deactivate Vigilo
