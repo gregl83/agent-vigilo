@@ -33,3 +33,8 @@ flowchart TD
     Hash -- No --> Persist
 
     Persist --> Success
+
+    class Start command
+    class Success success
+    class Compile,Version,Hash,Persist system
+    class CompileFail,VersionFail,HashFail error

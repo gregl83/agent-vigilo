@@ -27,6 +27,15 @@
   --diagram-external-fill: #fed7aa;
   --diagram-external-stroke: #ea580c;
   --diagram-external-text: #7c2d12;
+  --diagram-success-fill: #bbf7d0;
+  --diagram-success-stroke: #16a34a;
+  --diagram-success-text: #14532d;
+  --diagram-error-fill: #fecaca;
+  --diagram-error-stroke: #dc2626;
+  --diagram-error-text: #7f1d1d;
+  --diagram-command-fill: #ddd6fe;
+  --diagram-command-stroke: #7c3aed;
+  --diagram-command-text: #3b0764;
 }
 
 /* For readability concerns, you should choose a lighter palette in dark mode. */
@@ -51,6 +60,15 @@
   --diagram-external-fill: #7c2d12;
   --diagram-external-stroke: #fb923c;
   --diagram-external-text: #fff7ed;
+  --diagram-command-fill: #4c1d95;
+  --diagram-command-stroke: #a78bfa;
+  --diagram-command-text: #f5f3ff;
+  --diagram-success-fill: #14532d;
+  --diagram-success-stroke: #4ade80;
+  --diagram-success-text: #f0fdf4;
+  --diagram-error-fill: #7f1d1d;
+  --diagram-error-stroke: #f87171;
+  --diagram-error-text: #fee2e2;
 }
 
 /* Edge label backgrounds match the surrounding diagram viewer surface. */
@@ -162,6 +180,45 @@
 }
 .docusaurus-mermaid-container .component :is(.label, foreignObject) path {
   fill: var(--diagram-component-text) !important;
+}
+
+/* ==================== COMMAND NODE ==================== */
+.docusaurus-mermaid-container .command :is(rect, circle, polygon, path, .label-container) {
+  fill: var(--diagram-command-fill) !important;
+  stroke: var(--diagram-command-stroke) !important;
+  stroke-width: 2 !important;
+}
+.docusaurus-mermaid-container .command :is(.label, foreignObject, span, p, b, i, .fa) {
+  color: var(--diagram-command-text) !important;
+}
+.docusaurus-mermaid-container .command :is(.label, foreignObject) path {
+  fill: var(--diagram-command-text) !important;
+}
+
+/* ==================== SUCCESS NODE ==================== */
+.docusaurus-mermaid-container .success :is(rect, circle, polygon, path, .label-container) {
+  fill: var(--diagram-success-fill) !important;
+  stroke: var(--diagram-success-stroke) !important;
+  stroke-width: 2 !important;
+}
+.docusaurus-mermaid-container .success :is(.label, foreignObject, span, p, b, i, .fa) {
+  color: var(--diagram-success-text) !important;
+}
+.docusaurus-mermaid-container .success :is(.label, foreignObject) path {
+  fill: var(--diagram-success-text) !important;
+}
+
+/* ==================== ERROR NODE ==================== */
+.docusaurus-mermaid-container .error :is(rect, circle, polygon, path, .label-container) {
+  fill: var(--diagram-error-fill) !important;
+  stroke: var(--diagram-error-stroke) !important;
+  stroke-width: 2 !important;
+}
+.docusaurus-mermaid-container .error :is(.label, foreignObject, span, p, b, i, .fa) {
+  color: var(--diagram-error-text) !important;
+}
+.docusaurus-mermaid-container .error :is(.label, foreignObject) path {
+  fill: var(--diagram-error-text) !important;
 }
 
 /* ==================== EXTERNAL NODE ==================== */
