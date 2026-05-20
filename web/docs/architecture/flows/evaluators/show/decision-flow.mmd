@@ -1,0 +1,39 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+flowchart TD
+    Start([vigilo evaluators show])
+
+    Identifier{Fully qualified identifier?}
+    Lookup[Lookup evaluator by identity]
+    Found{Evaluator exists?}
+    Payload[Build detail payload]
+
+    Success([Success response])
+
+    IdentifierFail([Identifier format error])
+    NotFoundFail([Evaluator not found error])
+    LookupFail([Database lookup error])
+
+    Start --> Identifier
+
+    Identifier -- No --> IdentifierFail
+    Identifier -- Yes --> Lookup
+
+    Lookup --> Found
+    Lookup -. Lookup fails .-> LookupFail
+
+    Found -- Yes --> Payload
+    Found -- No --> NotFoundFail
+
+    Payload --> Success
+
+    class Start command
+    class Success success
+    class Identifier,Lookup,Found,Payload system
+    class IdentifierFail,NotFoundFail,LookupFail error

@@ -1,0 +1,29 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+sequenceDiagram
+    actor User
+    participant Vigilo
+    participant DB as Evaluators DB
+
+    User->>Vigilo: vigilo evaluators show
+    activate Vigilo
+
+    Vigilo->>Vigilo: Parse evaluator identifier
+    Vigilo->>DB: Select evaluator by identity
+
+    alt Evaluator found
+        DB-->>Vigilo: Evaluator record
+        Vigilo->>Vigilo: Build detail payload
+        Vigilo-->>User: Success response
+    else Evaluator missing
+        DB-->>Vigilo: No evaluator record
+        Vigilo-->>User: Not found error
+    end
+
+    deactivate Vigilo
