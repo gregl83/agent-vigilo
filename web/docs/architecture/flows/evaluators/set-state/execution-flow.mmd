@@ -1,0 +1,28 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+sequenceDiagram
+    actor User
+    participant Vigilo
+    participant DB as Evaluators DB
+
+    User->>Vigilo: vigilo evaluators set-state
+    activate Vigilo
+
+    Vigilo->>Vigilo: Parse evaluator identifier and requested state
+    Vigilo->>DB: Update evaluator lifecycle state
+
+    alt Evaluator updated
+        DB-->>Vigilo: State update applied
+        Vigilo-->>User: Success response
+    else Evaluator not updated
+        DB-->>Vigilo: No mutable evaluator row
+        Vigilo-->>User: State update error
+    end
+
+    deactivate Vigilo

@@ -1,0 +1,41 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+flowchart TD
+    Start([vigilo evaluators set-state])
+
+    Identifier{Fully qualified identifier?}
+    State{Requested state valid?}
+    Update[Update evaluator lifecycle state]
+    Updated{Any evaluator row updated?}
+
+    Success([Success response])
+
+    IdentifierFail([Identifier format error])
+    StateFail([State value error])
+    UpdateFail([Database update error])
+    NotUpdatedFail([State update error])
+
+    Start --> Identifier
+
+    Identifier -- No --> IdentifierFail
+    Identifier -- Yes --> State
+
+    State -- No --> StateFail
+    State -- Yes --> Update
+
+    Update --> Updated
+    Update -. Update fails .-> UpdateFail
+
+    Updated -- Yes --> Success
+    Updated -- No --> NotUpdatedFail
+
+    class Start command
+    class Success success
+    class Identifier,State,Update,Updated system
+    class IdentifierFail,StateFail,UpdateFail,NotUpdatedFail error
