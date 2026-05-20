@@ -107,6 +107,10 @@
   stroke: var(--diagram-user-stroke) !important;
   stroke-width: 2 !important;
 }
+.docusaurus-mermaid-container .actor-line[name="User"] {
+  stroke: var(--diagram-user-stroke) !important;
+  stroke-width: 2 !important;
+}
 .docusaurus-mermaid-container text.actor.actor-man,
 .docusaurus-mermaid-container text.actor.actor-man tspan {
   fill: var(--diagram-user-text) !important;
@@ -126,6 +130,16 @@
 }
 .docusaurus-mermaid-container rect.actor[name="Vigilo"],
 .docusaurus-mermaid-container rect.actor[name="DB"] {
+  fill: var(--diagram-system-fill) !important;
+  stroke: var(--diagram-system-stroke) !important;
+  stroke-width: 2 !important;
+}
+.docusaurus-mermaid-container .actor-line[name="Vigilo"],
+.docusaurus-mermaid-container .actor-line[name="DB"] {
+  stroke: var(--diagram-system-stroke) !important;
+  stroke-width: 2 !important;
+}
+.docusaurus-mermaid-container :is(.activation0, .activation1, .activation2) {
   fill: var(--diagram-system-fill) !important;
   stroke: var(--diagram-system-stroke) !important;
   stroke-width: 2 !important;
