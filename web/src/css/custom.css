@@ -102,6 +102,15 @@
 .docusaurus-mermaid-container .person :is(.label, foreignObject) path {
   fill: var(--diagram-user-text) !important;
 }
+.docusaurus-mermaid-container .actor-man:is(.actor-top, .actor-bottom) :is(circle, line) {
+  fill: var(--diagram-user-fill) !important;
+  stroke: var(--diagram-user-stroke) !important;
+  stroke-width: 2 !important;
+}
+.docusaurus-mermaid-container text.actor.actor-man,
+.docusaurus-mermaid-container text.actor.actor-man tspan {
+  fill: var(--diagram-user-text) !important;
+}
 
 /* ==================== SYSTEM NODE ==================== */
 .docusaurus-mermaid-container .system :is(rect, circle, polygon, path, .label-container) {
@@ -113,6 +122,18 @@
   color: var(--diagram-system-text) !important;
 }
 .docusaurus-mermaid-container .system :is(.label, foreignObject) path {
+  fill: var(--diagram-system-text) !important;
+}
+.docusaurus-mermaid-container rect.actor[name="Vigilo"],
+.docusaurus-mermaid-container rect.actor[name="DB"] {
+  fill: var(--diagram-system-fill) !important;
+  stroke: var(--diagram-system-stroke) !important;
+  stroke-width: 2 !important;
+}
+.docusaurus-mermaid-container g:has(> rect.actor[name="Vigilo"]) text.actor.actor-box,
+.docusaurus-mermaid-container g:has(> rect.actor[name="Vigilo"]) text.actor.actor-box tspan,
+.docusaurus-mermaid-container g:has(> rect.actor[name="DB"]) text.actor.actor-box,
+.docusaurus-mermaid-container g:has(> rect.actor[name="DB"]) text.actor.actor-box tspan {
   fill: var(--diagram-system-text) !important;
 }
 
