@@ -20,6 +20,17 @@ import DiagramViewport from '@site/src/components/DiagramViewport';
 
 let iconRegistrationPromise: Promise<void> | undefined;
 
+const VIEWPORT_DOC_PATH_PREFIXES = [
+  '/docs/architecture/flows',
+  '/docs/architecture/structure',
+];
+
+function shouldUseDiagramViewport(pathname: string): boolean {
+  return VIEWPORT_DOC_PATH_PREFIXES.some((prefix) =>
+    pathname.startsWith(prefix),
+  );
+}
+
 function registerFontAwesomeIcons(): Promise<void> {
   iconRegistrationPromise ??= Promise.all([
     import('mermaid'),
@@ -107,7 +118,7 @@ function MermaidRenderer({
 function MermaidWithIcons(props: Props): ReactNode {
   const {pathname} = useLocation();
   const [iconsReady, setIconsReady] = useState(false);
-  const useViewport = pathname.startsWith('/docs/architecture/structure');
+  const useViewport = shouldUseDiagramViewport(pathname);
 
   useEffect(() => {
     let mounted = true;

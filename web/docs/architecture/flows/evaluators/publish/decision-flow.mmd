@@ -1,0 +1,31 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+flowchart TD
+    Start([vigilo evaluators publish])
+    Compile{WASM compiles and validates?}
+    Version{namespace + name + version exists?}
+    Hash{namespace + hash exists?}
+    Persist[Insert evaluator WASM and metadata]
+    Success([201 Created])
+
+    CompileFail([400 Bad Request<br/>Compilation or validation failed])
+    VersionFail([409 Conflict<br/>Version already exists])
+    HashFail([409 Conflict<br/>Identical evaluator code already exists])
+
+    Start --> Compile
+    Compile -- No --> CompileFail
+    Compile -- Yes --> Version
+
+    Version -- Yes --> VersionFail
+    Version -- No --> Hash
+
+    Hash -- Yes --> HashFail
+    Hash -- No --> Persist
+
+    Persist --> Success

@@ -16,7 +16,7 @@ flowchart TD
 
 
     %% components
-    Vigilo["fa:fa-terminal <br/> <b>Vigilo Command Runtime</b> <br/> <small>[Container: Rust]</small> <br/> <small>Provides evaluator and run management functionality via CLI.</small>"]:::component
+    Vigilo["fa:fa-terminal <br/> <b>Vigilo</b> <br/> <small>[Container: Rust]</small> <br/> <small>Provides evaluator and run management functionality via CLI.</small>"]:::component
     Coordinator["fa:fa-compass <br/> <b>Coordinator</b> <br/> <small>[Container: Rust]</small> <br/> <small>Chunks run cases, publishes work batches, tracks progress, and handles orchestration failures.</small>"]:::component
     Worker["fa:fa-gear <br/> <b>Worker</b> <br/> <small>[Container: Rust]</small> <br/> <small>Consumes work batches, prompts the target agent, runs evaluators, validates output, and persists normalized results.</small>"]:::component
     Database[("<b>Database</b> <br/> <small>[Container: PostgreSQL]</small> <br/> <small>Stores evaluators, datasets, runs, case batches, results, events, and runtime state.</small>")]:::component

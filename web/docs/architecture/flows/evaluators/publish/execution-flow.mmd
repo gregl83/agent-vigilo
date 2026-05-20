@@ -1,0 +1,28 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+sequenceDiagram
+    actor User
+    participant Vigilo
+    participant DB as Evaluators DB
+
+    User->>Vigilo: vigilo evaluators publish
+    activate Vigilo
+
+    Vigilo->>Vigilo: Compile and validate WASM
+    Vigilo->>DB: Check evaluator version uniqueness
+    DB-->>Vigilo: Version available
+
+    Vigilo->>DB: Check evaluator hash uniqueness
+    DB-->>Vigilo: Hash available
+
+    Vigilo->>DB: Insert evaluator WASM and metadata
+    DB-->>Vigilo: Saved
+
+    Vigilo-->>User: 201 Created
+    deactivate Vigilo
