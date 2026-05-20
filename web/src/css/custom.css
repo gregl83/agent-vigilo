@@ -158,7 +158,11 @@
   stroke-width: 2 !important;
 }
 .docusaurus-mermaid-container :is(.activation0, .activation1, .activation2) {
-  fill: var(--diagram-system-fill) !important;
+  fill: color-mix(
+    in srgb,
+    var(--diagram-system-fill) 40%,
+    var(--ifm-background-surface-color)
+  ) !important;
   stroke: var(--diagram-system-stroke) !important;
   stroke-width: 2 !important;
 }
