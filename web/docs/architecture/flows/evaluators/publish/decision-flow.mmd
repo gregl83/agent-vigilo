@@ -8,17 +8,21 @@ config:
 ---
 flowchart TD
     Start([vigilo evaluators publish])
-    Compile{WASM compiles and validates?}
-    Version{namespace + name + version exists?}
-    Hash{namespace + hash exists?}
-    Persist[Insert evaluator WASM and metadata]
-    Success([201 Created])
 
-    CompileFail([400 Bad Request<br/>Compilation or validation failed])
-    VersionFail([409 Conflict<br/>Version already exists])
-    HashFail([409 Conflict<br/>Identical evaluator code already exists])
+    Compile{WASM compiles and validates?}
+    Version{Evaluator version exists?}
+    Hash{Evaluator hash exists?}
+
+    Persist[Insert evaluator WASM and metadata]
+
+    Success([Success response])
+
+    CompileFail([Compilation or validation error])
+    VersionFail([Evaluator version conflict])
+    HashFail([Duplicate evaluator code conflict])
 
     Start --> Compile
+
     Compile -- No --> CompileFail
     Compile -- Yes --> Version
 
