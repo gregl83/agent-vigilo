@@ -1,68 +1,69 @@
 import type {ReactNode} from 'react';
-import clsx from 'clsx';
 import Heading from '@theme/Heading';
 import styles from './styles.module.css';
 
 type FeatureItem = {
+  label: string;
   title: string;
-  Svg: React.ComponentType<React.ComponentProps<'svg'>>;
   description: ReactNode;
 };
 
 const FeatureList: FeatureItem[] = [
   {
-    title: 'Easy to Use',
-    Svg: require('@site/static/img/undraw_docusaurus_mountain.svg').default,
+    label: '01',
+    title: 'Publish evaluator artifacts',
     description: (
       <>
-        Docusaurus was designed from the ground up to be easily installed and
-        used to get your website up and running quickly.
+        Version WASM evaluators once, reference them from profiles, and keep
+        scoring logic stable across local runs, CI, and production gates.
       </>
     ),
   },
   {
-    title: 'Focus on What Matters',
-    Svg: require('@site/static/img/undraw_docusaurus_tree.svg').default,
+    label: '02',
+    title: 'Run distributed evaluations',
     description: (
       <>
-        Docusaurus lets you focus on your docs, and we&apos;ll do the chores. Go
-        ahead and move your docs into the <code>docs</code> directory.
+        Coordinators dispatch durable run chunks while workers call the target
+        agent, execute evaluators, and persist normalized results.
       </>
     ),
   },
   {
-    title: 'Powered by React',
-    Svg: require('@site/static/img/undraw_docusaurus_react.svg').default,
+    label: '03',
+    title: 'Gate releases with evidence',
     description: (
       <>
-        Extend or customize your website layout by reusing React. Docusaurus can
-        be extended while reusing the same header and footer.
+        Watch pass/fail outcomes, inspect summaries, and export execution
+        evidence for release decisions and debugging.
       </>
     ),
   },
 ];
 
-function Feature({title, Svg, description}: FeatureItem) {
+function Feature({label, title, description}: FeatureItem) {
   return (
-    <div className={clsx('col col--4')}>
-      <div className="text--center">
-        <Svg className={styles.featureSvg} role="img" />
-      </div>
-      <div className="text--center padding-horiz--md">
-        <Heading as="h3">{title}</Heading>
-        <p>{description}</p>
-      </div>
-    </div>
+    <article className={styles.feature}>
+      <span className={styles.featureLabel}>{label}</span>
+      <Heading as="h3" className={styles.featureTitle}>
+        {title}
+      </Heading>
+      <p className={styles.featureText}>{description}</p>
+    </article>
   );
 }
 
 export default function HomepageFeatures(): ReactNode {
   return (
     <section className={styles.features}>
-      <div className="container">
-        <div className="row">
-          {FeatureList.map((props, idx) => (
-            <Feature key={idx} {...props} />
+      <div className={styles.inner}>
+        <div className={styles.sectionHeader}>
+          <span>What you get</span>
+          <Heading as="h2">Evaluation infrastructure, not another score script.</Heading>
+        </div>
+        <div className={styles.featureGrid}>
+          {FeatureList.map((props) => (
+            <Feature key={props.label} {...props} />
           ))}
         </div>
       </div>

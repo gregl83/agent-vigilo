@@ -6,24 +6,24 @@
 
 /* You can override the default Infima variables here. */
 :root {
-  --ifm-color-primary: #2e8555;
-  --ifm-color-primary-dark: #29784c;
-  --ifm-color-primary-darker: #277148;
-  --ifm-color-primary-darkest: #205d3b;
-  --ifm-color-primary-light: #33925d;
-  --ifm-color-primary-lighter: #359962;
-  --ifm-color-primary-lightest: #3cad6e;
+  --ifm-color-primary: #0b5fff;
+  --ifm-color-primary-dark: #0052d6;
+  --ifm-color-primary-darker: #0047ba;
+  --ifm-color-primary-darkest: #003985;
+  --ifm-color-primary-light: #2f7dff;
+  --ifm-color-primary-lighter: #5f9bff;
+  --ifm-color-primary-lightest: #a8c8ff;
   --ifm-code-font-size: 95%;
   --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
   --diagram-user-fill: #bbf7d0;
   --diagram-user-stroke: #16a34a;
   --diagram-user-text: #14532d;
-  --diagram-system-fill: #bfdbfe;
-  --diagram-system-stroke: #2563eb;
-  --diagram-system-text: #1e3a8a;
-  --diagram-component-fill: #bfdbfe;
-  --diagram-component-stroke: #2563eb;
-  --diagram-component-text: #1e3a8a;
+  --diagram-system-fill: #d6e6ff;
+  --diagram-system-stroke: #0b5fff;
+  --diagram-system-text: #003985;
+  --diagram-component-fill: #d6e6ff;
+  --diagram-component-stroke: #0b5fff;
+  --diagram-component-text: #003985;
   --diagram-external-fill: #fed7aa;
   --diagram-external-stroke: #ea580c;
   --diagram-external-text: #7c2d12;
@@ -40,23 +40,23 @@
 
 /* For readability concerns, you should choose a lighter palette in dark mode. */
 [data-theme='dark'] {
-  --ifm-color-primary: #25c2a0;
-  --ifm-color-primary-dark: #21af90;
-  --ifm-color-primary-darker: #1fa588;
-  --ifm-color-primary-darkest: #1a8870;
-  --ifm-color-primary-light: #29d5b0;
-  --ifm-color-primary-lighter: #32d8b4;
-  --ifm-color-primary-lightest: #4fddbf;
+  --ifm-color-primary: #78aaff;
+  --ifm-color-primary-dark: #5f9bff;
+  --ifm-color-primary-darker: #2f7dff;
+  --ifm-color-primary-darkest: #0b5fff;
+  --ifm-color-primary-light: #9fc2ff;
+  --ifm-color-primary-lighter: #bfd6ff;
+  --ifm-color-primary-lightest: #dbe8ff;
   --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
   --diagram-user-fill: #14532d;
   --diagram-user-stroke: #4ade80;
   --diagram-user-text: #f0fdf4;
-  --diagram-system-fill: #1e3a8a;
-  --diagram-system-stroke: #60a5fa;
-  --diagram-system-text: #e0f2fe;
-  --diagram-component-fill: #1e3a8a;
-  --diagram-component-stroke: #60a5fa;
-  --diagram-component-text: #e0f2fe;
+  --diagram-system-fill: #08275f;
+  --diagram-system-stroke: #78aaff;
+  --diagram-system-text: #eaf3ff;
+  --diagram-component-fill: #08275f;
+  --diagram-component-stroke: #78aaff;
+  --diagram-component-text: #eaf3ff;
   --diagram-external-fill: #7c2d12;
   --diagram-external-stroke: #fb923c;
   --diagram-external-text: #fff7ed;
