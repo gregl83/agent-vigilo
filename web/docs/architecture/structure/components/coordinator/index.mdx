@@ -14,12 +14,22 @@ import coordinatorDiagram from './diagram.mmd';
 
 # Coordinator Components
 
-Describes the major internal responsibilities of the coordinator service.
+Describes the major internal responsibilities of the coordinator runtime.
 
 <Mermaid value={coordinatorDiagram} />
+
+## Notes
+
+- Dispatch claims pending runs, marks them running, and enqueues chunk-ready events.
+- Finalization is coordinator-owned and lease guarded; workers persist execution outcomes but do not complete the run row.
+- Outbox publication is deliberately separate from state changes so committed events can be retried after broker or process failures.
 
 ## Related
 
 - [Structure overview](../..)
 - [Container view](../../containers)
+- [Coordinator flows](../../../flows/coordinator)
+- [Run lifecycle](../../../state/run-lifecycle)
+- [Outbox lifecycle](../../../state/outbox-lifecycle)
+- [Vigilo components](../vigilo)
 - [Worker components](../worker)
