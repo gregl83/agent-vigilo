@@ -25,7 +25,7 @@ flowchart TD
     Execute[Allocate attempts and persist results]
     CompleteChunk[Complete chunks]
 
-    GuardRun[Run status and coordinator lease]
+    GuardRun[Run status and lifecycle lease]
     GuardChunk[Chunk status and worker lease]
     GuardAttempt[Current attempt id and attempt number]
     GuardOutbox[Outbox availability and dedupe key]
@@ -49,6 +49,7 @@ flowchart TD
     Publish --> GuardOutbox
     ChunkClaim --> GuardChunk
     CompleteChunk --> GuardChunk
+    Execute --> GuardRun
     Execute --> GuardAttempt
 
     GuardRun --> DB

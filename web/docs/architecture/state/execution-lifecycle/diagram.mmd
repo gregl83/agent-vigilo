@@ -8,7 +8,7 @@ config:
 ---
 flowchart TD
     Worker([worker message])
-    RunGuard{Run is running?}
+    RunGuard{Shared run-state guard}
     Pending[Execution pending]
     Supersede[Mark prior running attempts stale]
     Running[Execution running]
@@ -31,8 +31,8 @@ flowchart TD
     Reject[Reject stale transition]
 
     Worker --> RunGuard
-    RunGuard -- Yes --> Pending --> Supersede --> Running --> AttemptRunning --> AgentAndEvaluators
-    RunGuard -- No --> Reject
+    RunGuard -- Running --> Pending --> Supersede --> Running --> AttemptRunning --> AgentAndEvaluators
+    RunGuard -- Not running --> Reject
     Supersede --> Stale
 
     AgentAndEvaluators --> TerminalGuard

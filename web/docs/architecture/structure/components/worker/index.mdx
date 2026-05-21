@@ -22,6 +22,7 @@ Describes the major internal responsibilities of the worker runtime.
 
 - Workers consume `run.chunk.ready` messages and claim chunk leases before loading case data.
 - Run context and evaluator components are cached inside the worker process to avoid repeated profile parsing and WASM compilation.
+- Execution writes use shared run-state guards so chunks for the same running run do not serialize on the run row.
 - Execution terminal transitions are authority guarded by the current attempt id and attempt number.
 - Queue messages are acknowledged only after invalid, stale, or completed work is handled; recoverable chunk failures release the lease and requeue the message.
 

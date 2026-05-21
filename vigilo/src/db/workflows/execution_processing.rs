@@ -417,6 +417,9 @@ async fn allocate_execution_attempts_for_cases(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
+    // The run guard is intentionally shared: workers for different chunks of
+    // the same running run can proceed together, while lifecycle updates such
+    // as cancellation still wait for the short worker write statement.
     let mut query_builder = QueryBuilder::<Postgres>::new(
         r#"
         WITH input (
@@ -460,7 +463,7 @@ async fn allocate_execution_attempts_for_cases(
     query_builder.push(
         r#"::uuid
               AND status = 'running'::run_status
-            FOR UPDATE
+            FOR SHARE
         ),
         upserted AS (
             INSERT INTO executions (
@@ -618,7 +621,8 @@ async fn allocate_execution_attempts_for_cases(
 ///
 /// The batch updates attempts and executions together. If any transition no
 /// longer owns the current attempt, the entire batch is rejected so stale
-/// workers cannot mark executions terminal.
+/// workers cannot mark executions terminal. The run-state guard is shared so
+/// other chunks for the same running run are not serialized on the run row.
 pub(crate) async fn finalize_execution_terminal_transitions(
     db: &PgPool,
     run_id: Uuid,
@@ -670,7 +674,7 @@ pub(crate) async fn finalize_execution_terminal_transitions(
             FROM runs
             WHERE id = $6::uuid
               AND status = 'running'::run_status
-            FOR UPDATE
+            FOR SHARE
         ),
         authoritative_input AS (
             SELECT
@@ -1258,6 +1262,8 @@ async fn persist_completed_execution_results_batch(
         return Ok(BatchPersistenceStats::default());
     }
 
+    // The shared run-state guard preserves cancellation/finalization ordering
+    // without turning the run row into an exclusive worker-side mutex.
     let mut tx = db.begin().await?;
 
     let mut authority_query = QueryBuilder::<Postgres>::new(
@@ -1287,7 +1293,7 @@ async fn persist_completed_execution_results_batch(
     authority_query.push(
         r#"::uuid
               AND status = 'running'::run_status
-            FOR UPDATE
+            FOR SHARE
         ),
         locked AS (
             SELECT executions.id

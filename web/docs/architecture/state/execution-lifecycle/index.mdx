@@ -22,7 +22,7 @@ How executions and attempts become authoritative work records while workers proc
 
 ## Notes
 
-- Executions are inserted or upserted only while the owning run is `running`.
+- Executions are inserted or upserted only while the owning run is `running`; workers use a shared run-state guard so chunks for the same run can proceed concurrently.
 - A new worker attempt marks any previous running attempt `stale`.
 - Terminal transitions require the execution's current attempt id and attempt number to match the worker's transition.
 - Completed executions require an aggregate row; failed transitions upsert an error aggregate.
