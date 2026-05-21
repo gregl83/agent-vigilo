@@ -13,6 +13,10 @@ use std::{
     time::Instant,
 };
 
+use futures_util::{
+    StreamExt,
+    stream::FuturesUnordered,
+};
 use serde_json::json;
 use sqlx::{
     PgPool,
@@ -74,6 +78,7 @@ pub(crate) struct RunEvaluatorCatalogEntry {
 /// Lookup table keyed by fully qualified evaluator ref.
 pub(crate) type RunEvaluatorCatalog = BTreeMap<String, RunEvaluatorCatalogEntry>;
 
+const CASE_EXECUTION_PARALLELISM: usize = 8;
 const EVALUATOR_EXECUTION_PARALLELISM: usize = 8;
 
 /// Terminal state transition to apply after evaluator processing finishes.
@@ -924,10 +929,17 @@ async fn evaluate_case_execution(
         Vec<evaluator_results::EvaluatorResultInsertRow>,
     )> = async {
         let test_case = make_test_case(case)?;
-        let agent_output =
-            agent_client::invoke(run_id, execution_id, attempt_id, run_profile, &test_case)
-                .await
-                .map_err(|err| anyhow::anyhow!("agent invocation failed: {}", err))?;
+        let http = context.http().await?;
+        let agent_output = agent_client::invoke(
+            http,
+            run_id,
+            execution_id,
+            attempt_id,
+            run_profile,
+            &test_case,
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("agent invocation failed: {}", err))?;
 
         let mut ordered_records = BTreeMap::new();
         let mut ordered_rows = BTreeMap::new();
@@ -1386,10 +1398,11 @@ async fn persist_completed_execution_results_batch(
 
 /// Processes a chunk-sized batch of dataset cases.
 ///
-/// The function allocates authoritative attempts in one statement, runs each
-/// case's evaluators with bounded per-case parallelism, and persists all
-/// completed case results in one chunk-level transaction. Terminal execution
-/// transitions are returned for the caller to batch-apply after persistence.
+/// The function allocates authoritative attempts in one statement, runs cases
+/// with bounded chunk-local parallelism, runs each case's evaluators with
+/// bounded per-case parallelism, and persists all completed case results in one
+/// chunk-level transaction. Terminal execution transitions are returned for the
+/// caller to batch-apply after persistence.
 pub(crate) async fn process_case_batch_execution(
     context: &Context,
     db: &PgPool,
@@ -1433,32 +1446,54 @@ pub(crate) async fn process_case_batch_execution(
         "initialized execution attempts for case batch"
     );
 
-    let mut processed = Vec::with_capacity(cases.len());
-    let mut completed = Vec::new();
-    for ((case, evaluator_bindings), allocation) in cases
-        .iter()
-        .zip(evaluator_bindings_by_case.iter())
-        .zip(allocations.iter())
-    {
-        if allocation.case_id != case.case_id {
-            anyhow::bail!(
-                "attempt allocation returned case '{}' while processing case '{}'",
-                allocation.case_id,
-                case.case_id
-            );
+    let parallelism = CASE_EXECUTION_PARALLELISM.min(cases.len().max(1));
+    let mut next_index = 0usize;
+    let mut pending = FuturesUnordered::new();
+    let mut ordered_outcomes = Vec::with_capacity(cases.len());
+
+    while next_index < cases.len() || !pending.is_empty() {
+        while next_index < cases.len() && pending.len() < parallelism {
+            let index = next_index;
+            next_index += 1;
+
+            let case = &cases[index];
+            let evaluator_bindings = &evaluator_bindings_by_case[index];
+            let allocation = &allocations[index];
+            pending.push(async move {
+                if allocation.case_id != case.case_id {
+                    anyhow::bail!(
+                        "attempt allocation returned case '{}' while processing case '{}'",
+                        allocation.case_id,
+                        case.case_id
+                    );
+                }
+
+                let outcome = evaluate_case_execution(
+                    context,
+                    run_id,
+                    run_profile,
+                    evaluator_catalog,
+                    case,
+                    evaluator_bindings,
+                    allocation,
+                )
+                .await;
+
+                Ok::<_, anyhow::Error>((index, outcome))
+            });
         }
 
-        let outcome = evaluate_case_execution(
-            context,
-            run_id,
-            run_profile,
-            evaluator_catalog,
-            case,
-            evaluator_bindings,
-            allocation,
-        )
-        .await;
+        let Some(result) = pending.next().await else {
+            continue;
+        };
+        ordered_outcomes.push(result?);
+    }
 
+    ordered_outcomes.sort_by_key(|(index, _)| *index);
+
+    let mut processed = Vec::with_capacity(cases.len());
+    let mut completed = Vec::new();
+    for (_, outcome) in ordered_outcomes {
         if let Some(persistence) = outcome.persistence {
             completed.push(persistence);
         }
@@ -1471,6 +1506,7 @@ pub(crate) async fn process_case_batch_execution(
     debug!(
         run_id = %run_id,
         case_count = cases.len(),
+        case_parallelism = parallelism,
         completed_case_count = completed.len(),
         evaluator_results_attempted = persistence_stats.evaluator_results_attempted,
         evaluator_results_inserted = persistence_stats.evaluator_results_inserted,

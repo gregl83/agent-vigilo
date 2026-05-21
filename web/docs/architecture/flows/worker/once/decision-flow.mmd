@@ -16,7 +16,7 @@ flowchart TD
     Context[Load run context]
     Warm[Warm evaluator components]
     Cases[Load chunk case batch]
-    Execute[Execute case evaluations]
+    Execute[Execute case evaluations with bounded chunk-local parallelism]
     Persist[Persist terminal transitions]
     Complete[Mark chunk completed]
     Ack[Acknowledge message]

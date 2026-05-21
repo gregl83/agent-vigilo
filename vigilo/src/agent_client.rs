@@ -394,6 +394,7 @@ fn attach_invocation_metadata(
 }
 
 pub(crate) async fn invoke(
+    client: &reqwest::Client,
     run_id: Uuid,
     execution_id: Uuid,
     attempt_id: Uuid,
@@ -412,13 +413,13 @@ pub(crate) async fn invoke(
         .method
         .parse::<reqwest::Method>()
         .map_err(|err| anyhow::anyhow!("invalid agent HTTP method '{}': {}", http.method, err))?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(u64::from(timeout_secs)))
-        .build()?;
 
     let request_body =
         build_request_body(run_id, execution_id, attempt_id, run_profile, test_case)?;
-    let mut request = client.request(method, &http.url).json(&request_body);
+    let mut request = client
+        .request(method, &http.url)
+        .timeout(Duration::from_secs(u64::from(timeout_secs)))
+        .json(&request_body);
     for (name, value) in &http.headers {
         request = request.header(name, value);
     }

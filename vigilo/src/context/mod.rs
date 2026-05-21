@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 pub(crate) mod database;
+pub(crate) mod http;
 pub(crate) mod messaging;
 pub(crate) mod output;
 pub(crate) mod registry;
@@ -8,6 +9,7 @@ pub(crate) mod wasm;
 
 struct ContextInner {
     pub db: database::Context,
+    pub http: http::Context,
     pub mq: messaging::Context,
     pub out: output::Context,
     pub reg: registry::Context,
@@ -31,6 +33,9 @@ impl Context {
                 max_connections: db_max_connections,
                 cell: Default::default(),
             },
+            http: http::Context {
+                cell: Default::default(),
+            },
             mq: messaging::Context {
                 config: crate::mq::Config::new(mq_uri),
                 cell: Default::default(),
@@ -51,6 +56,10 @@ impl Context {
 
     pub async fn db(&self) -> anyhow::Result<&sqlx::PgPool> {
         self.0.db.get().await
+    }
+
+    pub async fn http(&self) -> anyhow::Result<&reqwest::Client> {
+        self.0.http.get().await
     }
 
     pub async fn out(&self) -> anyhow::Result<&output::Buffer> {

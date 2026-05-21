@@ -16,7 +16,7 @@ flowchart TD
     %% components
     CommandFacade["fa:fa-gear <br/> <b>Worker Command Facade</b> <br/> <small>[Component: Rust / Clap]</small> <br/> <small>Selects start or once mode and builds the evaluator loader.</small>"]:::component
     ServiceLoop["fa:fa-rotate <br/> <b>Service Loop Runner</b> <br/> <small>[Component: Rust / Tokio]</small> <br/> <small>Runs the long-lived consumer loop and handles shutdown.</small>"]:::component
-    RuntimeContext["fa:fa-layer-group <br/> <b>Runtime Context Access</b> <br/> <small>[Component: Rust]</small> <br/> <small>Provides database, messaging, registry cache, and Wasm runtime clients.</small>"]:::component
+    RuntimeContext["fa:fa-layer-group <br/> <b>Runtime Context Access</b> <br/> <small>[Component: Rust]</small> <br/> <small>Provides database, messaging, HTTP, registry cache, and Wasm runtime clients.</small>"]:::component
 
     WorkerConsumer["fa:fa-inbox <br/> <b>Worker Queue Consumer</b> <br/> <small>[Component: Rust / AMQP]</small> <br/> <small>Fetches one message for once mode or opens a prefetch-limited delivery stream.</small>"]:::component
     MessageHandler["fa:fa-envelope-open-text <br/> <b>Chunk Message Handler</b> <br/> <small>[Component: Rust]</small> <br/> <small>Parses chunk-ready payloads and routes invalid, stale, successful, and retryable outcomes.</small>"]:::component
@@ -27,7 +27,7 @@ flowchart TD
     EvaluatorLoader["fa:fa-cubes <br/> <b>Evaluator Loader Service</b> <br/> <small>[Component: Rust / Wasmtime]</small> <br/> <small>Validates evaluator refs, loads runnable registry records, and warms compiled components.</small>"]:::component
     CaseBatchLoader["fa:fa-table-list <br/> <b>Case Batch Loader</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Loads dataset cases covered by the claimed chunk ordinal range.</small>"]:::component
 
-    ExecutionProcessor["fa:fa-list-check <br/> <b>Execution Processing Workflow</b> <br/> <small>[Component: Rust]</small> <br/> <small>Allocates attempts under a shared run-state guard and coordinates case-level execution.</small>"]:::component
+    ExecutionProcessor["fa:fa-list-check <br/> <b>Execution Processing Workflow</b> <br/> <small>[Component: Rust / Tokio]</small> <br/> <small>Allocates attempts under a shared run-state guard and runs chunk cases with bounded parallelism.</small>"]:::component
     AgentClient["fa:fa-brain <br/> <b>Agent Invocation Client</b> <br/> <small>[Component: Rust / HTTP]</small> <br/> <small>Sends evaluator-safe case input to the configured target and normalizes agent output.</small>"]:::component
     EvaluatorExecutor["fa:fa-microchip <br/> <b>Evaluator Runtime Executor</b> <br/> <small>[Component: Rust / Wasmtime]</small> <br/> <small>Runs WIT-backed evaluator components with bounded per-case parallelism.</small>"]:::component
     ResultPersistence["fa:fa-database <br/> <b>Result Persistence Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Appends evaluator results and upserts aggregates with child-row authority checks.</small>"]:::component
@@ -67,6 +67,7 @@ flowchart TD
     CommandFacade -->|"Creates shared access through"| RuntimeContext
     WorkerConsumer -->|"Uses messaging client from"| RuntimeContext
     MessageHandler -->|"Uses database and messaging clients from"| RuntimeContext
+    AgentClient -->|"Uses shared HTTP client from"| RuntimeContext
     EvaluatorLoader -->|"Uses registry cache and Wasm runtime from"| RuntimeContext
     EvaluatorExecutor -->|"Uses Wasm runtime from"| RuntimeContext
 
@@ -87,7 +88,7 @@ flowchart TD
     CaseBatchLoader -->|"Reads dataset case rows from <br> <small>[SQL/TCP]</small>"| Database
     MessageHandler -->|"Processes claimed case batch with"| ExecutionProcessor
 
-    ExecutionProcessor -->|"Allocates attempts and evaluates each case through"| AgentClient
+    ExecutionProcessor -->|"Invokes agent for chunk cases with bounded concurrency through"| AgentClient
     AgentClient -->|"Sends case input and receives output from <br> <small>[TEXT/HTTP]</small>"| TargetAgent
     ExecutionProcessor -->|"Runs evaluator bindings with"| EvaluatorExecutor
     EvaluatorExecutor -->|"Gets compiled components from"| EvaluatorLoader
