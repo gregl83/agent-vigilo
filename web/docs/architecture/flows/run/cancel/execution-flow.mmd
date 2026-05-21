@@ -1,0 +1,34 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+sequenceDiagram
+    actor User
+    participant Vigilo
+    participant DB as Vigilo DB
+
+    User->>Vigilo: vigilo run cancel
+    activate Vigilo
+    Vigilo->>Vigilo: Parse run id
+    Vigilo->>DB: Begin cancellation transaction and lock run
+    DB-->>Vigilo: Run status
+
+    alt Run does not exist
+        Vigilo-->>User: Run not found error
+    else Run is completed or failed
+        Vigilo-->>User: Cancellation error
+    else Run is already cancelled
+        Vigilo->>DB: Load cancelled run snapshot
+        DB-->>Vigilo: Cancellation outcome
+        Vigilo-->>User: Success response
+    else Run is pending, running, or finalizing
+        Vigilo->>DB: Cancel open attempts, executions, and chunks
+        Vigilo->>DB: Mark run cancelled and enqueue event
+        DB-->>Vigilo: Cancellation outcome
+        Vigilo-->>User: Success response
+    end
+    deactivate Vigilo
