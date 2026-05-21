@@ -1,0 +1,45 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+flowchart TD
+    Start([vigilo run results])
+
+    RunId{Run id valid?}
+    LoadRun[Load run]
+    Found{Run exists?}
+    Summary[Load results summary]
+    Payload[Build summary-only payload]
+
+    Success([Success response])
+
+    RunIdFail([Run id error])
+    NotFoundFail([Run not found error])
+    SummaryFail([Summary lookup error])
+    OutputFail([Output write error])
+
+    Start --> RunId
+
+    RunId -- No --> RunIdFail
+    RunId -- Yes --> LoadRun
+
+    LoadRun --> Found
+    LoadRun -. Lookup fails .-> NotFoundFail
+
+    Found -- No --> NotFoundFail
+    Found -- Yes --> Summary
+
+    Summary --> Payload
+    Summary -. Lookup fails .-> SummaryFail
+
+    Payload --> Success
+    Payload -. Write fails .-> OutputFail
+
+    class Start command
+    class Success success
+    class RunId,LoadRun,Found,Summary,Payload system
+    class RunIdFail,NotFoundFail,SummaryFail,OutputFail error

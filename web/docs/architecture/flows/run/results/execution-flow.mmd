@@ -1,0 +1,30 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+sequenceDiagram
+    actor User
+    participant Vigilo
+    participant DB as Vigilo DB
+
+    User->>Vigilo: vigilo run results
+    activate Vigilo
+
+    Vigilo->>Vigilo: Validate run id
+    Vigilo->>DB: Load run
+    DB-->>Vigilo: Run record
+    Vigilo->>DB: Load results summary
+    DB-->>Vigilo: Summary counts and scores
+
+    alt Results loaded
+        Vigilo->>Vigilo: Build summary-only payload
+        Vigilo-->>User: Success response
+    else Run or summary lookup fails
+        Vigilo-->>User: Results error
+    end
+
+    deactivate Vigilo
