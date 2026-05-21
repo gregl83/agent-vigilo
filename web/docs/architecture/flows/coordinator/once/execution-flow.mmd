@@ -35,11 +35,14 @@ sequenceDiagram
     DB-->>Vigilo: Outbox batch
 
     loop Bounded outbox publish concurrency
-        Vigilo->>Queue: Publish event
-        alt Publish succeeds
-            Vigilo->>DB: Mark event published
-        else Publish fails
-            Vigilo->>DB: Reschedule event for retry
+        Vigilo->>Queue: Declare durable topology and publish persistent mandatory event
+        Queue-->>Vigilo: Confirmed routed publish or returned/nacked publish
+        alt Publish confirmed and claim token current
+            Vigilo->>DB: Mark event published with claim token
+        else Publish failed or unroutable
+            Vigilo->>DB: Reschedule event for retry with claim token
+        else Claim token no longer current
+            Vigilo->>Vigilo: Ignore stale publisher result
         end
     end
 

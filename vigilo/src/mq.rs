@@ -18,10 +18,12 @@ use lapin::{
         BasicNackOptions,
         BasicPublishOptions,
         BasicQosOptions,
+        ConfirmSelectOptions,
         ExchangeDeclareOptions,
         QueueBindOptions,
         QueueDeclareOptions,
     },
+    publisher_confirm::Confirmation,
     types::FieldTable,
 };
 use serde_json::Value;
@@ -37,6 +39,7 @@ use uuid::Uuid;
 pub(crate) struct Config {
     pub(crate) uri: String,
     pub(crate) exchange: String,
+    pub(crate) event_queue: String,
     pub(crate) worker_queue: String,
 }
 
@@ -46,6 +49,7 @@ impl Config {
         Self {
             uri,
             exchange: "vigilo.events".to_string(),
+            event_queue: "vigilo.events.domain".to_string(),
             worker_queue: "vigilo.worker".to_string(),
         }
     }
@@ -68,7 +72,7 @@ pub(crate) struct Client {
     config: Config,
     connection: OnceCell<Connection>,
     channel: OnceCell<Channel>,
-    worker_topology_ready: OnceCell<()>,
+    topology_ready: OnceCell<()>,
 }
 
 impl Client {
@@ -78,15 +82,45 @@ impl Client {
             config,
             connection: OnceCell::new(),
             channel: OnceCell::new(),
-            worker_topology_ready: OnceCell::new(),
+            topology_ready: OnceCell::new(),
         }
     }
 
-    /// Ensures the worker queue and binding exist.
-    async fn ensure_worker_topology(&self) -> anyhow::Result<()> {
-        self.worker_topology_ready
+    /// Ensures durable queues, bindings, and publisher confirms are enabled.
+    async fn ensure_topology(&self) -> anyhow::Result<()> {
+        self.topology_ready
             .get_or_try_init(|| async {
                 let channel = self.channel().await?;
+
+                channel
+                    .queue_declare(
+                        &self.config.event_queue,
+                        QueueDeclareOptions {
+                            passive: false,
+                            durable: true,
+                            exclusive: false,
+                            auto_delete: false,
+                            nowait: false,
+                        },
+                        FieldTable::default(),
+                    )
+                    .await
+                    .map_err(|err| {
+                        anyhow::anyhow!("rabbitmq event queue declaration failed: {}", err)
+                    })?;
+
+                channel
+                    .queue_bind(
+                        &self.config.event_queue,
+                        &self.config.exchange,
+                        "run.*",
+                        QueueBindOptions::default(),
+                        FieldTable::default(),
+                    )
+                    .await
+                    .map_err(|err| {
+                        anyhow::anyhow!("rabbitmq event queue binding failed: {}", err)
+                    })?;
 
                 channel
                     .queue_declare(
@@ -113,6 +147,11 @@ impl Client {
                     )
                     .await
                     .map_err(|err| anyhow::anyhow!("rabbitmq queue binding failed: {}", err))?;
+
+                channel
+                    .confirm_select(ConfirmSelectOptions::default())
+                    .await
+                    .map_err(|err| anyhow::anyhow!("rabbitmq confirm-select failed: {}", err))?;
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -171,25 +210,62 @@ impl Client {
         &self,
         routing_key: &str,
         payload: &Value,
+        message_id: &str,
     ) -> anyhow::Result<()> {
+        self.ensure_topology().await?;
+
         let body = serde_json::to_vec(payload)
             .map_err(|err| anyhow::anyhow!("failed to serialize message payload: {}", err))?;
 
         let channel = self.channel().await?;
-        channel
+        let confirmation = channel
             .basic_publish(
                 &self.config.exchange,
                 routing_key,
-                BasicPublishOptions::default(),
+                BasicPublishOptions {
+                    mandatory: true,
+                    ..BasicPublishOptions::default()
+                },
                 &body,
-                BasicProperties::default().with_content_type("application/json".into()),
+                BasicProperties::default()
+                    .with_content_type("application/json".into())
+                    .with_delivery_mode(2)
+                    .with_message_id(message_id.to_string().into()),
             )
             .await
             .map_err(|err| anyhow::anyhow!("rabbitmq publish failed: {}", err))?
             .await
             .map_err(|err| anyhow::anyhow!("rabbitmq publish confirmation failed: {}", err))?;
 
-        Ok(())
+        match confirmation {
+            Confirmation::Ack(None) => Ok(()),
+            Confirmation::Ack(Some(returned)) => {
+                let route_error = returned
+                    .error()
+                    .map(|err| err.to_string())
+                    .unwrap_or_else(|| returned.reply_text.to_string());
+                anyhow::bail!(
+                    "rabbitmq publish was confirmed but returned unroutable for routing key '{}': {}",
+                    routing_key,
+                    route_error
+                );
+            }
+            Confirmation::Nack(returned) => {
+                let route_error = returned
+                    .as_deref()
+                    .and_then(|message| message.error())
+                    .map(|err| err.to_string())
+                    .unwrap_or_else(|| "broker negatively acknowledged publish".to_string());
+                anyhow::bail!(
+                    "rabbitmq publish was negatively acknowledged for routing key '{}': {}",
+                    routing_key,
+                    route_error
+                );
+            }
+            Confirmation::NotRequested => {
+                anyhow::bail!("rabbitmq publish confirmation was not requested");
+            }
+        }
     }
 
     /// Fetches one available worker message without creating a long-lived consumer.
@@ -197,7 +273,7 @@ impl Client {
     /// Workers currently poll with `basic_get`, which keeps the command model
     /// simple for one-shot worker mode.
     pub(crate) async fn consume_worker_message(&self) -> anyhow::Result<Option<ConsumedMessage>> {
-        self.ensure_worker_topology().await?;
+        self.ensure_topology().await?;
         let channel = self.channel().await?;
 
         let maybe_delivery = channel
@@ -224,7 +300,7 @@ impl Client {
         consumer_tag_prefix: &str,
         prefetch: u16,
     ) -> anyhow::Result<lapin::Consumer> {
-        self.ensure_worker_topology().await?;
+        self.ensure_topology().await?;
 
         let channel = self.channel().await?;
         channel

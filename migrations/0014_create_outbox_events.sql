@@ -12,6 +12,9 @@ CREATE TABLE outbox_events (
 
     status outbox_status NOT NULL DEFAULT 'pending',
     available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    claim_token UUID,
+    claimed_until TIMESTAMPTZ,
+    publish_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (publish_attempt_count >= 0),
     published_at TIMESTAMPTZ,
     error_message TEXT,
 
@@ -25,6 +28,10 @@ CREATE INDEX idx_outbox_events_status_available_at
 CREATE INDEX idx_outbox_events_pending_available
     ON outbox_events(available_at, id)
     WHERE status = 'pending';
+
+CREATE INDEX idx_outbox_events_claim_token
+    ON outbox_events(id, claim_token)
+    WHERE status = 'pending' AND claim_token IS NOT NULL;
 
 CREATE INDEX idx_outbox_events_aggregate
     ON outbox_events(aggregate_type, aggregate_id);
@@ -58,6 +65,15 @@ COMMENT ON COLUMN outbox_events.status IS
 
 COMMENT ON COLUMN outbox_events.available_at IS
     'Timestamp indicating when the event is eligible for publication. Used for delayed delivery or retry backoff.';
+
+COMMENT ON COLUMN outbox_events.claim_token IS
+    'Opaque token assigned when a publisher claims the event. Mark-published and retry updates must present the same token so stale publishers cannot overwrite a newer claim.';
+
+COMMENT ON COLUMN outbox_events.claimed_until IS
+    'Lease deadline for the current publisher claim. Mirrors the temporary availability delay used by the hot pending-event claim path.';
+
+COMMENT ON COLUMN outbox_events.publish_attempt_count IS
+    'Number of times this event has been claimed for publication.';
 
 COMMENT ON COLUMN outbox_events.published_at IS
     'Timestamp when the event was successfully delivered to the external system.';

@@ -1,10 +1,7 @@
 use super::*;
 
 /// Starts the long-running coordinator loop.
-pub(super) async fn exec(
-    context: Context,
-    config: CoordinatorRuntimeConfig,
-) -> anyhow::Result<()> {
+pub(super) async fn exec(context: Context, config: CoordinatorRuntimeConfig) -> anyhow::Result<()> {
     // One logical coordinator id is reused across loop iterations.
     let coordinator_id = Uuid::now_v7();
     ServiceRunner::new("coordinator")

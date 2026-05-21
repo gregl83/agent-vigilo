@@ -32,7 +32,7 @@ sequenceDiagram
             DB-->>Vigilo: Claimed chunk or no claim
 
             alt Chunk not claimable
-                Vigilo->>Queue: Acknowledge message
+                Vigilo->>Queue: Acknowledge duplicate or stale message
                 Vigilo-->>User: Success response
             else Chunk claimed
                 Vigilo->>DB: Load run context and case batch

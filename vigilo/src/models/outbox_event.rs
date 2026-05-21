@@ -55,6 +55,12 @@ pub(crate) struct OutboxEvent {
     pub(crate) status: String,
     /// Earliest time the event may be claimed for publication.
     pub(crate) available_at: DateTime<Utc>,
+    /// Current publisher claim token, if the event is leased for publication.
+    pub(crate) claim_token: Option<Uuid>,
+    /// Deadline for the current publisher claim.
+    pub(crate) claimed_until: Option<DateTime<Utc>>,
+    /// Number of publication claims issued for this event.
+    pub(crate) publish_attempt_count: i32,
     /// Time the event was successfully published.
     pub(crate) published_at: Option<DateTime<Utc>>,
     /// Latest delivery error, if any.

@@ -33,6 +33,9 @@ pub(crate) async fn insert_outbox_event(
             payload,
             status::text as status,
             available_at,
+            claim_token,
+            claimed_until,
+            publish_attempt_count,
             published_at,
             error_message,
             created_at,
@@ -65,6 +68,9 @@ pub(crate) async fn select_outbox_event_by_id(
             payload,
             status::text as status,
             available_at,
+            claim_token,
+            claimed_until,
+            publish_attempt_count,
             published_at,
             error_message,
             created_at,
@@ -97,6 +103,9 @@ pub(crate) async fn list_outbox_events_by_status(
             payload,
             status::text as status,
             available_at,
+            claim_token,
+            claimed_until,
+            publish_attempt_count,
             published_at,
             error_message,
             created_at,
@@ -136,7 +145,10 @@ pub(crate) async fn claim_publishable_outbox_events(
             LIMIT $1
         )
         UPDATE outbox_events oe
-        SET available_at = now() + ($2::int * interval '1 second'),
+        SET claim_token = gen_random_uuid(),
+            claimed_until = now() + ($2::int * interval '1 second'),
+            available_at = now() + ($2::int * interval '1 second'),
+            publish_attempt_count = publish_attempt_count + 1,
             updated_at = now()
         FROM claim
         WHERE oe.id = claim.id
@@ -149,6 +161,9 @@ pub(crate) async fn claim_publishable_outbox_events(
             oe.payload,
             oe.status::text as status,
             oe.available_at,
+            oe.claim_token,
+            oe.claimed_until,
+            oe.publish_attempt_count,
             oe.published_at,
             oe.error_message,
             oe.created_at,
@@ -164,18 +179,27 @@ pub(crate) async fn claim_publishable_outbox_events(
 }
 
 /// Marks an outbox event as successfully published.
-pub(crate) async fn mark_outbox_event_published(db: &PgPool, id: Uuid) -> anyhow::Result<u64> {
+pub(crate) async fn mark_outbox_event_published(
+    db: &PgPool,
+    id: Uuid,
+    claim_token: Uuid,
+) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
         UPDATE outbox_events
         SET status = 'published'::outbox_status,
             published_at = now(),
+            claim_token = NULL,
+            claimed_until = NULL,
             error_message = NULL,
             updated_at = now()
         WHERE id = $1::uuid
+          AND claim_token = $2::uuid
+          AND status = 'pending'::outbox_status
         "#,
     )
     .bind(id)
+    .bind(claim_token)
     .execute(db)
     .await?;
 
@@ -186,6 +210,7 @@ pub(crate) async fn mark_outbox_event_published(db: &PgPool, id: Uuid) -> anyhow
 pub(crate) async fn reschedule_outbox_event(
     db: &PgPool,
     id: Uuid,
+    claim_token: Uuid,
     retry_after_seconds: i32,
     error_message: &str,
 ) -> anyhow::Result<u64> {
@@ -193,13 +218,18 @@ pub(crate) async fn reschedule_outbox_event(
         r#"
         UPDATE outbox_events
         SET status = 'pending'::outbox_status,
-            available_at = now() + ($2::int * interval '1 second'),
-            error_message = $3,
+            available_at = now() + ($3::int * interval '1 second'),
+            claim_token = NULL,
+            claimed_until = NULL,
+            error_message = $4,
             updated_at = now()
         WHERE id = $1::uuid
+          AND claim_token = $2::uuid
+          AND status = 'pending'::outbox_status
         "#,
     )
     .bind(id)
+    .bind(claim_token)
     .bind(retry_after_seconds)
     .bind(error_message)
     .execute(db)
@@ -219,6 +249,8 @@ pub(crate) async fn update_outbox_event_status(
         UPDATE outbox_events
         SET status = $2::outbox_status,
             published_at = CASE WHEN $2 = 'published' THEN now() ELSE published_at END,
+            claim_token = NULL,
+            claimed_until = NULL,
             error_message = $3,
             updated_at = now()
         WHERE id = $1::uuid
@@ -231,6 +263,9 @@ pub(crate) async fn update_outbox_event_status(
             payload,
             status::text as status,
             available_at,
+            claim_token,
+            claimed_until,
+            publish_attempt_count,
             published_at,
             error_message,
             created_at,

@@ -38,11 +38,11 @@ mod start;
 
 const COORDINATOR_TICK_SECONDS: u64 = 5;
 const COORDINATOR_LEASE_SECONDS: i32 = 60;
-const COORDINATOR_MAX_DISPATCH_PER_CYCLE: usize = 64;
-const COORDINATOR_MAX_FINALIZE_PER_CYCLE: usize = 64;
+const COORDINATOR_MAX_DISPATCH_PER_CYCLE: u64 = 64;
+const COORDINATOR_MAX_FINALIZE_PER_CYCLE: u64 = 64;
 const RUN_CHUNK_DISPATCH_WINDOW_SIZE: i64 = 512;
 const OUTBOX_BATCH_SIZE: i64 = 1_000;
-const OUTBOX_PUBLISH_PARALLELISM: usize = 64;
+const OUTBOX_PUBLISH_PARALLELISM: u64 = 64;
 const OUTBOX_LEASE_SECONDS: i32 = 60;
 const OUTBOX_RETRY_DELAY_SECONDS: i32 = 10;
 
@@ -85,12 +85,12 @@ pub(crate) struct Command {
     pub lease_seconds: i32,
 
     /// Maximum run dispatch windows prepared per coordinator cycle
-    #[arg(long, env = "VIGILO_COORDINATOR_MAX_DISPATCH_PER_CYCLE", default_value_t = COORDINATOR_MAX_DISPATCH_PER_CYCLE, value_parser = clap::value_parser!(usize).range(1..=100_000))]
-    pub max_dispatch_per_cycle: usize,
+    #[arg(long, env = "VIGILO_COORDINATOR_MAX_DISPATCH_PER_CYCLE", default_value_t = COORDINATOR_MAX_DISPATCH_PER_CYCLE, value_parser = clap::value_parser!(u64).range(1..=100_000))]
+    pub max_dispatch_per_cycle: u64,
 
     /// Maximum runs finalized per coordinator cycle
-    #[arg(long, env = "VIGILO_COORDINATOR_MAX_FINALIZE_PER_CYCLE", default_value_t = COORDINATOR_MAX_FINALIZE_PER_CYCLE, value_parser = clap::value_parser!(usize).range(1..=100_000))]
-    pub max_finalize_per_cycle: usize,
+    #[arg(long, env = "VIGILO_COORDINATOR_MAX_FINALIZE_PER_CYCLE", default_value_t = COORDINATOR_MAX_FINALIZE_PER_CYCLE, value_parser = clap::value_parser!(u64).range(1..=100_000))]
+    pub max_finalize_per_cycle: u64,
 
     /// Number of run chunks made ready per dispatch window
     #[arg(long, env = "VIGILO_RUN_CHUNK_DISPATCH_WINDOW_SIZE", default_value_t = RUN_CHUNK_DISPATCH_WINDOW_SIZE, value_parser = clap::value_parser!(i64).range(1..=1_000_000))]
@@ -101,8 +101,8 @@ pub(crate) struct Command {
     pub outbox_batch_size: i64,
 
     /// Maximum concurrent outbox broker publishes per publish pass
-    #[arg(long, env = "VIGILO_OUTBOX_PUBLISH_PARALLELISM", default_value_t = OUTBOX_PUBLISH_PARALLELISM, value_parser = clap::value_parser!(usize).range(1..=10_000))]
-    pub outbox_publish_parallelism: usize,
+    #[arg(long, env = "VIGILO_OUTBOX_PUBLISH_PARALLELISM", default_value_t = OUTBOX_PUBLISH_PARALLELISM, value_parser = clap::value_parser!(u64).range(1..=10_000))]
+    pub outbox_publish_parallelism: u64,
 
     /// Outbox publish lease duration
     #[arg(long, env = "VIGILO_OUTBOX_LEASE_SECONDS", default_value_t = OUTBOX_LEASE_SECONDS, value_parser = clap::value_parser!(i32).range(1..=86400))]
@@ -121,11 +121,11 @@ impl Command {
         CoordinatorRuntimeConfig {
             tick_seconds: self.tick_seconds,
             lease_seconds: self.lease_seconds,
-            max_dispatch_per_cycle: self.max_dispatch_per_cycle,
-            max_finalize_per_cycle: self.max_finalize_per_cycle,
+            max_dispatch_per_cycle: self.max_dispatch_per_cycle as usize,
+            max_finalize_per_cycle: self.max_finalize_per_cycle as usize,
             run_chunk_dispatch_window_size: self.run_chunk_dispatch_window_size,
             outbox_batch_size: self.outbox_batch_size,
-            outbox_publish_parallelism: self.outbox_publish_parallelism,
+            outbox_publish_parallelism: self.outbox_publish_parallelism as usize,
             outbox_lease_seconds: self.outbox_lease_seconds,
             outbox_retry_delay_seconds: self.outbox_retry_delay_seconds,
         }
@@ -190,6 +190,7 @@ async fn run_coordinator_cycle(
         outbox_events_claimed = publish_stats.claimed,
         outbox_events_published = publish_stats.published,
         outbox_events_failed = publish_stats.failed,
+        outbox_stale_claims = publish_stats.stale_claims,
         "completed outbox publish cycle"
     );
 

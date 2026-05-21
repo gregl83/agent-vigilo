@@ -12,10 +12,14 @@ flowchart TD
     Dedupe{Dedupe key exists?}
     Ready{Pending and available now?}
     Claim[FOR UPDATE SKIP LOCKED over pending index]
-    Leased[Pending with future available_at]
-    Publish[Bounded concurrent publish to queue]
+    Leased[Pending with claim_token and future available_at]
+    Topology[Declare durable exchange queues and bindings]
+    Publish[Persistent mandatory publish with message id]
+    Confirm{Broker confirms and routed?}
+    Fence{Claim token still current?}
     Published[Outbox published]
     Retry[Pending with retry delay]
+    Stale[Stale publisher result ignored]
     Failed[Outbox failed]
     Noop[No transition]
     Queue[Message broker]
@@ -27,17 +31,19 @@ flowchart TD
     Pending --> Ready
     Retry --> Ready
 
-    Ready -- Yes --> Claim --> Leased --> Publish --> Queue
+    Ready -- Yes --> Claim --> Leased --> Topology --> Publish --> Queue --> Confirm
     Ready -- No --> Noop
 
-    Publish -- Success --> Published
-    Publish -- Failure --> Retry
+    Confirm -- Yes --> Fence
+    Confirm -- No --> Retry
+    Fence -- Yes --> Published
+    Fence -- No --> Stale
     Retry --> Pending
 
     Pending -. Direct administrative update .-> Failed
 
     class StateChange command
-    class Pending,Dedupe,Ready,Claim,Leased,Publish,Retry system
+    class Pending,Dedupe,Ready,Claim,Leased,Topology,Publish,Confirm,Fence,Retry,Stale system
     class Published success
     class Failed error
     class Noop component

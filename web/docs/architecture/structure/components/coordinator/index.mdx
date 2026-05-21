@@ -24,7 +24,9 @@ Describes the major internal responsibilities of the coordinator runtime.
 - Finalization is coordinator-owned and lease guarded; workers persist execution outcomes but do not complete the run row.
 - Outbox publication is deliberately separate from state changes so committed events can be retried after broker or process failures.
 - Coordinator throughput knobs can tune cycle interval, dispatch windows, outbox batch size, publish parallelism, leases, and retry delay.
-- Outbox publishers claim pending rows from a hot partial index and publish claimed batches with bounded concurrency.
+- Outbox publishers claim pending rows from a hot partial index, assign claim tokens, and publish claimed batches with bounded concurrency.
+- RabbitMQ publishes use durable topology, persistent messages, mandatory routing, publisher confirms, and the outbox dedupe key as the AMQP message id.
+- Broker delivery remains at-least-once; exactly-once effects are enforced by database idempotency and authority checks.
 
 ## Related
 

@@ -31,10 +31,10 @@ sequenceDiagram
             Vigilo->>DB: Claim publishable outbox events
             DB-->>Vigilo: Outbox batch
             loop Bounded outbox publish concurrency
-                Vigilo->>Queue: Publish claimed events
+                Vigilo->>Queue: Declare durable topology and publish persistent mandatory events
             end
-            Queue-->>Vigilo: Publish outcomes
-            Vigilo->>DB: Mark published events or schedule retries
+            Queue-->>Vigilo: Confirmed routed publishes or returned/nacked publishes
+            Vigilo->>DB: Mark published or retry using outbox claim tokens
         else Cycle or shutdown fails
             Vigilo-->>User: Service error
         end

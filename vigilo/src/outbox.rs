@@ -13,7 +13,10 @@ use futures_util::{
     stream::FuturesUnordered,
 };
 use sqlx::PgPool;
-use tracing::error;
+use tracing::{
+    error,
+    warn,
+};
 
 use crate::{
     db::tables::outbox_events,
@@ -55,12 +58,14 @@ pub(crate) struct OutboxPublishStats {
     pub(crate) claimed: usize,
     pub(crate) published: usize,
     pub(crate) failed: usize,
+    pub(crate) stale_claims: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum OutboxPublishOutcome {
     Published,
     Failed,
+    StaleClaim,
 }
 
 /// Transport boundary for publishing outbox events.
@@ -89,7 +94,7 @@ impl<'a> MqEventPublisher<'a> {
 impl EventPublisher for MqEventPublisher<'_> {
     async fn publish(&self, event: &OutboxEvent) -> anyhow::Result<()> {
         self.client
-            .publish_json(&event.event_type, &event.payload)
+            .publish_json(&event.event_type, &event.payload, &event.dedupe_key)
             .await
     }
 }
@@ -100,9 +105,27 @@ async fn publish_claimed_event(
     retry_delay_seconds: i32,
     event: OutboxEvent,
 ) -> anyhow::Result<OutboxPublishOutcome> {
+    let Some(claim_token) = event.claim_token else {
+        warn!(
+            event_id = %event.id,
+            event_type = %event.event_type,
+            "claimed outbox event did not include a claim token"
+        );
+        return Ok(OutboxPublishOutcome::StaleClaim);
+    };
+
     match publisher.publish(&event).await {
         Ok(()) => {
-            outbox_events::mark_outbox_event_published(db, event.id).await?;
+            let marked =
+                outbox_events::mark_outbox_event_published(db, event.id, claim_token).await?;
+            if marked == 0 {
+                warn!(
+                    event_id = %event.id,
+                    event_type = %event.event_type,
+                    "outbox publish succeeded but claim was no longer current"
+                );
+                return Ok(OutboxPublishOutcome::StaleClaim);
+            }
             Ok(OutboxPublishOutcome::Published)
         }
         Err(err) => {
@@ -113,13 +136,22 @@ async fn publish_claimed_event(
                 error = %message,
                 "outbox publish failed; scheduling retry"
             );
-            outbox_events::reschedule_outbox_event(
+            let rescheduled = outbox_events::reschedule_outbox_event(
                 db,
                 event.id,
+                claim_token,
                 retry_delay_seconds,
                 &message,
             )
             .await?;
+            if rescheduled == 0 {
+                warn!(
+                    event_id = %event.id,
+                    event_type = %event.event_type,
+                    "outbox publish failed but claim was no longer current"
+                );
+                return Ok(OutboxPublishOutcome::StaleClaim);
+            }
             Ok(OutboxPublishOutcome::Failed)
         }
     }
@@ -172,6 +204,9 @@ pub(crate) async fn publish_pending_events(
             }
             OutboxPublishOutcome::Failed => {
                 stats.failed += 1;
+            }
+            OutboxPublishOutcome::StaleClaim => {
+                stats.stale_claims += 1;
             }
         }
     }
