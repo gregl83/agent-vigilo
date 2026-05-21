@@ -1,0 +1,65 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+flowchart TD
+    Start([vigilo run export])
+
+    Request{Export request valid?}
+    RunId{Run id valid?}
+    LoadRun[Load run]
+    Found{Run exists?}
+    Summary[Load results summary]
+    Format{Export format?}
+    JsonBatches[Load all export batches]
+    JsonPayload[Build JSON export payload]
+    JsonlHeader[Write run and summary lines]
+    JsonlBatches[Stream export batches]
+
+    Success([Success response])
+
+    RequestFail([Export request error])
+    RunIdFail([Run id error])
+    NotFoundFail([Run not found error])
+    SummaryFail([Summary lookup error])
+    BatchFail([Batch export error])
+    OutputFail([Output write error])
+
+    Start --> Request
+
+    Request -- Invalid --> RequestFail
+    Request -- Valid --> RunId
+
+    RunId -- Invalid --> RunIdFail
+    RunId -- Valid --> LoadRun
+
+    LoadRun --> Found
+    LoadRun -. Lookup fails .-> NotFoundFail
+
+    Found -- No --> NotFoundFail
+    Found -- Yes --> Summary
+
+    Summary --> Format
+    Summary -. Lookup fails .-> SummaryFail
+
+    Format -- JSON --> JsonBatches
+    Format -- JSONL --> JsonlHeader
+
+    JsonBatches --> JsonPayload
+    JsonBatches -. Batch fails .-> BatchFail
+    JsonPayload --> Success
+    JsonPayload -. Write fails .-> OutputFail
+
+    JsonlHeader --> JsonlBatches
+    JsonlHeader -. Write fails .-> OutputFail
+    JsonlBatches --> Success
+    JsonlBatches -. Batch or write fails .-> BatchFail
+
+    class Start command
+    class Success success
+    class Request,RunId,LoadRun,Found,Summary,Format,JsonBatches,JsonPayload,JsonlHeader,JsonlBatches system
+    class RequestFail,RunIdFail,NotFoundFail,SummaryFail,BatchFail,OutputFail error

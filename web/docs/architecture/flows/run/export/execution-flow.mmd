@@ -1,0 +1,44 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+sequenceDiagram
+    actor User
+    participant Vigilo
+    participant DB as Vigilo DB
+
+    User->>Vigilo: vigilo run export
+    activate Vigilo
+
+    Vigilo->>Vigilo: Validate export request
+    Vigilo->>DB: Load run
+    DB-->>Vigilo: Run record
+    Vigilo->>DB: Load results summary
+    DB-->>Vigilo: Summary counts and scores
+
+    alt JSON export
+        loop Execution batches
+            Vigilo->>DB: Load executions and related records
+            DB-->>Vigilo: Batch data
+            Vigilo->>Vigilo: Accumulate export data
+        end
+        Vigilo->>Vigilo: Build export payload
+        Vigilo-->>User: Success response
+    else JSONL export
+        Vigilo-->>User: Run line
+        Vigilo-->>User: Summary line
+        loop Execution batches
+            Vigilo->>DB: Load executions and related records
+            DB-->>Vigilo: Batch data
+            Vigilo-->>User: Execution, aggregate, attempt, and result lines
+        end
+        Vigilo-->>User: Success response
+    else Validation or lookup fails
+        Vigilo-->>User: Export error
+    end
+
+    deactivate Vigilo
