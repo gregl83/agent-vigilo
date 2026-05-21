@@ -1,0 +1,41 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+flowchart TD
+    Start([vigilo run test])
+
+    Sources{Profile and dataset sources valid?}
+    Parse{Profile and dataset schemas valid?}
+    Executable{Profile executable for dataset?}
+    Payload[Build validation payload]
+
+    Success([Success response])
+
+    SourceFail([Input source error])
+    ParseFail([Input schema error])
+    ExecutabilityFail([Executability validation error])
+    OutputFail([Output write error])
+
+    Start --> Sources
+
+    Sources -- No --> SourceFail
+    Sources -- Yes --> Parse
+
+    Parse -- No --> ParseFail
+    Parse -- Yes --> Executable
+
+    Executable -- No --> ExecutabilityFail
+    Executable -- Yes --> Payload
+
+    Payload --> Success
+    Payload -. Write fails .-> OutputFail
+
+    class Start command
+    class Success success
+    class Sources,Parse,Executable,Payload system
+    class SourceFail,ParseFail,ExecutabilityFail,OutputFail error

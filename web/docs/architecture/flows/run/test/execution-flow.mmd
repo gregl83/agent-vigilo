@@ -1,0 +1,28 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+sequenceDiagram
+    actor User
+    participant Vigilo
+    participant DB as Vigilo DB
+
+    User->>Vigilo: vigilo run test
+    activate Vigilo
+
+    Vigilo->>Vigilo: Load and parse profile and dataset inputs
+    Vigilo->>DB: Validate profile executability
+    DB-->>Vigilo: Runnable evaluator summary
+
+    alt Inputs are executable
+        Vigilo->>Vigilo: Build validation payload
+        Vigilo-->>User: Success response
+    else Input or executability validation fails
+        Vigilo-->>User: Validation error
+    end
+
+    deactivate Vigilo
