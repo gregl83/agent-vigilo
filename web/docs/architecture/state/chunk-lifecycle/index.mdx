@@ -1,0 +1,28 @@
+---
+title: Chunk Lifecycle
+sidebar_label: Chunk
+sidebar_position: 2
+---
+
+import Mermaid from '@theme/Mermaid';
+import chunkLifecycleDiagram from './diagram.mmd';
+
+# Chunk Lifecycle
+
+How `run_chunks.status` protects worker ownership and prevents stale workers from completing or releasing chunks they no longer own.
+
+<Mermaid value={chunkLifecycleDiagram} />
+
+## Notes
+
+- Run creation inserts chunks as `pending`.
+- Workers can claim a chunk only when the owning run is `running`.
+- Completion and release both compare the stored lease timestamp to the worker's claimed lease.
+- Cancellation changes open chunks to `cancelled`.
+
+## Related
+
+- [Worker start flow](/docs/architecture/flows/worker/start/)
+- [Worker once flow](/docs/architecture/flows/worker/once/)
+- [Run lifecycle](/docs/architecture/state/run-lifecycle/)
+- [State ownership](/docs/architecture/state/ownership/)

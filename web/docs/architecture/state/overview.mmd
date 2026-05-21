@@ -1,0 +1,48 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+flowchart TD
+    Run[Run state]
+    Chunk[Chunk state]
+    Execution[Execution state]
+    Attempt[Attempt state]
+    Outbox[Outbox state]
+
+    Create([Run create])
+    Coordinator[Coordinator]
+    Worker[Worker]
+    Cancel([Run cancel])
+    Queue[Queue publication]
+
+    Create --> Run
+    Create --> Chunk
+
+    Coordinator --> Run
+    Coordinator --> Outbox
+    Coordinator --> Queue
+
+    Worker --> Chunk
+    Worker --> Execution
+    Worker --> Attempt
+
+    Cancel --> Run
+    Cancel --> Chunk
+    Cancel --> Execution
+    Cancel --> Attempt
+    Cancel --> Outbox
+
+    Run -->|dispatch guard| Chunk
+    Chunk -->|work ownership| Execution
+    Execution -->|current attempt guard| Attempt
+    Run -->|state-change events| Outbox
+    Outbox -->|publish or retry| Queue
+
+    class Create,Cancel command
+    class Coordinator,Worker system
+    class Run,Chunk,Execution,Attempt,Outbox component
+    class Queue external

@@ -1,0 +1,28 @@
+---
+title: State Ownership
+sidebar_label: Ownership
+sidebar_position: 5
+---
+
+import Mermaid from '@theme/Mermaid';
+import ownershipDiagram from './diagram.mmd';
+
+# State Ownership
+
+Which process owns each state transition and which database guard prevents conflicting writers.
+
+<Mermaid value={ownershipDiagram} />
+
+## Notes
+
+- CLI commands create, cancel, and read state.
+- Coordinators own run dispatch, run finalization, and outbox publishing.
+- Workers own chunk leases and execution/attempt terminal transitions.
+- DB guards are the authority boundary: row locks, leases, conflict keys, and current-attempt checks prevent stale writes.
+
+## Related
+
+- [Run lifecycle](/docs/architecture/state/run-lifecycle/)
+- [Chunk lifecycle](/docs/architecture/state/chunk-lifecycle/)
+- [Execution lifecycle](/docs/architecture/state/execution-lifecycle/)
+- [Outbox lifecycle](/docs/architecture/state/outbox-lifecycle/)

@@ -1,0 +1,64 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+flowchart TD
+    CLI[CLI]
+    Coordinator[Coordinator]
+    Worker[Worker]
+    DB[(DB guards)]
+    Queue[Message broker]
+
+    RunCreate[Create run and pending chunks]
+    RunCancel[Cancel run and open work]
+    RunRead[Read status, watch, results, export]
+
+    Dispatch[Dispatch pending runs]
+    Finalize[Finalize terminal runs]
+    Publish[Publish outbox events]
+
+    ChunkClaim[Claim and release chunks]
+    Execute[Allocate attempts and persist results]
+    CompleteChunk[Complete chunks]
+
+    GuardRun[Run status and coordinator lease]
+    GuardChunk[Chunk status and worker lease]
+    GuardAttempt[Current attempt id and attempt number]
+    GuardOutbox[Outbox availability and dedupe key]
+
+    CLI --> RunCreate
+    CLI --> RunCancel
+    CLI --> RunRead
+
+    Coordinator --> Dispatch
+    Coordinator --> Finalize
+    Coordinator --> Publish
+
+    Worker --> ChunkClaim
+    Worker --> Execute
+    Worker --> CompleteChunk
+
+    RunCreate --> DB
+    RunCancel --> DB
+    Dispatch --> GuardRun
+    Finalize --> GuardRun
+    Publish --> GuardOutbox
+    ChunkClaim --> GuardChunk
+    CompleteChunk --> GuardChunk
+    Execute --> GuardAttempt
+
+    GuardRun --> DB
+    GuardChunk --> DB
+    GuardAttempt --> DB
+    GuardOutbox --> DB
+    Publish --> Queue
+
+    class CLI command
+    class Coordinator,Worker,GuardRun,GuardChunk,GuardAttempt,GuardOutbox system
+    class RunCreate,RunCancel,RunRead,Dispatch,Finalize,Publish,ChunkClaim,Execute,CompleteChunk component
+    class DB success
+    class Queue external

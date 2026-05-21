@@ -1,0 +1,64 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+flowchart TD
+    Create([run create])
+    Pending[Run pending]
+    DispatchGuard{Pending and coordinator lease open?}
+    DispatchLock[FOR UPDATE SKIP LOCKED]
+    Running[Run running]
+    DispatchEvents[Insert run.started and chunk-ready events]
+
+    FinalizeGuard{Running or finalizing with no open chunks?}
+    Finalizing[Run finalizing]
+    FinalizeCheck{Still finalizing and no open chunks?}
+    Gate{Gate outcome}
+    CompletedPass[Run completed + gate pass]
+    CompletedFail[Run completed + gate fail]
+    CompletedEvent[Insert run.completed event]
+
+    CancelGuard{Cancelable status?}
+    CancelCascade[Cancel open chunks, executions, and attempts]
+    Cancelled[Run cancelled + gate fail]
+    CancelEvent[Insert run.cancelled event]
+
+    Failed[Run failed]
+    Noop[No transition]
+    Reject([Cancellation error])
+
+    Create --> Pending
+
+    Pending --> DispatchGuard
+    DispatchGuard -- Yes --> DispatchLock --> Running --> DispatchEvents
+    DispatchGuard -- No --> Noop
+
+    Running --> FinalizeGuard
+    FinalizeGuard -- Yes --> Finalizing
+    FinalizeGuard -- No --> Noop
+
+    Finalizing --> FinalizeCheck
+    FinalizeCheck -- Yes --> Gate
+    FinalizeCheck -- No --> Noop
+
+    Gate -- Criteria met --> CompletedPass --> CompletedEvent
+    Gate -- Failure or missing aggregate --> CompletedFail --> CompletedEvent
+
+    Pending --> CancelGuard
+    Running --> CancelGuard
+    Finalizing --> CancelGuard
+    CancelGuard -- Pending running or finalizing --> CancelCascade --> Cancelled --> CancelEvent
+    CancelGuard -- Completed or failed --> Reject
+    Cancelled -->|Repeated cancel| Noop
+
+    Running -. Unrecoverable system error .-> Failed
+
+    class Create command
+    class Pending,Running,Finalizing,DispatchGuard,DispatchLock,DispatchEvents,FinalizeGuard,FinalizeCheck,Gate,CompletedEvent,CancelGuard,CancelCascade,CancelEvent system
+    class CompletedPass success
+    class CompletedFail,Cancelled,Failed,Reject error
+    class Noop component

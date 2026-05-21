@@ -1,0 +1,28 @@
+---
+title: Outbox Lifecycle
+sidebar_label: Outbox
+sidebar_position: 4
+---
+
+import Mermaid from '@theme/Mermaid';
+import outboxLifecycleDiagram from './diagram.mmd';
+
+# Outbox Lifecycle
+
+How durable outbox rows make state-change events publishable, retryable, and idempotent.
+
+<Mermaid value={outboxLifecycleDiagram} />
+
+## Notes
+
+- State workflows insert events in the same database operation as the state change.
+- The publisher claims `pending` events with `available_at <= now()` and `FOR UPDATE SKIP LOCKED`.
+- A claim keeps `status = pending` but moves `available_at` into the future as a publish lease.
+- Successful publishes mark events `published`; failed publishes return them to `pending` with a retry delay and error message.
+
+## Related
+
+- [Coordinator once flow](/docs/architecture/flows/coordinator/once/)
+- [Coordinator start flow](/docs/architecture/flows/coordinator/start/)
+- [Run lifecycle](/docs/architecture/state/run-lifecycle/)
+- [State ownership](/docs/architecture/state/ownership/)

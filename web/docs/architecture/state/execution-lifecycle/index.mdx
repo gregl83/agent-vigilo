@@ -1,0 +1,28 @@
+---
+title: Execution Lifecycle
+sidebar_label: Execution
+sidebar_position: 3
+---
+
+import Mermaid from '@theme/Mermaid';
+import executionLifecycleDiagram from './diagram.mmd';
+
+# Execution Lifecycle
+
+How executions and attempts become authoritative work records while workers process chunk cases.
+
+<Mermaid value={executionLifecycleDiagram} />
+
+## Notes
+
+- Executions are inserted or upserted only while the owning run is `running`.
+- A new worker attempt marks any previous running attempt `stale`.
+- Terminal transitions require the execution's current attempt id and attempt number to match the worker's transition.
+- Completed executions require an aggregate row; failed transitions upsert an error aggregate.
+
+## Related
+
+- [Worker start flow](/docs/architecture/flows/worker/start/)
+- [Chunk lifecycle](/docs/architecture/state/chunk-lifecycle/)
+- [Run lifecycle](/docs/architecture/state/run-lifecycle/)
+- [State ownership](/docs/architecture/state/ownership/)

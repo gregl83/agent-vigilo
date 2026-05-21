@@ -22,6 +22,7 @@ let iconRegistrationPromise: Promise<void> | undefined;
 
 const VIEWPORT_DOC_PATH_PREFIXES = [
   '/docs/architecture/flows',
+  '/docs/architecture/state',
   '/docs/architecture/structure',
 ];
 

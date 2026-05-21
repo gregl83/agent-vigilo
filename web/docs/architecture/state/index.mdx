@@ -1,0 +1,37 @@
+---
+title: State
+sidebar_position: 3
+---
+
+import Mermaid from '@theme/Mermaid';
+import overviewDiagram from './overview.mmd';
+
+# State Management
+
+State diagrams for the database-backed lifecycle boundaries in Agent Vigilo.
+
+These views focus on:
+
+- lifecycle states stored in the DB
+- guarded transitions owned by CLI, coordinator, and worker processes
+- leases, row locks, idempotent events, and no-op branches
+- terminal outcomes that feed run status, gate status, and exportable evidence
+
+## Overview
+
+<Mermaid value={overviewDiagram} />
+
+## State Views
+
+- [Run lifecycle](./run-lifecycle/)
+- [Chunk lifecycle](./chunk-lifecycle/)
+- [Execution lifecycle](./execution-lifecycle/)
+- [Outbox lifecycle](./outbox-lifecycle/)
+- [State ownership](./ownership/)
+
+## Related
+
+- [Architecture flows](/docs/architecture/flows/)
+- [System structure](/docs/architecture/structure/)
+- [Runtime architecture](/docs/architecture/flow)
+- [Reliability](/docs/architecture/failure-modes)

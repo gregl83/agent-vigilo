@@ -1,0 +1,62 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+flowchart TD
+    Worker([worker message])
+    RunGuard{Run is running?}
+    Pending[Execution pending]
+    Supersede[Mark prior running attempts stale]
+    Running[Execution running]
+    AttemptRunning[Attempt running]
+    AgentAndEvaluators[Invoke agent and run evaluators]
+    TerminalGuard{Current attempt still authoritative?}
+    AggregateGuard{Aggregate available or failure transition?}
+    AttemptCompleted[Attempt completed]
+    ExecutionCompleted[Execution completed]
+    AttemptAgentFail[Attempt failed agent call]
+    AttemptEvalFail[Attempt failed evaluation]
+    ExecutionFailed[Execution failed]
+    Cancel([run cancel])
+    ExecutionCancelled[Execution cancelled]
+    AttemptCancelled[Attempt cancelled]
+    RetryScheduled[Execution retry scheduled]
+    TimedOut[Timed out]
+    Awaiting[Awaiting evaluators]
+    Stale[Attempt stale]
+    Reject[Reject stale transition]
+
+    Worker --> RunGuard
+    RunGuard -- Yes --> Pending --> Supersede --> Running --> AttemptRunning --> AgentAndEvaluators
+    RunGuard -- No --> Reject
+    Supersede --> Stale
+
+    AgentAndEvaluators --> TerminalGuard
+    TerminalGuard -- Yes --> AggregateGuard
+    TerminalGuard -- No --> Stale
+
+    AggregateGuard -- Completed with aggregate --> AttemptCompleted --> ExecutionCompleted
+    AggregateGuard -- Agent invocation failed --> AttemptAgentFail --> ExecutionFailed
+    AggregateGuard -- Evaluation or persistence failed --> AttemptEvalFail --> ExecutionFailed
+    AggregateGuard -- Missing required aggregate --> Reject
+
+    Running --> Cancel
+    Pending --> Cancel
+    AttemptRunning --> Cancel
+    Cancel --> ExecutionCancelled
+    Cancel --> AttemptCancelled
+
+    Running -. Reserved retry path .-> RetryScheduled
+    Running -. Reserved partial path .-> Awaiting
+    Running -. Reserved timeout path .-> TimedOut
+    AttemptRunning -. Reserved timeout path .-> TimedOut
+
+    class Worker,Cancel command
+    class RunGuard,Pending,Supersede,Running,AttemptRunning,AgentAndEvaluators,TerminalGuard,AggregateGuard,Awaiting,RetryScheduled system
+    class AttemptCompleted,ExecutionCompleted success
+    class AttemptAgentFail,AttemptEvalFail,ExecutionFailed,ExecutionCancelled,AttemptCancelled,TimedOut,Reject error
+    class Stale component

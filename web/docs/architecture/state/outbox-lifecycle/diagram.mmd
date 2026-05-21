@@ -1,0 +1,44 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+flowchart TD
+    StateChange[State change transaction]
+    Pending[Outbox pending]
+    Dedupe{Dedupe key exists?}
+    Ready{Pending and available now?}
+    Claim[FOR UPDATE SKIP LOCKED]
+    Leased[Pending with future available_at]
+    Publish[Publish event to queue]
+    Published[Outbox published]
+    Retry[Pending with retry delay]
+    Failed[Outbox failed]
+    Noop[No transition]
+    Queue[Message broker]
+
+    StateChange --> Dedupe
+    Dedupe -- No --> Pending
+    Dedupe -- Yes --> Noop
+
+    Pending --> Ready
+    Retry --> Ready
+
+    Ready -- Yes --> Claim --> Leased --> Publish --> Queue
+    Ready -- No --> Noop
+
+    Publish -- Success --> Published
+    Publish -- Failure --> Retry
+    Retry --> Pending
+
+    Pending -. Direct administrative update .-> Failed
+
+    class StateChange command
+    class Pending,Dedupe,Ready,Claim,Leased,Publish,Retry system
+    class Published success
+    class Failed error
+    class Noop component
+    class Queue external

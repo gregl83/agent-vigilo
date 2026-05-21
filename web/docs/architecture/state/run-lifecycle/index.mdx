@@ -1,0 +1,28 @@
+---
+title: Run Lifecycle
+sidebar_label: Run
+sidebar_position: 1
+---
+
+import Mermaid from '@theme/Mermaid';
+import runLifecycleDiagram from './diagram.mmd';
+
+# Run Lifecycle
+
+How `runs.status` and `runs.gate_status` move through creation, dispatch, finalization, cancellation, and terminal outcomes.
+
+<Mermaid value={runLifecycleDiagram} />
+
+## Notes
+
+- `run create` inserts a run as `pending`.
+- Coordinator dispatch claims `pending` runs with an open coordinator lease and `FOR UPDATE SKIP LOCKED`.
+- Finalization only claims runs whose chunks are all terminal and whose finalization lease is open.
+- Cancellation is idempotent for already-cancelled runs and rejected for completed or failed runs.
+
+## Related
+
+- [Run create flow](/docs/architecture/flows/run/create/)
+- [Run cancel flow](/docs/architecture/flows/run/cancel/)
+- [Coordinator start flow](/docs/architecture/flows/coordinator/start/)
+- [State ownership](/docs/architecture/state/ownership/)

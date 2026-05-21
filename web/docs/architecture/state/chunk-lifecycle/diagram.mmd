@@ -1,0 +1,50 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+flowchart TD
+    Create([run create])
+    Pending[Chunk pending]
+    ClaimGuard{Run running and chunk claimable?}
+    Leased[Chunk leased]
+    LoadCases[Load case batch]
+    Process{Processing outcome}
+    CompleteGuard{Still leased by same worker?}
+    Completed[Chunk completed]
+    ReleaseGuard{Still leased by same worker?}
+    Requeued[Chunk pending for retry]
+    Cancel([run cancel])
+    Cancelled[Chunk cancelled]
+    Failed[Chunk failed]
+    Noop[No transition]
+
+    Create --> Pending
+
+    Pending --> ClaimGuard
+    Leased -->|Lease expired| ClaimGuard
+    ClaimGuard -- Yes --> Leased --> LoadCases --> Process
+    ClaimGuard -- No --> Noop
+
+    Process -- Success --> CompleteGuard
+    CompleteGuard -- Yes --> Completed
+    CompleteGuard -- No --> Noop
+
+    Process -- Recoverable failure --> ReleaseGuard
+    ReleaseGuard -- Yes --> Requeued --> Pending
+    ReleaseGuard -- No --> Noop
+
+    Pending --> Cancel
+    Leased --> Cancel
+    Cancel --> Cancelled
+
+    Leased -. Reserved terminal path .-> Failed
+
+    class Create,Cancel command
+    class Pending,Leased,ClaimGuard,LoadCases,Process,CompleteGuard,ReleaseGuard,Requeued system
+    class Completed success
+    class Cancelled,Failed error
+    class Noop component
