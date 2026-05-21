@@ -12,168 +12,178 @@ keywords:
 
 # `Vigilo.toml` Reference
 
-`Vigilo.toml` is the manifest file that tells `vigilo` how to publish a wasm component. It lives alongside the package manifest (`Cargo.toml` or `pyproject.toml`) at the component root.
+`Vigilo.toml` tells `vigilo` how to prepare and publish an evaluator WebAssembly component. It lives beside the evaluator crate `Cargo.toml`.
 
 ---
 
 ## File Location
 
-Place `Vigilo.toml` in the same directory as your package manifest:
+Place `Vigilo.toml` in the evaluator crate directory:
 
-```
+```text
 my-evaluator/
-├── Cargo.toml
-├── Vigilo.toml     ← here
-└── src/
+  Cargo.toml
+  Vigilo.toml
+  src/
+    lib.rs
 ```
-
-For Python evaluators:
-
-```
-my-evaluator/
-├── pyproject.toml
-├── Vigilo.toml     ← here
-└── app.py
-```
-
----
-
-## Fields
-
-### `manifest`
-
-**Required.** Path to the package manifest file, relative to `Vigilo.toml`.
-
-```toml
-manifest = "Cargo.toml"
-```
-
-`vigilo` reads `name` and `version` exclusively from this file. They are not declared in `Vigilo.toml` itself — this ensures the registry identity stays in sync with the package source and cannot drift independently.
-
-Supported manifest files:
-
-| Value | Ecosystem | Identity fields read |
-|-------|-----------|----------------------|
-| `"Cargo.toml"` | Rust | `[package].name`, `[package].version` |
-| `"pyproject.toml"` | Python | `[project].name`, `[project].version` |
-
-The declared file must exist at publish time. If it is missing, `vigilo` will error immediately before reading any other fields.
-
----
-
-### `profile`
-
-**Required.** The build profile used to produce the wasm output.
-
-```toml
-profile = "release"
-```
-
-Common values:
-
-| Value | Description |
-|-------|-------------|
-| `"release"` | Optimized build, recommended for publishing |
-| `"debug"` | Unoptimized build with debug symbols |
-| `"<custom>"` | Any custom profile defined in `Cargo.toml` |
-
-The profile is stored as part of the evaluator's registry identity alongside `name` and `version`. This means `my-evaluator@1.0.0/release` and `my-evaluator@1.0.0/debug` are distinct registry entries.
-
-:::caution
-Publishing a `debug` profile evaluator will produce a warning. Non-release builds should only be published intentionally to development or staging registries.
-:::
-
----
-
-### `wasm`
-
-**Required.** Path to the compiled wasm evaluator output, relative to `Vigilo.toml`.
-
-```toml
-wasm = "target/wasm32-unknown-unknown/release/my_evaluator.wasm"
-```
-
-Common output paths by build tool:
-
-| Build tool | Typical output path |
-|------------|---------------------|
-| `cargo component build --release` | `target/wasm32-unknown-unknown/release/<name>.wasm` |
-| `cargo component build` (debug) | `target/wasm32-unknown-unknown/debug/<name>.wasm` |
-| `componentize-py` | configurable, often `<name>.wasm` in project root |
-
-The file at this path must exist and must be a valid wasm component at publish time.
 
 ---
 
 ## Complete Example
 
 ```toml
-# Vigilo.toml
 [package]
 manifest = "Cargo.toml"
+description = "Example evaluator"
+tags = ["example", "quality"]
+
+[package.metadata]
+owner = "evaluators-team"
+tier = "example"
+
+[wit]
+path = "../../wit/evaluator.wit"
+world = "evaluator-world"
+package = "vigilo:evaluator"
+version = "0.1.0"
+interface = "evaluator"
+strict = true
 
 [profile.dev]
-wasm = "target/wasm32-wasip1/debug/my_evaluator.wasm"
+wasm = "wasm32-wasip2/debug/my_evaluator.wasm"
 
 [profile.release]
-wasm = "target/wasm32-wasip1/release/my_evaluator.wasm"
+wasm = "wasm32-wasip2/release/my_evaluator.wasm"
 ```
 
-For a Python component:
+---
+
+## `[package]`
+
+### `manifest`
+
+Required. Path to the Cargo manifest file, relative to `Vigilo.toml`.
 
 ```toml
-# Vigilo.toml
 [package]
-manifest = "pyproject.toml"
-
-[profile.dev]
-wasm = "my_evaluator.dev.wasm"
-
-[profile.release]
-wasm = "my_evaluator.release.wasm"
+manifest = "Cargo.toml"
 ```
+
+Current publishing code supports `Cargo.toml`. `vigilo` reads evaluator `name`, `version`, Cargo description, Cargo keywords, and optional `[package.metadata.vigilo]` from this manifest.
+
+### `description`
+
+Optional. Human-readable evaluator description stored in the registry. When present, this overrides the Cargo package description.
+
+```toml
+[package]
+description = "Basic English-only lexicon sentiment evaluator"
+```
+
+### `tags`
+
+Optional. Searchable evaluator tags stored in the registry. When present, these override Cargo package keywords.
+
+```toml
+[package]
+tags = ["sentiment", "classification", "example"]
+```
+
+### `[package.metadata]`
+
+Optional. Extra evaluator metadata stored as JSON in the registry. When present, this overrides `[package.metadata.vigilo]` from `Cargo.toml`.
+
+```toml
+[package.metadata]
+owner = "evaluators-team"
+tier = "example"
+```
+
+---
+
+## `[wit]`
+
+Optional but recommended. Declares the WIT contract implemented by the evaluator.
+
+```toml
+[wit]
+path = "../../wit/evaluator.wit"
+world = "evaluator-world"
+package = "vigilo:evaluator"
+version = "0.1.0"
+interface = "evaluator"
+strict = true
+```
+
+Fields:
+
+- `path`: path to the WIT file, relative to `Vigilo.toml`
+- `world`: expected WIT world name
+- `package`: expected WIT package name
+- `version`: expected WIT package version
+- `interface`: expected exported evaluator interface
+- `strict`: when `true`, publish fails if the WIT file does not match these values
+
+If `[wit]` is omitted, the evaluator can still be prepared, but registry interface metadata is not populated from the manifest.
+
+---
+
+## `[profile.<name>]`
+
+Required for every build profile you want to publish. Each profile maps a name to a compiled wasm artifact path.
+
+```toml
+[profile.release]
+wasm = "wasm32-wasip2/release/my_evaluator.wasm"
+```
+
+The `wasm` path is joined to Cargo's target directory for the evaluator package. With the default Cargo target directory, the path above resolves to:
+
+```text
+target/wasm32-wasip2/release/my_evaluator.wasm
+```
+
+Common profiles:
+
+| Profile | Publish selection |
+|---------|-------------------|
+| `dev` | default when no profile flag is provided |
+| `release` | selected by `vigilo evaluators publish <path> --release` |
+| custom | selected by `vigilo evaluators publish <path> --profile <name>` |
 
 ---
 
 ## Registry Identity
 
-A published evaluator is uniquely identified by three values derived at publish time:
+Published evaluators use the strict identifier format:
 
-| Field | Source |
-|-------|--------|
-| `name` | Read from `manifest` |
-| `version` | Read from `manifest` |
-| `profile` | Declared in `Vigilo.toml` |
+```text
+<namespace>/<name>:<version>
+```
 
-The combination of `name + version + profile` must be unique in the registry. Attempting to publish a duplicate will be rejected unless `--force` is passed explicitly.
+Current CLI publishing inserts into the built-in `vigilo` namespace and reads `name` and `version` from `Cargo.toml`.
+
+The selected profile chooses which artifact path to publish; it is not part of the evaluator identifier. Publishing changed content under an existing identifier is rejected. Bump `Cargo.toml` version before publishing changed evaluator behavior or contract shape.
 
 ---
 
 ## Stale Build Detection
 
-`vigilo` compares the modification time of the `wasm` file against the `manifest` file before publishing. If the manifest was modified more recently than the wasm, the publish is aborted with an error indicating a potential stale build.
+`vigilo` compares the modification time of the selected wasm artifact against `Cargo.toml`. If the manifest was modified more recently than the wasm, publish fails with a stale-build error.
 
-This check exists to catch the most common mistake: bumping the version in the package manifest without rebuilding the evaluator. See the [Publishing Guide](../guides/publishing.mdx) for details on the full publish flow.
+Rebuild the selected profile before publishing:
 
----
-
-## Gitignore Recommendations
-
-Wasm output directories should be listed in `.gitignore` to exclude build artifacts from source control:
-
-```gitignore
-# Rust wasm component output
-target/
-
-# Python wasm component output
-*.wasm
+```bash
+cargo build --manifest-path evaluators/my-evaluator/Cargo.toml --target wasm32-wasip2 --release
+vigilo evaluators publish ./evaluators/my-evaluator --release
 ```
-
-This is particularly important if you use source hashing tools alongside `vigilo`, as build output included in the hash will cause instability across clean builds.
 
 ---
 
 ## Related Configuration
 
+- [Publishing Evaluators](../guides/publishing.mdx)
+- [Creating Evaluators](../guides/creating-evaluators.mdx)
 - [Run Profile Configuration](./run-profile.mdx)
 - [Dataset Format](./dataset-format.mdx)

@@ -24,6 +24,7 @@ A minimal evaluator crate should:
 - expose one evaluator entrypoint (`evaluate`)
 - accept the canonical evaluator `input`
 - return the canonical evaluator `output`
+- build as a `cdylib` for `wasm32-wasip2`
 
 Use `evaluators/sentiment-basic-en` as the concrete reference implementation.
 
@@ -42,10 +43,12 @@ my-evaluator/
 
 Key files:
 
-- `Cargo.toml`: crate identity (`name`, `version`) and dependencies
-- `Vigilo.toml`: build artifact profile paths and publish config
+- `Cargo.toml`: crate identity (`name`, `version`), `cdylib` output, and dependencies
+- `Vigilo.toml`: build artifact profile paths, WIT contract reference, and publish metadata
 - `src/lib.rs`: evaluator implementation and mapping logic
 - `example-input.json`: canonical input payload for local test runs
+
+The reference evaluator uses `wit-bindgen`, imports `evaluator-world`, implements `Guest for Evaluator`, and exports the implementation with `export!(Evaluator)`.
 
 ## Contract-First Implementation
 
@@ -66,7 +69,13 @@ Build your evaluator for WASI Preview 2:
 cargo build --manifest-path evaluators/my-evaluator/Cargo.toml --target wasm32-wasip2 --release
 ```
 
-Run a focused evaluator test using the sample input:
+Publish the release artifact:
+
+```bash
+vigilo evaluators publish ./evaluators/my-evaluator --release
+```
+
+Run a focused evaluator test against the published version using the sample input:
 
 ```bash
 vigilo evaluators test 'vigilo/my-evaluator:0.1.0' --input-file evaluators/my-evaluator/example-input.json
@@ -79,7 +88,7 @@ If you hit an interface conversion error, check that the published evaluator ver
 After validating behavior locally:
 
 ```bash
-vigilo publish ./evaluators/my-evaluator
+vigilo evaluators publish ./evaluators/my-evaluator --release
 ```
 
 For complete publish workflow details, see [Publishing Evaluators](./publishing.mdx).
@@ -98,13 +107,16 @@ Recommended prompt constraints:
 Recommended validation checklist:
 
 1. Confirm the generated evaluator builds for `wasm32-wasip2`.
-2. Confirm `vigilo evaluators test ... --input-file ...` succeeds.
-3. Confirm identifiers and output fields use the canonical naming (`input`/`output`).
-4. Bump evaluator version and republish after any contract-shape change.
+2. Confirm `vigilo evaluators publish ... --release` publishes or skips the expected version.
+3. Confirm `vigilo evaluators test ... --input-file ...` succeeds.
+4. Confirm identifiers and output fields use the canonical naming (`input`/`output`).
+5. Bump evaluator version and republish after any contract-shape or behavior change.
 
 ## Troubleshooting
 
 - **`failed to convert function to given type`**: published evaluator ABI does not match current host WIT expectations.
+- **`configured wasm artifact was not found`**: build the selected profile first, or fix the profile path in `Vigilo.toml`.
+- **`evaluation manifest was modified after wasm build`**: rebuild the evaluator after changing `Cargo.toml`.
+- **Existing evaluator with a different content hash**: bump the evaluator version before publishing changed content.
 - **No evaluator trace/debug output**: run with appropriate log level filters so debug logs are visible.
 - **Evaluator not found**: use a fully qualified identifier: `<namespace>/<name>:<version>`.
-
