@@ -1,0 +1,34 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+sequenceDiagram
+    actor User
+    participant Vigilo
+    participant DB as Vigilo DB
+
+    User->>Vigilo: vigilo run create
+    activate Vigilo
+
+    Vigilo->>Vigilo: Load and parse profile and dataset inputs
+    Vigilo->>Vigilo: Canonicalize payloads and validate dataset
+    Vigilo->>DB: Validate profile executability
+    DB-->>Vigilo: Runnable evaluator summary
+
+    Vigilo->>Vigilo: Plan case blobs, dataset version, run, and chunks
+    Vigilo->>DB: Store run creation records in transaction
+
+    alt Run creation committed
+        DB-->>Vigilo: Run, dataset, case, and chunk records saved
+        Vigilo->>Vigilo: Build run creation payload
+        Vigilo-->>User: Success response
+    else Validation or persistence fails
+        DB-->>Vigilo: Error
+        Vigilo-->>User: Run creation error
+    end
+
+    deactivate Vigilo

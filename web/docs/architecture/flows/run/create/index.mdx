@@ -1,0 +1,28 @@
+---
+title: Create
+sidebar_label: Create
+sidebar_position: 1
+---
+
+import Mermaid from '@theme/Mermaid';
+import executionFlowDiagram from './execution-flow.mmd';
+import decisionFlowDiagram from './decision-flow.mmd';
+
+# Run Create Command
+
+How `vigilo run create` validates run inputs, stores durable run work, and returns a run creation response.
+
+## Execution Flow
+
+<Mermaid value={executionFlowDiagram} />
+
+## Decision Flow
+
+<Mermaid value={decisionFlowDiagram} />
+
+## Related
+
+- [Evaluator publish flow](/docs/architecture/flows/evaluators/publish/)
+- [Evaluator search flow](/docs/architecture/flows/evaluators/search/)
+- [Structure overview](/docs/architecture/structure/)
+- [Container view](/docs/architecture/structure/containers/)
