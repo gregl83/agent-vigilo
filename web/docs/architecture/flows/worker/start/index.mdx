@@ -1,6 +1,6 @@
 ---
-title: Once
-sidebar_label: Once
+title: Start
+sidebar_label: Start
 sidebar_position: 1
 ---
 
@@ -8,9 +8,9 @@ import Mermaid from '@theme/Mermaid';
 import executionFlowDiagram from './execution-flow.mmd';
 import decisionFlowDiagram from './decision-flow.mmd';
 
-# Coordinator Once Command
+# Worker Start Command
 
-How `vigilo coordinator once` executes one bounded orchestration cycle and exits.
+How `vigilo worker start` runs a long-lived worker consumer that processes chunk-ready messages until shutdown or service failure.
 
 ## Execution Flow
 
@@ -23,8 +23,7 @@ How `vigilo coordinator once` executes one bounded orchestration cycle and exits
 ## Related
 
 - [Coordinator start flow](/docs/architecture/flows/coordinator/start/)
-- [Worker start flow](/docs/architecture/flows/worker/start/)
 - [Run create flow](/docs/architecture/flows/run/create/)
 - [Run watch flow](/docs/architecture/flows/run/watch/)
-- [Coordinator component](/docs/architecture/structure/components/coordinator/)
+- [Worker component](/docs/architecture/structure/components/worker/)
 - [Container view](/docs/architecture/structure/containers/agent-vigilo/)
