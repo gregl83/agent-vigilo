@@ -83,6 +83,21 @@ const config: Config = {
   themeConfig: {
     // Replace with your project's social card
     image: 'img/docusaurus-social-card.jpg',
+    metadata: [
+      {
+        name: 'keywords',
+        content:
+          'Agent Vigilo, AI evaluation infrastructure, generative AI evaluation, LLM evaluation, agent evaluation, deployment gating, CI gates, WASM evaluators, durable evaluation runs, evaluator registry',
+      },
+      {
+        property: 'og:type',
+        content: 'website',
+      },
+      {
+        name: 'twitter:card',
+        content: 'summary_large_image',
+      },
+    ],
     colorMode: {
       respectPrefersColorScheme: true,
     },
