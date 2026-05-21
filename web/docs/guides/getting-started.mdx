@@ -1,47 +1,176 @@
 ---
+sidebar_label: Getting Started
+title: Getting Started
+description: Run your first Agent Vigilo evaluation and see how evaluators, runs, workers, and gates fit together.
 sidebar_position: 1
 ---
 
 # Getting Started
 
-Let's discover **Docusaurus in less than 5 minutes**.
+Agent Vigilo turns generative AI evaluation into release infrastructure.
 
-## Getting Started
+Instead of a one-off script that prints a score, Vigilo gives you a system for publishing versioned WASM evaluators, creating durable evaluation runs, processing work through coordinator and worker services, and using pass/fail gates before an agent change ships.
 
-Get started by **creating a new site**.
+## Why It Is Different
 
-Or **try Docusaurus immediately** with **[docusaurus.new](https://docusaurus.new)**.
+- **Evaluators are versioned artifacts.** Publish reusable WASM evaluators and refer to them by stable identifiers like `vigilo/sentiment-basic-en:0.1.0`.
+- **Runs are durable.** Profiles, datasets, chunks, attempts, evaluator results, summaries, and gate outcomes are stored in Postgres.
+- **Execution is distributed.** Coordinators dispatch work through RabbitMQ; workers claim chunks, call the target agent, run evaluators, and persist normalized results.
+- **The CLI is automation-friendly.** Commands return structured output, support quiet mode, and expose watch/status/results/export flows for CI and agentic clients.
 
-### What you'll need
+## The Mental Model
 
-- [Node.js](https://nodejs.org/en/download/) version 20.0 or above:
-  - When installing Node.js, you are recommended to check all checkboxes related to dependencies.
-
-## Generate a new site
-
-Generate a new Docusaurus site using the **classic template**.
-
-The classic template will automatically be added to your project after you run the command:
-
-```bash
-npm init docusaurus@latest my-website classic
+```text
+profile + dataset
+      |
+      v
+vigilo run create
+      |
+      v
+coordinator -> queue -> worker -> target agent -> WASM evaluators
+      |
+      v
+run outcome: completed/pass, completed/fail, running, cancelled, or failed
 ```
 
-You can type this command into Command Prompt, Powershell, Terminal, or any other integrated terminal of your code editor.
+A profile describes the agent, request format, evaluator set, aggregation, and gate rules. A dataset supplies the cases. Vigilo turns those files into a durable run that can be watched, queried, exported, and used as a deployment gate.
 
-The command also installs all necessary dependencies you need to run Docusaurus.
+## Prerequisites
 
-## Start your site
+You need:
 
-Run the development server:
+- Rust and Cargo
+- The `wasm32-wasip2` Rust target
+- Docker Compose
+- A local checkout of the Agent Vigilo repository
+- A local model file if you want to run the bundled llama.cpp example end to end
 
-```bash
-cd my-website
-npm run start
+The bundled example expects this model path:
+
+```text
+models/qwen2.5-0.5b-instruct-q4_k_m.gguf
 ```
 
-The `cd` command changes the directory you're working with. In order to work with your newly created Docusaurus site, you'll need to navigate the terminal there.
+Install the WASM target if you do not already have it:
 
-The `npm run start` command builds your website locally and serves it through a development server, ready for you to view at http://localhost:3000/.
+```bash
+rustup target add wasm32-wasip2
+```
 
-Open `docs/intro.md` (this page) and edit some lines: the site **reloads automatically** and displays your changes.
+## Start The Local Stack
+
+From the repository root:
+
+```bash
+docker compose -f infra/dev/docker-compose.yml up -d postgres rabbitmq
+```
+
+Set the local connection strings:
+
+```bash
+export DATABASE_URL='postgres://postgres:password@localhost:5432/agent_vigilo'
+export MESSAGING_URL='amqp://guest:guest@localhost:5672/'
+```
+
+On PowerShell:
+
+```powershell
+$env:DATABASE_URL='postgres://postgres:password@localhost:5432/agent_vigilo'
+$env:MESSAGING_URL='amqp://guest:guest@localhost:5672/'
+```
+
+Apply migrations and publish the bundled evaluator:
+
+```bash
+cargo run -p vigilo -- setup
+```
+
+The setup command is safe to rerun. It applies pending migrations, builds bundled evaluators for release, and publishes them into the local registry when they are not already present.
+
+## Validate The Example
+
+Before creating durable work, verify the example profile and dataset are executable:
+
+```bash
+cargo run -p vigilo -- run test \
+  --profile-file example/profile.yaml \
+  --dataset-file example/dataset.yaml
+```
+
+This checks that the profile, dataset, evaluator references, and runnable evaluator set line up.
+
+## Run The System
+
+Start the full dev stack, including the local agent, coordinator, and worker:
+
+```bash
+docker compose -f infra/dev/docker-compose.yml up -d
+```
+
+Create a run:
+
+```bash
+cargo run -p vigilo -- run create \
+  --profile-file example/profile.yaml \
+  --dataset-file example/dataset.yaml
+```
+
+Copy the returned `run_id`, then watch it:
+
+```bash
+cargo run -p vigilo -- run watch <run_id>
+```
+
+When the run reaches a terminal status, inspect the summary:
+
+```bash
+cargo run -p vigilo -- run results <run_id>
+```
+
+Export detailed artifacts when you need evidence for debugging, release notes, or CI archives:
+
+```bash
+cargo run -p vigilo -- run export <run_id> --format jsonl
+```
+
+## Use It As A Gate
+
+For CI and release automation, the important command is `run watch`.
+
+By default, it exits successfully only when the run reaches an accepted terminal outcome. A failed run or failed gate becomes a failed command, which makes it natural to wire into deployment jobs:
+
+```bash
+cargo run -p vigilo -- run create \
+  --profile-file example/profile.yaml \
+  --dataset-file example/dataset.yaml
+
+cargo run -p vigilo -- run watch <run_id> --timeout-seconds 900
+```
+
+Use structured output for automation:
+
+```bash
+cargo run -p vigilo -- -q -f json run status <run_id>
+```
+
+## Build Your Own Evaluator
+
+The fastest path to custom evaluation is:
+
+1. Start from the bundled evaluator shape in `evaluators/sentiment-basic-en`.
+2. Implement the WIT `input` to `output` contract.
+3. Build to `wasm32-wasip2`.
+4. Publish the evaluator.
+5. Reference it from a run profile.
+
+Next guide: [Creating Evaluators](./creating-evaluators.mdx).
+
+## Explore The Architecture
+
+If you want to understand how the system works before extending it:
+
+- [Architecture flows](/docs/architecture/flows/) show the command-by-command runtime behavior.
+- [Run create flow](/docs/architecture/flows/run/create/) shows how profile and dataset files become durable work.
+- [Coordinator start flow](/docs/architecture/flows/coordinator/start/) shows orchestration and outbox publishing.
+- [Worker start flow](/docs/architecture/flows/worker/start/) shows queue consumption, agent calls, evaluator execution, and result persistence.
+- [Container view](/docs/architecture/structure/containers/agent-vigilo/) shows the runtime boundaries.
