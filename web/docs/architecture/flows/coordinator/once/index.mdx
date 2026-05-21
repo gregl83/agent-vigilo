@@ -1,0 +1,28 @@
+---
+title: Once
+sidebar_label: Once
+sidebar_position: 1
+---
+
+import Mermaid from '@theme/Mermaid';
+import executionFlowDiagram from './execution-flow.mmd';
+import decisionFlowDiagram from './decision-flow.mmd';
+
+# Coordinator Once Command
+
+How `vigilo coordinator once` executes one bounded orchestration cycle and exits.
+
+## Execution Flow
+
+<Mermaid value={executionFlowDiagram} />
+
+## Decision Flow
+
+<Mermaid value={decisionFlowDiagram} />
+
+## Related
+
+- [Run create flow](/docs/architecture/flows/run/create/)
+- [Run watch flow](/docs/architecture/flows/run/watch/)
+- [Coordinator component](/docs/architecture/structure/components/coordinator/)
+- [Container view](/docs/architecture/structure/containers/agent-vigilo/)

@@ -148,14 +148,16 @@
 }
 .docusaurus-mermaid-container rect.actor[name="Vigilo"],
 .docusaurus-mermaid-container rect.actor[name="DB"],
-.docusaurus-mermaid-container rect.actor[name="WASM"] {
+.docusaurus-mermaid-container rect.actor[name="WASM"],
+.docusaurus-mermaid-container rect.actor[name="Queue"] {
   fill: var(--diagram-system-fill) !important;
   stroke: var(--diagram-system-stroke) !important;
   stroke-width: 2 !important;
 }
 .docusaurus-mermaid-container .actor-line[name="Vigilo"],
 .docusaurus-mermaid-container .actor-line[name="DB"],
-.docusaurus-mermaid-container .actor-line[name="WASM"] {
+.docusaurus-mermaid-container .actor-line[name="WASM"],
+.docusaurus-mermaid-container .actor-line[name="Queue"] {
   stroke: var(--diagram-system-stroke) !important;
   stroke-width: 2 !important;
 }
@@ -173,7 +175,9 @@
 .docusaurus-mermaid-container g:has(> rect.actor[name="DB"]) text.actor.actor-box,
 .docusaurus-mermaid-container g:has(> rect.actor[name="DB"]) text.actor.actor-box tspan,
 .docusaurus-mermaid-container g:has(> rect.actor[name="WASM"]) text.actor.actor-box,
-.docusaurus-mermaid-container g:has(> rect.actor[name="WASM"]) text.actor.actor-box tspan {
+.docusaurus-mermaid-container g:has(> rect.actor[name="WASM"]) text.actor.actor-box tspan,
+.docusaurus-mermaid-container g:has(> rect.actor[name="Queue"]) text.actor.actor-box,
+.docusaurus-mermaid-container g:has(> rect.actor[name="Queue"]) text.actor.actor-box tspan {
   fill: var(--diagram-system-text) !important;
 }
 

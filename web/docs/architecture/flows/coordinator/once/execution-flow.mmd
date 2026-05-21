@@ -1,0 +1,47 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+sequenceDiagram
+    actor User
+    participant Vigilo
+    participant DB as Vigilo DB
+    participant Queue as RabbitMQ
+
+    User->>Vigilo: vigilo coordinator once
+    activate Vigilo
+    Vigilo->>Vigilo: Generate coordinator id
+    Vigilo->>Vigilo: Load database and messaging contexts
+
+    loop Dispatch bounded pending runs
+        Vigilo->>DB: Claim pending run and enqueue dispatch events
+        DB-->>Vigilo: Dispatched run or no work
+    end
+
+    loop Finalize bounded terminal runs
+        Vigilo->>DB: Claim finalizable run
+        DB-->>Vigilo: Finalization claim or no work
+        alt Run claimed
+            Vigilo->>DB: Roll up counts, set gate, and enqueue completion event
+            DB-->>Vigilo: Finalized run or no update
+        end
+    end
+
+    Vigilo->>DB: Claim publishable outbox events
+    DB-->>Vigilo: Outbox batch
+
+    loop Publish claimed events
+        Vigilo->>Queue: Publish event
+        alt Publish succeeds
+            Vigilo->>DB: Mark event published
+        else Publish fails
+            Vigilo->>DB: Reschedule event for retry
+        end
+    end
+
+    Vigilo-->>User: Success response
+    deactivate Vigilo

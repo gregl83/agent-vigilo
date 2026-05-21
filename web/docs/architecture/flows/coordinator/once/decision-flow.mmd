@@ -1,0 +1,74 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+flowchart TD
+    Start([vigilo coordinator once])
+
+    CoordinatorId[Generate coordinator id]
+    Contexts{Runtime contexts available?}
+    DispatchClaim{Pending run claimed?}
+    DispatchRun[Mark run running and enqueue dispatch events]
+    FinalizeClaim{Finalizable run claimed?}
+    FinalizeRun[Roll up counts, set gate, and enqueue completion event]
+    ClaimOutbox[Claim publishable outbox events]
+    Events{Claimed events remain?}
+    Publish[Publish event to queue]
+    PublishResult{Publish succeeded?}
+    MarkPublished[Mark event published]
+    Reschedule[Reschedule event for retry]
+    Stats[Log cycle statistics]
+
+    Success([Success response])
+
+    ContextFail([Runtime context error])
+    DispatchFail([Dispatch persistence error])
+    FinalizeFail([Finalization persistence error])
+    OutboxFail([Outbox persistence error])
+
+    Start --> CoordinatorId
+    CoordinatorId --> Contexts
+
+    Contexts -- No --> ContextFail
+    Contexts -- Yes --> DispatchClaim
+
+    DispatchClaim -- Yes --> DispatchRun
+    DispatchClaim -- No or batch limit reached --> FinalizeClaim
+
+    DispatchRun --> DispatchClaim
+    DispatchRun -. Update fails .-> DispatchFail
+
+    FinalizeClaim -- Yes --> FinalizeRun
+    FinalizeClaim -- No or batch limit reached --> ClaimOutbox
+
+    FinalizeRun --> FinalizeClaim
+    FinalizeRun -. Update fails .-> FinalizeFail
+
+    ClaimOutbox --> Events
+    ClaimOutbox -. Claim fails .-> OutboxFail
+
+    Events -- Yes --> Publish
+    Events -- No --> Stats
+
+    Publish --> PublishResult
+
+    PublishResult -- Yes --> MarkPublished
+    PublishResult -- No --> Reschedule
+
+    MarkPublished --> Events
+    MarkPublished -. Update fails .-> OutboxFail
+
+    Reschedule --> Events
+    Reschedule -. Update fails .-> OutboxFail
+
+    Stats --> Success
+
+    class Start command
+    class Success success
+    class CoordinatorId,Contexts,DispatchClaim,DispatchRun,FinalizeClaim,FinalizeRun,ClaimOutbox,Events,PublishResult,MarkPublished,Reschedule,Stats system
+    class Publish component
+    class ContextFail,DispatchFail,FinalizeFail,OutboxFail error
