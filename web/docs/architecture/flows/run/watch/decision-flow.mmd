@@ -1,0 +1,65 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+flowchart TD
+    Start([vigilo run watch])
+
+    RunId{Run id valid?}
+    LoadRun[Load run]
+    Found{Run exists?}
+    Emit{Snapshot changed or terminal?}
+    Write[Write watch update]
+    Terminal{Terminal status?}
+    Outcome{Terminal outcome accepted?}
+    Deadline{Timeout reached?}
+    Wait[Wait for next poll interval]
+    Reload[Reload run]
+
+    Success([Success response])
+
+    RunIdFail([Run id error])
+    NotFoundFail([Run not found error])
+    OutputFail([Output write error])
+    TerminalFail([Watch error])
+    TimeoutFail([Timeout error])
+    ReloadFail([Run lookup error])
+
+    Start --> RunId
+
+    RunId -- No --> RunIdFail
+    RunId -- Yes --> LoadRun
+
+    LoadRun --> Found
+    LoadRun -. Lookup fails .-> ReloadFail
+
+    Found -- No --> NotFoundFail
+    Found -- Yes --> Emit
+
+    Emit -- Yes --> Write
+    Emit -- No --> Terminal
+
+    Write --> Terminal
+    Write -. Write fails .-> OutputFail
+
+    Terminal -- Yes --> Outcome
+    Terminal -- No --> Deadline
+
+    Outcome -- Yes --> Success
+    Outcome -- No --> TerminalFail
+
+    Deadline -- Yes --> TimeoutFail
+    Deadline -- No --> Wait
+
+    Wait --> Reload
+    Reload --> Emit
+    Reload -. Lookup fails .-> ReloadFail
+
+    class Start command
+    class Success success
+    class RunId,LoadRun,Found,Emit,Write,Terminal,Outcome,Deadline,Wait,Reload system
+    class RunIdFail,NotFoundFail,OutputFail,TerminalFail,TimeoutFail,ReloadFail error

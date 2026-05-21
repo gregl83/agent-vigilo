@@ -1,0 +1,41 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+sequenceDiagram
+    actor User
+    participant Vigilo
+    participant DB as Vigilo DB
+
+    User->>Vigilo: vigilo run watch
+    activate Vigilo
+    Vigilo->>Vigilo: Parse run id and prepare watch loop
+    Vigilo->>DB: Load run
+    DB-->>Vigilo: Run snapshot
+
+    loop Until terminal status or timeout
+        Vigilo->>Vigilo: Compare snapshot with last emitted state
+        alt Snapshot changed or terminal
+            Vigilo-->>User: Watch update
+        end
+
+        alt Run is terminal
+            Vigilo->>Vigilo: Evaluate terminal status and gate outcome
+            alt Terminal outcome accepted
+                Vigilo-->>User: Success response
+            else Terminal outcome rejected
+                Vigilo-->>User: Watch error
+            end
+        else Watch timed out
+            Vigilo-->>User: Timeout error
+        else Run is still active
+            Vigilo->>Vigilo: Wait for next poll interval
+            Vigilo->>DB: Reload run
+            DB-->>Vigilo: Run snapshot
+        end
+    end
+    deactivate Vigilo
