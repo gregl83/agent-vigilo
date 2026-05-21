@@ -58,7 +58,19 @@ const config: Config = {
     ],
   ],
 
-  themes: ['@docusaurus/theme-mermaid'],
+  themes: [
+    '@docusaurus/theme-mermaid',
+    [
+      '@easyops-cn/docusaurus-search-local',
+      {
+        hashed: true,
+        indexDocs: true,
+        indexBlog: false,
+        indexPages: true,
+        language: ['en'],
+      },
+    ],
+  ],
 
   plugins: [
     function mermaidSourceLoader() {
