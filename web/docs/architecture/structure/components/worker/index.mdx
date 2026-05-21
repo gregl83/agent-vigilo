@@ -14,17 +14,25 @@ import workerDiagram from './diagram.mmd';
 
 # Worker Components
 
-Briefly: what this diagram shows and where this boundary starts/stops.
+Describes the major internal responsibilities of the worker runtime.
 
 <Mermaid value={workerDiagram} />
 
 ## Notes
 
-- Key responsibility of this view
-- Important boundary or dependency
-- Anything intentionally omitted
+- Workers consume `run.chunk.ready` messages and claim chunk leases before loading case data.
+- Run context and evaluator components are cached inside the worker process to avoid repeated profile parsing and WASM compilation.
+- Execution terminal transitions are authority guarded by the current attempt id and attempt number.
+- Queue messages are acknowledged only after invalid, stale, or completed work is handled; recoverable chunk failures release the lease and requeue the message.
 
 ## Related
 
-- [Runtime flow](../../../flow)
+- [Structure overview](../..)
+- [Container view](../../containers)
+- [Worker flows](../../../flows/worker)
+- [Chunk lifecycle](../../../state/chunk-lifecycle)
+- [Execution lifecycle](../../../state/execution-lifecycle)
+- [State ownership](../../../state/ownership)
 - [Failure modes](../../../failure-modes)
+- [Vigilo components](../vigilo)
+- [Coordinator components](../coordinator)

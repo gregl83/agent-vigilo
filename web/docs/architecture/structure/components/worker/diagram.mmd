@@ -1,7 +1,105 @@
 ---
 config:
-  theme: neutral
-  look: handDrawn
+  flowchart:
+    nodeSpacing: 120
+    rankSpacing: 160
+  themeVariables:
+    fontSize: 18px
+    padding: 50
+    edgeLabelBackground: 'transparent'
 ---
 flowchart TD
-    %% Define Styles
+    %% actors
+    Vigilo["fa:fa-terminal <br/> <b>Vigilo CLI</b> <br/> <small>[Container: Rust]</small> <br/> <small>Starts the worker loop or one-shot cycle.</small>"]:::component
+    Coordinator["fa:fa-compass <br/> <b>Coordinator</b> <br/> <small>[Container: Rust]</small> <br/> <small>Publishes run.chunk.ready events after dispatch.</small>"]:::component
+
+    %% components
+    CommandFacade["fa:fa-gear <br/> <b>Worker Command Facade</b> <br/> <small>[Component: Rust / Clap]</small> <br/> <small>Selects start or once mode and builds the evaluator loader.</small>"]:::component
+    ServiceLoop["fa:fa-rotate <br/> <b>Service Loop Runner</b> <br/> <small>[Component: Rust / Tokio]</small> <br/> <small>Runs the long-lived consumer loop and handles shutdown.</small>"]:::component
+    RuntimeContext["fa:fa-layer-group <br/> <b>Runtime Context Access</b> <br/> <small>[Component: Rust]</small> <br/> <small>Provides database, messaging, registry cache, and Wasm runtime clients.</small>"]:::component
+
+    WorkerConsumer["fa:fa-inbox <br/> <b>Worker Queue Consumer</b> <br/> <small>[Component: Rust / AMQP]</small> <br/> <small>Fetches one message for once mode or opens a prefetch-limited delivery stream.</small>"]:::component
+    MessageHandler["fa:fa-envelope-open-text <br/> <b>Chunk Message Handler</b> <br/> <small>[Component: Rust]</small> <br/> <small>Parses chunk-ready payloads and routes invalid, stale, successful, and retryable outcomes.</small>"]:::component
+    MessageSettlement["fa:fa-check-double <br/> <b>Message Settlement</b> <br/> <small>[Component: Rust / AMQP]</small> <br/> <small>Acknowledges handled messages or nacks and requeues recoverable chunk failures.</small>"]:::component
+
+    ChunkWorkflow["fa:fa-handshake <br/> <b>Chunk Lease Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Claims pending or expired chunks for running runs and completes or releases owned leases.</small>"]:::component
+    RunContextCache["fa:fa-boxes-stacked <br/> <b>Run Context Cache</b> <br/> <small>[Component: Rust / Moka]</small> <br/> <small>Caches run profile snapshots, evaluator refs, and evaluator runtime catalog entries.</small>"]:::component
+    EvaluatorLoader["fa:fa-cubes <br/> <b>Evaluator Loader Service</b> <br/> <small>[Component: Rust / Wasmtime]</small> <br/> <small>Validates evaluator refs, loads runnable registry records, and warms compiled components.</small>"]:::component
+    CaseBatchLoader["fa:fa-table-list <br/> <b>Case Batch Loader</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Loads dataset cases covered by the claimed chunk ordinal range.</small>"]:::component
+
+    ExecutionProcessor["fa:fa-list-check <br/> <b>Execution Processing Workflow</b> <br/> <small>[Component: Rust]</small> <br/> <small>Allocates authoritative attempts and coordinates case-level agent and evaluator execution.</small>"]:::component
+    AgentClient["fa:fa-brain <br/> <b>Agent Invocation Client</b> <br/> <small>[Component: Rust / HTTP]</small> <br/> <small>Sends evaluator-safe case input to the configured target and normalizes agent output.</small>"]:::component
+    EvaluatorExecutor["fa:fa-microchip <br/> <b>Evaluator Runtime Executor</b> <br/> <small>[Component: Rust / Wasmtime]</small> <br/> <small>Runs WIT-backed evaluator components with bounded per-case parallelism.</small>"]:::component
+    ResultPersistence["fa:fa-database <br/> <b>Result Persistence Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Appends evaluator results and upserts execution aggregates in a chunk-level transaction.</small>"]:::component
+    TerminalTransitions["fa:fa-shield-halved <br/> <b>Terminal Transition Guard</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Marks attempts and executions terminal only when current-attempt authority still matches.</small>"]:::component
+
+    %% worker boundary
+    subgraph WorkerRuntime["&nbsp;"]
+        CommandFacade
+        ServiceLoop
+        RuntimeContext
+        WorkerConsumer
+        MessageHandler
+        MessageSettlement
+        ChunkWorkflow
+        RunContextCache
+        EvaluatorLoader
+        CaseBatchLoader
+        ExecutionProcessor
+        AgentClient
+        EvaluatorExecutor
+        ResultPersistence
+        TerminalTransitions
+    end
+    style WorkerRuntime stroke-dasharray: 5 5,fill:none,stroke:#1168bd,stroke-width:2px
+
+    %% external containers
+    Database[("<b>Database</b> <br/> <small>[Container: PostgreSQL]</small> <br/> <small>Stores runs, chunks, cases, evaluator registry rows, attempts, results, and aggregates.</small>")]:::component
+    Queue[("<b>Queue</b> <br/> <small>[Container: RabbitMQ]</small> <br/> <small>Delivers run.chunk.ready events to workers.</small>")]:::component
+    TargetAgent["fa:fa-brain <br/> <b>Agent / AI Provider</b> <br/> <small>[External System]</small> <br/> <small>The model, agent wrapper, or HTTP endpoint being evaluated.</small>"]:::external
+
+    %% edges
+    Vigilo -->|"Runs worker start or once through"| CommandFacade
+    CommandFacade -->|"Starts continuous mode with"| ServiceLoop
+    CommandFacade -->|"Runs one bounded drain pass through"| WorkerConsumer
+    ServiceLoop -->|"Maintains delivery stream with"| WorkerConsumer
+
+    CommandFacade -->|"Creates shared access through"| RuntimeContext
+    WorkerConsumer -->|"Uses messaging client from"| RuntimeContext
+    MessageHandler -->|"Uses database and messaging clients from"| RuntimeContext
+    EvaluatorLoader -->|"Uses registry cache and Wasm runtime from"| RuntimeContext
+    EvaluatorExecutor -->|"Uses Wasm runtime from"| RuntimeContext
+
+    Coordinator -->|"Publishes chunk-ready events to <br> <small>[JSON/AMQP]</small>"| Queue
+    RuntimeContext -->|"Opens messaging access to <br> <small>[AMQP]</small>"| Queue
+    RuntimeContext -->|"Opens database access to <br> <small>[SQL/TCP]</small>"| Database
+
+    WorkerConsumer -->|"Delivers messages to"| MessageHandler
+    MessageHandler -->|"Claims chunk ownership with"| ChunkWorkflow
+    ChunkWorkflow -->|"Reads and updates chunk leases in <br> <small>[SQL/TCP]</small>"| Database
+
+    MessageHandler -->|"Loads profile and evaluator metadata through"| RunContextCache
+    RunContextCache -->|"Reads run profile and evaluator catalog from <br> <small>[SQL/TCP]</small>"| Database
+    RunContextCache -->|"Warms evaluator refs with"| EvaluatorLoader
+    EvaluatorLoader -->|"Reads runnable evaluator WASM from <br> <small>[SQL/TCP]</small>"| Database
+
+    MessageHandler -->|"Loads cases with"| CaseBatchLoader
+    CaseBatchLoader -->|"Reads dataset case rows from <br> <small>[SQL/TCP]</small>"| Database
+    MessageHandler -->|"Processes claimed case batch with"| ExecutionProcessor
+
+    ExecutionProcessor -->|"Allocates attempts and evaluates each case through"| AgentClient
+    AgentClient -->|"Sends case input and receives output from <br> <small>[TEXT/HTTP]</small>"| TargetAgent
+    ExecutionProcessor -->|"Runs evaluator bindings with"| EvaluatorExecutor
+    EvaluatorExecutor -->|"Gets compiled components from"| EvaluatorLoader
+    ExecutionProcessor -->|"Persists completed case evidence through"| ResultPersistence
+    ResultPersistence -->|"Appends results and upserts aggregates in <br> <small>[SQL/TCP]</small>"| Database
+    MessageHandler -->|"Applies terminal execution updates with"| TerminalTransitions
+    TerminalTransitions -->|"Updates attempts and executions with authority checks in <br> <small>[SQL/TCP]</small>"| Database
+
+    MessageHandler -->|"Completes or releases owned chunk through"| ChunkWorkflow
+    MessageHandler -->|"Settles delivery with"| MessageSettlement
+    MessageSettlement -->|"Acknowledges or requeues message over <br> <small>[AMQP]</small>"| Queue
+
+    %% links
+    click Vigilo "/docs/architecture/structure/components/vigilo/"
+    click Coordinator "/docs/architecture/structure/components/coordinator/"
