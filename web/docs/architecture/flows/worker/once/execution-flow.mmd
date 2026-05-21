@@ -1,0 +1,56 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+sequenceDiagram
+    actor User
+    participant Vigilo
+    participant Queue as RabbitMQ
+    participant DB as Vigilo DB
+    participant WASM as WASM Runtime
+
+    User->>Vigilo: vigilo worker once
+    activate Vigilo
+    Vigilo->>Vigilo: Build evaluator loader
+    Vigilo->>Queue: Consume one worker message
+    Queue-->>Vigilo: Chunk-ready message or no work
+
+    alt No worker message
+        Vigilo-->>User: Success response
+    else Message received
+        Vigilo->>Vigilo: Deserialize chunk-ready payload
+        alt Invalid payload
+            Vigilo->>Queue: Acknowledge message
+            Vigilo-->>User: Success response
+        else Valid payload
+            Vigilo->>DB: Claim chunk lease
+            DB-->>Vigilo: Claimed chunk or no claim
+
+            alt Chunk not claimable
+                Vigilo->>Queue: Acknowledge message
+                Vigilo-->>User: Success response
+            else Chunk claimed
+                Vigilo->>DB: Load run context and case batch
+                DB-->>Vigilo: Profile, evaluator catalog, and cases
+                Vigilo->>WASM: Warm evaluator components
+                WASM-->>Vigilo: Warmup result
+                Vigilo->>WASM: Execute case batch evaluators
+                WASM-->>Vigilo: Evaluation outputs
+                Vigilo->>DB: Persist execution results and complete chunk
+                DB-->>Vigilo: Processing outcome
+                Vigilo->>Queue: Acknowledge message
+                Vigilo-->>User: Success response
+            else Recoverable processing failure
+                Vigilo->>DB: Release chunk lease
+                Vigilo->>Queue: Requeue or acknowledge message
+                Vigilo-->>User: Success response
+            end
+        end
+    else Worker cycle fails
+        Vigilo-->>User: Worker error
+    end
+    deactivate Vigilo

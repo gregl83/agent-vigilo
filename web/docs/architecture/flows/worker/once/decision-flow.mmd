@@ -1,0 +1,79 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+flowchart TD
+    Start([vigilo worker once])
+
+    Loader[Build evaluator loader]
+    Consume{Worker message available?}
+    Payload{Chunk-ready payload valid?}
+    Claim{Chunk claimable?}
+    Context[Load run context]
+    Warm[Warm evaluator components]
+    Cases[Load chunk case batch]
+    Execute[Execute case evaluations]
+    Persist[Persist terminal transitions]
+    Complete[Mark chunk completed]
+    Ack[Acknowledge message]
+    Release[Release chunk lease]
+    Released{Chunk released?}
+    Requeue[Nack and requeue message]
+
+    Success([Success response])
+
+    ServiceFail([Worker error])
+
+    Start --> Loader
+    Loader --> Consume
+
+    Consume -- No --> Success
+    Consume -- Yes --> Payload
+    Consume -. Consume fails .-> ServiceFail
+
+    Payload -- No --> Ack
+    Payload -- Yes --> Claim
+
+    Claim -- No --> Ack
+    Claim -- Yes --> Context
+    Claim -. Claim fails .-> ServiceFail
+
+    Context --> Warm
+    Context -. Context load fails .-> ServiceFail
+
+    Warm --> Cases
+    Warm -. Warmup fails .-> Release
+
+    Cases --> Execute
+    Cases -. Load fails .-> Release
+
+    Execute --> Persist
+    Execute -. Processing fails .-> Release
+
+    Persist --> Complete
+    Persist -. Persistence fails .-> Release
+
+    Complete --> Ack
+    Complete -. Completion fails .-> ServiceFail
+
+    Ack --> Success
+    Ack -. Ack fails .-> ServiceFail
+
+    Release --> Released
+    Release -. Release fails .-> ServiceFail
+
+    Released -- Yes --> Requeue
+    Released -- No --> Ack
+
+    Requeue --> Success
+    Requeue -. Requeue fails .-> ServiceFail
+
+    class Start command
+    class Success success
+    class Loader,Consume,Payload,Claim,Context,Cases,Persist,Complete,Ack,Release,Released,Requeue system
+    class Warm,Execute component
+    class ServiceFail error
