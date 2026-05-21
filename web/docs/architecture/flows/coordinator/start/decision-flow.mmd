@@ -1,0 +1,59 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+flowchart TD
+    Start([vigilo coordinator start])
+
+    CoordinatorId[Generate coordinator id]
+    Runner[Start coordinator service runner]
+    Event{Next service event?}
+    Contexts{Runtime contexts available?}
+    Dispatch[Drain pending run dispatches]
+    Finalize[Drain finalizable runs]
+    Outbox[Publish pending outbox events]
+    Wait[Wait for next tick]
+    Shutdown[Cancel service loop]
+    Stop{Service stopped in time?}
+
+    Success([Success response])
+
+    ContextFail([Runtime context error])
+    CycleFail([Coordinator cycle error])
+    ShutdownFail([Shutdown error])
+
+    Start --> CoordinatorId
+    CoordinatorId --> Runner
+    Runner --> Event
+
+    Event -- Tick elapsed --> Contexts
+    Event -- Shutdown signal --> Shutdown
+
+    Contexts -- No --> ContextFail
+    Contexts -- Yes --> Dispatch
+
+    Dispatch --> Finalize
+    Dispatch -. Dispatch fails .-> CycleFail
+
+    Finalize --> Outbox
+    Finalize -. Finalization fails .-> CycleFail
+
+    Outbox --> Wait
+    Outbox -. Publish pass fails .-> CycleFail
+
+    Wait --> Event
+
+    Shutdown --> Stop
+    Shutdown -. Shutdown hook fails .-> ShutdownFail
+
+    Stop -- Yes --> Success
+    Stop -- No --> ShutdownFail
+
+    class Start command
+    class Success success
+    class CoordinatorId,Runner,Event,Contexts,Dispatch,Finalize,Outbox,Wait,Shutdown,Stop system
+    class ContextFail,CycleFail,ShutdownFail error

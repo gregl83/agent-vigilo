@@ -1,0 +1,40 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+sequenceDiagram
+    actor User
+    participant Vigilo
+    participant DB as Vigilo DB
+    participant Queue as RabbitMQ
+
+    User->>Vigilo: vigilo coordinator start
+    activate Vigilo
+    Vigilo->>Vigilo: Generate coordinator id
+    Vigilo->>Vigilo: Start coordinator service loop
+
+    loop Until shutdown or service failure
+        alt Shutdown signal received
+            User->>Vigilo: Shutdown signal
+            Vigilo->>Vigilo: Cancel loop and wait for service stop
+            Vigilo-->>User: Success response
+        else Tick elapsed
+            Vigilo->>Vigilo: Run coordinator cycle
+            Vigilo->>DB: Drain pending run dispatches
+            DB-->>Vigilo: Dispatch count
+            Vigilo->>DB: Drain finalizable runs
+            DB-->>Vigilo: Finalization count
+            Vigilo->>DB: Claim publishable outbox events
+            DB-->>Vigilo: Outbox batch
+            Vigilo->>Queue: Publish claimed events
+            Queue-->>Vigilo: Publish outcomes
+            Vigilo->>DB: Mark published events or schedule retries
+        else Cycle or shutdown fails
+            Vigilo-->>User: Service error
+        end
+    end
+    deactivate Vigilo
