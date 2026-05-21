@@ -6,3 +6,18 @@ sidebar_position: 1
 # Evaluators Flows
 
 Command flows for publishing, validating, and operating evaluator artifacts.
+
+These flows cover the CLI paths that manage evaluator versions before they are selected by a run. They focus on artifact validation, registry reads and writes, state changes, and local test execution.
+
+Each command page includes:
+
+- an execution flow that shows the runtime boundary calls
+- a decision flow that shows validation, branching, and response outcomes
+
+## Commands
+
+- [Publish](./publish/) records a validated evaluator artifact and its metadata.
+- [Search](./search/) reads evaluator registry entries for discovery and filtering.
+- [Show](./show/) loads one evaluator record for inspection.
+- [Test](./test/) validates an evaluator against local input without publishing it.
+- [Set state](./set-state/) updates an evaluator version state used by run selection.

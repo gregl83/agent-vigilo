@@ -6,3 +6,15 @@ sidebar_position: 3
 # Coordinator Flows
 
 Command flows for dispatching pending runs, finalizing completed work, and publishing orchestration events.
+
+These flows cover the orchestration process that turns persisted run state into worker-ready chunks, finalizes runs after chunk completion, and publishes queued state-change events. The coordinator owns scheduling decisions, not evaluator execution.
+
+Each command page includes:
+
+- an execution flow that shows the coordinator loop boundaries
+- a decision flow that shows dispatch, finalize, publish, idle, and error paths
+
+## Commands
+
+- [Once](./once/) performs one bounded coordinator cycle and exits.
+- [Start](./start/) runs the coordinator loop until shutdown.

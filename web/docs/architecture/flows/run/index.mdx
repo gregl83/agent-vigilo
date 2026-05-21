@@ -6,3 +6,20 @@ sidebar_position: 2
 # Run Flows
 
 Command flows for creating, observing, and managing evaluation runs.
+
+These flows cover the user-facing run commands that create durable work, inspect run progress, stream updates, export evidence, and cancel open work. They connect CLI responses to the same persisted lifecycle shown in the state diagrams.
+
+Each command page includes:
+
+- an execution flow that shows calls between the user, Vigilo, and backing services
+- a decision flow that shows validation, branching, terminal responses, and error handling
+
+## Commands
+
+- [Create](./create/) validates run inputs and stores pending run work.
+- [Test](./test/) performs a local evaluator test path without creating a durable run.
+- [Status](./status/) reads the current run and gate status.
+- [Watch](./watch/) follows run state until completion or interruption.
+- [Results](./results/) reads completed run output for review.
+- [Export](./export/) writes run evidence into an external artifact format.
+- [Cancel](./cancel/) requests cancellation for open run work.
