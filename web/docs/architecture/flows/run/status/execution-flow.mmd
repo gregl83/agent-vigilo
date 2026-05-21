@@ -1,0 +1,27 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+sequenceDiagram
+    actor User
+    participant Vigilo
+    participant DB as Vigilo DB
+
+    User->>Vigilo: vigilo run status
+    activate Vigilo
+    Vigilo->>Vigilo: Parse run id
+    Vigilo->>DB: Load run
+    DB-->>Vigilo: Run snapshot
+
+    alt Run loaded
+        Vigilo->>Vigilo: Mark whether status is terminal
+        Vigilo->>Vigilo: Build status payload
+        Vigilo-->>User: Success response
+    else Run lookup fails
+        Vigilo-->>User: Status error
+    end
+    deactivate Vigilo
