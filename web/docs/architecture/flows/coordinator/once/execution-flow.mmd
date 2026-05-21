@@ -14,7 +14,7 @@ sequenceDiagram
 
     User->>Vigilo: vigilo coordinator once
     activate Vigilo
-    Vigilo->>Vigilo: Generate coordinator id
+    Vigilo->>Vigilo: Load throughput knobs and generate coordinator id
     Vigilo->>Vigilo: Load database and messaging contexts
 
     loop Dispatch bounded run windows
@@ -34,7 +34,7 @@ sequenceDiagram
     Vigilo->>DB: Claim publishable outbox events
     DB-->>Vigilo: Outbox batch
 
-    loop Publish claimed events
+    loop Bounded outbox publish concurrency
         Vigilo->>Queue: Publish event
         alt Publish succeeds
             Vigilo->>DB: Mark event published

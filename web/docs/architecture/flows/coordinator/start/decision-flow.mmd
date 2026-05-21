@@ -15,7 +15,7 @@ flowchart TD
     Contexts{Runtime contexts available?}
     Dispatch[Drain dispatchable run windows]
     Finalize[Drain finalizable runs]
-    Outbox[Publish pending outbox events]
+    Outbox[Claim pending outbox batch and publish with bounded concurrency]
     Wait[Wait for next tick]
     Shutdown[Cancel service loop]
     Stop{Service stopped in time?}

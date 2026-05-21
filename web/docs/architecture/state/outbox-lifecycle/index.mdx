@@ -23,8 +23,9 @@ How durable outbox rows make state-change events publishable, retryable, and ide
 ## Notes
 
 - State workflows insert events in the same database operation as the state change.
-- The publisher claims `pending` events with `available_at <= now()` and `FOR UPDATE SKIP LOCKED`.
+- The publisher claims `pending` events with `available_at <= now()` and `FOR UPDATE SKIP LOCKED`, using a partial pending-event index for the hot claim path.
 - A claim keeps `status = pending` but moves `available_at` into the future as a publish lease.
+- Claimed batches are published with bounded concurrency controlled by the coordinator outbox publish parallelism setting.
 - Successful publishes mark events `published`; failed publishes return them to `pending` with a retry delay and error message.
 
 ## Related

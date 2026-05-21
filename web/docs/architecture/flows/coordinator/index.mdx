@@ -15,12 +15,12 @@ keywords:
 
 Command flows for dispatching run chunk windows, finalizing completed work, and publishing orchestration events.
 
-These flows cover the orchestration process that turns persisted run state into worker-ready chunks, finalizes runs after chunk completion, and publishes queued state-change events. The coordinator owns scheduling decisions, not evaluator execution.
+These flows cover the orchestration process that turns persisted run state into worker-ready chunks, finalizes runs after chunk completion, and publishes queued state-change events with bounded outbox concurrency. The coordinator owns scheduling decisions, not evaluator execution.
 
 Each command page includes:
 
 - an execution flow that shows the coordinator loop boundaries
-- a decision flow that shows dispatch, finalize, publish, idle, and error paths
+- a decision flow that shows dispatch, finalize, concurrent publish, idle, and error paths
 
 ## Commands
 

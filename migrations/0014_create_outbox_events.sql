@@ -22,8 +22,15 @@ CREATE TABLE outbox_events (
 CREATE INDEX idx_outbox_events_status_available_at
     ON outbox_events(status, available_at);
 
+CREATE INDEX idx_outbox_events_pending_available
+    ON outbox_events(available_at, id)
+    WHERE status = 'pending';
+
 CREATE INDEX idx_outbox_events_aggregate
     ON outbox_events(aggregate_type, aggregate_id);
+
+COMMENT ON INDEX idx_outbox_events_pending_available IS
+    'Hot partial index for high-throughput outbox publishers claiming pending events by availability time.';
 
 COMMENT ON TABLE outbox_events IS
     'Outbox table used to ensure reliable, at-least-once delivery of domain events. Events are written transactionally with state changes and later published asynchronously to external systems.';

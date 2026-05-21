@@ -14,7 +14,7 @@ sequenceDiagram
 
     User->>Vigilo: vigilo coordinator start
     activate Vigilo
-    Vigilo->>Vigilo: Generate coordinator id
+    Vigilo->>Vigilo: Load throughput knobs and generate coordinator id
     Vigilo->>Vigilo: Start coordinator service loop
 
     loop Until shutdown or service failure
@@ -30,7 +30,9 @@ sequenceDiagram
             DB-->>Vigilo: Finalization count
             Vigilo->>DB: Claim publishable outbox events
             DB-->>Vigilo: Outbox batch
-            Vigilo->>Queue: Publish claimed events
+            loop Bounded outbox publish concurrency
+                Vigilo->>Queue: Publish claimed events
+            end
             Queue-->>Vigilo: Publish outcomes
             Vigilo->>DB: Mark published events or schedule retries
         else Cycle or shutdown fails

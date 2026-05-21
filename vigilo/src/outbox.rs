@@ -8,6 +8,10 @@
 //! without losing events when a process exits between commit and publish.
 
 use async_trait::async_trait;
+use futures_util::{
+    StreamExt,
+    stream::FuturesUnordered,
+};
 use sqlx::PgPool;
 use tracing::error;
 
@@ -19,12 +23,14 @@ use crate::{
 
 /// Runtime knobs for one outbox publishing pass.
 ///
-/// `batch_size` bounds coordinator work per cycle, `lease_seconds` prevents
-/// other coordinators from claiming the same events immediately, and
-/// `retry_delay_seconds` controls when a failed publish becomes eligible again.
+/// `batch_size` bounds coordinator work per cycle, `publish_parallelism` bounds
+/// concurrent broker publishes, `lease_seconds` prevents other coordinators
+/// from claiming the same events immediately, and `retry_delay_seconds`
+/// controls when a failed publish becomes eligible again.
 #[derive(Debug, Clone)]
 pub(crate) struct OutboxPublisherConfig {
     pub(crate) batch_size: i64,
+    pub(crate) publish_parallelism: usize,
     pub(crate) lease_seconds: i32,
     pub(crate) retry_delay_seconds: i32,
 }
@@ -32,8 +38,9 @@ pub(crate) struct OutboxPublisherConfig {
 impl Default for OutboxPublisherConfig {
     fn default() -> Self {
         Self {
-            batch_size: 32,
-            lease_seconds: 30,
+            batch_size: 1_000,
+            publish_parallelism: 64,
+            lease_seconds: 60,
             retry_delay_seconds: 10,
         }
     }
@@ -48,6 +55,12 @@ pub(crate) struct OutboxPublishStats {
     pub(crate) claimed: usize,
     pub(crate) published: usize,
     pub(crate) failed: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OutboxPublishOutcome {
+    Published,
+    Failed,
 }
 
 /// Transport boundary for publishing outbox events.
@@ -81,6 +94,37 @@ impl EventPublisher for MqEventPublisher<'_> {
     }
 }
 
+async fn publish_claimed_event(
+    db: &PgPool,
+    publisher: &dyn EventPublisher,
+    retry_delay_seconds: i32,
+    event: OutboxEvent,
+) -> anyhow::Result<OutboxPublishOutcome> {
+    match publisher.publish(&event).await {
+        Ok(()) => {
+            outbox_events::mark_outbox_event_published(db, event.id).await?;
+            Ok(OutboxPublishOutcome::Published)
+        }
+        Err(err) => {
+            let message = err.to_string();
+            error!(
+                event_id = %event.id,
+                event_type = %event.event_type,
+                error = %message,
+                "outbox publish failed; scheduling retry"
+            );
+            outbox_events::reschedule_outbox_event(
+                db,
+                event.id,
+                retry_delay_seconds,
+                &message,
+            )
+            .await?;
+            Ok(OutboxPublishOutcome::Failed)
+        }
+    }
+}
+
 /// Claims and publishes a bounded batch of pending outbox events.
 ///
 /// Each claimed event is published independently. Successful publishes are
@@ -100,27 +144,33 @@ pub(crate) async fn publish_pending_events(
         ..OutboxPublishStats::default()
     };
 
-    for event in claimed_events {
-        match publisher.publish(&event).await {
-            Ok(()) => {
-                outbox_events::mark_outbox_event_published(db, event.id).await?;
+    let parallelism = config.publish_parallelism.max(1);
+    let mut events = claimed_events.into_iter();
+    let mut pending = FuturesUnordered::new();
+
+    loop {
+        while pending.len() < parallelism {
+            let Some(event) = events.next() else {
+                break;
+            };
+
+            pending.push(publish_claimed_event(
+                db,
+                publisher,
+                config.retry_delay_seconds,
+                event,
+            ));
+        }
+
+        let Some(result) = pending.next().await else {
+            break;
+        };
+
+        match result? {
+            OutboxPublishOutcome::Published => {
                 stats.published += 1;
             }
-            Err(err) => {
-                let message = err.to_string();
-                error!(
-                    event_id = %event.id,
-                    event_type = %event.event_type,
-                    error = %message,
-                    "outbox publish failed; scheduling retry"
-                );
-                outbox_events::reschedule_outbox_event(
-                    db,
-                    event.id,
-                    config.retry_delay_seconds,
-                    &message,
-                )
-                .await?;
+            OutboxPublishOutcome::Failed => {
                 stats.failed += 1;
             }
         }

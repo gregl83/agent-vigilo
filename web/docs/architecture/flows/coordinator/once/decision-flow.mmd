@@ -9,7 +9,7 @@ config:
 flowchart TD
     Start([vigilo coordinator once])
 
-    CoordinatorId[Generate coordinator id]
+    CoordinatorId[Load throughput knobs and generate coordinator id]
     Contexts{Runtime contexts available?}
     DispatchClaim{Dispatchable run claimed?}
     DispatchRun[Start run if needed and enqueue chunk window]
@@ -17,7 +17,7 @@ flowchart TD
     FinalizeRun[Roll up counts, set gate, and enqueue completion event]
     ClaimOutbox[Claim publishable outbox events]
     Events{Claimed events remain?}
-    Publish[Publish event to queue]
+    Publish[Publish event to queue with bounded concurrency]
     PublishResult{Publish succeeded?}
     MarkPublished[Mark event published]
     Reschedule[Reschedule event for retry]

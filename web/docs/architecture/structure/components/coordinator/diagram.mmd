@@ -14,7 +14,7 @@ flowchart TD
     Worker["fa:fa-gear <br/> <b>Worker</b> <br/> <small>[Container: Rust]</small> <br/> <small>Consumes chunk-ready events and persists execution outcomes.</small>"]:::component
 
     %% components
-    CommandFacade["fa:fa-compass <br/> <b>Coordinator Command Facade</b> <br/> <small>[Component: Rust / Clap]</small> <br/> <small>Selects start or once mode and creates a coordinator identity.</small>"]:::component
+    CommandFacade["fa:fa-compass <br/> <b>Coordinator Command Facade</b> <br/> <small>[Component: Rust / Clap]</small> <br/> <small>Selects start or once mode, loads throughput knobs, and creates a coordinator identity.</small>"]:::component
     ServiceLoop["fa:fa-rotate <br/> <b>Service Loop Runner</b> <br/> <small>[Component: Rust / Tokio]</small> <br/> <small>Runs coordinator cycles on a fixed tick and handles shutdown.</small>"]:::component
     RuntimeContext["fa:fa-layer-group <br/> <b>Runtime Context Access</b> <br/> <small>[Component: Rust]</small> <br/> <small>Provides database and messaging clients for each cycle.</small>"]:::component
 
@@ -25,7 +25,7 @@ flowchart TD
     FinalizeDrainer["fa:fa-flag-checkered <br/> <b>Finalization Batch Drainer</b> <br/> <small>[Component: Rust]</small> <br/> <small>Bounds finalizable-run work per coordinator cycle.</small>"]:::component
     FinalizeWorkflow["fa:fa-calculator <br/> <b>Run Finalization Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Claims terminal runs, rolls up execution counts, sets gate status, and inserts run.completed events.</small>"]:::component
 
-    OutboxPublisher["fa:fa-paper-plane <br/> <b>Outbox Publisher</b> <br/> <small>[Component: Rust]</small> <br/> <small>Claims publishable events, publishes them, and records publish or retry state.</small>"]:::component
+    OutboxPublisher["fa:fa-paper-plane <br/> <b>Outbox Publisher</b> <br/> <small>[Component: Rust / Tokio]</small> <br/> <small>Claims publishable batches, publishes with bounded concurrency, and records publish or retry state.</small>"]:::component
     EventPublisher["fa:fa-plug <br/> <b>Event Publisher Boundary</b> <br/> <small>[Component: Rust Trait]</small> <br/> <small>Separates durable outbox handling from the broker transport.</small>"]:::component
     MqPublisher["fa:fa-envelope-open-text <br/> <b>RabbitMQ Event Publisher</b> <br/> <small>[Component: Rust / AMQP]</small> <br/> <small>Publishes JSON events using the configured message queue client.</small>"]:::component
 
@@ -69,7 +69,7 @@ flowchart TD
 
     CycleOrchestrator -->|"Finally publishes with"| OutboxPublisher
     OutboxPublisher -->|"Claims, marks, and reschedules events in <br> <small>[SQL/TCP]</small>"| Database
-    OutboxPublisher -->|"Publishes each event through"| EventPublisher
+    OutboxPublisher -->|"Publishes claimed events concurrently through"| EventPublisher
     EventPublisher -->|"Uses production transport"| MqPublisher
     MqPublisher -->|"Publishes run events to <br> <small>[JSON/AMQP]</small>"| Queue
     Queue -->|"Streams run.chunk.ready events to"| Worker

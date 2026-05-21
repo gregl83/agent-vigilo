@@ -41,9 +41,23 @@ const COORDINATOR_LEASE_SECONDS: i32 = 60;
 const COORDINATOR_MAX_DISPATCH_PER_CYCLE: usize = 64;
 const COORDINATOR_MAX_FINALIZE_PER_CYCLE: usize = 64;
 const RUN_CHUNK_DISPATCH_WINDOW_SIZE: i64 = 512;
-const OUTBOX_BATCH_SIZE: i64 = 32;
-const OUTBOX_LEASE_SECONDS: i32 = 30;
+const OUTBOX_BATCH_SIZE: i64 = 1_000;
+const OUTBOX_PUBLISH_PARALLELISM: usize = 64;
+const OUTBOX_LEASE_SECONDS: i32 = 60;
 const OUTBOX_RETRY_DELAY_SECONDS: i32 = 10;
+
+#[derive(Debug, Clone)]
+struct CoordinatorRuntimeConfig {
+    tick_seconds: u64,
+    lease_seconds: i32,
+    max_dispatch_per_cycle: usize,
+    max_finalize_per_cycle: usize,
+    run_chunk_dispatch_window_size: i64,
+    outbox_batch_size: i64,
+    outbox_publish_parallelism: usize,
+    outbox_lease_seconds: i32,
+    outbox_retry_delay_seconds: i32,
+}
 
 #[derive(Debug, Subcommand)]
 /// Coordinator execution modes.
@@ -62,22 +76,75 @@ pub(crate) enum SubCommand {
 /// - `start` runs the loop continuously
 /// - `once` executes one orchestration cycle and exits
 pub(crate) struct Command {
+    /// Seconds between coordinator cycles in start mode
+    #[arg(long, env = "VIGILO_COORDINATOR_TICK_SECONDS", default_value_t = COORDINATOR_TICK_SECONDS, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    pub tick_seconds: u64,
+
+    /// Coordinator lease duration for run dispatch/finalization
+    #[arg(long, env = "VIGILO_COORDINATOR_LEASE_SECONDS", default_value_t = COORDINATOR_LEASE_SECONDS, value_parser = clap::value_parser!(i32).range(1..=86400))]
+    pub lease_seconds: i32,
+
+    /// Maximum run dispatch windows prepared per coordinator cycle
+    #[arg(long, env = "VIGILO_COORDINATOR_MAX_DISPATCH_PER_CYCLE", default_value_t = COORDINATOR_MAX_DISPATCH_PER_CYCLE, value_parser = clap::value_parser!(usize).range(1..=100_000))]
+    pub max_dispatch_per_cycle: usize,
+
+    /// Maximum runs finalized per coordinator cycle
+    #[arg(long, env = "VIGILO_COORDINATOR_MAX_FINALIZE_PER_CYCLE", default_value_t = COORDINATOR_MAX_FINALIZE_PER_CYCLE, value_parser = clap::value_parser!(usize).range(1..=100_000))]
+    pub max_finalize_per_cycle: usize,
+
+    /// Number of run chunks made ready per dispatch window
+    #[arg(long, env = "VIGILO_RUN_CHUNK_DISPATCH_WINDOW_SIZE", default_value_t = RUN_CHUNK_DISPATCH_WINDOW_SIZE, value_parser = clap::value_parser!(i64).range(1..=1_000_000))]
+    pub run_chunk_dispatch_window_size: i64,
+
+    /// Maximum outbox events claimed per publish pass
+    #[arg(long, env = "VIGILO_OUTBOX_BATCH_SIZE", default_value_t = OUTBOX_BATCH_SIZE, value_parser = clap::value_parser!(i64).range(1..=1_000_000))]
+    pub outbox_batch_size: i64,
+
+    /// Maximum concurrent outbox broker publishes per publish pass
+    #[arg(long, env = "VIGILO_OUTBOX_PUBLISH_PARALLELISM", default_value_t = OUTBOX_PUBLISH_PARALLELISM, value_parser = clap::value_parser!(usize).range(1..=10_000))]
+    pub outbox_publish_parallelism: usize,
+
+    /// Outbox publish lease duration
+    #[arg(long, env = "VIGILO_OUTBOX_LEASE_SECONDS", default_value_t = OUTBOX_LEASE_SECONDS, value_parser = clap::value_parser!(i32).range(1..=86400))]
+    pub outbox_lease_seconds: i32,
+
+    /// Delay before a failed outbox publish can be retried
+    #[arg(long, env = "VIGILO_OUTBOX_RETRY_DELAY_SECONDS", default_value_t = OUTBOX_RETRY_DELAY_SECONDS, value_parser = clap::value_parser!(i32).range(1..=86400))]
+    pub outbox_retry_delay_seconds: i32,
+
     #[command(subcommand)]
     pub command: Option<SubCommand>,
+}
+
+impl Command {
+    fn runtime_config(&self) -> CoordinatorRuntimeConfig {
+        CoordinatorRuntimeConfig {
+            tick_seconds: self.tick_seconds,
+            lease_seconds: self.lease_seconds,
+            max_dispatch_per_cycle: self.max_dispatch_per_cycle,
+            max_finalize_per_cycle: self.max_finalize_per_cycle,
+            run_chunk_dispatch_window_size: self.run_chunk_dispatch_window_size,
+            outbox_batch_size: self.outbox_batch_size,
+            outbox_publish_parallelism: self.outbox_publish_parallelism,
+            outbox_lease_seconds: self.outbox_lease_seconds,
+            outbox_retry_delay_seconds: self.outbox_retry_delay_seconds,
+        }
+    }
 }
 
 #[async_trait]
 impl Executable for Command {
     /// Executes the selected coordinator mode.
     async fn exec(self, context: Context) -> anyhow::Result<()> {
+        let config = self.runtime_config();
         match self.command {
             Some(SubCommand::Start) => {
                 info!("starting coordinator process");
-                start::exec(context).await
+                start::exec(context, config).await
             }
             Some(SubCommand::Once) => {
                 info!("running single coordinator cycle");
-                once::exec(context).await
+                once::exec(context, config).await
             }
             None => anyhow::bail!("missing coordinator subcommand; use `vigilo coordinator start`"),
         }
@@ -90,7 +157,11 @@ impl Executable for Command {
 /// 1. atomically start pending runs and dispatch chunk-ready windows
 /// 2. claim/finalize finalizable runs (bounded batch)
 /// 3. publish a bounded batch of pending outbox events
-async fn run_coordinator_cycle(context: Context, coordinator_id: Uuid) -> anyhow::Result<()> {
+async fn run_coordinator_cycle(
+    context: Context,
+    coordinator_id: Uuid,
+    config: &CoordinatorRuntimeConfig,
+) -> anyhow::Result<()> {
     debug!(coordinator_id = %coordinator_id, "starting coordinator cycle pre-flight");
 
     debug!(coordinator_id = %coordinator_id, "acquiring database context");
@@ -101,15 +172,16 @@ async fn run_coordinator_cycle(context: Context, coordinator_id: Uuid) -> anyhow
     let mq = context.mq().await?;
     debug!(coordinator_id = %coordinator_id, "messaging context ready");
 
-    let dispatch_count = drain_dispatch_batch(db, coordinator_id).await?;
-    let finalized_count = drain_finalize_batch(db, coordinator_id).await?;
+    let dispatch_count = drain_dispatch_batch(db, coordinator_id, config).await?;
+    let finalized_count = drain_finalize_batch(db, coordinator_id, config).await?;
 
     debug!(coordinator_id = %coordinator_id, "starting outbox publish pass");
     let publisher = MqEventPublisher::new(mq);
     let outbox_config = OutboxPublisherConfig {
-        batch_size: OUTBOX_BATCH_SIZE,
-        lease_seconds: OUTBOX_LEASE_SECONDS,
-        retry_delay_seconds: OUTBOX_RETRY_DELAY_SECONDS,
+        batch_size: config.outbox_batch_size,
+        publish_parallelism: config.outbox_publish_parallelism,
+        lease_seconds: config.outbox_lease_seconds,
+        retry_delay_seconds: config.outbox_retry_delay_seconds,
     };
     let publish_stats = publish_pending_events(db, &publisher, &outbox_config).await?;
     info!(
@@ -126,16 +198,20 @@ async fn run_coordinator_cycle(context: Context, coordinator_id: Uuid) -> anyhow
     Ok(())
 }
 
-async fn drain_dispatch_batch(db: &sqlx::PgPool, coordinator_id: Uuid) -> anyhow::Result<usize> {
+async fn drain_dispatch_batch(
+    db: &sqlx::PgPool,
+    coordinator_id: Uuid,
+    config: &CoordinatorRuntimeConfig,
+) -> anyhow::Result<usize> {
     debug!(coordinator_id = %coordinator_id, "draining dispatchable run windows");
 
     let mut dispatched = 0usize;
-    for _ in 0..COORDINATOR_MAX_DISPATCH_PER_CYCLE {
+    for _ in 0..config.max_dispatch_per_cycle {
         let Some(run) = run_dispatch::dispatch_next_run_window(
             db,
             coordinator_id,
-            COORDINATOR_LEASE_SECONDS,
-            RUN_CHUNK_DISPATCH_WINDOW_SIZE,
+            config.lease_seconds,
+            config.run_chunk_dispatch_window_size,
         )
         .await?
         else {
@@ -167,13 +243,17 @@ async fn drain_dispatch_batch(db: &sqlx::PgPool, coordinator_id: Uuid) -> anyhow
     Ok(dispatched)
 }
 
-async fn drain_finalize_batch(db: &sqlx::PgPool, coordinator_id: Uuid) -> anyhow::Result<usize> {
+async fn drain_finalize_batch(
+    db: &sqlx::PgPool,
+    coordinator_id: Uuid,
+    config: &CoordinatorRuntimeConfig,
+) -> anyhow::Result<usize> {
     debug!(coordinator_id = %coordinator_id, "draining finalizable runs");
 
     let mut finalized = 0usize;
-    for _ in 0..COORDINATOR_MAX_FINALIZE_PER_CYCLE {
+    for _ in 0..config.max_finalize_per_cycle {
         let Some(run) =
-            run_finalize::claim_next_finalizable_run(db, coordinator_id, COORDINATOR_LEASE_SECONDS)
+            run_finalize::claim_next_finalizable_run(db, coordinator_id, config.lease_seconds)
                 .await?
         else {
             break;

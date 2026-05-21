@@ -11,9 +11,9 @@ flowchart TD
     Pending[Outbox pending]
     Dedupe{Dedupe key exists?}
     Ready{Pending and available now?}
-    Claim[FOR UPDATE SKIP LOCKED]
+    Claim[FOR UPDATE SKIP LOCKED over pending index]
     Leased[Pending with future available_at]
-    Publish[Publish event to queue]
+    Publish[Bounded concurrent publish to queue]
     Published[Outbox published]
     Retry[Pending with retry delay]
     Failed[Outbox failed]
