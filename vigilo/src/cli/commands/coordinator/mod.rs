@@ -1,7 +1,7 @@
 //! Coordinator process command.
 //!
 //! The coordinator drives run-level orchestration:
-//! - atomically dispatches pending runs into chunk-ready events
+//! - atomically starts pending runs and dispatches chunk-ready event windows
 //! - finalizes runs whose chunks/executions are terminal
 //! - publishes outbox events to messaging
 
@@ -40,6 +40,7 @@ const COORDINATOR_TICK_SECONDS: u64 = 5;
 const COORDINATOR_LEASE_SECONDS: i32 = 60;
 const COORDINATOR_MAX_DISPATCH_PER_CYCLE: usize = 64;
 const COORDINATOR_MAX_FINALIZE_PER_CYCLE: usize = 64;
+const RUN_CHUNK_DISPATCH_WINDOW_SIZE: i64 = 512;
 const OUTBOX_BATCH_SIZE: i64 = 32;
 const OUTBOX_LEASE_SECONDS: i32 = 30;
 const OUTBOX_RETRY_DELAY_SECONDS: i32 = 10;
@@ -86,7 +87,7 @@ impl Executable for Command {
 /// Executes one full coordinator cycle.
 ///
 /// The cycle is intentionally ordered to keep run progression deterministic:
-/// 1. atomically claim/dispatch pending runs (bounded batch)
+/// 1. atomically start pending runs and dispatch chunk-ready windows
 /// 2. claim/finalize finalizable runs (bounded batch)
 /// 3. publish a bounded batch of pending outbox events
 async fn run_coordinator_cycle(context: Context, coordinator_id: Uuid) -> anyhow::Result<()> {
@@ -112,7 +113,7 @@ async fn run_coordinator_cycle(context: Context, coordinator_id: Uuid) -> anyhow
     };
     let publish_stats = publish_pending_events(db, &publisher, &outbox_config).await?;
     info!(
-        runs_dispatched = dispatch_count,
+        dispatch_windows_prepared = dispatch_count,
         runs_finalized = finalized_count,
         outbox_events_claimed = publish_stats.claimed,
         outbox_events_published = publish_stats.published,
@@ -126,34 +127,39 @@ async fn run_coordinator_cycle(context: Context, coordinator_id: Uuid) -> anyhow
 }
 
 async fn drain_dispatch_batch(db: &sqlx::PgPool, coordinator_id: Uuid) -> anyhow::Result<usize> {
-    debug!(coordinator_id = %coordinator_id, "draining pending runs for dispatch");
+    debug!(coordinator_id = %coordinator_id, "draining dispatchable run windows");
 
     let mut dispatched = 0usize;
     for _ in 0..COORDINATOR_MAX_DISPATCH_PER_CYCLE {
-        let Some(run) =
-            run_dispatch::dispatch_next_pending_run(db, coordinator_id, COORDINATOR_LEASE_SECONDS)
-                .await?
+        let Some(run) = run_dispatch::dispatch_next_run_window(
+            db,
+            coordinator_id,
+            COORDINATOR_LEASE_SECONDS,
+            RUN_CHUNK_DISPATCH_WINDOW_SIZE,
+        )
+        .await?
         else {
             break;
         };
 
         dispatched += 1;
-        debug!(run_id = %run.id, run_key = %run.run_key, "claimed pending run");
+        debug!(run_id = %run.id, run_key = %run.run_key, "claimed dispatchable run window");
         info!(
             run_id = %run.id,
             run_key = %run.run_key,
             chunk_events_enqueued = run.chunk_events_enqueued,
+            chunks_marked_dispatched = run.chunks_marked_dispatched,
             run_started_events_enqueued = run.run_started_events_enqueued,
-            "claimed run and prepared dispatch events"
+            "prepared bounded dispatch window"
         );
     }
 
     if dispatched == 0 {
-        info!("no pending runs available for coordinator cycle");
+        info!("no dispatchable run windows available for coordinator cycle");
     } else {
         info!(
             coordinator_id = %coordinator_id,
-            runs_dispatched = dispatched,
+            dispatch_windows_prepared = dispatched,
             "completed coordinator dispatch drain pass"
         );
     }

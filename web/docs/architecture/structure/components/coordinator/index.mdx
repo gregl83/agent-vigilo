@@ -20,7 +20,7 @@ Describes the major internal responsibilities of the coordinator runtime.
 
 ## Notes
 
-- Dispatch claims pending runs, marks them running, and enqueues chunk-ready events.
+- Dispatch claims pending or running runs with undispatched chunks, starts runs when needed, and enqueues bounded chunk-ready windows.
 - Finalization is coordinator-owned and lease guarded; workers persist execution outcomes but do not complete the run row.
 - Outbox publication is deliberately separate from state changes so committed events can be retried after broker or process failures.
 

@@ -133,7 +133,7 @@ pub(crate) struct Run {
     pub(crate) created_at: DateTime<Utc>,
     /// Time run processing first started.
     pub(crate) started_at: Option<DateTime<Utc>>,
-    /// Time run chunks were dispatched for worker processing.
+    /// Time the first run chunks were dispatched for worker processing.
     pub(crate) dispatched_at: Option<DateTime<Utc>>,
     /// Time finalization completed aggregate rollups.
     pub(crate) finalized_at: Option<DateTime<Utc>>,

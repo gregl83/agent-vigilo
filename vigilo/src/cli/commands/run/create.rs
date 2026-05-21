@@ -4,7 +4,8 @@ use super::*;
 ///
 /// This flow validates executability, creates case/dataset/run drafts, stores
 /// durable run work in one transaction, and emits a machine-readable summary.
-/// Coordinators publish chunk-ready events after they mark the run running.
+/// Coordinators publish chunk-ready events in bounded windows after they mark
+/// the run running.
 pub(super) async fn exec(
     context: Context,
     profile: Option<String>,

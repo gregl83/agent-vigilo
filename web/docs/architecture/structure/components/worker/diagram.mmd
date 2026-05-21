@@ -11,7 +11,7 @@ config:
 flowchart TD
     %% actors
     Vigilo["fa:fa-terminal <br/> <b>Vigilo CLI</b> <br/> <small>[Container: Rust]</small> <br/> <small>Starts the worker loop or one-shot cycle.</small>"]:::component
-    Coordinator["fa:fa-compass <br/> <b>Coordinator</b> <br/> <small>[Container: Rust]</small> <br/> <small>Publishes run.chunk.ready events after dispatch.</small>"]:::component
+    Coordinator["fa:fa-compass <br/> <b>Coordinator</b> <br/> <small>[Container: Rust]</small> <br/> <small>Publishes bounded run.chunk.ready windows.</small>"]:::component
 
     %% components
     CommandFacade["fa:fa-gear <br/> <b>Worker Command Facade</b> <br/> <small>[Component: Rust / Clap]</small> <br/> <small>Selects start or once mode and builds the evaluator loader.</small>"]:::component
@@ -70,7 +70,7 @@ flowchart TD
     EvaluatorLoader -->|"Uses registry cache and Wasm runtime from"| RuntimeContext
     EvaluatorExecutor -->|"Uses Wasm runtime from"| RuntimeContext
 
-    Coordinator -->|"Publishes chunk-ready events to <br> <small>[JSON/AMQP]</small>"| Queue
+    Coordinator -->|"Publishes chunk-ready windows to <br> <small>[JSON/AMQP]</small>"| Queue
     RuntimeContext -->|"Opens messaging access to <br> <small>[AMQP]</small>"| Queue
     RuntimeContext -->|"Opens database access to <br> <small>[SQL/TCP]</small>"| Database
 

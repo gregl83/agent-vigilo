@@ -13,7 +13,7 @@ flowchart TD
     Runner[Start coordinator service runner]
     Event{Next service event?}
     Contexts{Runtime contexts available?}
-    Dispatch[Drain pending run dispatches]
+    Dispatch[Drain dispatchable run windows]
     Finalize[Drain finalizable runs]
     Outbox[Publish pending outbox events]
     Wait[Wait for next tick]

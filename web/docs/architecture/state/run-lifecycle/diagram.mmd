@@ -9,10 +9,11 @@ config:
 flowchart TD
     Create([run create])
     Pending[Run pending]
-    DispatchGuard{Pending and coordinator lease open?}
-    DispatchLock[FOR UPDATE SKIP LOCKED]
+    DispatchGuard{Pending or running with undispatched chunks?}
+    DispatchLock[Lock one dispatchable run]
     Running[Run running]
-    DispatchEvents[Insert run.started and chunk-ready events]
+    DispatchEvents[Insert run.started if new and chunk-ready window]
+    DispatchCursor[Mark selected chunks dispatched]
 
     FinalizeGuard{Running or finalizing with no open chunks?}
     Finalizing[Run finalizing]
@@ -34,7 +35,7 @@ flowchart TD
     Create --> Pending
 
     Pending --> DispatchGuard
-    DispatchGuard -- Yes --> DispatchLock --> Running --> DispatchEvents
+    DispatchGuard -- Yes --> DispatchLock --> Running --> DispatchEvents --> DispatchCursor
     DispatchGuard -- No --> Noop
 
     Running --> FinalizeGuard
@@ -58,7 +59,7 @@ flowchart TD
     Running -. Unrecoverable system error .-> Failed
 
     class Create command
-    class Pending,Running,Finalizing,DispatchGuard,DispatchLock,DispatchEvents,FinalizeGuard,FinalizeCheck,Gate,CompletedEvent,CancelGuard,CancelCascade,CancelEvent system
+    class Pending,Running,Finalizing,DispatchGuard,DispatchLock,DispatchEvents,DispatchCursor,FinalizeGuard,FinalizeCheck,Gate,CompletedEvent,CancelGuard,CancelCascade,CancelEvent system
     class CompletedPass success
     class CompletedFail,Cancelled,Failed,Reject error
     class Noop component

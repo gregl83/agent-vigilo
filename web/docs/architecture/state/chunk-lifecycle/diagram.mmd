@@ -9,6 +9,7 @@ config:
 flowchart TD
     Create([run create])
     Pending[Chunk pending]
+    Dispatch[Dispatch window marks dispatched_at]
     ClaimGuard{Run running and chunk claimable?}
     Leased[Chunk leased]
     LoadCases[Load case batch]
@@ -24,7 +25,7 @@ flowchart TD
 
     Create --> Pending
 
-    Pending --> ClaimGuard
+    Pending --> Dispatch --> ClaimGuard
     Leased -->|Lease expired| ClaimGuard
     ClaimGuard -- Yes --> Leased --> LoadCases --> Process
     ClaimGuard -- No --> Noop
@@ -44,7 +45,7 @@ flowchart TD
     Leased -. Reserved terminal path .-> Failed
 
     class Create,Cancel command
-    class Pending,Leased,ClaimGuard,LoadCases,Process,CompleteGuard,ReleaseGuard,Requeued system
+    class Pending,Dispatch,Leased,ClaimGuard,LoadCases,Process,CompleteGuard,ReleaseGuard,Requeued system
     class Completed success
     class Cancelled,Failed error
     class Noop component

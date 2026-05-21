@@ -6,6 +6,7 @@ CREATE TABLE run_chunks (
     ordinal_start INTEGER NOT NULL CHECK (ordinal_start >= 0),
     ordinal_end INTEGER NOT NULL CHECK (ordinal_end > ordinal_start),
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'leased', 'completed', 'failed', 'cancelled')),
+    dispatched_at TIMESTAMPTZ,
     leased_until TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -34,6 +35,10 @@ END $$;
 CREATE INDEX idx_run_chunks_run_status_leased_until
     ON run_chunks(run_id, status, leased_until);
 
+CREATE INDEX idx_run_chunks_undispatched
+    ON run_chunks(run_id, ordinal_start, id)
+    WHERE status = 'pending' AND dispatched_at IS NULL;
+
 COMMENT ON TABLE run_chunks IS
     'Chunk-level scheduling units for run processing, hash partitioned by run_id for run-local worker scheduling.';
 
@@ -57,6 +62,9 @@ COMMENT ON COLUMN run_chunks.ordinal_end IS
 
 COMMENT ON COLUMN run_chunks.status IS
     'Chunk processing lifecycle status.';
+
+COMMENT ON COLUMN run_chunks.dispatched_at IS
+    'Timestamp when the coordinator first made this chunk visible to workers by enqueueing a run.chunk.ready event. NULL means the chunk has not been dispatched yet.';
 
 COMMENT ON COLUMN run_chunks.leased_until IS
     'Lease expiration timestamp for worker ownership of this chunk.';

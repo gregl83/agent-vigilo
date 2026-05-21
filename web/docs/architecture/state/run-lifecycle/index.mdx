@@ -23,8 +23,8 @@ How `runs.status` and `runs.gate_status` move through creation, dispatch, finali
 ## Notes
 
 - `run create` inserts a run as `pending`.
-- Coordinator dispatch claims `pending` runs with an open coordinator lease and `FOR UPDATE SKIP LOCKED`.
-- Finalization only claims runs whose chunks are all terminal and whose finalization lease is open.
+- Coordinator dispatch claims a `pending` run, marks it `running`, and then enqueues bounded chunk-ready windows for undispatched chunks.
+- Finalization only claims runs whose chunks are all terminal and whose finalization lease is open; undispatched `pending` chunks keep the run out of finalization.
 - Cancellation is idempotent for already-cancelled runs and rejected for completed or failed runs.
 
 ## Related

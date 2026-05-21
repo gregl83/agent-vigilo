@@ -24,8 +24,8 @@ sequenceDiagram
             Vigilo-->>User: Success response
         else Tick elapsed
             Vigilo->>Vigilo: Run coordinator cycle
-            Vigilo->>DB: Drain pending run dispatches
-            DB-->>Vigilo: Dispatch count
+            Vigilo->>DB: Drain dispatchable run windows
+            DB-->>Vigilo: Dispatch window count
             Vigilo->>DB: Drain finalizable runs
             DB-->>Vigilo: Finalization count
             Vigilo->>DB: Claim publishable outbox events

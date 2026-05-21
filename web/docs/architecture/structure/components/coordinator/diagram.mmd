@@ -19,8 +19,8 @@ flowchart TD
     RuntimeContext["fa:fa-layer-group <br/> <b>Runtime Context Access</b> <br/> <small>[Component: Rust]</small> <br/> <small>Provides database and messaging clients for each cycle.</small>"]:::component
 
     CycleOrchestrator["fa:fa-arrows-spin <br/> <b>Coordinator Cycle Orchestrator</b> <br/> <small>[Component: Rust]</small> <br/> <small>Runs dispatch, finalization, and outbox publication in deterministic order.</small>"]:::component
-    DispatchDrainer["fa:fa-list-check <br/> <b>Dispatch Batch Drainer</b> <br/> <small>[Component: Rust]</small> <br/> <small>Bounds pending-run dispatch work per coordinator cycle.</small>"]:::component
-    DispatchWorkflow["fa:fa-share-nodes <br/> <b>Run Dispatch Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Claims pending runs, marks them running, and inserts run.started and run.chunk.ready events.</small>"]:::component
+    DispatchDrainer["fa:fa-list-check <br/> <b>Dispatch Batch Drainer</b> <br/> <small>[Component: Rust]</small> <br/> <small>Bounds chunk-window dispatch work per coordinator cycle.</small>"]:::component
+    DispatchWorkflow["fa:fa-share-nodes <br/> <b>Run Dispatch Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Starts pending runs and inserts bounded run.chunk.ready windows.</small>"]:::component
 
     FinalizeDrainer["fa:fa-flag-checkered <br/> <b>Finalization Batch Drainer</b> <br/> <small>[Component: Rust]</small> <br/> <small>Bounds finalizable-run work per coordinator cycle.</small>"]:::component
     FinalizeWorkflow["fa:fa-calculator <br/> <b>Run Finalization Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Claims terminal runs, rolls up execution counts, sets gate status, and inserts run.completed events.</small>"]:::component
@@ -60,8 +60,8 @@ flowchart TD
     RuntimeContext -->|"Opens messaging access to <br> <small>[AMQP]</small>"| Queue
 
     CycleOrchestrator -->|"First drains"| DispatchDrainer
-    DispatchDrainer -->|"Claims and dispatches one pending run at a time with"| DispatchWorkflow
-    DispatchWorkflow -->|"Updates runs and writes outbox events to <br> <small>[SQL/TCP]</small>"| Database
+    DispatchDrainer -->|"Claims one dispatchable run window with"| DispatchWorkflow
+    DispatchWorkflow -->|"Updates runs, chunk dispatch markers, and outbox events in <br> <small>[SQL/TCP]</small>"| Database
 
     CycleOrchestrator -->|"Then drains"| FinalizeDrainer
     FinalizeDrainer -->|"Claims and finalizes one terminal run at a time with"| FinalizeWorkflow

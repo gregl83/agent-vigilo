@@ -11,8 +11,8 @@ flowchart TD
 
     CoordinatorId[Generate coordinator id]
     Contexts{Runtime contexts available?}
-    DispatchClaim{Pending run claimed?}
-    DispatchRun[Mark run running and enqueue dispatch events]
+    DispatchClaim{Dispatchable run claimed?}
+    DispatchRun[Start run if needed and enqueue chunk window]
     FinalizeClaim{Finalizable run claimed?}
     FinalizeRun[Roll up counts, set gate, and enqueue completion event]
     ClaimOutbox[Claim publishable outbox events]

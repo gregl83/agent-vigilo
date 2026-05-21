@@ -2,9 +2,9 @@
 //!
 //! These helpers write immutable dataset content, dataset membership, the run
 //! row, and pending run chunks inside the caller's transaction. Dispatch owns
-//! chunk-ready event creation so workers cannot process a run before a
-//! coordinator marks it running. Bulk paths are chunked to keep statement size
-//! and bind counts bounded for large datasets.
+//! chunk-ready event creation in bounded windows so workers cannot process a
+//! run before a coordinator marks it running. Bulk paths are chunked to keep
+//! statement size and bind counts bounded for large datasets.
 
 use sqlx::{
     Postgres,
@@ -247,8 +247,8 @@ pub(crate) async fn insert_run_create(
 
 /// Inserts pending chunk rows for the run.
 ///
-/// Chunk-ready outbox events are created by dispatch after the run is marked
-/// running.
+/// Chunk-ready outbox events are created by dispatch windows after the run is
+/// marked running.
 pub(crate) async fn bulk_insert_run_chunks(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     run_id: Uuid,
