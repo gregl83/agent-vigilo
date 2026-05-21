@@ -1,0 +1,59 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 150
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+flowchart TD
+    Command([User command])
+    Family{Command family}
+
+    Evaluators[Evaluator commands]
+    Runs[Run commands]
+    Coordinator[Coordinator commands]
+    Worker[Worker commands]
+
+    Decision{Decision flow}
+    Execution[Vigilo execution flow]
+
+    Contracts[Runtime contracts]
+    DB[(DB)]
+    Broker[Message broker]
+    Artifacts[Evaluator artifacts]
+
+    Success[Success response]
+    Failure[Error response]
+
+    Command --> Family
+    Family --> Evaluators
+    Family --> Runs
+    Family --> Coordinator
+    Family --> Worker
+
+    Evaluators --> Decision
+    Runs --> Decision
+    Coordinator --> Decision
+    Worker --> Decision
+
+    Decision --> Execution
+    Execution --> Contracts
+    Execution --> DB
+    Execution --> Broker
+    Execution --> Artifacts
+
+    Contracts --> Success
+    DB --> Success
+    Broker --> Success
+    Artifacts --> Success
+
+    Decision --> Failure
+    Execution --> Failure
+
+    class Command command
+    class Family,Decision,Execution,Contracts,DB system
+    class Evaluators,Runs,Coordinator,Worker component
+    class Broker,Artifacts external
+    class Success success
+    class Failure error
