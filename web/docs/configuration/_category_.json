@@ -2,7 +2,7 @@
   "label": "Configuration",
   "position": 2,
   "link": {
-    "type": "generated-index",
-    "description": "Configuring Agent Vigilo."
+    "type": "doc",
+    "id": "configuration/index"
   }
 }
