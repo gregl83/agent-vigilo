@@ -28,7 +28,7 @@ flowchart TD
     GuardRun[Run status and lifecycle lease]
     GuardChunk[Chunk status and worker lease]
     GuardAttempt[Current attempt id and attempt number]
-    GuardOutbox[Outbox availability and dedupe key]
+    GuardOutbox[Outbox dedupe key and delivery claim token]
 
     CLI --> RunCreate
     CLI --> RunCancel

@@ -188,20 +188,26 @@ run.gate_status = pass | fail
 
 ### 8. Event Publication (Outbox Pattern)
 
-A RunCompleted event is inserted into the outbox:
+A run-completed event is inserted into the durable outbox ledger:
 
 ```text
-outbox.status = pending
+outbox_events.status = pending
 ```
 
-A publisher process:
+The database creates a matching hot delivery row in the same transaction:
 
 ```text
-pending → published
-        ↘ failed (retry)
+outbox_delivery_queue.available_at = now()
 ```
 
-This ensures reliable, at-least-once delivery.
+A publisher process claims delivery rows, publishes the joined event payload to RabbitMQ, and waits for broker confirmation:
+
+```text
+delivery row claimed -> confirmed publish -> delete delivery row
+                     -> publish failure   -> retry delivery row later
+```
+
+The ledger row is retained for idempotency, audit, and replay. The delivery queue only contains unfinished publish work.
 
 ## State Machines
 
@@ -271,6 +277,7 @@ The outbox pattern ensures:
 - no lost events
 - retryable publishing
 - eventual consistency
+- a bounded hot delivery table separate from event history
 
 ## Design Philosophy
 

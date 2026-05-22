@@ -16,18 +16,19 @@ import outboxLifecycleDiagram from './diagram.mmd';
 
 # Outbox Lifecycle
 
-How durable outbox rows make state-change events publishable, retryable, and idempotent.
+How durable outbox ledger rows and hot delivery rows make state-change events publishable, retryable, and idempotent.
 
 <Mermaid value={outboxLifecycleDiagram} />
 
 ## Notes
 
-- State workflows insert events in the same database operation as the state change.
-- The publisher claims `pending` events with `available_at <= now()` and `FOR UPDATE SKIP LOCKED`, using a partial pending-event index for the hot claim path.
-- A claim keeps `status = pending`, assigns a `claim_token`, sets `claimed_until`, and moves `available_at` into the future as a publish lease.
+- State workflows insert durable events into `outbox_events` in the same database operation as the state change.
+- An insert trigger creates one `outbox_delivery_queue` row for each new event; this is the hot queue scanned by coordinators.
+- The publisher claims delivery rows with `available_at <= now()` and `FOR UPDATE SKIP LOCKED`, using the sharded delivery queue index for the hot claim path.
+- A claim assigns a `claim_token`, sets `claimed_until`, and moves the delivery row `available_at` into the future as a publish lease.
 - Claimed batches are published with bounded concurrency controlled by the coordinator outbox publish parallelism setting.
 - RabbitMQ publication declares durable queues and bindings before publish, uses persistent messages, sets the outbox `dedupe_key` as the AMQP message id, publishes with mandatory routing, and waits for publisher confirmation.
-- Successful publishes mark events `published` only when the database row still has the same `claim_token`; failed publishes clear the claim and return the row to `pending` with a retry delay and error message.
+- Successful publishes mark the ledger event `published` and delete the delivery row only when the delivery row still has the same `claim_token`; failed publishes clear the claim and return the delivery row to retry with a delay and error message.
 - Broker delivery is at-least-once. Exactly-once effects are managed by idempotency guards: outbox `dedupe_key`, fenced publisher claims, chunk-claim checks, current-attempt authority checks, and evaluator-result uniqueness.
 
 ## Related

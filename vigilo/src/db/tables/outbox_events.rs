@@ -1,8 +1,9 @@
 //! Outbox event table access.
 //!
-//! The outbox table is used for durable, idempotent event publication. Claiming
-//! publishable events uses `FOR UPDATE SKIP LOCKED` so multiple publishers can
-//! work concurrently without taking the same event.
+//! `outbox_events` is the durable event ledger. `outbox_delivery_queue` is the
+//! hot claim/retry table scanned by publishers. Successful publication updates
+//! the ledger and deletes the delivery row so the hot queue only contains
+//! unfinished work.
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -13,33 +14,44 @@ use crate::models::outbox_event::{
     OutboxEventPatch,
 };
 
-/// Inserts one outbox event.
+const OUTBOX_EVENT_SELECT: &str = r#"
+    SELECT
+        e.id,
+        e.event_type,
+        e.aggregate_type,
+        e.aggregate_id,
+        e.dedupe_key,
+        e.payload,
+        e.status::text as status,
+        q.claim_shard,
+        q.available_at,
+        q.claim_token,
+        q.claimed_until,
+        q.publish_attempt_count,
+        e.published_at,
+        COALESCE(q.error_message, e.error_message) AS error_message,
+        e.created_at,
+        e.updated_at
+    FROM outbox_events e
+    LEFT JOIN outbox_delivery_queue q
+      ON q.event_id = e.id
+"#;
+
+/// Inserts one durable outbox event.
+///
+/// The database trigger creates the matching `outbox_delivery_queue` row inside
+/// the same transaction.
 pub(crate) async fn insert_outbox_event(
     db: &PgPool,
     draft: &OutboxEventDraft,
 ) -> anyhow::Result<OutboxEvent> {
-    let event = sqlx::query_as::<_, OutboxEvent>(
+    let id = sqlx::query_scalar::<_, Uuid>(
         r#"
         INSERT INTO outbox_events (
             event_type, aggregate_type, aggregate_id, dedupe_key
         )
         VALUES ($1, $2, $3::uuid, $4)
-        RETURNING
-            id,
-            event_type,
-            aggregate_type,
-            aggregate_id,
-            dedupe_key,
-            payload,
-            status::text as status,
-            available_at,
-            claim_token,
-            claimed_until,
-            publish_attempt_count,
-            published_at,
-            error_message,
-            created_at,
-            updated_at
+        RETURNING id
         "#,
     )
     .bind(&draft.event_type)
@@ -49,7 +61,9 @@ pub(crate) async fn insert_outbox_event(
     .fetch_one(db)
     .await?;
 
-    Ok(event)
+    select_outbox_event_by_id(db, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("outbox event '{}' disappeared after insert", id))
 }
 
 /// Finds an outbox event by primary key.
@@ -57,28 +71,13 @@ pub(crate) async fn select_outbox_event_by_id(
     db: &PgPool,
     id: Uuid,
 ) -> anyhow::Result<Option<OutboxEvent>> {
-    let event = sqlx::query_as::<_, OutboxEvent>(
+    let event = sqlx::query_as::<_, OutboxEvent>(&format!(
         r#"
-        SELECT
-            id,
-            event_type,
-            aggregate_type,
-            aggregate_id,
-            dedupe_key,
-            payload,
-            status::text as status,
-            available_at,
-            claim_token,
-            claimed_until,
-            publish_attempt_count,
-            published_at,
-            error_message,
-            created_at,
-            updated_at
-        FROM outbox_events
-        WHERE id = $1::uuid
+        {}
+        WHERE e.id = $1::uuid
         "#,
-    )
+        OUTBOX_EVENT_SELECT
+    ))
     .bind(id)
     .fetch_optional(db)
     .await?;
@@ -86,36 +85,21 @@ pub(crate) async fn select_outbox_event_by_id(
     Ok(event)
 }
 
-/// Lists outbox events with a given status.
+/// Lists outbox events with a given ledger status.
 pub(crate) async fn list_outbox_events_by_status(
     db: &PgPool,
     status: &str,
     limit: i64,
 ) -> anyhow::Result<Vec<OutboxEvent>> {
-    let events = sqlx::query_as::<_, OutboxEvent>(
+    let events = sqlx::query_as::<_, OutboxEvent>(&format!(
         r#"
-        SELECT
-            id,
-            event_type,
-            aggregate_type,
-            aggregate_id,
-            dedupe_key,
-            payload,
-            status::text as status,
-            available_at,
-            claim_token,
-            claimed_until,
-            publish_attempt_count,
-            published_at,
-            error_message,
-            created_at,
-            updated_at
-        FROM outbox_events
-        WHERE status = $1::outbox_status
-        ORDER BY available_at ASC
+        {}
+        WHERE e.status = $1::outbox_status
+        ORDER BY e.created_at ASC
         LIMIT $2
         "#,
-    )
+        OUTBOX_EVENT_SELECT
+    ))
     .bind(status)
     .bind(limit)
     .fetch_all(db)
@@ -124,10 +108,10 @@ pub(crate) async fn list_outbox_events_by_status(
     Ok(events)
 }
 
-/// Claims pending outbox events by pushing their availability into the future.
+/// Claims available delivery rows and returns their joined event payloads.
 ///
 /// The returned rows are the caller's publish lease. If publishing fails, use
-/// `reschedule_outbox_event` to make the event available for retry.
+/// `reschedule_outbox_event` to make the delivery row available for retry.
 pub(crate) async fn claim_publishable_outbox_events(
     db: &PgPool,
     limit: i64,
@@ -136,38 +120,53 @@ pub(crate) async fn claim_publishable_outbox_events(
     let events = sqlx::query_as::<_, OutboxEvent>(
         r#"
         WITH claim AS (
-            SELECT id
-            FROM outbox_events
-            WHERE status = 'pending'::outbox_status
-              AND available_at <= now()
-            ORDER BY available_at ASC
+            SELECT claim_shard, event_id
+            FROM outbox_delivery_queue
+            WHERE available_at <= now()
+            ORDER BY available_at ASC, event_id ASC
             FOR UPDATE SKIP LOCKED
             LIMIT $1
+        ),
+        leased AS (
+            UPDATE outbox_delivery_queue q
+            SET claim_token = gen_random_uuid(),
+                claimed_until = now() + ($2::int * interval '1 second'),
+                available_at = now() + ($2::int * interval '1 second'),
+                publish_attempt_count = q.publish_attempt_count + 1,
+                updated_at = now()
+            FROM claim
+            WHERE q.claim_shard = claim.claim_shard
+              AND q.event_id = claim.event_id
+            RETURNING
+                q.claim_shard,
+                q.event_id,
+                q.available_at,
+                q.claim_token,
+                q.claimed_until,
+                q.publish_attempt_count,
+                q.error_message
         )
-        UPDATE outbox_events oe
-        SET claim_token = gen_random_uuid(),
-            claimed_until = now() + ($2::int * interval '1 second'),
-            available_at = now() + ($2::int * interval '1 second'),
-            publish_attempt_count = publish_attempt_count + 1,
-            updated_at = now()
-        FROM claim
-        WHERE oe.id = claim.id
-        RETURNING
-            oe.id,
-            oe.event_type,
-            oe.aggregate_type,
-            oe.aggregate_id,
-            oe.dedupe_key,
-            oe.payload,
-            oe.status::text as status,
-            oe.available_at,
-            oe.claim_token,
-            oe.claimed_until,
-            oe.publish_attempt_count,
-            oe.published_at,
-            oe.error_message,
-            oe.created_at,
-            oe.updated_at
+        SELECT
+            e.id,
+            e.event_type,
+            e.aggregate_type,
+            e.aggregate_id,
+            e.dedupe_key,
+            e.payload,
+            e.status::text as status,
+            leased.claim_shard,
+            leased.available_at,
+            leased.claim_token,
+            leased.claimed_until,
+            leased.publish_attempt_count,
+            e.published_at,
+            COALESCE(leased.error_message, e.error_message) AS error_message,
+            e.created_at,
+            e.updated_at
+        FROM leased
+        JOIN outbox_events e
+          ON e.id = leased.event_id
+        ORDER BY leased.available_at ASC, e.id ASC
         "#,
     )
     .bind(limit)
@@ -178,7 +177,7 @@ pub(crate) async fn claim_publishable_outbox_events(
     Ok(events)
 }
 
-/// Marks an outbox event as successfully published.
+/// Marks an outbox event as successfully published and removes delivery work.
 pub(crate) async fn mark_outbox_event_published(
     db: &PgPool,
     id: Uuid,
@@ -186,16 +185,19 @@ pub(crate) async fn mark_outbox_event_published(
 ) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
-        UPDATE outbox_events
+        WITH deleted AS (
+            DELETE FROM outbox_delivery_queue
+            WHERE event_id = $1::uuid
+              AND claim_token = $2::uuid
+            RETURNING event_id
+        )
+        UPDATE outbox_events e
         SET status = 'published'::outbox_status,
             published_at = now(),
-            claim_token = NULL,
-            claimed_until = NULL,
             error_message = NULL,
             updated_at = now()
-        WHERE id = $1::uuid
-          AND claim_token = $2::uuid
-          AND status = 'pending'::outbox_status
+        FROM deleted
+        WHERE e.id = deleted.event_id
         "#,
     )
     .bind(id)
@@ -216,16 +218,22 @@ pub(crate) async fn reschedule_outbox_event(
 ) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
-        UPDATE outbox_events
-        SET status = 'pending'::outbox_status,
-            available_at = now() + ($3::int * interval '1 second'),
-            claim_token = NULL,
-            claimed_until = NULL,
-            error_message = $4,
+        WITH rescheduled AS (
+            UPDATE outbox_delivery_queue q
+            SET available_at = now() + ($3::int * interval '1 second'),
+                claim_token = NULL,
+                claimed_until = NULL,
+                error_message = $4,
+                updated_at = now()
+            WHERE q.event_id = $1::uuid
+              AND q.claim_token = $2::uuid
+            RETURNING q.event_id
+        )
+        UPDATE outbox_events e
+        SET error_message = $4,
             updated_at = now()
-        WHERE id = $1::uuid
-          AND claim_token = $2::uuid
-          AND status = 'pending'::outbox_status
+        FROM rescheduled
+        WHERE e.id = rescheduled.event_id
         "#,
     )
     .bind(id)
@@ -238,47 +246,47 @@ pub(crate) async fn reschedule_outbox_event(
     Ok(result.rows_affected())
 }
 
-/// Updates outbox status fields directly.
+/// Updates outbox ledger status fields directly.
 pub(crate) async fn update_outbox_event_status(
     db: &PgPool,
     id: Uuid,
     patch: &OutboxEventPatch,
 ) -> anyhow::Result<Option<OutboxEvent>> {
-    let event = sqlx::query_as::<_, OutboxEvent>(
+    let mut tx = db.begin().await?;
+
+    let event_id = sqlx::query_scalar::<_, Uuid>(
         r#"
         UPDATE outbox_events
         SET status = $2::outbox_status,
             published_at = CASE WHEN $2 = 'published' THEN now() ELSE published_at END,
-            claim_token = NULL,
-            claimed_until = NULL,
             error_message = $3,
             updated_at = now()
         WHERE id = $1::uuid
-        RETURNING
-            id,
-            event_type,
-            aggregate_type,
-            aggregate_id,
-            dedupe_key,
-            payload,
-            status::text as status,
-            available_at,
-            claim_token,
-            claimed_until,
-            publish_attempt_count,
-            published_at,
-            error_message,
-            created_at,
-            updated_at
+        RETURNING id
         "#,
     )
     .bind(id)
     .bind(&patch.status)
     .bind(&patch.error_message)
-    .fetch_optional(db)
+    .fetch_optional(&mut *tx)
     .await?;
 
-    Ok(event)
+    if let Some(event_id) = event_id {
+        if patch.status == "published" || patch.status == "failed" {
+            sqlx::query(
+                r#"
+                DELETE FROM outbox_delivery_queue
+                WHERE event_id = $1::uuid
+                "#,
+            )
+            .bind(event_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
+    tx.commit().await?;
+    select_outbox_event_by_id(db, id).await
 }
 
 /// Deletes an outbox event by primary key.

@@ -1,8 +1,8 @@
 //! Outbox event persistence models.
 //!
-//! Outbox events are durable messages written inside database transactions and
-//! later published by the coordinator. The table records claim/retry state so
-//! message publication can be retried without losing committed state changes.
+//! Outbox events are durable messages written inside database transactions.
+//! Active delivery state is stored in a separate hot queue table so publication
+//! can be retried without scanning the historical event ledger.
 
 use chrono::{
     DateTime,
@@ -51,16 +51,18 @@ pub(crate) struct OutboxEvent {
     pub(crate) dedupe_key: String,
     /// JSON event body to publish.
     pub(crate) payload: serde_json::Value,
-    /// Current outbox lifecycle status.
+    /// Current ledger lifecycle status.
     pub(crate) status: String,
-    /// Earliest time the event may be claimed for publication.
-    pub(crate) available_at: DateTime<Utc>,
-    /// Current publisher claim token, if the event is leased for publication.
+    /// Delivery queue shard, if the event still has pending delivery work.
+    pub(crate) claim_shard: Option<i16>,
+    /// Earliest time the event may be claimed for publication, if pending.
+    pub(crate) available_at: Option<DateTime<Utc>>,
+    /// Current publisher claim token, if the delivery row is leased.
     pub(crate) claim_token: Option<Uuid>,
-    /// Deadline for the current publisher claim.
+    /// Deadline for the current publisher claim, if leased.
     pub(crate) claimed_until: Option<DateTime<Utc>>,
-    /// Number of publication claims issued for this event.
-    pub(crate) publish_attempt_count: i32,
+    /// Number of publication claims issued for the delivery row.
+    pub(crate) publish_attempt_count: Option<i32>,
     /// Time the event was successfully published.
     pub(crate) published_at: Option<DateTime<Utc>>,
     /// Latest delivery error, if any.

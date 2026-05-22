@@ -8,27 +8,29 @@ config:
 ---
 flowchart TD
     StateChange[State change transaction]
-    Pending[Outbox pending]
+    Ledger[Outbox event ledger row]
+    Delivery[Delivery queue row]
     Dedupe{Dedupe key exists?}
-    Ready{Pending and available now?}
-    Claim[FOR UPDATE SKIP LOCKED over pending index]
-    Leased[Pending with claim_token and future available_at]
+    Ready{Delivery row available now?}
+    Claim[FOR UPDATE SKIP LOCKED over sharded delivery queue]
+    Leased[Delivery row with claim_token and future available_at]
     Topology[Declare durable exchange queues and bindings]
     Publish[Persistent mandatory publish with message id]
     Confirm{Broker confirms and routed?}
     Fence{Claim token still current?}
-    Published[Outbox published]
-    Retry[Pending with retry delay]
+    Published[Ledger published and delivery row deleted]
+    Retry[Delivery row with retry delay]
     Stale[Stale publisher result ignored]
-    Failed[Outbox failed]
+    Failed[Ledger failed and delivery row removed]
     Noop[No transition]
     Queue[Message broker]
 
     StateChange --> Dedupe
-    Dedupe -- No --> Pending
+    Dedupe -- No --> Ledger
     Dedupe -- Yes --> Noop
+    Ledger --> Delivery
 
-    Pending --> Ready
+    Delivery --> Ready
     Retry --> Ready
 
     Ready -- Yes --> Claim --> Leased --> Topology --> Publish --> Queue --> Confirm
@@ -38,12 +40,12 @@ flowchart TD
     Confirm -- No --> Retry
     Fence -- Yes --> Published
     Fence -- No --> Stale
-    Retry --> Pending
+    Retry --> Delivery
 
-    Pending -. Direct administrative update .-> Failed
+    Ledger -. Direct administrative update .-> Failed
 
     class StateChange command
-    class Pending,Dedupe,Ready,Claim,Leased,Topology,Publish,Confirm,Fence,Retry,Stale system
+    class Ledger,Delivery,Dedupe,Ready,Claim,Leased,Topology,Publish,Confirm,Fence,Retry,Stale system
     class Published success
     class Failed error
     class Noop component

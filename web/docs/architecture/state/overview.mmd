@@ -11,7 +11,8 @@ flowchart TD
     Chunk[Chunk state]
     Execution[Execution state]
     Attempt[Attempt state]
-    Outbox[Outbox state]
+    Outbox[Outbox ledger]
+    Delivery[Delivery queue]
 
     Create([Run create])
     Coordinator[Coordinator]
@@ -24,6 +25,7 @@ flowchart TD
 
     Coordinator --> Run
     Coordinator --> Outbox
+    Coordinator --> Delivery
     Coordinator --> Queue
 
     Worker --> Chunk
@@ -35,14 +37,16 @@ flowchart TD
     Cancel --> Execution
     Cancel --> Attempt
     Cancel --> Outbox
+    Cancel --> Delivery
 
     Run -->|dispatch guard| Chunk
     Chunk -->|work ownership| Execution
     Execution -->|current attempt guard| Attempt
     Run -->|state-change events| Outbox
-    Outbox -->|publish or retry| Queue
+    Outbox -->|enqueue delivery row| Delivery
+    Delivery -->|publish or retry| Queue
 
     class Create,Cancel command
     class Coordinator,Worker system
-    class Run,Chunk,Execution,Attempt,Outbox component
+    class Run,Chunk,Execution,Attempt,Outbox,Delivery component
     class Queue external

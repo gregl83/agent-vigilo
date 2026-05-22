@@ -15,12 +15,12 @@ flowchart TD
     DispatchRun[Start run if needed and enqueue chunk window]
     FinalizeClaim{Finalizable run claimed?}
     FinalizeRun[Roll up counts, set gate, and enqueue completion event]
-    ClaimOutbox[Claim publishable outbox events]
-    Events{Claimed events remain?}
+    ClaimOutbox[Claim publishable delivery rows]
+    Events{Claimed delivery rows remain?}
     Publish[Publish event to queue with bounded concurrency]
     PublishResult{Publish succeeded?}
-    MarkPublished[Mark event published]
-    Reschedule[Reschedule event for retry]
+    MarkPublished[Mark ledger published and delete delivery row]
+    Reschedule[Reschedule delivery row for retry]
     Stats[Log cycle statistics]
 
     Success([Success response])

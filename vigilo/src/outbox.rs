@@ -2,8 +2,9 @@
 //!
 //! Database workflows insert events into `outbox_events` in the same
 //! transaction as state changes. The coordinator calls this module after each
-//! orchestration pass to claim a bounded batch, publish each event to the
-//! message broker, and either mark it published or reschedule it for retry.
+//! orchestration pass to claim a bounded batch of delivery rows, publish each
+//! joined event payload to the message broker, and either mark it published or
+//! reschedule the delivery row for retry.
 //! This keeps database state and external message delivery loosely coupled
 //! without losing events when a process exits between commit and publish.
 
@@ -157,11 +158,12 @@ async fn publish_claimed_event(
     }
 }
 
-/// Claims and publishes a bounded batch of pending outbox events.
+/// Claims and publishes a bounded batch of pending outbox delivery rows.
 ///
 /// Each claimed event is published independently. Successful publishes are
-/// marked `published`; failures are logged and rescheduled so a later
-/// coordinator pass can retry them.
+/// marked `published` in the ledger and removed from the delivery queue;
+/// failures are logged and rescheduled so a later coordinator pass can retry
+/// them.
 pub(crate) async fn publish_pending_events(
     db: &PgPool,
     publisher: &dyn EventPublisher,

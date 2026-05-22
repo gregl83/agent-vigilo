@@ -51,7 +51,7 @@ flowchart TD
     style VigiloRuntime stroke-dasharray: 5 5,fill:none,stroke:#1168bd,stroke-width:2px
 
     %% external containers
-    Database[("<b>Database</b> <br/> <small>[Container: PostgreSQL]</small> <br/> <small>Stores evaluators, datasets, runs, chunks, results, outbox events, and migrations.</small>")]:::component
+    Database[("<b>Database</b> <br/> <small>[Container: PostgreSQL]</small> <br/> <small>Stores evaluators, datasets, runs, chunks, results, outbox ledger events, hot delivery rows, and migrations.</small>")]:::component
     Queue[("<b>Queue</b> <br/> <small>[Container: RabbitMQ]</small> <br/> <small>Distributes run chunk-ready events to workers.</small>")]:::component
     Coordinator["fa:fa-compass <br/> <b>Coordinator</b> <br/> <small>[Container: Rust]</small> <br/> <small>Owns run dispatch, finalization, and outbox publication.</small>"]:::component
     Worker["fa:fa-gear <br/> <b>Worker</b> <br/> <small>[Container: Rust]</small> <br/> <small>Consumes chunks, invokes the target agent, runs evaluators, and persists results.</small>"]:::component

@@ -28,13 +28,13 @@ sequenceDiagram
             DB-->>Vigilo: Dispatch window count
             Vigilo->>DB: Drain finalizable runs
             DB-->>Vigilo: Finalization count
-            Vigilo->>DB: Claim publishable outbox events
-            DB-->>Vigilo: Outbox batch
+            Vigilo->>DB: Claim publishable outbox delivery rows
+            DB-->>Vigilo: Joined event payload batch
             loop Bounded outbox publish concurrency
                 Vigilo->>Queue: Declare durable topology and publish persistent mandatory events
             end
             Queue-->>Vigilo: Confirmed routed publishes or returned/nacked publishes
-            Vigilo->>DB: Mark published or retry using outbox claim tokens
+            Vigilo->>DB: Mark ledger published and delete or retry delivery rows
         else Cycle or shutdown fails
             Vigilo-->>User: Service error
         end
