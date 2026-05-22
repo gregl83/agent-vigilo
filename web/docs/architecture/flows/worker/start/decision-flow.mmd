@@ -19,7 +19,8 @@ flowchart TD
     Context[Load run context]
     Warm[Warm evaluator components]
     Cases[Load chunk case batch]
-    Execute[Execute case evaluations with bounded chunk-local parallelism]
+    Permit[Acquire Wasm evaluation permits]
+    Execute[Execute case evaluations in sandboxed stores]
     Persist[Persist terminal transitions]
     Complete[Mark chunk completed]
     Ack[Acknowledge message]
@@ -65,8 +66,11 @@ flowchart TD
     Warm --> Cases
     Warm -. Warmup fails .-> Release
 
-    Cases --> Execute
+    Cases --> Permit
     Cases -. Load fails .-> Release
+
+    Permit --> Execute
+    Permit -. Permit acquisition fails .-> Release
 
     Execute --> Persist
     Execute -. Processing fails .-> Release
@@ -96,5 +100,5 @@ flowchart TD
     class Start command
     class Success success
     class Loader,Runner,Stream,Event,Decode,Payload,Claim,Context,Cases,Persist,Complete,Ack,Release,Released,Requeue,Reopen,Shutdown,Stop system
-    class Warm,Execute component
+    class Warm,Permit,Execute component
     class ServiceFail,ShutdownFail error

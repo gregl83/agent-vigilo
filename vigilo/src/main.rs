@@ -65,7 +65,19 @@ async fn main() -> ExitCode {
         Ok(app) => {
             init_logger(app.quiet, app.verbose);
 
-            let wasm_config = wasm::Config::default();
+            let wasm_config = wasm::Config {
+                max_memory_bytes: app.wasm_max_memory_bytes,
+                max_table_elements: app.wasm_max_table_elements,
+                max_instances: app.wasm_max_instances,
+                max_memories: app.wasm_max_memories,
+                max_tables: app.wasm_max_tables,
+                fuel_per_evaluation: app.wasm_fuel_per_evaluation,
+                timeout_ms: app.wasm_timeout_ms,
+                epoch_tick_interval_ms: app.wasm_epoch_tick_interval_ms,
+                max_concurrent_evaluations: app.wasm_max_concurrent_evaluations,
+                max_log_message_bytes: app.wasm_max_log_message_bytes,
+                max_log_messages: app.wasm_max_log_messages,
+            };
             let context = Context::new(
                 app.database_url.clone(),
                 app.database_max_connections,

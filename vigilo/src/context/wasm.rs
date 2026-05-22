@@ -8,7 +8,12 @@ use std::{
     },
     io::ErrorKind,
     path::PathBuf,
-    time::SystemTime,
+    sync::Arc,
+    thread,
+    time::{
+        Duration,
+        SystemTime,
+    },
 };
 
 use cargo_metadata::MetadataCommand;
@@ -18,7 +23,11 @@ use serde::{
     Serialize,
 };
 use serde_json::Value;
-use tokio::sync::OnceCell;
+use tokio::sync::{
+    OnceCell,
+    OwnedSemaphorePermit,
+    Semaphore,
+};
 use tracing::{
     debug,
     warn,
@@ -31,6 +40,8 @@ use wasmtime::{
     Config as EngineConfig,
     Engine,
     Store,
+    StoreLimits,
+    StoreLimitsBuilder,
     component,
     component::ResourceTable,
 };
@@ -67,6 +78,10 @@ mod evaluator_test_bindings {
 struct EvaluatorTestHost {
     table: ResourceTable,
     ctx: WasiCtx,
+    limits: StoreLimits,
+    max_log_message_bytes: usize,
+    max_log_messages: u32,
+    log_messages: u32,
 }
 
 impl WasiView for EvaluatorTestHost {
@@ -80,19 +95,27 @@ impl WasiView for EvaluatorTestHost {
 
 impl evaluator_test_bindings::vigilo::evaluator::executor::Host for EvaluatorTestHost {
     fn trace(&mut self, msg: String) {
-        debug!("evaluator.trace: {}", msg);
+        if let Some(msg) = self.capped_log_message(msg) {
+            debug!("evaluator.trace: {}", msg);
+        }
     }
 
     fn debug(&mut self, msg: String) {
-        debug!("evaluator.debug: {}", msg);
+        if let Some(msg) = self.capped_log_message(msg) {
+            debug!("evaluator.debug: {}", msg);
+        }
     }
 
     fn warn(&mut self, msg: String) {
-        warn!("evaluator.warn: {}", msg);
+        if let Some(msg) = self.capped_log_message(msg) {
+            warn!("evaluator.warn: {}", msg);
+        }
     }
 
     fn error(&mut self, msg: String) {
-        warn!("evaluator.error: {}", msg);
+        if let Some(msg) = self.capped_log_message(msg) {
+            warn!("evaluator.error: {}", msg);
+        }
     }
 
     fn send_http_request(
@@ -101,6 +124,30 @@ impl evaluator_test_bindings::vigilo::evaluator::executor::Host for EvaluatorTes
     ) -> Result<evaluator_test_bindings::vigilo::evaluator::executor::HttpResponse, String> {
         Err("send_http_request is not enabled yet; outbound HTTP policy enforcement is not configured".to_string())
     }
+}
+
+impl EvaluatorTestHost {
+    fn capped_log_message(&mut self, msg: String) -> Option<String> {
+        if self.max_log_messages == 0 || self.log_messages >= self.max_log_messages {
+            return None;
+        }
+
+        self.log_messages += 1;
+        Some(truncate_utf8_bytes(msg, self.max_log_message_bytes))
+    }
+}
+
+fn truncate_utf8_bytes(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value
 }
 
 /// Parse JSON payload from raw str.
@@ -785,13 +832,96 @@ pub struct Component {
     pub serialized: Vec<u8>,
 }
 
-#[derive(Clone)]
-pub struct Config {}
+const DEFAULT_MAX_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_MAX_TABLE_ELEMENTS: u64 = 10_000;
+const DEFAULT_MAX_INSTANCES: u64 = 1;
+const DEFAULT_MAX_MEMORIES: u64 = 1;
+const DEFAULT_MAX_TABLES: u64 = 2;
+const DEFAULT_FUEL_PER_EVALUATION: u64 = 50_000_000;
+const DEFAULT_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_EPOCH_TICK_INTERVAL_MS: u64 = 10;
+const DEFAULT_MAX_CONCURRENT_EVALUATIONS: u64 = 8;
+const DEFAULT_MAX_LOG_MESSAGE_BYTES: u64 = 4 * 1024;
+const DEFAULT_MAX_LOG_MESSAGES: u32 = 128;
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub max_memory_bytes: u64,
+    pub max_table_elements: u64,
+    pub max_instances: u64,
+    pub max_memories: u64,
+    pub max_tables: u64,
+    pub fuel_per_evaluation: u64,
+    pub timeout_ms: u64,
+    pub epoch_tick_interval_ms: u64,
+    pub max_concurrent_evaluations: u64,
+    pub max_log_message_bytes: u64,
+    pub max_log_messages: u32,
+}
 
 impl Default for Config {
     fn default() -> Self {
-        Self {}
+        Self {
+            max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
+            max_table_elements: DEFAULT_MAX_TABLE_ELEMENTS,
+            max_instances: DEFAULT_MAX_INSTANCES,
+            max_memories: DEFAULT_MAX_MEMORIES,
+            max_tables: DEFAULT_MAX_TABLES,
+            fuel_per_evaluation: DEFAULT_FUEL_PER_EVALUATION,
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+            epoch_tick_interval_ms: DEFAULT_EPOCH_TICK_INTERVAL_MS,
+            max_concurrent_evaluations: DEFAULT_MAX_CONCURRENT_EVALUATIONS,
+            max_log_message_bytes: DEFAULT_MAX_LOG_MESSAGE_BYTES,
+            max_log_messages: DEFAULT_MAX_LOG_MESSAGES,
+        }
     }
+}
+
+impl Config {
+    fn store_limits(&self) -> anyhow::Result<StoreLimits> {
+        Ok(StoreLimitsBuilder::new()
+            .memory_size(to_usize("wasm max memory bytes", self.max_memory_bytes)?)
+            .table_elements(to_usize(
+                "wasm max table elements",
+                self.max_table_elements,
+            )?)
+            .instances(to_usize("wasm max instances", self.max_instances)?)
+            .memories(to_usize("wasm max memories", self.max_memories)?)
+            .tables(to_usize("wasm max tables", self.max_tables)?)
+            .trap_on_grow_failure(true)
+            .build())
+    }
+
+    fn epoch_deadline_ticks(&self) -> u64 {
+        if self.timeout_ms == 0 {
+            return 0;
+        }
+
+        self.timeout_ms
+            .div_ceil(self.epoch_tick_interval_ms.max(1))
+            .max(1)
+    }
+}
+
+fn to_usize(name: &str, value: u64) -> anyhow::Result<usize> {
+    usize::try_from(value).map_err(|_| anyhow::anyhow!("{} is too large: {}", name, value))
+}
+
+fn start_epoch_ticker(engine: Engine, tick_interval_ms: u64) {
+    if tick_interval_ms == 0 {
+        return;
+    }
+
+    let interval = Duration::from_millis(tick_interval_ms);
+    let _ = thread::Builder::new()
+        .name("vigilo-wasm-epoch-ticker".to_string())
+        .spawn(move || {
+            loop {
+                thread::sleep(interval);
+                #[cfg(target_has_atomic = "64")]
+                engine.increment_epoch();
+            }
+        });
 }
 
 /// Wasm engine wrapper.
@@ -799,20 +929,43 @@ impl Default for Config {
 pub struct Wasm {
     engine: Engine,
     fingerprint: String,
+    config: Config,
+    evaluation_semaphore: Arc<Semaphore>,
 }
 
 impl Wasm {
-    pub fn new(_config: Config) -> anyhow::Result<Self> {
+    pub fn new(config: Config) -> anyhow::Result<Self> {
         let mut engine_config = EngineConfig::new();
         engine_config.wasm_component_model(true);
+        engine_config.consume_fuel(true);
+        if config.timeout_ms > 0 {
+            engine_config.epoch_interruption(true);
+        }
 
         let engine = Engine::new(&engine_config)?;
         let fingerprint = get_engine_fingerprint(&engine);
+        if config.timeout_ms > 0 {
+            start_epoch_ticker(engine.clone(), config.epoch_tick_interval_ms);
+        }
+        let max_concurrent_evaluations = to_usize(
+            "wasm max concurrent evaluations",
+            config.max_concurrent_evaluations,
+        )?;
 
         Ok(Self {
             engine,
             fingerprint,
+            config,
+            evaluation_semaphore: Arc::new(Semaphore::new(max_concurrent_evaluations)),
         })
+    }
+
+    pub(crate) async fn acquire_evaluation_permit(&self) -> anyhow::Result<OwnedSemaphorePermit> {
+        self.evaluation_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|err| anyhow::anyhow!("wasm evaluation semaphore closed: {}", err))
     }
 
     /// Prepare evaluator for execution.
@@ -934,8 +1087,24 @@ impl Wasm {
             EvaluatorTestHost {
                 table: ResourceTable::new(),
                 ctx: WasiCtxBuilder::new().build(),
+                limits: self.config.store_limits()?,
+                max_log_message_bytes: to_usize(
+                    "wasm max log message bytes",
+                    self.config.max_log_message_bytes,
+                )?,
+                max_log_messages: self.config.max_log_messages,
+                log_messages: 0,
             },
         );
+        store.limiter(|host| &mut host.limits);
+        store.set_fuel(self.config.fuel_per_evaluation)?;
+        if self.config.timeout_ms > 0 {
+            #[cfg(target_has_atomic = "64")]
+            {
+                store.set_epoch_deadline(self.config.epoch_deadline_ticks());
+                store.epoch_deadline_trap();
+            }
+        }
         let bindings =
             evaluator_test_bindings::EvaluatorWorld::instantiate(&mut store, component, &linker)?;
 
@@ -943,7 +1112,8 @@ impl Wasm {
 
         let output = bindings
             .vigilo_evaluator_evaluator()
-            .call_evaluate(&mut store, &input)?
+            .call_evaluate(&mut store, &input)
+            .map_err(|err| anyhow::anyhow!("evaluator trapped in wasm sandbox: {}", err))?
             .map_err(|err| anyhow::anyhow!("evaluator returned error: {}", err))?;
 
         map_wit_output_to_output(output)

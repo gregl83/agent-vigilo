@@ -29,3 +29,7 @@ RabbitMQ publishes use durable topology, persistent messages, mandatory routing,
 ## Partial persistence
 
 Worker persistence batches are guarded by current-attempt authority checks. If a stale worker loses authority, its final state changes are rejected rather than overwriting a newer attempt.
+
+## Evaluator resource exhaustion
+
+Each Wasm evaluator invocation runs in a fresh Wasmtime store with memory, table, instance, fuel, timeout, and log-message limits. A worker-wide semaphore caps active evaluator invocations so aggregate Wasm memory and CPU exposure stay bounded. If an evaluator exceeds its budget, the worker records an evaluator runtime error and continues through the normal result persistence path.

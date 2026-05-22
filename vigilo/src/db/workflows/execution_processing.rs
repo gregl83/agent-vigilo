@@ -978,6 +978,7 @@ async fn evaluate_case_execution(
                 tasks.spawn(async move {
                     let wasm = context.wasm().await?.clone();
                     let component = get_or_load_component(&context, &binding.evaluator_ref).await?;
+                    let wasm_permit = wasm.acquire_evaluation_permit().await?;
 
                     let evaluator_input = EvaluatorInput {
                         run_id: run_id.to_string(),
@@ -988,6 +989,7 @@ async fn evaluate_case_execution(
                         evaluator_config: binding.config.clone(),
                     };
                     let output = task::spawn_blocking(move || {
+                        let _wasm_permit = wasm_permit;
                         wasm.test_evaluator_component(&component, evaluator_input)
                     })
                     .await

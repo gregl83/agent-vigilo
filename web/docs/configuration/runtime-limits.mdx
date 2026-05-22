@@ -1,0 +1,49 @@
+---
+title: Runtime Limits
+description: Operational limits for Agent Vigilo database pools, Wasm evaluator isolation, and worker concurrency.
+keywords:
+  - Agent Vigilo runtime limits
+  - Wasm evaluator isolation
+  - worker concurrency
+  - Wasmtime sandbox
+---
+
+# Runtime Limits
+
+These process-level settings bound evaluator execution resource use. They can be supplied as CLI flags or environment variables.
+
+## Wasm Evaluator Isolation
+
+Each evaluator invocation runs in a fresh Wasmtime store with CPU, memory, table, instance, timeout, and logging limits. Workers also use a process-wide semaphore so many valid evaluators cannot exhaust host resources at the same time.
+
+| Flag | Environment | Default | Purpose |
+| --- | --- | ---: | --- |
+| `--wasm-max-memory-bytes` | `VIGILO_WASM_MAX_MEMORY_BYTES` | `67108864` | Maximum linear memory bytes per evaluator invocation. |
+| `--wasm-max-table-elements` | `VIGILO_WASM_MAX_TABLE_ELEMENTS` | `10000` | Maximum table elements per evaluator invocation. |
+| `--wasm-max-instances` | `VIGILO_WASM_MAX_INSTANCES` | `1` | Maximum component instances per evaluator invocation. |
+| `--wasm-max-memories` | `VIGILO_WASM_MAX_MEMORIES` | `1` | Maximum linear memories per evaluator invocation. |
+| `--wasm-max-tables` | `VIGILO_WASM_MAX_TABLES` | `2` | Maximum tables per evaluator invocation. |
+| `--wasm-fuel-per-evaluation` | `VIGILO_WASM_FUEL_PER_EVALUATION` | `50000000` | Wasmtime fuel budget for deterministic CPU interruption. |
+| `--wasm-timeout-ms` | `VIGILO_WASM_TIMEOUT_MS` | `5000` | Wall-clock timeout enforced by epoch interruption. |
+| `--wasm-epoch-tick-interval-ms` | `VIGILO_WASM_EPOCH_TICK_INTERVAL_MS` | `10` | Epoch ticker granularity used for timeout checks. |
+| `--wasm-max-concurrent-evaluations` | `VIGILO_WASM_MAX_CONCURRENT_EVALUATIONS` | `8` | Hard process-local cap on active Wasm evaluator invocations. |
+| `--wasm-max-log-message-bytes` | `VIGILO_WASM_MAX_LOG_MESSAGE_BYTES` | `4096` | Maximum bytes retained from each evaluator host log message. |
+| `--wasm-max-log-messages` | `VIGILO_WASM_MAX_LOG_MESSAGES` | `128` | Maximum evaluator host log messages per invocation. |
+
+## Sizing
+
+Set `VIGILO_WASM_MAX_CONCURRENT_EVALUATIONS` from available CPU and memory, not from queue depth. A worker's evaluator memory exposure is approximately:
+
+```text
+wasm_max_concurrent_evaluations * wasm_max_memory_bytes
+```
+
+plus Wasmtime/runtime overhead and non-evaluator worker memory.
+
+For example, the defaults allow up to 8 active evaluator invocations at 64 MiB each, or about 512 MiB of evaluator linear memory exposure per worker process.
+
+## Failure Behavior
+
+If an evaluator exceeds its sandbox budget, the invocation is recorded as an evaluator runtime error. The worker continues processing the rest of the batch and persists the error result through the normal evaluator-result path.
+
+Outbound evaluator HTTP remains denied unless a future policy explicitly enables it.

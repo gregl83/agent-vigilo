@@ -41,6 +41,50 @@ pub(crate) struct App {
     #[arg(long, env = "MESSAGING_URL")]
     pub messaging_url: String,
 
+    /// Maximum linear memory bytes per Wasm evaluator invocation
+    #[arg(long, env = "VIGILO_WASM_MAX_MEMORY_BYTES", default_value_t = 67_108_864, value_parser = clap::value_parser!(u64).range(65_536..=1_073_741_824))]
+    pub wasm_max_memory_bytes: u64,
+
+    /// Maximum table elements per Wasm evaluator invocation
+    #[arg(long, env = "VIGILO_WASM_MAX_TABLE_ELEMENTS", default_value_t = 10_000, value_parser = clap::value_parser!(u64).range(1..=10_000_000))]
+    pub wasm_max_table_elements: u64,
+
+    /// Maximum component instances per Wasm evaluator invocation
+    #[arg(long, env = "VIGILO_WASM_MAX_INSTANCES", default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=1024))]
+    pub wasm_max_instances: u64,
+
+    /// Maximum linear memories per Wasm evaluator invocation
+    #[arg(long, env = "VIGILO_WASM_MAX_MEMORIES", default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=64))]
+    pub wasm_max_memories: u64,
+
+    /// Maximum tables per Wasm evaluator invocation
+    #[arg(long, env = "VIGILO_WASM_MAX_TABLES", default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=256))]
+    pub wasm_max_tables: u64,
+
+    /// Fuel budget per Wasm evaluator invocation
+    #[arg(long, env = "VIGILO_WASM_FUEL_PER_EVALUATION", default_value_t = 50_000_000, value_parser = clap::value_parser!(u64).range(1..=10_000_000_000))]
+    pub wasm_fuel_per_evaluation: u64,
+
+    /// Wall-clock timeout in milliseconds per Wasm evaluator invocation
+    #[arg(long, env = "VIGILO_WASM_TIMEOUT_MS", default_value_t = 5_000, value_parser = clap::value_parser!(u64).range(1..=600_000))]
+    pub wasm_timeout_ms: u64,
+
+    /// Epoch ticker interval in milliseconds used for Wasm timeout traps
+    #[arg(long, env = "VIGILO_WASM_EPOCH_TICK_INTERVAL_MS", default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=1_000))]
+    pub wasm_epoch_tick_interval_ms: u64,
+
+    /// Maximum active Wasm evaluator executions per process
+    #[arg(long, env = "VIGILO_WASM_MAX_CONCURRENT_EVALUATIONS", default_value_t = 8, value_parser = clap::value_parser!(u64).range(1..=1024))]
+    pub wasm_max_concurrent_evaluations: u64,
+
+    /// Maximum bytes logged per evaluator host log message
+    #[arg(long, env = "VIGILO_WASM_MAX_LOG_MESSAGE_BYTES", default_value_t = 4_096, value_parser = clap::value_parser!(u64).range(1..=1_048_576))]
+    pub wasm_max_log_message_bytes: u64,
+
+    /// Maximum evaluator host log messages per invocation
+    #[arg(long, env = "VIGILO_WASM_MAX_LOG_MESSAGES", default_value_t = 128, value_parser = clap::value_parser!(u32).range(0..=100_000))]
+    pub wasm_max_log_messages: u32,
+
     /// Suppress all diagnostic output and progress messages
     #[arg(global = true, short, long, default_value_t = false)]
     pub quiet: bool,

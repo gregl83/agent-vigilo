@@ -43,7 +43,8 @@ sequenceDiagram
                 par Agent calls
                     Vigilo->>Agent: Invoke multiple cases with shared HTTP client
                 and Evaluator calls
-                    Vigilo->>WASM: Execute per-case evaluators with bounded parallelism
+                    Vigilo->>Vigilo: Acquire Wasm evaluation semaphore permits
+                    Vigilo->>WASM: Execute evaluators in sandboxed stores
                 end
                 WASM-->>Vigilo: Evaluation outputs
                 Vigilo->>DB: Persist batched execution results and complete chunk

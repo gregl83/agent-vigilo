@@ -23,6 +23,7 @@ Describes the major internal responsibilities of the worker runtime.
 - Workers consume `run.chunk.ready` messages and claim chunk leases before loading case data.
 - Run context and evaluator components are cached inside the worker process to avoid repeated profile parsing and WASM compilation.
 - Workers use a shared HTTP client and run chunk cases with bounded chunk-local parallelism before persisting results in batch.
+- Evaluator execution is admitted through a process-wide Wasm semaphore and each invocation runs in a fresh Wasmtime store with memory, table, instance, fuel, timeout, and log-message limits.
 - Execution writes use shared run-state guards so chunks for the same running run do not serialize on the run row.
 - Execution terminal transitions are authority guarded by the current attempt id and attempt number.
 - Queue messages are acknowledged only after invalid, stale, or completed work is handled; recoverable chunk failures release the lease and requeue the message.
@@ -35,6 +36,7 @@ Describes the major internal responsibilities of the worker runtime.
 - [Worker flows](../../../flows/worker)
 - [Chunk lifecycle](../../../state/chunk-lifecycle)
 - [Execution lifecycle](../../../state/execution-lifecycle)
+- [Runtime limits](/docs/configuration/runtime-limits)
 - [State ownership](../../../state/ownership)
 - [Failure modes](../../../failure-modes)
 - [Vigilo components](../vigilo)

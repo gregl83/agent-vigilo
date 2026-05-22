@@ -110,6 +110,8 @@ execution.status = retry_scheduled (if retryable)
 After a successful agent response:
 
 - evaluators are executed
+- Wasm evaluator invocations acquire a worker-local semaphore permit
+- each evaluator runs in a fresh Wasmtime store with memory, table, instance, fuel, timeout, and log-message limits
 - results are appended to evaluator_results
 
 Each evaluator produces:
