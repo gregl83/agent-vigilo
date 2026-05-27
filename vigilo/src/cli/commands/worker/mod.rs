@@ -283,7 +283,7 @@ impl Executable for Command {
 /// 2. parse payload and claim chunk lease
 /// 3. warm evaluator components from run profile
 /// 4. load and process the chunk case batch
-/// 5. ack on success, nack+requeue on recoverable failures
+/// 5. ack on success, retry with backoff on recoverable failures
 async fn run_worker_drain_pass(
     context: Context,
     evaluator_loader: &EvaluatorLoaderService,
@@ -315,9 +315,25 @@ async fn run_worker_cycle(
 
     debug!("attempting to consume worker message");
 
-    let Some(message) = mq.consume_worker_message().await? else {
+    let Some(raw_message) = mq.consume_worker_message().await? else {
         debug!("no worker messages available");
         return Ok(WorkerCycleOutcome::Empty);
+    };
+    let message = match serde_json::from_slice::<serde_json::Value>(&raw_message.body) {
+        Ok(payload) => crate::mq::ConsumedMessage {
+            raw: raw_message,
+            payload,
+        },
+        Err(err) => {
+            mq.quarantine_worker_message(
+                &raw_message,
+                &format!("worker message body was not valid JSON: {}", err),
+                "invalid_json",
+            )
+            .await?;
+            warn!("quarantined invalid worker message body");
+            return Ok(WorkerCycleOutcome::Processed);
+        }
     };
 
     run_worker_message(context, evaluator_loader, message).await
@@ -332,18 +348,23 @@ async fn run_worker_message(
     let mq = context.mq().await?;
 
     debug!(
-        delivery_tag = message.delivery_tag,
+        delivery_tag = message.delivery_tag(),
         "consumed worker message"
     );
 
     let payload = match serde_json::from_value::<ChunkReadyMessage>(message.payload.clone()) {
         Ok(payload) => payload,
         Err(err) => {
-            mq.ack(message.delivery_tag).await?;
-            warn!(error = %err, "dropping invalid chunk-ready message payload");
+            mq.quarantine_worker_message(
+                &message.raw,
+                &format!("invalid chunk-ready message payload: {}", err),
+                "invalid_schema",
+            )
+            .await?;
+            warn!(error = %err, "quarantined invalid chunk-ready message payload");
             debug!(
-                delivery_tag = message.delivery_tag,
-                "invalid message acknowledged and dropped"
+                delivery_tag = message.delivery_tag(),
+                "invalid message quarantined"
             );
             return Ok(WorkerCycleOutcome::Processed);
         }
@@ -363,14 +384,14 @@ async fn run_worker_message(
     )
     .await?
     else {
-        mq.ack(message.delivery_tag).await?;
+        mq.ack(message.delivery_tag()).await?;
         info!(
             chunk_id = %payload.chunk_id,
             run_id = %payload.run_id,
             "chunk not claimable; acknowledging message"
         );
         debug!(
-            delivery_tag = message.delivery_tag,
+            delivery_tag = message.delivery_tag(),
             "unclaimable chunk message acknowledged"
         );
         return Ok(WorkerCycleOutcome::Processed);
@@ -393,7 +414,7 @@ async fn run_worker_message(
     let Some(extended_chunk) =
         chunk_processing::extend_chunk_lease(db, &chunk, processing_lease_seconds).await?
     else {
-        mq.ack(message.delivery_tag).await?;
+        mq.ack(message.delivery_tag()).await?;
         warn!(
             run_id = %chunk.run_id,
             chunk_id = %chunk.id,
@@ -427,9 +448,10 @@ async fn run_worker_message(
         Err(err) => {
             let released = chunk_processing::release_chunk_as_pending(db, &chunk).await?;
             if released > 0 {
-                mq.nack_requeue(message.delivery_tag).await?;
+                mq.retry_worker_message(&message.raw, &err.to_string(), "evaluator_warmup")
+                    .await?;
             } else {
-                mq.ack(message.delivery_tag).await?;
+                mq.ack(message.delivery_tag()).await?;
             }
             warn!(
                 run_id = %chunk.run_id,
@@ -462,9 +484,10 @@ async fn run_worker_message(
                 Err(err) => {
                     let released = chunk_processing::release_chunk_as_pending(db, &chunk).await?;
                     if released > 0 {
-                        mq.nack_requeue(message.delivery_tag).await?;
+                        mq.retry_worker_message(&message.raw, &err.to_string(), "chunk_processing")
+                            .await?;
                     } else {
-                        mq.ack(message.delivery_tag).await?;
+                        mq.ack(message.delivery_tag()).await?;
                     }
                     warn!(
                         run_id = %chunk.run_id,
@@ -513,9 +536,10 @@ async fn run_worker_message(
             {
                 let released = chunk_processing::release_chunk_as_pending(db, &chunk).await?;
                 if released > 0 {
-                    mq.nack_requeue(message.delivery_tag).await?;
+                    mq.retry_worker_message(&message.raw, &err.to_string(), "terminal_transition")
+                        .await?;
                 } else {
-                    mq.ack(message.delivery_tag).await?;
+                    mq.ack(message.delivery_tag()).await?;
                 }
                 warn!(
                     run_id = %chunk.run_id,
@@ -529,7 +553,7 @@ async fn run_worker_message(
 
             let completed = chunk_processing::mark_chunk_completed(db, &chunk).await?;
             if completed == 0 {
-                mq.ack(message.delivery_tag).await?;
+                mq.ack(message.delivery_tag()).await?;
                 warn!(
                     run_id = %chunk.run_id,
                     chunk_id = %chunk.id,
@@ -538,7 +562,7 @@ async fn run_worker_message(
                 return Ok(WorkerCycleOutcome::Processed);
             }
 
-            mq.ack(message.delivery_tag).await?;
+            mq.ack(message.delivery_tag()).await?;
             info!(
                 run_id = %chunk.run_id,
                 chunk_id = %chunk.id,
@@ -548,7 +572,7 @@ async fn run_worker_message(
                 "processed case batch from queue chunk"
             );
             debug!(
-                delivery_tag = message.delivery_tag,
+                delivery_tag = message.delivery_tag(),
                 chunk_id = %chunk.id,
                 "chunk processing complete; message acknowledged"
             );
@@ -557,9 +581,10 @@ async fn run_worker_message(
         Err(err) => {
             let released = chunk_processing::release_chunk_as_pending(db, &chunk).await?;
             if released > 0 {
-                mq.nack_requeue(message.delivery_tag).await?;
+                mq.retry_worker_message(&message.raw, &err.to_string(), "case_batch_load")
+                    .await?;
             } else {
-                mq.ack(message.delivery_tag).await?;
+                mq.ack(message.delivery_tag()).await?;
             }
             warn!(
                 run_id = %chunk.run_id,
@@ -569,7 +594,7 @@ async fn run_worker_message(
                 "failed to load chunk case batch; handled claimed chunk lease"
             );
             debug!(
-                delivery_tag = message.delivery_tag,
+                delivery_tag = message.delivery_tag(),
                 chunk_id = %chunk.id,
                 chunk_released = released > 0,
                 "chunk processing failed; handled claimed chunk lease"
