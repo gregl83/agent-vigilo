@@ -1,0 +1,8 @@
+{
+  "label": "State",
+  "position": 4,
+  "link": {
+    "type": "doc",
+    "id": "architecture/state/index"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "label": "Command Flows",
+  "position": 5,
+  "link": {
+    "type": "doc",
+    "id": "architecture/flows/index"
+  }
+}

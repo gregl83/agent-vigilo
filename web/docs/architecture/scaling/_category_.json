@@ -1,0 +1,8 @@
+{
+  "label": "Scaling",
+  "position": 3,
+  "link": {
+    "type": "doc",
+    "id": "architecture/scaling/index"
+  }
+}
