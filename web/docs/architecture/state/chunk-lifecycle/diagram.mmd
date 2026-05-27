@@ -12,6 +12,8 @@ flowchart TD
     Dispatch[Dispatch window marks dispatched_at]
     ClaimGuard{Run running and chunk claimable?}
     Leased[Chunk leased]
+    Recover{Coordinator recovery budget left?}
+    RecoveryEvent[Recovery event enqueued]
     LoadCases[Load case batch]
     Process{Processing outcome}
     CompleteGuard{Still leased by same worker?}
@@ -26,7 +28,9 @@ flowchart TD
     Create --> Pending
 
     Pending --> Dispatch --> ClaimGuard
-    Leased -->|Lease expired| ClaimGuard
+    Leased -->|Lease expired| Recover
+    Recover -- Yes --> RecoveryEvent --> Pending
+    Recover -- No --> Failed
     ClaimGuard -- Yes --> Leased --> LoadCases --> Process
     ClaimGuard -- No --> Noop
 
@@ -45,7 +49,7 @@ flowchart TD
     Leased -. Reserved terminal path .-> Failed
 
     class Create,Cancel command
-    class Pending,Dispatch,Leased,ClaimGuard,LoadCases,Process,CompleteGuard,ReleaseGuard,Requeued system
+    class Pending,Dispatch,Leased,Recover,RecoveryEvent,ClaimGuard,LoadCases,Process,CompleteGuard,ReleaseGuard,Requeued system
     class Completed success
     class Cancelled,Failed error
     class Noop component

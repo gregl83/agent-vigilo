@@ -18,6 +18,125 @@ pub(crate) struct DispatchedRun {
     pub(crate) run_started_events_enqueued: i64,
 }
 
+/// Counts returned after one expired chunk lease recovery pass.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ChunkLeaseRecoveryStats {
+    pub(crate) recovered: i64,
+    pub(crate) failed: i64,
+}
+
+/// Recovers expired worker chunk leases for running runs.
+///
+/// Recovered chunks are moved back to `pending` and receive a fresh
+/// `run.chunk.ready` event with a recovery-scoped dedupe key. Chunks that have
+/// already reached the recovery limit are marked failed so finalization can
+/// terminate the run instead of leaving it blocked by a dead lease forever.
+pub(crate) async fn recover_expired_chunk_leases(
+    db: &PgPool,
+    max_recoveries: i32,
+    batch_size: i64,
+) -> anyhow::Result<ChunkLeaseRecoveryStats> {
+    let mut tx = db.begin().await?;
+
+    let recovered = sqlx::query_scalar::<_, i64>(
+        r#"
+        WITH expired AS (
+            SELECT
+                rc.run_id,
+                rc.id,
+                rc.recovery_count + 1 AS next_recovery_count
+            FROM run_chunks rc
+            JOIN runs r
+              ON r.id = rc.run_id
+            WHERE rc.status = 'leased'
+              AND rc.leased_until < now()
+              AND rc.recovery_count < $1
+              AND r.status = 'running'::run_status
+            ORDER BY rc.leased_until ASC, rc.run_id ASC, rc.id ASC
+            FOR UPDATE OF rc SKIP LOCKED
+            LIMIT $2
+        ),
+        recovered AS (
+            UPDATE run_chunks rc
+            SET status = 'pending',
+                leased_until = NULL,
+                recovery_count = expired.next_recovery_count,
+                last_recovered_at = now(),
+                updated_at = now()
+            FROM expired
+            WHERE rc.run_id = expired.run_id
+              AND rc.id = expired.id
+            RETURNING rc.run_id, rc.id, rc.recovery_count
+        ),
+        recovery_events AS (
+            INSERT INTO outbox_events (event_type, aggregate_type, aggregate_id, dedupe_key, payload)
+            SELECT
+                'run.chunk.ready',
+                'run',
+                recovered.run_id,
+                format(
+                    'run:%s:chunk:%s:ready:recovery:%s',
+                    recovered.run_id,
+                    recovered.id,
+                    recovered.recovery_count
+                ),
+                jsonb_build_object(
+                    'run_id', recovered.run_id,
+                    'chunk_id', recovered.id,
+                    'recovery_count', recovered.recovery_count
+                )
+            FROM recovered
+            ON CONFLICT (dedupe_key) DO NOTHING
+            RETURNING id
+        )
+        SELECT COUNT(*)::bigint
+        FROM recovered
+        "#,
+    )
+    .bind(max_recoveries)
+    .bind(batch_size)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let failed = sqlx::query_scalar::<_, i64>(
+        r#"
+        WITH expired AS (
+            SELECT rc.run_id, rc.id
+            FROM run_chunks rc
+            JOIN runs r
+              ON r.id = rc.run_id
+            WHERE rc.status = 'leased'
+              AND rc.leased_until < now()
+              AND rc.recovery_count >= $1
+              AND r.status = 'running'::run_status
+            ORDER BY rc.leased_until ASC, rc.run_id ASC, rc.id ASC
+            FOR UPDATE OF rc SKIP LOCKED
+            LIMIT $2
+        ),
+        failed AS (
+            UPDATE run_chunks rc
+            SET status = 'failed',
+                leased_until = NULL,
+                updated_at = now()
+            FROM expired
+            WHERE rc.run_id = expired.run_id
+              AND rc.id = expired.id
+            RETURNING 1
+        )
+        SELECT COUNT(*)::bigint
+        FROM failed
+        "#,
+    )
+    .bind(max_recoveries)
+    .bind(batch_size)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(ChunkLeaseRecoveryStats { recovered, failed })
+}
+
 /// Claims one dispatchable run and enqueues a bounded chunk-ready window.
 ///
 /// Pending runs are first marked running and receive a `run.started` event.

@@ -24,6 +24,8 @@ sequenceDiagram
             Vigilo-->>User: Success response
         else Tick elapsed
             Vigilo->>Vigilo: Run coordinator cycle
+            Vigilo->>DB: Recover expired chunk leases
+            DB-->>Vigilo: Recovered and failed chunk counts
             Vigilo->>DB: Drain dispatchable run windows
             DB-->>Vigilo: Dispatch window count
             Vigilo->>DB: Drain finalizable runs

@@ -20,10 +20,11 @@ Describes the major internal responsibilities of the coordinator runtime.
 
 ## Notes
 
+- Lease recovery runs before dispatch and finalization: expired worker chunk leases are either requeued with recovery-scoped chunk-ready events or marked failed after the recovery limit.
 - Dispatch claims pending or running runs with undispatched chunks, starts runs when needed, and enqueues bounded chunk-ready windows.
 - Finalization is coordinator-owned and lease guarded; workers persist execution outcomes but do not complete the run row.
 - Outbox publication is deliberately separate from state changes so committed ledger events can be retried after broker or process failures.
-- Coordinator throughput knobs can tune cycle interval, dispatch windows, outbox batch size, publish parallelism, leases, and retry delay.
+- Coordinator throughput knobs can tune cycle interval, chunk lease recovery batch size and limit, dispatch windows, outbox batch size, publish parallelism, leases, and retry delay.
 - Outbox publishers claim rows from the sharded `outbox_delivery_queue`, assign claim tokens, and publish joined ledger payloads with bounded concurrency.
 - Confirmed publishes update `outbox_events` to `published` and delete the delivery row, keeping the hot queue limited to unfinished work.
 - RabbitMQ publishes use durable topology, persistent messages, mandatory routing, publisher confirms, and the outbox dedupe key as the AMQP message id.

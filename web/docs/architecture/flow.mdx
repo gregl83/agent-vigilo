@@ -167,7 +167,9 @@ This occurs when:
 
 ### 7. Run Finalization
 
-Workers (or a coordinator) check:
+Before finalization, the coordinator recovers expired chunk leases for running runs. Recoverable chunks are reset to `pending` and receive a recovery-scoped `run.chunk.ready` event. Chunks that exceed the recovery limit are marked `failed`.
+
+The coordinator checks:
 
 > Are there any non-terminal executions remaining?
 

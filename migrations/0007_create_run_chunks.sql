@@ -8,6 +8,8 @@ CREATE TABLE run_chunks (
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'leased', 'completed', 'failed', 'cancelled')),
     dispatched_at TIMESTAMPTZ,
     leased_until TIMESTAMPTZ,
+    recovery_count INTEGER NOT NULL DEFAULT 0 CHECK (recovery_count >= 0),
+    last_recovered_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
@@ -39,6 +41,10 @@ CREATE INDEX idx_run_chunks_undispatched
     ON run_chunks(run_id, ordinal_start, id)
     WHERE status = 'pending' AND dispatched_at IS NULL;
 
+CREATE INDEX idx_run_chunks_expired_leases
+    ON run_chunks(run_id, leased_until, recovery_count)
+    WHERE status = 'leased';
+
 COMMENT ON TABLE run_chunks IS
     'Chunk-level scheduling units for run processing, hash partitioned by run_id for run-local worker scheduling.';
 
@@ -69,8 +75,17 @@ COMMENT ON COLUMN run_chunks.dispatched_at IS
 COMMENT ON COLUMN run_chunks.leased_until IS
     'Lease expiration timestamp for worker ownership of this chunk.';
 
+COMMENT ON COLUMN run_chunks.recovery_count IS
+    'Number of times an expired worker lease has been recovered and requeued by the coordinator.';
+
+COMMENT ON COLUMN run_chunks.last_recovered_at IS
+    'Timestamp of the most recent coordinator recovery for an expired worker lease.';
+
 COMMENT ON COLUMN run_chunks.created_at IS
     'Timestamp when this chunk was created.';
 
 COMMENT ON COLUMN run_chunks.updated_at IS
     'Timestamp of the last state update for this chunk.';
+
+COMMENT ON INDEX idx_run_chunks_expired_leases IS
+    'Hot index for coordinator recovery scans over expired leased chunks.';

@@ -18,7 +18,8 @@ flowchart TD
     ServiceLoop["fa:fa-rotate <br/> <b>Service Loop Runner</b> <br/> <small>[Component: Rust / Tokio]</small> <br/> <small>Runs coordinator cycles on a fixed tick and handles shutdown.</small>"]:::component
     RuntimeContext["fa:fa-layer-group <br/> <b>Runtime Context Access</b> <br/> <small>[Component: Rust]</small> <br/> <small>Provides database and messaging clients for each cycle.</small>"]:::component
 
-    CycleOrchestrator["fa:fa-arrows-spin <br/> <b>Coordinator Cycle Orchestrator</b> <br/> <small>[Component: Rust]</small> <br/> <small>Runs dispatch, finalization, and outbox publication in deterministic order.</small>"]:::component
+    CycleOrchestrator["fa:fa-arrows-spin <br/> <b>Coordinator Cycle Orchestrator</b> <br/> <small>[Component: Rust]</small> <br/> <small>Runs lease recovery, dispatch, finalization, and outbox publication in deterministic order.</small>"]:::component
+    LeaseRecovery["fa:fa-life-ring <br/> <b>Chunk Lease Recovery</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Recovers expired chunk leases or marks poison chunks failed after the recovery limit.</small>"]:::component
     DispatchDrainer["fa:fa-list-check <br/> <b>Dispatch Batch Drainer</b> <br/> <small>[Component: Rust]</small> <br/> <small>Bounds chunk-window dispatch work per coordinator cycle.</small>"]:::component
     DispatchWorkflow["fa:fa-share-nodes <br/> <b>Run Dispatch Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Starts pending runs and inserts bounded run.chunk.ready windows.</small>"]:::component
 
@@ -35,6 +36,7 @@ flowchart TD
         ServiceLoop
         RuntimeContext
         CycleOrchestrator
+        LeaseRecovery
         DispatchDrainer
         DispatchWorkflow
         FinalizeDrainer
@@ -59,11 +61,14 @@ flowchart TD
     RuntimeContext -->|"Opens database access to <br> <small>[SQL/TCP]</small>"| Database
     RuntimeContext -->|"Opens messaging access to <br> <small>[AMQP]</small>"| Queue
 
-    CycleOrchestrator -->|"First drains"| DispatchDrainer
+    CycleOrchestrator -->|"First recovers"| LeaseRecovery
+    LeaseRecovery -->|"Resets expired leases, inserts recovery events, or fails exhausted chunks in <br> <small>[SQL/TCP]</small>"| Database
+
+    CycleOrchestrator -->|"Then drains"| DispatchDrainer
     DispatchDrainer -->|"Claims one dispatchable run window with"| DispatchWorkflow
     DispatchWorkflow -->|"Updates runs, chunk dispatch markers, outbox events, and delivery rows in <br> <small>[SQL/TCP]</small>"| Database
 
-    CycleOrchestrator -->|"Then drains"| FinalizeDrainer
+    CycleOrchestrator -->|"Then finalizes"| FinalizeDrainer
     FinalizeDrainer -->|"Claims and finalizes one terminal run at a time with"| FinalizeWorkflow
     FinalizeWorkflow -->|"Reads aggregates and updates run summary in <br> <small>[SQL/TCP]</small>"| Database
 

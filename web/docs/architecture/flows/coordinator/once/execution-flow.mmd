@@ -17,6 +17,9 @@ sequenceDiagram
     Vigilo->>Vigilo: Load throughput knobs and generate coordinator id
     Vigilo->>Vigilo: Load database and messaging contexts
 
+    Vigilo->>DB: Recover expired chunk leases
+    DB-->>Vigilo: Recovered chunks and poison chunks failed
+
     loop Dispatch bounded run windows
         Vigilo->>DB: Claim dispatchable run and enqueue chunk window
         DB-->>Vigilo: Dispatch window or no work

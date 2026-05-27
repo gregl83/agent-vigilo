@@ -24,6 +24,8 @@ How `run_chunks.status` protects worker ownership and prevents stale workers fro
 
 - Run creation inserts chunks as `pending`.
 - Coordinator dispatch marks selected pending chunks with `dispatched_at` as it enqueues bounded `run.chunk.ready` windows.
+- Coordinator recovery scans expired `leased` chunks for running runs, increments `recovery_count`, resets recoverable chunks to `pending`, and emits a recovery-scoped `run.chunk.ready` event.
+- Chunks that exceed the configured recovery limit are marked `failed` so run finalization can complete with a failed gate instead of waiting forever.
 - Workers can claim a chunk only when the owning run is `running`.
 - Completion and release both compare the stored lease timestamp to the worker's claimed lease.
 - Cancellation changes open chunks to `cancelled`.

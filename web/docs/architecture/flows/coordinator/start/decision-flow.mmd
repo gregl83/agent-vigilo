@@ -13,6 +13,7 @@ flowchart TD
     Runner[Start coordinator service runner]
     Event{Next service event?}
     Contexts{Runtime contexts available?}
+    Recover[Recover expired chunk leases]
     Dispatch[Drain dispatchable run windows]
     Finalize[Drain finalizable runs]
     Outbox[Claim delivery queue batch and publish with bounded concurrency]
@@ -34,7 +35,10 @@ flowchart TD
     Event -- Shutdown signal --> Shutdown
 
     Contexts -- No --> ContextFail
-    Contexts -- Yes --> Dispatch
+    Contexts -- Yes --> Recover
+
+    Recover --> Dispatch
+    Recover -. Recovery fails .-> CycleFail
 
     Dispatch --> Finalize
     Dispatch -. Dispatch fails .-> CycleFail
@@ -55,5 +59,5 @@ flowchart TD
 
     class Start command
     class Success success
-    class CoordinatorId,Runner,Event,Contexts,Dispatch,Finalize,Outbox,Wait,Shutdown,Stop system
+    class CoordinatorId,Runner,Event,Contexts,Recover,Dispatch,Finalize,Outbox,Wait,Shutdown,Stop system
     class ContextFail,CycleFail,ShutdownFail error

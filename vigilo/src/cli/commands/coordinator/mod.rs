@@ -41,6 +41,8 @@ const COORDINATOR_LEASE_SECONDS: i32 = 60;
 const COORDINATOR_MAX_DISPATCH_PER_CYCLE: u64 = 64;
 const COORDINATOR_MAX_FINALIZE_PER_CYCLE: u64 = 64;
 const RUN_CHUNK_DISPATCH_WINDOW_SIZE: i64 = 512;
+const CHUNK_LEASE_RECOVERY_BATCH_SIZE: i64 = 1_000;
+const CHUNK_LEASE_MAX_RECOVERIES: i32 = 3;
 const OUTBOX_BATCH_SIZE: i64 = 1_000;
 const OUTBOX_PUBLISH_PARALLELISM: u64 = 64;
 const OUTBOX_LEASE_SECONDS: i32 = 60;
@@ -53,6 +55,8 @@ struct CoordinatorRuntimeConfig {
     max_dispatch_per_cycle: usize,
     max_finalize_per_cycle: usize,
     run_chunk_dispatch_window_size: i64,
+    chunk_lease_recovery_batch_size: i64,
+    chunk_lease_max_recoveries: i32,
     outbox_batch_size: i64,
     outbox_publish_parallelism: usize,
     outbox_lease_seconds: i32,
@@ -96,6 +100,14 @@ pub(crate) struct Command {
     #[arg(long, env = "VIGILO_RUN_CHUNK_DISPATCH_WINDOW_SIZE", default_value_t = RUN_CHUNK_DISPATCH_WINDOW_SIZE, value_parser = clap::value_parser!(i64).range(1..=1_000_000))]
     pub run_chunk_dispatch_window_size: i64,
 
+    /// Maximum expired chunk leases recovered per coordinator cycle
+    #[arg(long, env = "VIGILO_CHUNK_LEASE_RECOVERY_BATCH_SIZE", default_value_t = CHUNK_LEASE_RECOVERY_BATCH_SIZE, value_parser = clap::value_parser!(i64).range(1..=1_000_000))]
+    pub chunk_lease_recovery_batch_size: i64,
+
+    /// Maximum times an expired chunk lease can be recovered before the chunk fails
+    #[arg(long, env = "VIGILO_CHUNK_LEASE_MAX_RECOVERIES", default_value_t = CHUNK_LEASE_MAX_RECOVERIES, value_parser = clap::value_parser!(i32).range(0..=10_000))]
+    pub chunk_lease_max_recoveries: i32,
+
     /// Maximum outbox events claimed per publish pass
     #[arg(long, env = "VIGILO_OUTBOX_BATCH_SIZE", default_value_t = OUTBOX_BATCH_SIZE, value_parser = clap::value_parser!(i64).range(1..=1_000_000))]
     pub outbox_batch_size: i64,
@@ -124,6 +136,8 @@ impl Command {
             max_dispatch_per_cycle: self.max_dispatch_per_cycle as usize,
             max_finalize_per_cycle: self.max_finalize_per_cycle as usize,
             run_chunk_dispatch_window_size: self.run_chunk_dispatch_window_size,
+            chunk_lease_recovery_batch_size: self.chunk_lease_recovery_batch_size,
+            chunk_lease_max_recoveries: self.chunk_lease_max_recoveries,
             outbox_batch_size: self.outbox_batch_size,
             outbox_publish_parallelism: self.outbox_publish_parallelism as usize,
             outbox_lease_seconds: self.outbox_lease_seconds,
@@ -154,9 +168,10 @@ impl Executable for Command {
 /// Executes one full coordinator cycle.
 ///
 /// The cycle is intentionally ordered to keep run progression deterministic:
-/// 1. atomically start pending runs and dispatch chunk-ready windows
-/// 2. claim/finalize finalizable runs (bounded batch)
-/// 3. publish a bounded batch of pending outbox events
+/// 1. recover expired worker chunk leases
+/// 2. atomically start pending runs and dispatch chunk-ready windows
+/// 3. claim/finalize finalizable runs (bounded batch)
+/// 4. publish a bounded batch of pending outbox events
 async fn run_coordinator_cycle(
     context: Context,
     coordinator_id: Uuid,
@@ -172,6 +187,7 @@ async fn run_coordinator_cycle(
     let mq = context.mq().await?;
     debug!(coordinator_id = %coordinator_id, "messaging context ready");
 
+    let recovery_stats = recover_expired_chunk_leases(db, coordinator_id, config).await?;
     let dispatch_count = drain_dispatch_batch(db, coordinator_id, config).await?;
     let finalized_count = drain_finalize_batch(db, coordinator_id, config).await?;
 
@@ -185,6 +201,8 @@ async fn run_coordinator_cycle(
     };
     let publish_stats = publish_pending_events(db, &publisher, &outbox_config).await?;
     info!(
+        expired_chunk_leases_recovered = recovery_stats.recovered,
+        expired_chunk_leases_failed = recovery_stats.failed,
         dispatch_windows_prepared = dispatch_count,
         runs_finalized = finalized_count,
         outbox_events_claimed = publish_stats.claimed,
@@ -197,6 +215,37 @@ async fn run_coordinator_cycle(
     debug!(coordinator_id = %coordinator_id, "coordinator cycle complete");
 
     Ok(())
+}
+
+async fn recover_expired_chunk_leases(
+    db: &sqlx::PgPool,
+    coordinator_id: Uuid,
+    config: &CoordinatorRuntimeConfig,
+) -> anyhow::Result<run_dispatch::ChunkLeaseRecoveryStats> {
+    debug!(coordinator_id = %coordinator_id, "recovering expired chunk leases");
+
+    let stats = run_dispatch::recover_expired_chunk_leases(
+        db,
+        config.chunk_lease_max_recoveries,
+        config.chunk_lease_recovery_batch_size,
+    )
+    .await?;
+
+    if stats.recovered == 0 && stats.failed == 0 {
+        debug!(
+            coordinator_id = %coordinator_id,
+            "no expired chunk leases recovered for this cycle"
+        );
+    } else {
+        info!(
+            coordinator_id = %coordinator_id,
+            expired_chunk_leases_recovered = stats.recovered,
+            expired_chunk_leases_failed = stats.failed,
+            "completed expired chunk lease recovery pass"
+        );
+    }
+
+    Ok(stats)
 }
 
 async fn drain_dispatch_batch(

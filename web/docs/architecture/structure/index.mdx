@@ -101,7 +101,7 @@ Agent Vigilo is structured as a distributed AI evaluation system. Runs are creat
 ## Current Runtime Shape
 
 - **CLI runtime** parses commands, initializes shared context, applies migrations, publishes evaluators, creates runs, starts services, and renders JSON or TOON output.
-- **Coordinator** claims coordinator leases, dispatches runnable chunks, finalizes completed runs, and publishes state-change events from the outbox delivery queue.
+- **Coordinator** recovers expired chunk leases, claims coordinator leases, dispatches runnable chunks, finalizes completed runs, and publishes state-change events from the outbox delivery queue.
 - **Worker** consumes `run.chunk.ready` messages, claims chunk leases, invokes target agents, runs evaluator bindings, persists results, and settles RabbitMQ deliveries.
 - **PostgreSQL** is the authority for evaluators, datasets, runs, chunks, attempts, evaluator results, execution aggregates, coordinator leases, outbox ledger rows, and hot delivery rows.
 - **RabbitMQ** distributes worker-ready chunk messages and receives confirmed durable event publications from the outbox publisher.

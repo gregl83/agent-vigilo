@@ -18,6 +18,7 @@ flowchart TD
     RunRead[Read status, watch, results, export]
 
     Dispatch[Dispatch chunk windows]
+    RecoverLeases[Recover expired chunk leases]
     Finalize[Finalize terminal runs]
     Publish[Publish outbox events]
 
@@ -35,6 +36,7 @@ flowchart TD
     CLI --> RunRead
 
     Coordinator --> Dispatch
+    Coordinator --> RecoverLeases
     Coordinator --> Finalize
     Coordinator --> Publish
 
@@ -45,6 +47,7 @@ flowchart TD
     RunCreate --> DB
     RunCancel --> DB
     Dispatch --> GuardRun
+    RecoverLeases --> GuardChunk
     Finalize --> GuardRun
     Publish --> GuardOutbox
     ChunkClaim --> GuardChunk
@@ -60,6 +63,6 @@ flowchart TD
 
     class CLI command
     class Coordinator,Worker,GuardRun,GuardChunk,GuardAttempt,GuardOutbox system
-    class RunCreate,RunCancel,RunRead,Dispatch,Finalize,Publish,ChunkClaim,Execute,CompleteChunk component
+    class RunCreate,RunCancel,RunRead,Dispatch,RecoverLeases,Finalize,Publish,ChunkClaim,Execute,CompleteChunk component
     class DB success
     class Queue external

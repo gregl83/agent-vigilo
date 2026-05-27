@@ -11,6 +11,7 @@ flowchart TD
 
     CoordinatorId[Load throughput knobs and generate coordinator id]
     Contexts{Runtime contexts available?}
+    Recover[Recover expired chunk leases]
     DispatchClaim{Dispatchable run claimed?}
     DispatchRun[Start run if needed and enqueue chunk window]
     FinalizeClaim{Finalizable run claimed?}
@@ -34,7 +35,10 @@ flowchart TD
     CoordinatorId --> Contexts
 
     Contexts -- No --> ContextFail
-    Contexts -- Yes --> DispatchClaim
+    Contexts -- Yes --> Recover
+
+    Recover --> DispatchClaim
+    Recover -. Recovery fails .-> DispatchFail
 
     DispatchClaim -- Yes --> DispatchRun
     DispatchClaim -- No or batch limit reached --> FinalizeClaim
@@ -69,6 +73,6 @@ flowchart TD
 
     class Start command
     class Success success
-    class CoordinatorId,Contexts,DispatchClaim,DispatchRun,FinalizeClaim,FinalizeRun,ClaimOutbox,Events,PublishResult,MarkPublished,Reschedule,Stats system
+    class CoordinatorId,Contexts,Recover,DispatchClaim,DispatchRun,FinalizeClaim,FinalizeRun,ClaimOutbox,Events,PublishResult,MarkPublished,Reschedule,Stats system
     class Publish component
     class ContextFail,DispatchFail,FinalizeFail,OutboxFail error
