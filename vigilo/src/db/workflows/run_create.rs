@@ -24,6 +24,10 @@ const DATASET_MEMBERSHIP_INSERT_CHUNK_SIZE: usize = 2_000;
 const RUN_CHUNK_INSERT_CHUNK_SIZE: usize = 2_000;
 
 /// Inserts case blob rows, ignoring already-known content hashes.
+///
+/// Query behavior: bulk inserts immutable content-addressed case payloads in
+/// bounded batches. `ON CONFLICT (case_hash) DO NOTHING` makes shared case
+/// blobs reusable across runs and dataset versions.
 pub(crate) async fn bulk_insert_case_blobs(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     case_blobs: &[CaseBlobDraft],
@@ -58,6 +62,10 @@ pub(crate) async fn bulk_insert_case_blobs(
 ///
 /// Existing dataset version ids must refer to the same dataset and version
 /// value; otherwise run creation fails to preserve immutable dataset identity.
+///
+/// Query behavior: upserts by `dataset_version_id` but only allows the conflict
+/// update when the existing row has the same dataset identity. A zero affected
+/// row count means the id already belongs to different dataset content.
 pub(crate) async fn upsert_dataset_version(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     dataset_version_id: Uuid,
@@ -98,6 +106,13 @@ pub(crate) async fn upsert_dataset_version(
 /// Existing rows are left untouched to avoid rewriting shared dataset versions
 /// for every model run. A follow-up validation query checks that all requested
 /// memberships exist with the expected ordinal and case hash.
+///
+/// Query behavior:
+/// - Bulk inserts membership rows in bounded batches with conflict no-op.
+/// - For each batch, builds an inline input table and left joins persisted rows
+///   to detect missing or mismatched membership.
+/// - Fails if the dataset version id already describes different case
+///   ordering/content.
 pub(crate) async fn bulk_insert_dataset_membership(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     dataset_version_id: Uuid,
@@ -169,6 +184,11 @@ pub(crate) async fn bulk_insert_dataset_membership(
 }
 
 /// Inserts the run row using the caller-provided id.
+///
+/// Query behavior: writes the run metadata and immutable config/profile
+/// snapshots in `pending` state. No worker-visible chunk events are emitted
+/// here; dispatch owns making the run visible after validation and creation
+/// commit.
 pub(crate) async fn insert_run_create(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     run_id: Uuid,
@@ -249,6 +269,10 @@ pub(crate) async fn insert_run_create(
 ///
 /// Chunk-ready outbox events are created by dispatch windows after the run is
 /// marked running.
+///
+/// Query behavior: bulk inserts run-local chunk ranges in bounded batches. Each
+/// chunk points at the immutable dataset version and starts as `pending` with
+/// no dispatch cursor or worker lease.
 pub(crate) async fn bulk_insert_run_chunks(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     run_id: Uuid,

@@ -176,6 +176,9 @@ fn processed_terminal_failure(
 }
 
 /// Extracts unique evaluator refs from a run profile.
+///
+/// Database behavior: none. This is a deterministic profile scan used before
+/// catalog lookup so each evaluator identity is fetched once per run context.
 pub(crate) fn evaluator_refs_from_profile(profile: &RunProfile) -> anyhow::Result<Vec<String>> {
     let mut unique_refs = BTreeSet::new();
     for group in &profile.case_groups {
@@ -191,6 +194,12 @@ pub(crate) fn evaluator_refs_from_profile(profile: &RunProfile) -> anyhow::Resul
 ///
 /// The catalog validates that every referenced evaluator exists and is in a
 /// runnable state before workers begin processing cases.
+///
+/// Query behavior:
+/// - Parse each fully qualified evaluator ref from the profile.
+/// - Fetch runtime metadata for the unique identities in one table query.
+/// - Return a map keyed by the original ref string so execution can resolve
+///   bindings without repeatedly querying evaluator rows.
 pub(crate) async fn build_run_evaluator_catalog(
     db: &PgPool,
     profile: &RunProfile,
@@ -263,6 +272,10 @@ pub(crate) async fn build_run_evaluator_catalog(
 ///
 /// Component compilation is single-flight through the registry cache, so
 /// concurrent requests for the same evaluator share one load/compile operation.
+///
+/// Query behavior: on a cache miss, fetch the evaluator registry row, validate
+/// that it is still runnable, compile the stored WASM bytes, and cache the
+/// compiled component for the process.
 pub(crate) async fn get_or_load_component(
     context: &Context,
     evaluator_ref: &str,
@@ -370,6 +383,11 @@ fn matching_groups_for_case<'a>(
         .collect()
 }
 
+/// Selects evaluator bindings from the run profile for one dataset case.
+///
+/// Database behavior: none. Explicit `case_group` on a case is treated as a
+/// direct profile-group selection; otherwise task type and tag predicates are
+/// applied locally to match run-profile validation.
 fn evaluator_bindings_for_case(
     profile: &RunProfile,
     case: &chunk_processing::WorkerCaseBatchItem,
@@ -386,6 +404,10 @@ fn evaluator_bindings_for_case(
     unique.into_values().collect()
 }
 
+/// Converts a persisted chunk case row into the evaluator contract shape.
+///
+/// Database behavior: none. This is the boundary where stored payloads become
+/// WIT-facing `input`, `expected`, `context`, tag, and metadata fields.
 fn make_test_case(case: &chunk_processing::WorkerCaseBatchItem) -> anyhow::Result<TestCase> {
     Ok(TestCase {
         id: case.case_id.to_string(),
@@ -399,6 +421,22 @@ fn make_test_case(case: &chunk_processing::WorkerCaseBatchItem) -> anyhow::Resul
     })
 }
 
+/// Allocates durable execution attempts for a chunk case batch.
+///
+/// Query behavior:
+/// - Materializes the input cases as an inline table to preserve chunk order.
+/// - Takes a shared run-state guard so workers for other chunks can continue,
+///   while cancellation/finalization still waits for this short write.
+/// - Upserts execution rows without resetting durable retry or terminal state.
+/// - Splits rows into terminal, retry-waiting, exhausted-open, and retry-eligible
+///   buckets.
+/// - For eligible rows, marks older running attempts stale, increments the
+///   execution attempt number, inserts a new running attempt, and stores it as
+///   the current authoritative attempt.
+///
+/// The returned flags tell the worker whether a case should run now, wait for
+/// `retry_after`, be skipped because it is already terminal, or be failed
+/// because its retry budget is exhausted.
 async fn allocate_execution_attempts_for_cases(
     db: &PgPool,
     run_id: Uuid,
@@ -443,9 +481,19 @@ async fn allocate_execution_attempts_for_cases(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    // The run guard is intentionally shared: workers for different chunks of
-    // the same running run can proceed together, while lifecycle updates such
-    // as cancellation still wait for the short worker write statement.
+    // Query outline:
+    //
+    // input             - chunk cases and resolved evaluator manifests.
+    // run_guard         - shared lifecycle check for the running run.
+    // attempt_policy    - max_attempts copied into SQL for retry decisions.
+    // upserted          - create/update execution rows without clearing retry state.
+    // attempt_state     - durable state after the upsert.
+    // terminal_or_closed - already terminal rows, skipped by worker.
+    // retry_waiting     - retry_scheduled rows whose retry_after is not due.
+    // exhausted_open    - open rows at max_attempts, failed by caller.
+    // retry_eligible    - rows that should receive a new attempt now.
+    // superseded_attempts/bumped/inserted_attempt/updated_execution
+    //                   - authority handoff to the new running attempt.
     let mut query_builder = QueryBuilder::<Postgres>::new(
         r#"
         WITH input (
@@ -801,6 +849,15 @@ async fn allocate_execution_attempts_for_cases(
 /// longer owns the current attempt, the entire batch is rejected so stale
 /// workers cannot mark executions terminal. The run-state guard is shared so
 /// other chunks for the same running run are not serialized on the run row.
+///
+/// Query behavior:
+/// - Unnests the worker's transition batch into a relational input set.
+/// - Re-checks the run is still `running` and every transition still owns the
+///   execution's current attempt id and attempt number.
+/// - Requires completed transitions to have an aggregate for the same attempt.
+/// - Marks failed attempts retryable when `attempt_no < max_attempts`, using a
+///   bounded exponential `retry_after`.
+/// - Writes terminal failed aggregates only when retry budget is exhausted.
 pub(crate) async fn finalize_execution_terminal_transitions(
     db: &PgPool,
     run_id: Uuid,
@@ -832,6 +889,17 @@ pub(crate) async fn finalize_execution_terminal_transitions(
         .map(|transition| transition.error_message.clone())
         .collect::<Vec<_>>();
 
+    // Query outline:
+    //
+    // transition_input       - worker-produced terminal transitions.
+    // run_guard             - shared check that the run is still running.
+    // authoritative_input   - transitions that still own current_attempt_*.
+    // authority_check       - all-or-nothing stale worker guard.
+    // terminal_input        - requires aggregates for completed attempts.
+    // attempt_update        - marks attempts completed/failed and computes retry.
+    // failed_aggregate_upsert
+    //                       - creates final error aggregate only after retries end.
+    // execution_update      - moves executions to completed/retry_scheduled/failed.
     let applied = sqlx::query_scalar::<_, i64>(
         r#"
         WITH transition_input AS (
@@ -1074,6 +1142,11 @@ pub(crate) async fn finalize_execution_terminal_transitions(
 }
 
 /// Summarizes whether a chunk's executions are terminal or still waiting for retry.
+///
+/// Query behavior: counts open execution statuses for the chunk's case ids and
+/// returns the earliest retry window. The worker uses this after terminal
+/// transitions to decide whether to complete the chunk or release it and delay
+/// the message until retry work is due.
 pub(crate) async fn summarize_chunk_execution_state(
     db: &PgPool,
     run_id: Uuid,
@@ -1527,6 +1600,15 @@ async fn evaluate_case_execution(
     }
 }
 
+/// Persists successful evaluator evidence and execution aggregates.
+///
+/// Query behavior:
+/// - Checks every completed record still owns the execution's current attempt.
+/// - Inserts evaluator results as append-oriented evidence; uniqueness handles
+///   redelivery by turning duplicate result rows into conflicts.
+/// - Upserts aggregates for completed attempts after evidence insertion.
+/// - Leaves execution status changes to `finalize_execution_terminal_transitions`
+///   so state mutation remains one authority-checked batch.
 async fn persist_completed_execution_results_batch(
     db: &PgPool,
     run_id: Uuid,
@@ -1536,6 +1618,12 @@ async fn persist_completed_execution_results_batch(
         return Ok(BatchPersistenceStats::default());
     }
 
+    // Query outline:
+    //
+    // authority_query - short shared run-state/current-attempt guard.
+    // result insert   - append evaluator evidence for authoritative attempts.
+    // aggregate upsert- summarize completed attempts for terminal transition.
+    //
     // The shared run-state guard preserves cancellation/finalization ordering
     // without turning the run row into an exclusive worker-side mutex.
     let mut tx = db.begin().await?;
@@ -1665,6 +1753,15 @@ async fn persist_completed_execution_results_batch(
 /// bounded per-case parallelism, and persists all completed case results in one
 /// chunk-level transaction. Terminal execution transitions are returned for the
 /// caller to batch-apply after persistence.
+///
+/// Workflow behavior:
+/// - Resolve evaluator bindings from the run profile for each case.
+/// - Ask the database which executions are due, waiting, terminal, or exhausted.
+/// - Run only due cases; waiting and terminal cases are skipped for this pass.
+/// - Convert exhausted open cases into failed terminal transitions so retry
+///   loops cannot continue indefinitely.
+/// - Persist successful evaluator evidence before returning terminal
+///   transitions for authority-checked status updates.
 pub(crate) async fn process_case_batch_execution(
     context: &Context,
     db: &PgPool,

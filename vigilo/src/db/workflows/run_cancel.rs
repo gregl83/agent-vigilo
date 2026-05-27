@@ -39,6 +39,9 @@ async fn select_run_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_id: Uuid,
 ) -> anyhow::Result<Option<Run>> {
+    // Query behavior: read the run projection inside the caller's transaction.
+    // Used for idempotent already-cancelled responses after the status row has
+    // been locked by `cancel_run`.
     let run = sqlx::query_as::<_, Run>(
         r#"
         SELECT
@@ -82,6 +85,9 @@ async fn cancel_open_attempts(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_id: Uuid,
 ) -> anyhow::Result<i64> {
+    // Query behavior: close only pending/running attempts for the run, clear
+    // lease ownership, preserve any existing error text, and count affected
+    // rows for the cancellation summary.
     let count = sqlx::query_scalar::<_, i64>(
         r#"
         WITH updated AS (
@@ -111,6 +117,9 @@ async fn cancel_open_executions(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_id: Uuid,
 ) -> anyhow::Result<i64> {
+    // Query behavior: move every non-terminal execution state to cancelled,
+    // including retry_scheduled rows, so no worker can later allocate or
+    // finalize additional attempts for this run.
     let count = sqlx::query_scalar::<_, i64>(
         r#"
         WITH updated AS (
@@ -144,6 +153,8 @@ async fn cancel_open_chunks(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_id: Uuid,
 ) -> anyhow::Result<i64> {
+    // Query behavior: move only open chunks to cancelled and clear their worker
+    // lease. Completed/failed chunks remain as historical terminal outcomes.
     let count = sqlx::query_scalar::<_, i64>(
         r#"
         WITH updated AS (
@@ -173,6 +184,12 @@ async fn update_run_cancelled(
     executions_cancelled: i64,
     attempts_cancelled: i64,
 ) -> anyhow::Result<Run> {
+    // Query outline:
+    //
+    // execution_counts - summarize terminal execution and aggregate outcomes.
+    // chunk_counts     - summarize completed/failed/cancelled chunk coverage.
+    // update           - make the run terminal cancelled, clear coordinator
+    //                    lease state, and persist a cancellation summary.
     let run = sqlx::query_as::<_, Run>(
         r#"
         WITH execution_counts AS (
@@ -279,6 +296,8 @@ async fn enqueue_cancelled_event(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     outcome: &CancelRunOutcome,
 ) -> anyhow::Result<i64> {
+    // Query behavior: insert the durable run.cancelled event with a deterministic
+    // dedupe key. Repeated cancellation calls return zero inserted events.
     let count = sqlx::query_scalar::<_, i64>(
         r#"
         WITH inserted AS (
@@ -332,6 +351,15 @@ async fn enqueue_cancelled_event(
 ///
 /// Returns `Ok(None)` when the run does not exist. Repeated cancellation of an
 /// already-cancelled run is idempotent; completed or failed runs are rejected.
+///
+/// Workflow behavior:
+/// - Lock the run status first to serialize cancellation with dispatch,
+///   finalization, and other cancellation requests.
+/// - Reject completed/failed runs; return the existing run for idempotent
+///   already-cancelled requests.
+/// - Cancel attempts, executions, and chunks before updating the run so workers
+///   cannot discover open work after the terminal state is written.
+/// - Emit one idempotent outbox event and commit all state changes together.
 pub(crate) async fn cancel_run(
     db: &PgPool,
     run_id: Uuid,

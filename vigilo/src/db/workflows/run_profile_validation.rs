@@ -40,6 +40,15 @@ pub(crate) struct ProfileExecutabilitySummary {
 /// The function reports all discovered profile/dataset issues in one error so
 /// callers can fix invalid refs, missing evaluators, and unmatched cases
 /// together.
+///
+/// Query behavior:
+/// - Parse and de-duplicate evaluator refs from all case groups.
+/// - Fetch evaluator runtime metadata for those identities once.
+/// - Validate that every matched case has at least one runnable published
+///   evaluator before run creation writes durable work.
+///
+/// The rest of the checks are in-memory profile/dataset validation so callers
+/// get a complete list of issues without partial database writes.
 pub(crate) async fn validate_profile_executability(
     db: &PgPool,
     profile: &RunProfile,
@@ -206,6 +215,11 @@ pub(crate) async fn validate_profile_executability(
     })
 }
 
+/// Returns the case groups that should evaluate one dataset case.
+///
+/// Database behavior: none. Explicit `case_group` ids bypass task/tag matching;
+/// otherwise the group predicate requires task type, optional any-tag, and all
+/// required tags.
 fn matching_groups_for_case<'a>(
     profile: &'a RunProfile,
     case: &DatasetCase,
@@ -249,6 +263,10 @@ fn matching_groups_for_case<'a>(
     }
 }
 
+/// Returns whether a persisted evaluator state may be used by workers.
+///
+/// Database behavior: none. The same rule is used by validation and worker-side
+/// runtime loading so a run cannot start with an evaluator that workers reject.
 fn is_runnable_state(state: &EvaluatorState) -> bool {
     matches!(
         state,

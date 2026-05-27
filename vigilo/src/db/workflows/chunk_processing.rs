@@ -28,6 +28,11 @@ pub(crate) struct WorkerCaseBatchItem {
 ///
 /// Returns `None` when another worker already owns the current lease or the
 /// chunk's run is not currently processable.
+///
+/// Query behavior: one guarded `UPDATE ... RETURNING` claims ownership only if
+/// the chunk is pending or its previous lease has expired and the parent run is
+/// still `running`. The returned `leased_until` value is the worker's lease
+/// token for later completion, release, or failure.
 pub(crate) async fn claim_chunk_for_processing(
     db: &PgPool,
     run_id: Uuid,
@@ -79,6 +84,10 @@ pub(crate) async fn claim_chunk_for_processing(
 /// Lease ownership is represented by the `leased_until` value returned at
 /// claim/extension time. Completion and release must use the latest returned
 /// row, otherwise stale workers cannot overwrite the current owner.
+///
+/// Query behavior: updates the lease only when the chunk is still leased by the
+/// same timestamp token and the parent run is still `running`. `None` means the
+/// worker lost authority and should acknowledge the stale message.
 pub(crate) async fn extend_chunk_lease(
     db: &PgPool,
     chunk: &RunChunk,
@@ -123,6 +132,10 @@ pub(crate) async fn extend_chunk_lease(
 }
 
 /// Loads the dataset cases covered by a claimed chunk's ordinal range.
+///
+/// Query behavior: reads immutable dataset membership rows joined to case
+/// blobs, ordered by ordinal, for `[ordinal_start, ordinal_end)`. This function
+/// does not claim work; callers must already own the chunk lease.
 pub(crate) async fn load_chunk_case_batch(
     db: &PgPool,
     chunk: &RunChunk,
@@ -157,6 +170,10 @@ pub(crate) async fn load_chunk_case_batch(
 }
 
 /// Marks a leased chunk complete if the caller still owns the same lease.
+///
+/// Query behavior: clears the lease and moves the chunk to `completed` only if
+/// the stored lease timestamp still matches the worker's latest token. A zero
+/// row count means the worker is stale.
 pub(crate) async fn mark_chunk_completed(db: &PgPool, chunk: &RunChunk) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
@@ -180,6 +197,10 @@ pub(crate) async fn mark_chunk_completed(db: &PgPool, chunk: &RunChunk) -> anyho
 }
 
 /// Releases a leased chunk back to pending if the caller still owns the lease.
+///
+/// Query behavior: clears the lease and returns the chunk to `pending` only for
+/// the current lease token. Workers use this for recoverable processing
+/// failures and planned execution retry waits.
 pub(crate) async fn release_chunk_as_pending(db: &PgPool, chunk: &RunChunk) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
@@ -203,6 +224,10 @@ pub(crate) async fn release_chunk_as_pending(db: &PgPool, chunk: &RunChunk) -> a
 }
 
 /// Marks a leased chunk failed if the caller still owns the lease.
+///
+/// Query behavior: clears the lease and makes the chunk terminal `failed` only
+/// for the current lease token. Workers use this when bounded message retries
+/// are exhausted.
 pub(crate) async fn mark_chunk_failed(db: &PgPool, chunk: &RunChunk) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"

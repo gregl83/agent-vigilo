@@ -27,11 +27,22 @@ pub(crate) struct FinalizedRun {
 }
 
 /// Claims a run whose chunks are all terminal and whose finalization lease is open.
+///
+/// Query behavior:
+/// - Selects one `running` or expired-lease `finalizing` run whose chunks are
+///   no longer `pending` or `leased`.
+/// - Uses `FOR UPDATE SKIP LOCKED` so coordinators can race without blocking.
+/// - Moves the run to `finalizing` and writes a coordinator lease token that
+///   protects the later finalization pass.
 pub(crate) async fn claim_next_finalizable_run(
     db: &PgPool,
     coordinator_id: Uuid,
     lease_seconds: i32,
 ) -> anyhow::Result<Option<ClaimedRunForFinalization>> {
+    // Query outline:
+    //
+    // candidate - one run with only terminal chunks and an open finalization lease.
+    // update    - claim finalization ownership and extend coordinator lease.
     let claimed = sqlx::query_as::<_, ClaimedRunForFinalization>(
         r#"
         WITH candidate AS (
@@ -76,10 +87,28 @@ pub(crate) async fn claim_next_finalizable_run(
 ///
 /// Returns `None` if the run is no longer in `finalizing` state or if open
 /// chunks appeared after claim time.
+///
+/// Query behavior:
+/// - Locks the claimed run row.
+/// - Counts terminal executions and joins current-attempt aggregates.
+/// - Checks for failed/cancelled chunks and re-checks that no open chunks
+///   appeared since the finalization claim.
+/// - Marks the run `completed`, sets gate status to fail on failed chunks,
+///   missing execution coverage, missing aggregates, or failed/error
+///   executions.
+/// - Inserts one idempotent `run.completed` outbox event.
 pub(crate) async fn finalize_claimed_run(
     db: &PgPool,
     run_id: Uuid,
 ) -> anyhow::Result<Option<FinalizedRun>> {
+    // Query outline:
+    //
+    // run_row                - lock the claimed finalizing run.
+    // execution_counts       - count terminal executions and aggregate outcomes.
+    // terminal_chunk_failure - flag terminal chunk failures/cancellations.
+    // open_chunk_exists      - guard against late pending/leased chunks.
+    // finalized              - persist completed run state and summary.
+    // inserted_event         - idempotent run.completed outbox event.
     let finalized = sqlx::query_as::<_, FinalizedRun>(
         r#"
         WITH run_row AS (

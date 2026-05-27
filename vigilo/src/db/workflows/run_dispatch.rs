@@ -31,6 +31,17 @@ pub(crate) struct ChunkLeaseRecoveryStats {
 /// `run.chunk.ready` event with a recovery-scoped dedupe key. Chunks that have
 /// already reached the recovery limit are marked failed so finalization can
 /// terminate the run instead of leaving it blocked by a dead lease forever.
+///
+/// Query behavior:
+/// - Runs in one transaction so recovery and poison-chunk failure see a
+///   consistent lease snapshot.
+/// - First query locks a bounded oldest-expired set below `max_recoveries`,
+///   resets those chunks to `pending`, increments recovery metadata, and emits
+///   idempotent recovery-scoped chunk-ready events.
+/// - Second query locks a bounded oldest-expired set already at the recovery
+///   limit and marks them `failed`.
+/// - `SKIP LOCKED` lets multiple coordinators run recovery without blocking
+///   each other on the same chunk rows.
 pub(crate) async fn recover_expired_chunk_leases(
     db: &PgPool,
     max_recoveries: i32,
@@ -38,6 +49,11 @@ pub(crate) async fn recover_expired_chunk_leases(
 ) -> anyhow::Result<ChunkLeaseRecoveryStats> {
     let mut tx = db.begin().await?;
 
+    // Query outline:
+    //
+    // expired         - recoverable leased chunks whose lease is past due.
+    // recovered       - clear lease, increment recovery_count, return rows.
+    // recovery_events - publish a fresh, recovery-scoped chunk-ready event.
     let recovered = sqlx::query_scalar::<_, i64>(
         r#"
         WITH expired AS (
@@ -98,6 +114,10 @@ pub(crate) async fn recover_expired_chunk_leases(
     .fetch_one(&mut *tx)
     .await?;
 
+    // Query outline:
+    //
+    // expired - leased chunks past due that have exhausted recovery attempts.
+    // failed  - clear the dead lease and make the chunk terminal.
     let failed = sqlx::query_scalar::<_, i64>(
         r#"
         WITH expired AS (
@@ -143,12 +163,29 @@ pub(crate) async fn recover_expired_chunk_leases(
 /// Running runs are eligible while they still have pending chunks whose
 /// `dispatched_at` cursor is open. Chunk-ready events and cursor updates happen
 /// in the same statement so a rollback does not lose undispatched work.
+///
+/// Query behavior:
+/// - Selects one pending run or one running run with undispatched pending
+///   chunks, using `FOR UPDATE SKIP LOCKED` so coordinators can compete safely.
+/// - Marks newly selected pending runs as `running` and records coordinator
+///   lease metadata.
+/// - Selects a bounded chunk window, emits idempotent `run.chunk.ready` events,
+///   and advances each chunk's `dispatched_at` cursor in the same statement.
+/// - Emits `run.started` only when the run transitioned from `pending`.
 pub(crate) async fn dispatch_next_run_window(
     db: &PgPool,
     coordinator_id: Uuid,
     lease_seconds: i32,
     chunk_window_size: i64,
 ) -> anyhow::Result<Option<DispatchedRun>> {
+    // Query outline:
+    //
+    // candidate       - one run that can either start or dispatch more chunks.
+    // claimed         - running state/coordinator metadata for that run.
+    // selected_chunks - bounded undispatched pending chunk window.
+    // chunk_events    - idempotent queue-visible chunk-ready ledger rows.
+    // marked_chunks   - cursor update proving those chunks were dispatched.
+    // started_event   - one idempotent run.started event for new runs.
     let dispatched = sqlx::query_as::<_, DispatchedRun>(
         r#"
         WITH candidate AS (
