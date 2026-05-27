@@ -19,8 +19,10 @@ use uuid::Uuid;
 pub(crate) struct ExecutionAttemptDraft {
     /// Execution this attempt belongs to.
     pub(crate) execution_id: Uuid,
-    /// Run partition key and parent run id.
+    /// Parent run id.
     pub(crate) run_id: Uuid,
+    /// Logical shard inherited from the parent execution.
+    pub(crate) run_shard: i16,
     /// Monotonic attempt number within the execution.
     pub(crate) attempt_no: i32,
     /// Worker id that claimed this attempt, when known.
@@ -43,12 +45,14 @@ pub(crate) struct ExecutionAttemptPatch {
 /// Persisted execution attempt row.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub(crate) struct ExecutionAttempt {
-    /// Attempt row id, unique within the run partition key.
+    /// Attempt row id, unique within the run and shard key.
     pub(crate) id: Uuid,
     /// Execution this attempt belongs to.
     pub(crate) execution_id: Uuid,
-    /// Run partition key and parent run id.
+    /// Parent run id.
     pub(crate) run_id: Uuid,
+    /// Logical shard inherited from the parent execution.
+    pub(crate) run_shard: i16,
     /// Monotonic attempt number within the execution.
     pub(crate) attempt_no: i32,
     /// Current attempt lifecycle status.

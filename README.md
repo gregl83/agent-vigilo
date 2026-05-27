@@ -24,6 +24,7 @@ It is built for the parts of AI evaluation that become hard at scale: idempotent
 
 - [Getting started](https://agentvigilo.com/docs/guides/getting-started): run your first evaluation.
 - [Architecture overview](https://agentvigilo.com/docs/architecture/structure/): containers, components, flows, and state diagrams.
+- [Scale-out and shard migration](https://agentvigilo.com/docs/architecture/scaling): 128 logical run shards and expansion guidance.
 - [Worker runtime](https://agentvigilo.com/docs/architecture/structure/components/worker/): chunk claiming, evaluator execution, and result persistence.
 - [Runtime limits](https://agentvigilo.com/docs/configuration/runtime-limits): Wasm evaluator sandbox and worker concurrency controls.
 - [Outbox lifecycle](https://agentvigilo.com/docs/architecture/state/outbox-lifecycle/): durable event publication and retry behavior.

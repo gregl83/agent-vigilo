@@ -23,6 +23,7 @@ How `run_chunks.status` protects worker ownership and prevents stale workers fro
 ## Notes
 
 - Run creation inserts chunks as `pending`.
+- Each chunk receives a stable `run_shard` in the 128-shard logical range. Child execution, attempt, aggregate, and evaluator result rows inherit that shard.
 - Coordinator dispatch marks selected pending chunks with `dispatched_at` as it enqueues bounded `run.chunk.ready` windows.
 - Coordinator recovery scans expired `leased` chunks for running runs, increments `recovery_count`, resets recoverable chunks to `pending`, and emits a recovery-scoped `run.chunk.ready` event.
 - Chunks that exceed the configured recovery limit are marked `failed` so run finalization can complete with a failed gate instead of waiting forever.
@@ -37,3 +38,4 @@ How `run_chunks.status` protects worker ownership and prevents stale workers fro
 - [Worker once flow](/docs/architecture/flows/worker/once/)
 - [Run lifecycle](/docs/architecture/state/run-lifecycle/)
 - [State ownership](/docs/architecture/state/ownership/)
+- [Scale-out and shard migration](/docs/architecture/scaling)

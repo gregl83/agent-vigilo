@@ -36,6 +36,7 @@ pub(crate) struct WorkerCaseBatchItem {
 pub(crate) async fn claim_chunk_for_processing(
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
     chunk_id: Uuid,
     lease_seconds: i32,
 ) -> anyhow::Result<Option<RunChunk>> {
@@ -43,10 +44,11 @@ pub(crate) async fn claim_chunk_for_processing(
         r#"
 		UPDATE run_chunks
 		SET status = 'leased',
-			leased_until = now() + ($3::int * interval '1 second'),
+			leased_until = now() + ($4::int * interval '1 second'),
 			updated_at = now()
 		WHERE run_id = $1::uuid
-		  AND id = $2::uuid
+          AND run_shard = $2
+		  AND id = $3::uuid
 		  AND (
 			status = 'pending'
 			OR (status = 'leased' AND leased_until < now())
@@ -60,6 +62,7 @@ pub(crate) async fn claim_chunk_for_processing(
 		RETURNING
 			id,
 			run_id,
+            run_shard,
 			dataset_version_id,
 			profile_group_id,
 			ordinal_start,
@@ -71,6 +74,7 @@ pub(crate) async fn claim_chunk_for_processing(
 		"#,
     )
     .bind(run_id)
+    .bind(run_shard)
     .bind(chunk_id)
     .bind(lease_seconds)
     .fetch_optional(db)
@@ -96,12 +100,13 @@ pub(crate) async fn extend_chunk_lease(
     let chunk = sqlx::query_as::<_, RunChunk>(
         r#"
 		UPDATE run_chunks
-		SET leased_until = now() + ($3::int * interval '1 second'),
+		SET leased_until = now() + ($4::int * interval '1 second'),
 			updated_at = now()
 		WHERE run_id = $1::uuid
-		  AND id = $2::uuid
+          AND run_shard = $2
+		  AND id = $3::uuid
 		  AND status = 'leased'
-		  AND leased_until IS NOT DISTINCT FROM $4::timestamptz
+		  AND leased_until IS NOT DISTINCT FROM $5::timestamptz
 		  AND EXISTS (
 			SELECT 1
 			FROM runs
@@ -111,6 +116,7 @@ pub(crate) async fn extend_chunk_lease(
 		RETURNING
 			id,
 			run_id,
+            run_shard,
 			dataset_version_id,
 			profile_group_id,
 			ordinal_start,
@@ -122,6 +128,7 @@ pub(crate) async fn extend_chunk_lease(
 		"#,
     )
     .bind(chunk.run_id)
+    .bind(chunk.run_shard)
     .bind(chunk.id)
     .bind(lease_seconds)
     .bind(chunk.leased_until)
@@ -182,12 +189,14 @@ pub(crate) async fn mark_chunk_completed(db: &PgPool, chunk: &RunChunk) -> anyho
 			leased_until = NULL,
 			updated_at = now()
 		WHERE run_id = $1::uuid
-		  AND id = $2::uuid
+          AND run_shard = $2
+		  AND id = $3::uuid
 		  AND status = 'leased'
-		  AND leased_until IS NOT DISTINCT FROM $3::timestamptz
+		  AND leased_until IS NOT DISTINCT FROM $4::timestamptz
 		"#,
     )
     .bind(chunk.run_id)
+    .bind(chunk.run_shard)
     .bind(chunk.id)
     .bind(chunk.leased_until)
     .execute(db)
@@ -209,12 +218,14 @@ pub(crate) async fn release_chunk_as_pending(db: &PgPool, chunk: &RunChunk) -> a
 			leased_until = NULL,
 			updated_at = now()
 		WHERE run_id = $1::uuid
-		  AND id = $2::uuid
+          AND run_shard = $2
+		  AND id = $3::uuid
 		  AND status = 'leased'
-		  AND leased_until IS NOT DISTINCT FROM $3::timestamptz
+		  AND leased_until IS NOT DISTINCT FROM $4::timestamptz
 		"#,
     )
     .bind(chunk.run_id)
+    .bind(chunk.run_shard)
     .bind(chunk.id)
     .bind(chunk.leased_until)
     .execute(db)
@@ -236,12 +247,14 @@ pub(crate) async fn mark_chunk_failed(db: &PgPool, chunk: &RunChunk) -> anyhow::
 			leased_until = NULL,
 			updated_at = now()
 		WHERE run_id = $1::uuid
-		  AND id = $2::uuid
+          AND run_shard = $2
+		  AND id = $3::uuid
 		  AND status = 'leased'
-		  AND leased_until IS NOT DISTINCT FROM $3::timestamptz
+		  AND leased_until IS NOT DISTINCT FROM $4::timestamptz
 		"#,
     )
     .bind(chunk.run_id)
+    .bind(chunk.run_shard)
     .bind(chunk.id)
     .bind(chunk.leased_until)
     .execute(db)

@@ -21,14 +21,16 @@ pub(crate) async fn insert_execution(
     let execution = sqlx::query_as::<_, Execution>(
         r#"
         INSERT INTO executions (
-            run_id, case_id, task_type,
+            run_id, run_shard, chunk_id, case_id, task_type,
             evaluation_profile_id, evaluation_profile_version,
             expected_evaluator_count
         )
-        VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6)
+        VALUES ($1::uuid, $2, $3::uuid, $4::uuid, $5, $6, $7, $8)
         RETURNING
             id,
             run_id,
+            run_shard,
+            chunk_id,
             case_id,
             task_type,
             tags,
@@ -53,6 +55,8 @@ pub(crate) async fn insert_execution(
         "#,
     )
     .bind(draft.run_id)
+    .bind(draft.run_shard)
+    .bind(draft.chunk_id)
     .bind(draft.case_id)
     .bind(&draft.task_type)
     .bind(&draft.evaluation_profile_id)
@@ -64,10 +68,11 @@ pub(crate) async fn insert_execution(
     Ok(execution)
 }
 
-/// Finds an execution by run-local primary key.
+/// Finds an execution by run and shard-local primary key.
 pub(crate) async fn select_execution_by_id(
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
     id: Uuid,
 ) -> anyhow::Result<Option<Execution>> {
     let execution = sqlx::query_as::<_, Execution>(
@@ -75,6 +80,8 @@ pub(crate) async fn select_execution_by_id(
         SELECT
             id,
             run_id,
+            run_shard,
+            chunk_id,
             case_id,
             task_type,
             tags,
@@ -98,10 +105,12 @@ pub(crate) async fn select_execution_by_id(
             updated_at
         FROM executions
         WHERE run_id = $1::uuid
-          AND id = $2::uuid
+          AND run_shard = $2
+          AND id = $3::uuid
         "#,
     )
     .bind(run_id)
+    .bind(run_shard)
     .bind(id)
     .fetch_optional(db)
     .await?;
@@ -119,6 +128,8 @@ pub(crate) async fn list_executions_by_run_id(
         SELECT
             id,
             run_id,
+            run_shard,
+            chunk_id,
             case_id,
             task_type,
             tags,
@@ -156,6 +167,7 @@ pub(crate) async fn list_executions_by_run_id(
 pub(crate) async fn update_execution_status(
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
     id: Uuid,
     patch: &ExecutionPatch,
 ) -> anyhow::Result<Option<Execution>> {
@@ -168,10 +180,13 @@ pub(crate) async fn update_execution_status(
             last_error_message = $6,
             updated_at = now()
         WHERE run_id = $1::uuid
-          AND id = $2::uuid
+          AND run_shard = $2
+          AND id = $7::uuid
         RETURNING
             id,
             run_id,
+            run_shard,
+            chunk_id,
             case_id,
             task_type,
             tags,
@@ -196,31 +211,35 @@ pub(crate) async fn update_execution_status(
         "#,
     )
     .bind(run_id)
-    .bind(id)
+    .bind(run_shard)
     .bind(&patch.status)
     .bind(&patch.current_attempt_no)
     .bind(&patch.current_attempt_id)
     .bind(&patch.error_message)
+    .bind(id)
     .fetch_optional(db)
     .await?;
 
     Ok(execution)
 }
 
-/// Deletes an execution by run-local primary key.
+/// Deletes an execution by run and shard-local primary key.
 pub(crate) async fn delete_execution_by_id(
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
     id: Uuid,
 ) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
         DELETE FROM executions
         WHERE run_id = $1::uuid
-          AND id = $2::uuid
+          AND run_shard = $2
+          AND id = $3::uuid
         "#,
     )
     .bind(run_id)
+    .bind(run_shard)
     .bind(id)
     .execute(db)
     .await?;

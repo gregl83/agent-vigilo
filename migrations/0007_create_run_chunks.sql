@@ -1,6 +1,7 @@
 CREATE TABLE run_chunks (
     id UUID NOT NULL,
     run_id UUID NOT NULL,
+    run_shard SMALLINT NOT NULL CHECK (run_shard >= 0 AND run_shard < 128),
     dataset_version_id UUID NOT NULL,
     profile_group_id TEXT NOT NULL,
     ordinal_start INTEGER NOT NULL CHECK (ordinal_start >= 0),
@@ -18,16 +19,16 @@ CREATE TABLE run_chunks (
         REFERENCES runs(id, dataset_version_id)
         ON DELETE CASCADE,
 
-    CONSTRAINT pk_run_chunks PRIMARY KEY (run_id, id)
-) PARTITION BY HASH (run_id);
+    CONSTRAINT pk_run_chunks PRIMARY KEY (run_id, run_shard, id)
+) PARTITION BY LIST (run_shard);
 
 DO $$
 DECLARE
     partition_index INTEGER;
 BEGIN
-    FOR partition_index IN 0..31 LOOP
+    FOR partition_index IN 0..127 LOOP
         EXECUTE format(
-            'CREATE TABLE %I PARTITION OF run_chunks FOR VALUES WITH (MODULUS 32, REMAINDER %s)',
+            'CREATE TABLE %I PARTITION OF run_chunks FOR VALUES IN (%s)',
             'run_chunks_p' || lpad(partition_index::text, 2, '0'),
             partition_index
         );
@@ -35,24 +36,27 @@ BEGIN
 END $$;
 
 CREATE INDEX idx_run_chunks_run_status_leased_until
-    ON run_chunks(run_id, status, leased_until);
+    ON run_chunks(run_id, run_shard, status, leased_until);
 
 CREATE INDEX idx_run_chunks_undispatched
-    ON run_chunks(run_id, ordinal_start, id)
+    ON run_chunks(run_id, run_shard, ordinal_start, id)
     WHERE status = 'pending' AND dispatched_at IS NULL;
 
 CREATE INDEX idx_run_chunks_expired_leases
-    ON run_chunks(run_id, leased_until, recovery_count)
+    ON run_chunks(leased_until, run_id, run_shard, recovery_count)
     WHERE status = 'leased';
 
 COMMENT ON TABLE run_chunks IS
-    'Chunk-level scheduling units for run processing, hash partitioned by run_id for run-local worker scheduling.';
+    'Chunk-level scheduling units for run processing, list partitioned by run_shard so large runs can spread across 128 logical shards while workers stay chunk-local.';
 
 COMMENT ON COLUMN run_chunks.id IS
     'Unique chunk identifier used in work dispatch and worker claiming.';
 
 COMMENT ON COLUMN run_chunks.run_id IS
     'Owning run for this chunk.';
+
+COMMENT ON COLUMN run_chunks.run_shard IS
+    'Logical shard for this chunk. All execution, attempt, aggregate, and evaluator-result rows produced from the chunk carry the same shard key.';
 
 COMMENT ON COLUMN run_chunks.dataset_version_id IS
     'Dataset version identifier used to resolve chunk case membership.';

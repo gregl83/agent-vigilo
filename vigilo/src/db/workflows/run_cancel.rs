@@ -209,6 +209,7 @@ async fn update_run_cancelled(
             FROM executions e
             LEFT JOIN execution_aggregates ea
               ON ea.run_id = e.run_id
+             AND ea.run_shard = e.run_shard
              AND ea.execution_id = e.id
             WHERE e.run_id = $1::uuid
         ),

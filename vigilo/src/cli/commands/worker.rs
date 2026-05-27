@@ -80,6 +80,7 @@ struct WorkerRunContext {
 /// Queue payload that signals a run chunk is ready for processing.
 struct ChunkReadyMessage {
     run_id: Uuid,
+    run_shard: i16,
     chunk_id: Uuid,
 }
 
@@ -462,6 +463,7 @@ async fn run_worker_message(
 
     debug!(
         run_id = %payload.run_id,
+        run_shard = payload.run_shard,
         chunk_id = %payload.chunk_id,
         "parsed chunk-ready message payload"
     );
@@ -472,6 +474,7 @@ async fn run_worker_message(
     let Some(mut chunk) = chunk_processing::claim_chunk_for_processing(
         db,
         payload.run_id,
+        payload.run_shard,
         payload.chunk_id,
         CHUNK_LEASE_SECONDS,
     )
@@ -492,6 +495,7 @@ async fn run_worker_message(
 
     debug!(
         run_id = %chunk.run_id,
+        run_shard = chunk.run_shard,
         chunk_id = %chunk.id,
         ordinal_start = chunk.ordinal_start,
         ordinal_end = chunk.ordinal_end,
@@ -581,6 +585,8 @@ async fn run_worker_message(
                 &context,
                 db,
                 chunk.run_id,
+                chunk.run_shard,
+                chunk.id,
                 &run_context.profile,
                 &run_context.evaluator_catalog,
                 &cases,
@@ -643,6 +649,7 @@ async fn run_worker_message(
             if let Err(err) = execution_processing::finalize_execution_terminal_transitions(
                 db,
                 chunk.run_id,
+                chunk.run_shard,
                 i32::try_from(run_context.profile.defaults.max_attempts)?,
                 &terminal_transitions,
             )
@@ -670,9 +677,13 @@ async fn run_worker_message(
             // --- Check for pending execution retries ---
             // Open retry work releases the chunk and delays the message until
             // the next retry window.
-            let chunk_state =
-                execution_processing::summarize_chunk_execution_state(db, chunk.run_id, &cases)
-                    .await?;
+            let chunk_state = execution_processing::summarize_chunk_execution_state(
+                db,
+                chunk.run_id,
+                chunk.run_shard,
+                &cases,
+            )
+            .await?;
             if chunk_state.open_execution_count > 0 {
                 let reason = format!(
                     "chunk has {} open executions, including {} retry-scheduled executions; next_retry_after={:?}",

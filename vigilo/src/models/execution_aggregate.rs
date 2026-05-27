@@ -19,8 +19,10 @@ use uuid::Uuid;
 pub(crate) struct ExecutionAggregateDraft {
     /// Execution being summarized.
     pub(crate) execution_id: Uuid,
-    /// Run partition key and parent run id.
+    /// Parent run id.
     pub(crate) run_id: Uuid,
+    /// Logical shard inherited from the parent execution.
+    pub(crate) run_shard: i16,
     /// Attempt whose evaluator results produced this aggregate.
     pub(crate) attempt_id: Uuid,
     /// Overall status derived from evaluator results.
@@ -47,8 +49,10 @@ pub(crate) struct ExecutionAggregatePatch {
 pub(crate) struct ExecutionAggregate {
     /// Execution being summarized.
     pub(crate) execution_id: Uuid,
-    /// Run partition key and parent run id.
+    /// Parent run id.
     pub(crate) run_id: Uuid,
+    /// Logical shard inherited from the parent execution.
+    pub(crate) run_shard: i16,
     /// Attempt whose evaluator results produced this aggregate.
     pub(crate) attempt_id: Uuid,
     /// Overall status derived from evaluator results.

@@ -19,6 +19,8 @@ async fn select_execution_batch_by_run_id(
         SELECT
             id,
             run_id,
+            run_shard,
+            chunk_id,
             case_id,
             task_type,
             tags,
@@ -74,6 +76,10 @@ async fn select_run_export_batch_for_executions(
         .iter()
         .map(|execution| execution.id)
         .collect::<Vec<_>>();
+    let execution_shards = executions
+        .iter()
+        .map(|execution| execution.run_shard)
+        .collect::<Vec<_>>();
 
     let attempts = sqlx::query_as::<_, ExecutionAttempt>(
         r#"
@@ -81,6 +87,7 @@ async fn select_run_export_batch_for_executions(
             id,
             execution_id,
             run_id,
+            run_shard,
             attempt_no,
             status::text as status,
             worker_id,
@@ -103,11 +110,13 @@ async fn select_run_export_batch_for_executions(
         FROM execution_attempts
         WHERE run_id = $1::uuid
           AND execution_id = ANY($2::uuid[])
+          AND run_shard = ANY($3::int2[])
         ORDER BY execution_id, attempt_no, id
         "#,
     )
     .bind(run_id)
     .bind(&execution_ids)
+    .bind(&execution_shards)
     .fetch_all(db)
     .await?;
 
@@ -116,6 +125,7 @@ async fn select_run_export_batch_for_executions(
         SELECT
             execution_id,
             run_id,
+            run_shard,
             attempt_id,
             overall_status::text as overall_status,
             aggregate_score,
@@ -128,11 +138,13 @@ async fn select_run_export_batch_for_executions(
         FROM execution_aggregates
         WHERE run_id = $1::uuid
           AND execution_id = ANY($2::uuid[])
+          AND run_shard = ANY($3::int2[])
         ORDER BY execution_id
         "#,
     )
     .bind(run_id)
     .bind(&execution_ids)
+    .bind(&execution_shards)
     .fetch_all(db)
     .await?;
 
@@ -149,6 +161,7 @@ async fn select_run_export_batch_for_executions(
             SELECT
                 id,
                 run_id,
+                run_shard,
                 execution_id,
                 attempt_id,
                 evaluator_id,
@@ -175,11 +188,13 @@ async fn select_run_export_batch_for_executions(
             FROM evaluator_results
             WHERE run_id = $1::uuid
               AND attempt_id = ANY($2::uuid[])
+              AND run_shard = ANY($3::int2[])
             ORDER BY execution_id, attempt_id, created_at, id
             "#,
         )
         .bind(run_id)
         .bind(&attempt_ids)
+        .bind(&execution_shards)
         .fetch_all(db)
         .await?
     };

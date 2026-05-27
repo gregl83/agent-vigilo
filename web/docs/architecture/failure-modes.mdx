@@ -12,7 +12,7 @@ keywords:
 
 ## Worker crash
 
-Chunk messages are delivered at least once. A worker holds the RabbitMQ delivery unacked while it owns the chunk lease. If the worker exits before acknowledgement, RabbitMQ may redeliver the message and the next worker must win the database chunk claim before doing work. The coordinator also scans expired chunk leases, requeues recoverable chunks with recovery-scoped `run.chunk.ready` events, and marks chunks failed after the recovery limit.
+Chunk messages are delivered at least once. A worker holds the RabbitMQ delivery unacked while it owns the chunk lease. If the worker exits before acknowledgement, RabbitMQ may redeliver the message and the next worker must win the database chunk claim by `run_id + run_shard + chunk_id` before doing work. The coordinator also scans expired chunk leases, requeues recoverable chunks with recovery-scoped `run.chunk.ready` events, and marks chunks failed after the recovery limit.
 
 ## Duplicate delivery
 

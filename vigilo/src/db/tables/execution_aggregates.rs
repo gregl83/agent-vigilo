@@ -21,13 +21,14 @@ pub(crate) async fn insert_execution_aggregate(
     let aggregate = sqlx::query_as::<_, ExecutionAggregate>(
         r#"
         INSERT INTO execution_aggregates (
-            execution_id, run_id, attempt_id,
+            execution_id, run_id, run_shard, attempt_id,
             overall_status, aggregate_score, evaluator_result_count
         )
-        VALUES ($1::uuid, $2::uuid, $3::uuid, $4::evaluation_status, $5, $6)
+        VALUES ($1::uuid, $2::uuid, $3, $4::uuid, $5::evaluation_status, $6, $7)
         RETURNING
             execution_id,
             run_id,
+            run_shard,
             attempt_id,
             overall_status::text as overall_status,
             aggregate_score,
@@ -41,6 +42,7 @@ pub(crate) async fn insert_execution_aggregate(
     )
     .bind(draft.execution_id)
     .bind(draft.run_id)
+    .bind(draft.run_shard)
     .bind(draft.attempt_id)
     .bind(&draft.overall_status)
     .bind(draft.aggregate_score)
@@ -55,6 +57,7 @@ pub(crate) async fn insert_execution_aggregate(
 pub(crate) async fn select_execution_aggregate_by_execution_id(
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
     execution_id: Uuid,
 ) -> anyhow::Result<Option<ExecutionAggregate>> {
     let aggregate = sqlx::query_as::<_, ExecutionAggregate>(
@@ -62,6 +65,7 @@ pub(crate) async fn select_execution_aggregate_by_execution_id(
         SELECT
             execution_id,
             run_id,
+            run_shard,
             attempt_id,
             overall_status::text as overall_status,
             aggregate_score,
@@ -73,10 +77,12 @@ pub(crate) async fn select_execution_aggregate_by_execution_id(
             updated_at
         FROM execution_aggregates
         WHERE run_id = $1::uuid
-          AND execution_id = $2::uuid
+          AND run_shard = $2
+          AND execution_id = $3::uuid
         "#,
     )
     .bind(run_id)
+    .bind(run_shard)
     .bind(execution_id)
     .fetch_optional(db)
     .await?;
@@ -94,6 +100,7 @@ pub(crate) async fn list_execution_aggregates_by_run_id(
         SELECT
             execution_id,
             run_id,
+            run_shard,
             attempt_id,
             overall_status::text as overall_status,
             aggregate_score,
@@ -119,6 +126,7 @@ pub(crate) async fn list_execution_aggregates_by_run_id(
 pub(crate) async fn update_execution_aggregate(
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
     execution_id: Uuid,
     patch: &ExecutionAggregatePatch,
 ) -> anyhow::Result<Option<ExecutionAggregate>> {
@@ -130,10 +138,12 @@ pub(crate) async fn update_execution_aggregate(
             evaluator_result_count = $5,
             updated_at = now()
         WHERE run_id = $1::uuid
-          AND execution_id = $2::uuid
+          AND run_shard = $2
+          AND execution_id = $6::uuid
         RETURNING
             execution_id,
             run_id,
+            run_shard,
             attempt_id,
             overall_status::text as overall_status,
             aggregate_score,
@@ -146,30 +156,34 @@ pub(crate) async fn update_execution_aggregate(
         "#,
     )
     .bind(run_id)
-    .bind(execution_id)
+    .bind(run_shard)
     .bind(&patch.overall_status)
     .bind(patch.aggregate_score)
     .bind(patch.evaluator_result_count)
+    .bind(execution_id)
     .fetch_optional(db)
     .await?;
 
     Ok(aggregate)
 }
 
-/// Deletes an aggregate by run-local execution id.
+/// Deletes an aggregate by run and shard-local execution id.
 pub(crate) async fn delete_execution_aggregate_by_execution_id(
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
     execution_id: Uuid,
 ) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
         DELETE FROM execution_aggregates
         WHERE run_id = $1::uuid
-          AND execution_id = $2::uuid
+          AND run_shard = $2
+          AND execution_id = $3::uuid
         "#,
     )
     .bind(run_id)
+    .bind(run_shard)
     .bind(execution_id)
     .execute(db)
     .await?;

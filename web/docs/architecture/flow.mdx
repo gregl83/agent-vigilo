@@ -67,17 +67,19 @@ run.status = pending
 run.gate_status = unknown
 ```
 
-Executions are then generated:
+Run chunks are then generated and assigned a stable `run_shard` from the 128 logical shard range. Executions are allocated later by workers from the chunk's dataset cases:
 
 ```text
-execution.status = pending
+run_chunk.status = pending
+run_chunk.run_shard = 0..127
 ```
 
 ### 2. Execution Dispatch
 
-Workers claim executions:
+The coordinator emits `run.chunk.ready` messages with `run_id`, `run_shard`, and `chunk_id`. Workers claim chunks and allocate due executions for the chunk:
 
 ```text
+run_chunk.status = leased
 execution.status = running
 execution_attempt.status = running
 ```

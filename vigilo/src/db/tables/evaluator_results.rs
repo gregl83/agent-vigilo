@@ -22,6 +22,7 @@ const EVALUATOR_RESULTS_BATCH_CHUNK_SIZE: usize = 500;
 #[derive(Debug, Clone)]
 pub(crate) struct EvaluatorResultInsertRow {
     pub(crate) run_id: Uuid,
+    pub(crate) run_shard: i16,
     pub(crate) execution_id: Uuid,
     pub(crate) attempt_id: Uuid,
     pub(crate) evaluator_id: Uuid,
@@ -48,8 +49,8 @@ pub(crate) struct EvaluatorResultInsertRow {
 
 /// Inserts evaluator result rows for an attempt in bounded batches.
 ///
-/// Conflicts on `(run_id, attempt_id, evaluator_id)` are ignored to keep retries
-/// idempotent when the same authoritative attempt is observed again.
+/// Conflicts on `(run_id, run_shard, attempt_id, evaluator_id)` are ignored to
+/// keep retries idempotent when the same authoritative attempt is observed again.
 pub(crate) async fn insert_evaluator_results_batch(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     rows: &[EvaluatorResultInsertRow],
@@ -64,6 +65,7 @@ pub(crate) async fn insert_evaluator_results_batch(
             r#"
             INSERT INTO evaluator_results (
                 run_id,
+                run_shard,
                 execution_id,
                 attempt_id,
                 evaluator_id,
@@ -92,6 +94,7 @@ pub(crate) async fn insert_evaluator_results_batch(
 
         qb.push_values(chunk, |mut b, row| {
             b.push_bind(row.run_id)
+                .push_bind(row.run_shard)
                 .push_bind(row.execution_id)
                 .push_bind(row.attempt_id)
                 .push_bind(row.evaluator_id)
@@ -120,7 +123,7 @@ pub(crate) async fn insert_evaluator_results_batch(
 
         qb.push(
             r#"
-            ON CONFLICT (run_id, attempt_id, evaluator_id) DO NOTHING
+            ON CONFLICT (run_id, run_shard, attempt_id, evaluator_id) DO NOTHING
             "#,
         );
 
@@ -139,7 +142,7 @@ pub(crate) async fn insert_evaluator_result(
     let result = sqlx::query_as::<_, EvaluatorResult>(
         r#"
         INSERT INTO evaluator_results (
-            run_id, execution_id, attempt_id,
+            run_id, run_shard, execution_id, attempt_id,
             evaluator_id, evaluator_version,
             evaluator_profile_id, evaluator_profile_version,
             evaluator_interface_version, evaluator_runtime_version,
@@ -150,30 +153,32 @@ pub(crate) async fn insert_evaluator_result(
         )
         VALUES (
             $1::uuid,
-            $2::uuid,
+            $2,
             $3::uuid,
-            $4,
+            $4::uuid,
             $5,
             $6,
             $7,
             $8,
             $9,
             $10,
-            $11::evaluation_status,
-            $12,
+            $11,
+            $12::evaluation_status,
             $13,
             $14,
             $15,
             $16,
             $17,
             $18,
-            $19::severity,
-            $20,
-            $21
+            $19,
+            $20::severity,
+            $21,
+            $22
         )
         RETURNING
             id,
             run_id,
+            run_shard,
             execution_id,
             attempt_id,
             evaluator_id,
@@ -200,6 +205,7 @@ pub(crate) async fn insert_evaluator_result(
         "#,
     )
     .bind(draft.run_id)
+    .bind(draft.run_shard)
     .bind(draft.execution_id)
     .bind(draft.attempt_id)
     .bind(draft.evaluator_id)
@@ -226,10 +232,11 @@ pub(crate) async fn insert_evaluator_result(
     Ok(result)
 }
 
-/// Finds an evaluator result by run-local primary key.
+/// Finds an evaluator result by run and shard-local primary key.
 pub(crate) async fn select_evaluator_result_by_id(
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
     id: Uuid,
 ) -> anyhow::Result<Option<EvaluatorResult>> {
     let result = sqlx::query_as::<_, EvaluatorResult>(
@@ -237,6 +244,7 @@ pub(crate) async fn select_evaluator_result_by_id(
         SELECT
             id,
             run_id,
+            run_shard,
             execution_id,
             attempt_id,
             evaluator_id,
@@ -262,10 +270,12 @@ pub(crate) async fn select_evaluator_result_by_id(
             created_at
         FROM evaluator_results
         WHERE run_id = $1::uuid
-          AND id = $2::uuid
+          AND run_shard = $2
+          AND id = $3::uuid
         "#,
     )
     .bind(run_id)
+    .bind(run_shard)
     .bind(id)
     .fetch_optional(db)
     .await?;
@@ -277,6 +287,7 @@ pub(crate) async fn select_evaluator_result_by_id(
 pub(crate) async fn list_evaluator_results_by_attempt_id(
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
     attempt_id: Uuid,
 ) -> anyhow::Result<Vec<EvaluatorResult>> {
     let results = sqlx::query_as::<_, EvaluatorResult>(
@@ -284,6 +295,7 @@ pub(crate) async fn list_evaluator_results_by_attempt_id(
         SELECT
             id,
             run_id,
+            run_shard,
             execution_id,
             attempt_id,
             evaluator_id,
@@ -309,11 +321,13 @@ pub(crate) async fn list_evaluator_results_by_attempt_id(
             created_at
         FROM evaluator_results
         WHERE run_id = $1::uuid
-          AND attempt_id = $2::uuid
+          AND run_shard = $2
+          AND attempt_id = $3::uuid
         ORDER BY created_at ASC
         "#,
     )
     .bind(run_id)
+    .bind(run_shard)
     .bind(attempt_id)
     .fetch_all(db)
     .await?;
@@ -331,6 +345,7 @@ pub(crate) async fn list_evaluator_results_by_run_id(
         SELECT
             id,
             run_id,
+            run_shard,
             execution_id,
             attempt_id,
             evaluator_id,
@@ -370,6 +385,7 @@ pub(crate) async fn list_evaluator_results_by_run_id(
 pub(crate) async fn update_evaluator_result_reason(
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
     id: Uuid,
     patch: &EvaluatorResultPatch,
 ) -> anyhow::Result<Option<EvaluatorResult>> {
@@ -379,10 +395,12 @@ pub(crate) async fn update_evaluator_result_reason(
         SET reason = $3,
             failure_category = $4
         WHERE run_id = $1::uuid
-          AND id = $2::uuid
+          AND run_shard = $2
+          AND id = $5::uuid
         RETURNING
             id,
             run_id,
+            run_shard,
             execution_id,
             attempt_id,
             evaluator_id,
@@ -409,29 +427,33 @@ pub(crate) async fn update_evaluator_result_reason(
         "#,
     )
     .bind(run_id)
-    .bind(id)
+    .bind(run_shard)
     .bind(&patch.reason)
     .bind(&patch.failure_category)
+    .bind(id)
     .fetch_optional(db)
     .await?;
 
     Ok(result)
 }
 
-/// Deletes an evaluator result by run-local primary key.
+/// Deletes an evaluator result by run and shard-local primary key.
 pub(crate) async fn delete_evaluator_result_by_id(
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
     id: Uuid,
 ) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
         DELETE FROM evaluator_results
         WHERE run_id = $1::uuid
-          AND id = $2::uuid
+          AND run_shard = $2
+          AND id = $3::uuid
         "#,
     )
     .bind(run_id)
+    .bind(run_shard)
     .bind(id)
     .execute(db)
     .await?;

@@ -21,14 +21,15 @@ pub(crate) async fn insert_execution_attempt(
     let attempt = sqlx::query_as::<_, ExecutionAttempt>(
         r#"
         INSERT INTO execution_attempts (
-            execution_id, run_id, attempt_no,
+            execution_id, run_id, run_shard, attempt_no,
             worker_id, worker_host, queue_message_id
         )
-        VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6)
+        VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7)
         RETURNING
             id,
             execution_id,
             run_id,
+            run_shard,
             attempt_no,
             status::text as status,
             worker_id,
@@ -52,6 +53,7 @@ pub(crate) async fn insert_execution_attempt(
     )
     .bind(draft.execution_id)
     .bind(draft.run_id)
+    .bind(draft.run_shard)
     .bind(draft.attempt_no)
     .bind(draft.worker_id)
     .bind(&draft.worker_host)
@@ -62,10 +64,11 @@ pub(crate) async fn insert_execution_attempt(
     Ok(attempt)
 }
 
-/// Finds an execution attempt by run-local primary key.
+/// Finds an execution attempt by run and shard-local primary key.
 pub(crate) async fn select_execution_attempt_by_id(
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
     id: Uuid,
 ) -> anyhow::Result<Option<ExecutionAttempt>> {
     let attempt = sqlx::query_as::<_, ExecutionAttempt>(
@@ -74,6 +77,7 @@ pub(crate) async fn select_execution_attempt_by_id(
             id,
             execution_id,
             run_id,
+            run_shard,
             attempt_no,
             status::text as status,
             worker_id,
@@ -95,10 +99,12 @@ pub(crate) async fn select_execution_attempt_by_id(
             updated_at
         FROM execution_attempts
         WHERE run_id = $1::uuid
-          AND id = $2::uuid
+          AND run_shard = $2
+          AND id = $3::uuid
         "#,
     )
     .bind(run_id)
+    .bind(run_shard)
     .bind(id)
     .fetch_optional(db)
     .await?;
@@ -110,6 +116,7 @@ pub(crate) async fn select_execution_attempt_by_id(
 pub(crate) async fn list_execution_attempts_by_execution_id(
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
     execution_id: Uuid,
 ) -> anyhow::Result<Vec<ExecutionAttempt>> {
     let attempts = sqlx::query_as::<_, ExecutionAttempt>(
@@ -118,6 +125,7 @@ pub(crate) async fn list_execution_attempts_by_execution_id(
             id,
             execution_id,
             run_id,
+            run_shard,
             attempt_no,
             status::text as status,
             worker_id,
@@ -139,11 +147,13 @@ pub(crate) async fn list_execution_attempts_by_execution_id(
             updated_at
         FROM execution_attempts
         WHERE run_id = $1::uuid
-          AND execution_id = $2::uuid
+          AND run_shard = $2
+          AND execution_id = $3::uuid
         ORDER BY attempt_no ASC
         "#,
     )
     .bind(run_id)
+    .bind(run_shard)
     .bind(execution_id)
     .fetch_all(db)
     .await?;
@@ -162,6 +172,7 @@ pub(crate) async fn list_execution_attempts_by_run_id(
             id,
             execution_id,
             run_id,
+            run_shard,
             attempt_no,
             status::text as status,
             worker_id,
@@ -197,6 +208,7 @@ pub(crate) async fn list_execution_attempts_by_run_id(
 pub(crate) async fn update_execution_attempt_status(
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
     id: Uuid,
     patch: &ExecutionAttemptPatch,
 ) -> anyhow::Result<Option<ExecutionAttempt>> {
@@ -207,11 +219,13 @@ pub(crate) async fn update_execution_attempt_status(
             error_message = $4,
             updated_at = now()
         WHERE run_id = $1::uuid
-          AND id = $2::uuid
+          AND run_shard = $2
+          AND id = $5::uuid
         RETURNING
             id,
             execution_id,
             run_id,
+            run_shard,
             attempt_no,
             status::text as status,
             worker_id,
@@ -234,29 +248,33 @@ pub(crate) async fn update_execution_attempt_status(
         "#,
     )
     .bind(run_id)
-    .bind(id)
+    .bind(run_shard)
     .bind(&patch.status)
     .bind(&patch.error_message)
+    .bind(id)
     .fetch_optional(db)
     .await?;
 
     Ok(attempt)
 }
 
-/// Deletes an execution attempt by run-local primary key.
+/// Deletes an execution attempt by run and shard-local primary key.
 pub(crate) async fn delete_execution_attempt_by_id(
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
     id: Uuid,
 ) -> anyhow::Result<u64> {
     let result = sqlx::query(
         r#"
         DELETE FROM execution_attempts
         WHERE run_id = $1::uuid
-          AND id = $2::uuid
+          AND run_shard = $2
+          AND id = $3::uuid
         "#,
     )
     .bind(run_id)
+    .bind(run_shard)
     .bind(id)
     .execute(db)
     .await?;

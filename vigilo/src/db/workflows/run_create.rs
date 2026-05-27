@@ -285,12 +285,13 @@ pub(crate) async fn bulk_insert_run_chunks(
 
     for chunk_batch in chunks.chunks(RUN_CHUNK_INSERT_CHUNK_SIZE) {
         let mut query_builder = QueryBuilder::<Postgres>::new(
-            "INSERT INTO run_chunks (id, run_id, dataset_version_id, profile_group_id, ordinal_start, ordinal_end, status) ",
+            "INSERT INTO run_chunks (id, run_id, run_shard, dataset_version_id, profile_group_id, ordinal_start, ordinal_end, status) ",
         );
 
         query_builder.push_values(chunk_batch, |mut b, chunk| {
             b.push_bind(chunk.chunk_id)
                 .push_bind(run_id)
+                .push_bind(chunk.run_shard)
                 .push_bind(dataset_version_id)
                 .push_bind(&chunk.profile_group_id)
                 .push_bind(chunk.ordinal_start)

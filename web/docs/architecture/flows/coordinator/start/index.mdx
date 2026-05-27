@@ -19,6 +19,8 @@ import decisionFlowDiagram from './decision-flow.mmd';
 
 How `vigilo coordinator start` runs configurable coordinator cycles continuously until shutdown or service failure.
 
+Dispatch and recovery events include each chunk's `run_shard` in the `run.chunk.ready` payload so workers can claim chunk-local work without an extra routing lookup.
+
 ## Execution Flow
 
 <Mermaid value={executionFlowDiagram} />

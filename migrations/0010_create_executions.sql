@@ -1,6 +1,8 @@
 CREATE TABLE executions (
     id UUID NOT NULL DEFAULT gen_random_uuid(),
     run_id UUID NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    run_shard SMALLINT NOT NULL CHECK (run_shard >= 0 AND run_shard < 128),
+    chunk_id UUID NOT NULL,
 
     -- stable identity of the dataset case within a run
     case_id UUID NOT NULL,
@@ -37,41 +39,51 @@ CREATE TABLE executions (
     completed_at TIMESTAMPTZ,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-    CONSTRAINT pk_executions PRIMARY KEY (run_id, id),
-    CONSTRAINT uq_execution_run_case UNIQUE (run_id, case_id)
-) PARTITION BY HASH (run_id);
+    CONSTRAINT pk_executions PRIMARY KEY (run_id, run_shard, id),
+    CONSTRAINT fk_executions_chunk
+        FOREIGN KEY (run_id, run_shard, chunk_id)
+        REFERENCES run_chunks(run_id, run_shard, id)
+        ON DELETE CASCADE,
+    CONSTRAINT uq_execution_run_shard_case UNIQUE (run_id, run_shard, case_id)
+) PARTITION BY LIST (run_shard);
 
 DO $$
 DECLARE
     partition_index INTEGER;
 BEGIN
-    FOR partition_index IN 0..31 LOOP
+    FOR partition_index IN 0..127 LOOP
         EXECUTE format(
-            'CREATE TABLE %I PARTITION OF executions FOR VALUES WITH (MODULUS 32, REMAINDER %s)',
+            'CREATE TABLE %I PARTITION OF executions FOR VALUES IN (%s)',
             'executions_p' || lpad(partition_index::text, 2, '0'),
             partition_index
         );
     END LOOP;
 END $$;
 
-CREATE INDEX idx_executions_run_status ON executions(run_id, status);
+CREATE INDEX idx_executions_run_status ON executions(run_id, run_shard, status);
 
-CREATE INDEX idx_executions_run_current_attempt_id ON executions(run_id, current_attempt_id);
+CREATE INDEX idx_executions_run_current_attempt_id ON executions(run_id, run_shard, current_attempt_id);
 
-CREATE INDEX idx_executions_run_case_hash ON executions(run_id, case_hash);
+CREATE INDEX idx_executions_run_case_hash ON executions(run_id, run_shard, case_hash);
 
 CREATE INDEX idx_executions_run_retry
-    ON executions(run_id, retry_after)
+    ON executions(run_id, run_shard, retry_after)
     WHERE status = 'retry_scheduled';
 
 COMMENT ON TABLE executions IS
-    'Represents a single evaluation of a dataset case against the target system. Each execution is part of a run, may have multiple attempts due to retries or failures, and is hash partitioned by run_id.';
+    'Represents a single evaluation of a dataset case against the target system. Each execution is part of a run, may have multiple attempts due to retries or failures, and is list partitioned by run_shard for chunk-local scale-out.';
 
 COMMENT ON COLUMN executions.id IS
     'Unique identifier for the execution.';
 
 COMMENT ON COLUMN executions.run_id IS
     'Reference to the run this execution belongs to. Determines shared configuration and aggregation context.';
+
+COMMENT ON COLUMN executions.run_shard IS
+    'Logical shard inherited from the source run chunk. Workers include this key in hot queries so one chunk stays partition-local.';
+
+COMMENT ON COLUMN executions.chunk_id IS
+    'Source run chunk that owns this execution. Used with run_id and run_shard to preserve chunk-local placement.';
 
 COMMENT ON COLUMN executions.case_id IS
     'Identifier of the dataset case within the run. Unique per run and used to correlate input, expected output, and results.';

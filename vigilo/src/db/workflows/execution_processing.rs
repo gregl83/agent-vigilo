@@ -440,6 +440,8 @@ fn make_test_case(case: &chunk_processing::WorkerCaseBatchItem) -> anyhow::Resul
 async fn allocate_execution_attempts_for_cases(
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
+    chunk_id: Uuid,
     run_profile: &RunProfile,
     cases: &[chunk_processing::WorkerCaseBatchItem],
     evaluator_bindings_by_case: &[Vec<EvaluatorBinding>],
@@ -550,6 +552,8 @@ async fn allocate_execution_attempts_for_cases(
         upserted AS (
             INSERT INTO executions (
                 run_id,
+                run_shard,
+                chunk_id,
                 case_id,
                 case_hash,
                 profile_group_id,
@@ -570,6 +574,16 @@ async fn allocate_execution_attempts_for_cases(
                 "#,
     );
     query_builder.push_bind(run_id);
+    query_builder.push(
+        r#"::uuid,
+                "#,
+    );
+    query_builder.push_bind(run_shard);
+    query_builder.push(
+        r#",
+                "#,
+    );
+    query_builder.push_bind(chunk_id);
     query_builder.push(
         r#"::uuid,
                 input.case_id,
@@ -595,7 +609,7 @@ async fn allocate_execution_attempts_for_cases(
             FROM input
             JOIN run_guard
               ON true
-            ON CONFLICT (run_id, case_id) DO UPDATE
+            ON CONFLICT (run_id, run_shard, case_id) DO UPDATE
             SET case_hash = EXCLUDED.case_hash,
                 task_type = EXCLUDED.task_type,
                 tags = EXCLUDED.tags,
@@ -607,7 +621,7 @@ async fn allocate_execution_attempts_for_cases(
                 evaluator_manifest = EXCLUDED.evaluator_manifest,
                 expected_evaluator_count = EXCLUDED.expected_evaluator_count,
                 updated_at = now()
-            RETURNING id, case_id, run_id
+            RETURNING id, case_id, run_id, run_shard
         ),
         attempt_state AS (
             SELECT
@@ -615,6 +629,7 @@ async fn allocate_execution_attempts_for_cases(
                 input.input_ordinal,
                 upserted.id AS execution_id,
                 upserted.run_id,
+                upserted.run_shard,
                 executions.status,
                 executions.current_attempt_id,
                 executions.current_attempt_no,
@@ -622,6 +637,7 @@ async fn allocate_execution_attempts_for_cases(
             FROM upserted
             JOIN executions
               ON executions.run_id = upserted.run_id
+             AND executions.run_shard = upserted.run_shard
              AND executions.id = upserted.id
             JOIN input
               ON input.case_id = upserted.case_id
@@ -684,7 +700,8 @@ async fn allocate_execution_attempts_for_cases(
                 attempt_state.case_id,
                 attempt_state.input_ordinal,
                 attempt_state.execution_id AS id,
-                attempt_state.run_id
+                attempt_state.run_id,
+                attempt_state.run_shard
             FROM attempt_state, attempt_policy
             WHERE attempt_state.status IN (
                     'pending'::execution_status,
@@ -710,6 +727,7 @@ async fn allocate_execution_attempts_for_cases(
                 updated_at = now()
             FROM retry_eligible
             WHERE execution_attempts.run_id = retry_eligible.run_id
+              AND execution_attempts.run_shard = retry_eligible.run_shard
               AND execution_attempts.execution_id = retry_eligible.id
               AND execution_attempts.status = 'running'::attempt_status
             RETURNING execution_attempts.id
@@ -725,16 +743,19 @@ async fn allocate_execution_attempts_for_cases(
                 updated_at = now()
             FROM retry_eligible
             WHERE executions.run_id = retry_eligible.run_id
+              AND executions.run_shard = retry_eligible.run_shard
               AND executions.id = retry_eligible.id
             RETURNING
                 executions.id AS execution_id,
                 executions.run_id,
+                executions.run_shard,
                 executions.current_attempt_no AS attempt_no
         ),
         inserted_attempt AS (
             INSERT INTO execution_attempts (
                 execution_id,
                 run_id,
+                run_shard,
                 attempt_no,
                 status,
                 started_at,
@@ -744,19 +765,21 @@ async fn allocate_execution_attempts_for_cases(
             SELECT
                 bumped.execution_id,
                 bumped.run_id,
+                bumped.run_shard,
                 bumped.attempt_no,
                 'running'::attempt_status,
                 now(),
                 now(),
                 now()
             FROM bumped
-            RETURNING id AS attempt_id, execution_id, run_id, attempt_no
+            RETURNING id AS attempt_id, execution_id, run_id, run_shard, attempt_no
         ),
         updated_execution AS (
             UPDATE executions
             SET current_attempt_id = inserted_attempt.attempt_id
             FROM inserted_attempt
             WHERE executions.run_id = inserted_attempt.run_id
+              AND executions.run_shard = inserted_attempt.run_shard
               AND executions.id = inserted_attempt.execution_id
             RETURNING executions.id
         ),
@@ -861,6 +884,7 @@ async fn allocate_execution_attempts_for_cases(
 pub(crate) async fn finalize_execution_terminal_transitions(
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
     max_attempts: i32,
     transitions: &[ExecutionTerminalTransition],
 ) -> anyhow::Result<()> {
@@ -926,10 +950,12 @@ pub(crate) async fn finalize_execution_terminal_transitions(
         authoritative_input AS (
             SELECT
                 transition_input.*,
-                executions.run_id
+                executions.run_id,
+                executions.run_shard
             FROM transition_input
             JOIN executions
               ON executions.run_id = $6::uuid
+             AND executions.run_shard = $7
              AND executions.id = transition_input.execution_id
              AND executions.current_attempt_id = transition_input.attempt_id
              AND executions.current_attempt_no = transition_input.attempt_no
@@ -954,6 +980,7 @@ pub(crate) async fn finalize_execution_terminal_transitions(
             FROM authoritative_input
             LEFT JOIN execution_aggregates
               ON execution_aggregates.run_id = $6::uuid
+             AND execution_aggregates.run_shard = $7
              AND execution_aggregates.execution_id = authoritative_input.execution_id
              AND execution_aggregates.attempt_id = authoritative_input.attempt_id
             WHERE NOT authoritative_input.completed
@@ -979,8 +1006,10 @@ pub(crate) async fn finalize_execution_terminal_transitions(
             FROM transition_input
             JOIN executions
               ON executions.run_id = $6::uuid
+             AND executions.run_shard = $7
              AND executions.id = transition_input.execution_id
             WHERE execution_attempts.run_id = $6::uuid
+              AND execution_attempts.run_shard = $7
               AND execution_attempts.id = transition_input.attempt_id
               AND execution_attempts.execution_id = transition_input.execution_id
               AND execution_attempts.status = 'running'::attempt_status
@@ -1006,11 +1035,13 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                 updated_at = now()
             FROM terminal_input, terminal_input_check
             WHERE execution_attempts.run_id = $6::uuid
+              AND execution_attempts.run_shard = $7
               AND execution_attempts.id = terminal_input.attempt_id
               AND execution_attempts.execution_id = terminal_input.execution_id
             RETURNING
                 terminal_input.execution_id,
                 terminal_input.run_id,
+                terminal_input.run_shard,
                 terminal_input.attempt_id,
                 terminal_input.attempt_no,
                 terminal_input.completed,
@@ -1018,13 +1049,14 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                 terminal_input.overall_status,
                 (
                     NOT terminal_input.completed
-                    AND terminal_input.attempt_no < $7::int
+                    AND terminal_input.attempt_no < $8::int
                 ) AS retry_scheduled
         ),
         failed_aggregate_upsert AS (
             INSERT INTO execution_aggregates (
                 execution_id,
                 run_id,
+                run_shard,
                 attempt_id,
                 overall_status,
                 aggregate_score,
@@ -1037,6 +1069,7 @@ pub(crate) async fn finalize_execution_terminal_transitions(
             SELECT
                 attempt_update.execution_id,
                 attempt_update.run_id,
+                attempt_update.run_shard,
                 attempt_update.attempt_id,
                 'error'::evaluation_status,
                 NULL,
@@ -1056,7 +1089,7 @@ pub(crate) async fn finalize_execution_terminal_transitions(
             FROM attempt_update
             WHERE NOT attempt_update.completed
               AND NOT attempt_update.retry_scheduled
-            ON CONFLICT (run_id, execution_id) DO UPDATE
+            ON CONFLICT (run_id, run_shard, execution_id) DO UPDATE
             SET attempt_id = EXCLUDED.attempt_id,
                 overall_status = EXCLUDED.overall_status,
                 aggregate_score = EXCLUDED.aggregate_score,
@@ -1084,8 +1117,8 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                     WHEN attempt_update.retry_scheduled THEN
                         now() + (
                             LEAST(
-                                $8::int * POWER(3::numeric, GREATEST(attempt_update.attempt_no - 1, 0)),
-                                $9::int::numeric
+                                $9::int * POWER(3::numeric, GREATEST(attempt_update.attempt_no - 1, 0)),
+                                $10::int::numeric
                             )::int * interval '1 second'
                         )
                     ELSE NULL
@@ -1104,6 +1137,7 @@ pub(crate) async fn finalize_execution_terminal_transitions(
             LEFT JOIN failed_aggregate_upsert
               ON failed_aggregate_upsert.execution_id = attempt_update.execution_id
             WHERE executions.run_id = $6::uuid
+              AND executions.run_shard = $7
               AND executions.id = attempt_update.execution_id
               AND executions.current_attempt_id = attempt_update.attempt_id
               AND executions.current_attempt_no = attempt_update.attempt_no
@@ -1123,6 +1157,7 @@ pub(crate) async fn finalize_execution_terminal_transitions(
     .bind(completed_flags)
     .bind(error_messages)
     .bind(run_id)
+    .bind(run_shard)
     .bind(max_attempts)
     .bind(EXECUTION_RETRY_BASE_SECONDS)
     .bind(EXECUTION_RETRY_MAX_SECONDS)
@@ -1150,6 +1185,7 @@ pub(crate) async fn finalize_execution_terminal_transitions(
 pub(crate) async fn summarize_chunk_execution_state(
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
     cases: &[chunk_processing::WorkerCaseBatchItem],
 ) -> anyhow::Result<ChunkExecutionState> {
     if cases.is_empty() {
@@ -1180,10 +1216,12 @@ pub(crate) async fn summarize_chunk_execution_state(
             ) AS next_retry_after
         FROM executions
         WHERE run_id = $1::uuid
-          AND case_id = ANY($2::uuid[])
+          AND run_shard = $2
+          AND case_id = ANY($3::uuid[])
         "#,
     )
     .bind(run_id)
+    .bind(run_shard)
     .bind(&case_ids)
     .fetch_one(db)
     .await?;
@@ -1232,6 +1270,7 @@ fn map_severity(severity: &Severity) -> &'static str {
 async fn evaluate_case_execution(
     context: &Context,
     run_id: Uuid,
+    run_shard: i16,
     run_profile: &RunProfile,
     evaluator_catalog: &RunEvaluatorCatalog,
     case: &chunk_processing::WorkerCaseBatchItem,
@@ -1413,6 +1452,7 @@ async fn evaluate_case_execution(
 
                     let row = evaluator_results::EvaluatorResultInsertRow {
                         run_id,
+                        run_shard,
                         execution_id,
                         attempt_id,
                         evaluator_id: evaluator_entry.evaluator_id,
@@ -1612,6 +1652,7 @@ async fn evaluate_case_execution(
 async fn persist_completed_execution_results_batch(
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
     completed: &[CompletedExecutionPersistence],
 ) -> anyhow::Result<BatchPersistenceStats> {
     if completed.is_empty() {
@@ -1662,6 +1703,12 @@ async fn persist_completed_execution_results_batch(
         FROM run_guard
         JOIN executions
           ON executions.run_id = run_guard.id
+         AND executions.run_shard =
+        "#,
+    );
+    authority_query.push_bind(run_shard);
+    authority_query.push(
+        r#"
         JOIN input
           ON input.execution_id = executions.id
         WHERE executions.current_attempt_id = input.attempt_id
@@ -1697,6 +1744,7 @@ async fn persist_completed_execution_results_batch(
         INSERT INTO execution_aggregates (
             execution_id,
             run_id,
+            run_shard,
             attempt_id,
             overall_status,
             aggregate_score,
@@ -1710,6 +1758,7 @@ async fn persist_completed_execution_results_batch(
     aggregate_query.push_values(completed, |mut b, row| {
         b.push_bind(row.execution_id)
             .push_bind(run_id)
+            .push_bind(run_shard)
             .push_bind(row.attempt_id)
             .push_bind(&row.overall_status)
             .push_unseparated("::evaluation_status")
@@ -1722,7 +1771,7 @@ async fn persist_completed_execution_results_batch(
     });
     aggregate_query.push(
         r#"
-        ON CONFLICT (run_id, execution_id) DO UPDATE
+        ON CONFLICT (run_id, run_shard, execution_id) DO UPDATE
         SET attempt_id = EXCLUDED.attempt_id,
             overall_status = EXCLUDED.overall_status,
             aggregate_score = EXCLUDED.aggregate_score,
@@ -1766,6 +1815,8 @@ pub(crate) async fn process_case_batch_execution(
     context: &Context,
     db: &PgPool,
     run_id: Uuid,
+    run_shard: i16,
+    chunk_id: Uuid,
     run_profile: &RunProfile,
     evaluator_catalog: &RunEvaluatorCatalog,
     cases: &[chunk_processing::WorkerCaseBatchItem],
@@ -1792,6 +1843,8 @@ pub(crate) async fn process_case_batch_execution(
     let allocations = allocate_execution_attempts_for_cases(
         db,
         run_id,
+        run_shard,
+        chunk_id,
         run_profile,
         cases,
         &evaluator_bindings_by_case,
@@ -1855,6 +1908,7 @@ pub(crate) async fn process_case_batch_execution(
                     evaluate_case_execution(
                         context,
                         run_id,
+                        run_shard,
                         run_profile,
                         evaluator_catalog,
                         case,
@@ -1894,7 +1948,7 @@ pub(crate) async fn process_case_batch_execution(
 
     let persistence_started = Instant::now();
     let persistence_stats =
-        persist_completed_execution_results_batch(db, run_id, &completed).await?;
+        persist_completed_execution_results_batch(db, run_id, run_shard, &completed).await?;
     debug!(
         run_id = %run_id,
         case_count = cases.len(),

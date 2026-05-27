@@ -1,6 +1,7 @@
 CREATE TABLE execution_aggregates (
     execution_id UUID NOT NULL,
     run_id UUID NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    run_shard SMALLINT NOT NULL CHECK (run_shard >= 0 AND run_shard < 128),
     attempt_id UUID NOT NULL,
 
     overall_status evaluation_status NOT NULL,
@@ -14,27 +15,27 @@ CREATE TABLE execution_aggregates (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-    CONSTRAINT pk_execution_aggregates PRIMARY KEY (run_id, execution_id),
+    CONSTRAINT pk_execution_aggregates PRIMARY KEY (run_id, run_shard, execution_id),
     CONSTRAINT fk_execution_aggregates_execution
-        FOREIGN KEY (run_id, execution_id)
-        REFERENCES executions(run_id, id)
+        FOREIGN KEY (run_id, run_shard, execution_id)
+        REFERENCES executions(run_id, run_shard, id)
         ON DELETE CASCADE,
     CONSTRAINT fk_execution_aggregates_attempt
-        FOREIGN KEY (run_id, attempt_id)
-        REFERENCES execution_attempts(run_id, id)
+        FOREIGN KEY (run_id, run_shard, attempt_id)
+        REFERENCES execution_attempts(run_id, run_shard, id)
         ON DELETE CASCADE,
-    CONSTRAINT uq_execution_aggregates_run_attempt UNIQUE (run_id, attempt_id),
+    CONSTRAINT uq_execution_aggregates_run_attempt UNIQUE (run_id, run_shard, attempt_id),
     CONSTRAINT chk_execution_aggregate_score_range
       CHECK (aggregate_score IS NULL OR (aggregate_score >= 0.0 AND aggregate_score <= 1.0))
-) PARTITION BY HASH (run_id);
+) PARTITION BY LIST (run_shard);
 
 DO $$
 DECLARE
     partition_index INTEGER;
 BEGIN
-    FOR partition_index IN 0..31 LOOP
+    FOR partition_index IN 0..127 LOOP
         EXECUTE format(
-            'CREATE TABLE %I PARTITION OF execution_aggregates FOR VALUES WITH (MODULUS 32, REMAINDER %s)',
+            'CREATE TABLE %I PARTITION OF execution_aggregates FOR VALUES IN (%s)',
             'execution_aggregates_p' || lpad(partition_index::text, 2, '0'),
             partition_index
         );
@@ -42,16 +43,19 @@ BEGIN
 END $$;
 
 CREATE INDEX idx_execution_aggregates_run_overall_status
-    ON execution_aggregates(run_id, overall_status);
+    ON execution_aggregates(run_id, run_shard, overall_status);
 
 COMMENT ON TABLE execution_aggregates IS
-    'Stores the current authoritative aggregate result for an execution attempt. Derived from append-only evaluator results, hash partitioned by run_id, and used for execution summaries, final run counter rollups, scoring, and gate decisions.';
+    'Stores the current authoritative aggregate result for an execution attempt. Derived from append-only evaluator results, list partitioned by run_shard, and used for execution summaries, final run counter rollups, scoring, and gate decisions.';
 
 COMMENT ON COLUMN execution_aggregates.execution_id IS
     'Reference to the execution this aggregate summarizes. One authoritative aggregate exists per execution.';
 
 COMMENT ON COLUMN execution_aggregates.run_id IS
     'Reference to the run this execution aggregate belongs to. Included for query efficiency and run-level aggregation.';
+
+COMMENT ON COLUMN execution_aggregates.run_shard IS
+    'Logical shard inherited from the parent execution and source chunk.';
 
 COMMENT ON COLUMN execution_aggregates.attempt_id IS
     'Reference to the authoritative attempt whose evaluator results were used to produce this aggregate.';

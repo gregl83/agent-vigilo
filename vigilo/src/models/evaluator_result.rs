@@ -1,7 +1,7 @@
 //! Evaluator result persistence models.
 //!
 //! Evaluator results are append-oriented evidence rows produced when an
-//! evaluator scores an execution attempt. They are run-partitioned in the
+//! evaluator scores an execution attempt. They are shard-partitioned in the
 //! database and feed execution aggregates, run summaries, and gate decisions.
 
 use chrono::{
@@ -17,8 +17,10 @@ use uuid::Uuid;
 /// Insert payload for one evaluator outcome on an execution attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct EvaluatorResultDraft {
-    /// Run partition key and parent run id.
+    /// Parent run id.
     pub(crate) run_id: Uuid,
+    /// Logical shard inherited from the parent execution.
+    pub(crate) run_shard: i16,
     /// Execution being evaluated.
     pub(crate) execution_id: Uuid,
     /// Attempt that produced the agent output being evaluated.
@@ -73,10 +75,12 @@ pub(crate) struct EvaluatorResultPatch {
 /// Persisted evaluator result row.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub(crate) struct EvaluatorResult {
-    /// Result row id, unique within the run partition key.
+    /// Result row id, unique within the run and shard key.
     pub(crate) id: Uuid,
-    /// Run partition key and parent run id.
+    /// Parent run id.
     pub(crate) run_id: Uuid,
+    /// Logical shard inherited from the parent execution.
+    pub(crate) run_shard: i16,
     /// Execution being evaluated.
     pub(crate) execution_id: Uuid,
     /// Attempt that produced the agent output being evaluated.

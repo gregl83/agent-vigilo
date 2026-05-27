@@ -59,6 +59,7 @@ pub(crate) async fn recover_expired_chunk_leases(
         WITH expired AS (
             SELECT
                 rc.run_id,
+                rc.run_shard,
                 rc.id,
                 rc.recovery_count + 1 AS next_recovery_count
             FROM run_chunks rc
@@ -81,8 +82,9 @@ pub(crate) async fn recover_expired_chunk_leases(
                 updated_at = now()
             FROM expired
             WHERE rc.run_id = expired.run_id
+              AND rc.run_shard = expired.run_shard
               AND rc.id = expired.id
-            RETURNING rc.run_id, rc.id, rc.recovery_count
+            RETURNING rc.run_id, rc.run_shard, rc.id, rc.recovery_count
         ),
         recovery_events AS (
             INSERT INTO outbox_events (event_type, aggregate_type, aggregate_id, dedupe_key, payload)
@@ -98,6 +100,7 @@ pub(crate) async fn recover_expired_chunk_leases(
                 ),
                 jsonb_build_object(
                     'run_id', recovered.run_id,
+                    'run_shard', recovered.run_shard,
                     'chunk_id', recovered.id,
                     'recovery_count', recovered.recovery_count
                 )
@@ -121,7 +124,7 @@ pub(crate) async fn recover_expired_chunk_leases(
     let failed = sqlx::query_scalar::<_, i64>(
         r#"
         WITH expired AS (
-            SELECT rc.run_id, rc.id
+            SELECT rc.run_id, rc.run_shard, rc.id
             FROM run_chunks rc
             JOIN runs r
               ON r.id = rc.run_id
@@ -140,6 +143,7 @@ pub(crate) async fn recover_expired_chunk_leases(
                 updated_at = now()
             FROM expired
             WHERE rc.run_id = expired.run_id
+              AND rc.run_shard = expired.run_shard
               AND rc.id = expired.id
             RETURNING 1
         )
@@ -230,7 +234,7 @@ pub(crate) async fn dispatch_next_run_window(
             RETURNING r.id, r.run_key, candidate.previous_status
         ),
         selected_chunks AS (
-            SELECT rc.run_id, rc.id
+            SELECT rc.run_id, rc.run_shard, rc.id
             FROM run_chunks rc
             JOIN claimed
               ON claimed.id = rc.run_id
@@ -246,7 +250,11 @@ pub(crate) async fn dispatch_next_run_window(
                 'run',
                 selected_chunks.run_id,
                 format('run:%s:chunk:%s:ready', selected_chunks.run_id, selected_chunks.id),
-                jsonb_build_object('run_id', selected_chunks.run_id, 'chunk_id', selected_chunks.id)
+                jsonb_build_object(
+                    'run_id', selected_chunks.run_id,
+                    'run_shard', selected_chunks.run_shard,
+                    'chunk_id', selected_chunks.id
+                )
             FROM selected_chunks
             ON CONFLICT (dedupe_key) DO NOTHING
             RETURNING id
@@ -257,6 +265,7 @@ pub(crate) async fn dispatch_next_run_window(
                 updated_at = now()
             FROM selected_chunks
             WHERE rc.run_id = selected_chunks.run_id
+              AND rc.run_shard = selected_chunks.run_shard
               AND rc.id = selected_chunks.id
             RETURNING rc.id
         ),

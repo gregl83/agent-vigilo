@@ -103,7 +103,7 @@ Agent Vigilo is structured as a distributed AI evaluation system. Runs are creat
 - **CLI runtime** parses commands, initializes shared context, applies migrations, publishes evaluators, creates runs, starts services, and renders JSON or TOON output.
 - **Coordinator** recovers expired chunk leases, claims coordinator leases, dispatches runnable chunks, finalizes completed runs, and publishes state-change events from the outbox delivery queue.
 - **Worker** consumes `run.chunk.ready` messages, claims chunk leases, allocates due attempts, delays retry-scheduled chunks until `retry_after`, invokes target agents, runs evaluator bindings, persists results, and settles RabbitMQ deliveries.
-- **PostgreSQL** is the authority for evaluators, datasets, runs, chunks, attempts, evaluator results, execution aggregates, coordinator leases, outbox ledger rows, and hot delivery rows.
+- **PostgreSQL** is the authority for evaluators, datasets, runs, shard-partitioned chunks, attempts, evaluator results, execution aggregates, coordinator leases, outbox ledger rows, and hot delivery rows.
 - **RabbitMQ** distributes worker-ready chunk messages and receives confirmed durable event publications from the outbox publisher.
 - **Wasmtime** executes versioned WASI Preview 2 evaluator components with per-invocation store limits and a process-wide active-evaluation semaphore.
 
@@ -123,6 +123,7 @@ Runtime behavior and state transitions are documented outside the structure sect
 - [Architecture landing page](/docs/architecture/)
 - [Execution flow and state model](/docs/architecture/flow)
 - [Failure modes](/docs/architecture/failure-modes)
+- [Scale-out and shard migration](/docs/architecture/scaling)
 - [Command flows](/docs/architecture/flows/)
 - [Coordinator flows](/docs/architecture/flows/coordinator/)
 - [Worker flows](/docs/architecture/flows/worker/)

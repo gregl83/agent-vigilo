@@ -21,7 +21,7 @@ Describes the major internal responsibilities of the coordinator runtime.
 ## Notes
 
 - Lease recovery runs before dispatch and finalization: expired worker chunk leases are either requeued with recovery-scoped chunk-ready events or marked failed after the recovery limit.
-- Dispatch claims pending or running runs with undispatched chunks, starts runs when needed, and enqueues bounded chunk-ready windows.
+- Dispatch claims pending or running runs with undispatched chunks, starts runs when needed, and enqueues bounded chunk-ready windows that include each chunk's `run_shard`.
 - Finalization is coordinator-owned and lease guarded; workers persist execution outcomes but do not complete the run row.
 - Outbox publication is deliberately separate from state changes so committed ledger events can be retried after broker or process failures.
 - Coordinator throughput knobs can tune cycle interval, chunk lease recovery batch size and limit, dispatch windows, outbox batch size, publish parallelism, leases, and retry delay.
@@ -37,5 +37,6 @@ Describes the major internal responsibilities of the coordinator runtime.
 - [Coordinator flows](../../../flows/coordinator)
 - [Run lifecycle](../../../state/run-lifecycle)
 - [Outbox lifecycle](../../../state/outbox-lifecycle)
+- [Scale-out and shard migration](../../../scaling)
 - [Vigilo components](../vigilo)
 - [Worker components](../worker)

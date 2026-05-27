@@ -14,11 +14,19 @@ use serde::{
 };
 use uuid::Uuid;
 
+pub(crate) const RUN_SHARD_COUNT: i16 = 128;
+
+pub(crate) fn run_shard_for_chunk_index(chunk_index: usize) -> i16 {
+    (chunk_index % RUN_SHARD_COUNT as usize) as i16
+}
+
 /// Insert payload for one run scheduling chunk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RunChunkDraft {
     /// Deterministic chunk id generated during run planning.
     pub(crate) chunk_id: Uuid,
+    /// Logical shard assigned to this chunk.
+    pub(crate) run_shard: i16,
     /// Evaluation profile group applied to cases in this chunk.
     pub(crate) profile_group_id: String,
     /// Inclusive start ordinal in the dataset version.
@@ -30,10 +38,12 @@ pub(crate) struct RunChunkDraft {
 /// Persisted run scheduling chunk.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub(crate) struct RunChunk {
-    /// Chunk id, unique within the run partition key.
+    /// Chunk id, unique within the run and shard key.
     pub(crate) id: Uuid,
-    /// Run partition key and parent run id.
+    /// Parent run id.
     pub(crate) run_id: Uuid,
+    /// Logical shard for chunk-local worker processing.
+    pub(crate) run_shard: i16,
     /// Dataset version whose cases are covered by this chunk.
     pub(crate) dataset_version_id: Uuid,
     /// Evaluation profile group applied to cases in this chunk.

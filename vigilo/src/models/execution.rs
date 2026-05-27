@@ -2,8 +2,8 @@
 //!
 //! An execution is the run-local unit of work for evaluating one dataset case
 //! against the target agent and selected evaluator manifest. Execution rows are
-//! hash partitioned by `run_id` and carry the current attempt pointer used by
-//! workers and finalization.
+//! list partitioned by `run_shard` and carry the current attempt pointer used
+//! by workers and finalization.
 
 use chrono::{
     DateTime,
@@ -18,8 +18,12 @@ use uuid::Uuid;
 /// Insert payload for one run-local case execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ExecutionDraft {
-    /// Run partition key and parent run id.
+    /// Parent run id.
     pub(crate) run_id: Uuid,
+    /// Logical shard inherited from the source chunk.
+    pub(crate) run_shard: i16,
+    /// Source run chunk for this execution.
+    pub(crate) chunk_id: Uuid,
     /// Dataset case id resolved for this run.
     pub(crate) case_id: Uuid,
     /// Task type used to select compatible evaluators.
@@ -48,10 +52,14 @@ pub(crate) struct ExecutionPatch {
 /// Persisted execution row.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub(crate) struct Execution {
-    /// Execution row id, unique within the run partition key.
+    /// Execution row id, unique within the run and shard key.
     pub(crate) id: Uuid,
-    /// Run partition key and parent run id.
+    /// Parent run id.
     pub(crate) run_id: Uuid,
+    /// Logical shard inherited from the source chunk.
+    pub(crate) run_shard: i16,
+    /// Source run chunk for this execution.
+    pub(crate) chunk_id: Uuid,
     /// Dataset case id resolved for this run.
     pub(crate) case_id: Uuid,
     /// Task type used to select compatible evaluators.

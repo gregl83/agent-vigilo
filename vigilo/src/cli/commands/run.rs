@@ -58,7 +58,10 @@ use crate::{
             Run,
             RunDraft,
         },
-        run_chunk::RunChunkDraft,
+        run_chunk::{
+            RunChunkDraft,
+            run_shard_for_chunk_index,
+        },
     },
 };
 
@@ -262,8 +265,10 @@ fn build_chunks(total_cases: usize, chunk_size: usize) -> Vec<RunChunkDraft> {
 
     while start < total_cases {
         let end = (start + chunk_size).min(total_cases);
+        let chunk_index = chunks.len();
         chunks.push(RunChunkDraft {
             chunk_id: Uuid::now_v7(),
+            run_shard: run_shard_for_chunk_index(chunk_index),
             profile_group_id: "default".to_string(),
             ordinal_start: start as i32,
             ordinal_end: end as i32,
@@ -735,8 +740,19 @@ mod tests {
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].ordinal_start, 0);
         assert_eq!(chunks[0].ordinal_end, 100);
+        assert_eq!(chunks[0].run_shard, 0);
+        assert_eq!(chunks[1].run_shard, 1);
+        assert_eq!(chunks[2].run_shard, 2);
         assert_eq!(chunks[2].ordinal_start, 200);
         assert_eq!(chunks[2].ordinal_end, 205);
+    }
+
+    #[test]
+    fn build_chunks_assigns_128_logical_shards_round_robin() {
+        let chunks = build_chunks(129, 1);
+        assert_eq!(chunks[0].run_shard, 0);
+        assert_eq!(chunks[127].run_shard, 127);
+        assert_eq!(chunks[128].run_shard, 0);
     }
 
     fn run_with_status(status: &str, gate_status: &str) -> Run {
@@ -901,6 +917,8 @@ mod tests {
         let execution_id = Uuid::now_v7();
         let attempt_id = Uuid::now_v7();
         let evaluator_result_id = Uuid::now_v7();
+        let chunk_id = Uuid::now_v7();
+        let run_shard = 0;
 
         let summary = RunResultsSummary {
             execution_count: 1,
@@ -920,6 +938,8 @@ mod tests {
         let executions = vec![Execution {
             id: execution_id,
             run_id: run.id,
+            run_shard,
+            chunk_id,
             case_id: Uuid::now_v7(),
             task_type: "chat".to_string(),
             tags: json!(["smoke"]),
@@ -947,6 +967,7 @@ mod tests {
             id: attempt_id,
             execution_id,
             run_id: run.id,
+            run_shard,
             attempt_no: 1,
             status: "completed".to_string(),
             worker_id: None,
@@ -971,6 +992,7 @@ mod tests {
         let aggregates = vec![ExecutionAggregate {
             execution_id,
             run_id: run.id,
+            run_shard,
             attempt_id,
             overall_status: "passed".to_string(),
             aggregate_score: Some(1.0),
@@ -985,6 +1007,7 @@ mod tests {
         let evaluator_results = vec![EvaluatorResult {
             id: evaluator_result_id,
             run_id: run.id,
+            run_shard,
             execution_id,
             attempt_id,
             evaluator_id: Uuid::now_v7(),
