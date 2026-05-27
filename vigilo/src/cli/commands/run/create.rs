@@ -13,6 +13,9 @@ pub(super) async fn exec(
     dataset: Option<String>,
     dataset_file: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    // --- Load command inputs ---
+    // Acquire output/database handles and parse profile/dataset payloads before
+    // any durable writes are attempted.
     let db = context.db().await?;
     let out = context.out().await?;
 
@@ -20,6 +23,9 @@ pub(super) async fn exec(
     let profile_payload = canonical_json(&parsed.profile_payload);
     let dataset_payload = canonical_json(&parsed.dataset_payload);
 
+    // --- Validate executability ---
+    // Catch empty datasets, invalid agent settings, unmatched cases, and
+    // missing/non-runnable evaluators before creating run rows or chunks.
     if parsed.dataset.cases.is_empty() {
         anyhow::bail!("dataset must include at least one case");
     }
@@ -31,6 +37,9 @@ pub(super) async fn exec(
     )
     .await?;
 
+    // --- Derive immutable identities ---
+    // These hashes, ids, and chunks are persisted into the run snapshot for
+    // reproducibility and later export/debugging.
     let (case_blobs, dataset_cases) = build_case_plans(&parsed.dataset)?;
     let dataset_version_id = compute_dataset_version_id(&parsed.dataset, &dataset_cases)?;
     let profile_hash = hash_json(&profile_payload)?;
@@ -47,6 +56,8 @@ pub(super) async fn exec(
     let run_key = run_id.to_string();
     let agent = &parsed.profile.agent;
 
+    // --- Build run configuration snapshot ---
+    // The snapshot is written before dispatch makes any chunks visible.
     let snapshot = json!({
         "profile": profile_payload,
         "agent": agent,
@@ -99,6 +110,10 @@ pub(super) async fn exec(
         expected_execution_count: dataset_cases.len() as i32,
     };
 
+    // --- Persist pending run work ---
+    // Write immutable case blobs, dataset membership, the pending run, and
+    // pending chunks in one transaction. Coordinator dispatch owns worker
+    // visibility; no queue-visible events are emitted here.
     let mut tx = db.begin().await?;
 
     run_create::bulk_insert_case_blobs(&mut tx, &case_blobs).await?;
@@ -115,6 +130,7 @@ pub(super) async fn exec(
 
     tx.commit().await?;
 
+    // --- Emit create response ---
     let payload = json!({
         "data": {
             "run_id": run_id,

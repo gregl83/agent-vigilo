@@ -310,6 +310,8 @@ pub(super) async fn exec(
     format: RunExportFormat,
     batch_size: i64,
 ) -> anyhow::Result<()> {
+    // --- Load export header ---
+    // Validate options and load the run-level export header data.
     if batch_size <= 0 {
         anyhow::bail!("export batch_size must be greater than zero");
     }
@@ -323,6 +325,9 @@ pub(super) async fn exec(
 
     match format {
         RunExportFormat::Json => {
+            // --- Materialize JSON export ---
+            // JSON export loads the whole run into memory so callers receive
+            // one structured document.
             let mut all_executions = Vec::new();
             let mut all_attempts = Vec::new();
             let mut all_aggregates = Vec::new();
@@ -357,6 +362,9 @@ pub(super) async fn exec(
             out.write_value(&payload)?;
         }
         RunExportFormat::Jsonl => {
+            // --- Stream JSONL header ---
+            // JSONL export writes header records first, then emits
+            // execution-scoped records batch by batch for large runs.
             let run_line = json!({
                 "type": "run",
                 "run": run,
@@ -385,6 +393,9 @@ pub(super) async fn exec(
 
             let mut cursor = None;
             loop {
+                // --- Load execution page ---
+                // Page executions by id and load child attempts, aggregates,
+                // and evaluator results only for that page.
                 let execution_batch =
                     select_execution_batch_by_run_id(db, run_id, cursor, batch_size).await?;
                 if execution_batch.is_empty() {
@@ -418,6 +429,10 @@ pub(super) async fn exec(
                         .push(result);
                 }
 
+                // --- Emit execution group ---
+                // Emit one execution record followed by its aggregate, attempts,
+                // and attempt result rows. This preserves a stable local
+                // grouping without holding the entire export in memory.
                 for execution in &batch.executions {
                     let execution_line = json!({
                         "type": "execution",

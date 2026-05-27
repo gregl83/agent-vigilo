@@ -8,6 +8,8 @@ pub(super) async fn exec(context: Context) -> anyhow::Result<()> {
             let context = context.clone();
             let evaluator_loader = evaluator_loader.clone();
             async move {
+                // --- Open consumer stream ---
+                // The stream is reopened below if RabbitMQ closes it cleanly.
                 let mq = context.mq().await?;
                 let mut consumer = mq
                     .consume_worker_stream("vigilo-worker", WORKER_STREAM_PREFETCH)
@@ -15,9 +17,14 @@ pub(super) async fn exec(context: Context) -> anyhow::Result<()> {
 
                 loop {
                     tokio::select! {
+                        // --- Handle cooperative shutdown ---
+                        // Shutdown wins over waiting for more deliveries.
                         _ = shutdown.cancelled() => return Ok(()),
                         delivery = consumer.next() => {
                             let Some(delivery_result) = delivery else {
+                                // --- Reopen closed stream ---
+                                // Recover from a closed delivery stream without
+                                // exiting the worker service.
                                 warn!("worker consumer stream closed; reopening consumer");
                                 consumer = mq
                                     .consume_worker_stream("vigilo-worker", WORKER_STREAM_PREFETCH)
@@ -27,6 +34,10 @@ pub(super) async fn exec(context: Context) -> anyhow::Result<()> {
 
                             let delivery = delivery_result
                                 .map_err(|err| anyhow::anyhow!("worker consumer delivery failed: {}", err))?;
+
+                            // --- Normalize AMQP delivery ---
+                            // Convert stream deliveries into the same message
+                            // type used by one-shot worker mode.
                             let raw_message = crate::mq::RawConsumedMessage {
                                 delivery_tag: delivery.delivery_tag,
                                 body: delivery.data.clone(),
@@ -35,6 +46,10 @@ pub(super) async fn exec(context: Context) -> anyhow::Result<()> {
                                 routing_key: delivery.routing_key.to_string(),
                                 redelivered: delivery.redelivered,
                             };
+
+                            // --- Validate outer JSON body ---
+                            // Reject malformed messages before handing them to
+                            // the chunk workflow.
                             let payload = match serde_json::from_slice::<serde_json::Value>(&raw_message.body) {
                                 Ok(payload) => payload,
                                 Err(err) => {
@@ -53,6 +68,8 @@ pub(super) async fn exec(context: Context) -> anyhow::Result<()> {
                                 raw: raw_message,
                                 payload,
                             };
+
+                            // --- Run shared chunk workflow ---
                             run_worker_message(context.clone(), &evaluator_loader, message).await?;
                         }
                     }

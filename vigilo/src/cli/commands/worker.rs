@@ -315,6 +315,8 @@ async fn run_worker_cycle(
     context: Context,
     evaluator_loader: &EvaluatorLoaderService,
 ) -> anyhow::Result<WorkerCycleOutcome> {
+    // --- Fetch worker message ---
+    // `Empty` is a normal one-shot outcome, not an error.
     debug!("starting worker cycle pre-flight");
 
     debug!("acquiring messaging context");
@@ -327,6 +329,10 @@ async fn run_worker_cycle(
         debug!("no worker messages available");
         return Ok(WorkerCycleOutcome::Empty);
     };
+
+    // --- Validate outer JSON body ---
+    // Invalid JSON is not retryable worker work, so it is quarantined and the
+    // cycle is considered processed.
     let message = match serde_json::from_slice::<serde_json::Value>(&raw_message.body) {
         Ok(payload) => crate::mq::ConsumedMessage {
             raw: raw_message,
@@ -355,6 +361,10 @@ async fn settle_retryable_chunk_failure(
     reason: &str,
     error_class: &str,
 ) -> anyhow::Result<RetrySettlement> {
+    // This settlement path is for real worker failures: warmup, DB load,
+    // processing, or terminal-transition errors. These consume the bounded
+    // RabbitMQ retry budget and eventually fail the chunk if the worker still
+    // owns the lease.
     if mq.can_retry_worker_message(&message.raw) {
         let released = chunk_processing::release_chunk_as_pending(db, chunk).await?;
         if released > 0 {
@@ -390,6 +400,9 @@ async fn settle_chunk_waiting_for_execution_retry(
     reason: &str,
     next_retry_after: Option<chrono::DateTime<chrono::Utc>>,
 ) -> anyhow::Result<RetrySettlement> {
+    // This settlement path is for planned execution retry waits. It releases
+    // the chunk and delays redelivery without incrementing the worker-failure
+    // retry count; the database retry_after field remains the source of truth.
     let released = chunk_processing::release_chunk_as_pending(db, chunk).await?;
     if released == 0 {
         mq.ack(message.delivery_tag()).await?;
@@ -415,6 +428,9 @@ async fn run_worker_message(
     evaluator_loader: &EvaluatorLoaderService,
     message: crate::mq::ConsumedMessage,
 ) -> anyhow::Result<WorkerCycleOutcome> {
+    // --- Acquire shared services ---
+    // All subsequent settlement paths use these handles to keep ack/retry
+    // behavior centralized.
     let db = context.db().await?;
     let mq = context.mq().await?;
 
@@ -423,6 +439,9 @@ async fn run_worker_message(
         "consumed worker message"
     );
 
+    // --- Validate chunk-ready payload ---
+    // Schema errors cannot map to a run chunk safely, so they go to quarantine
+    // instead of retry.
     let payload = match serde_json::from_value::<ChunkReadyMessage>(message.payload.clone()) {
         Ok(payload) => payload,
         Err(err) => {
@@ -447,6 +466,9 @@ async fn run_worker_message(
         "parsed chunk-ready message payload"
     );
 
+    // --- Claim chunk ownership ---
+    // Duplicate, stale, cancelled, completed, or not-yet-running chunks are
+    // acknowledged because the database refused ownership.
     let Some(mut chunk) = chunk_processing::claim_chunk_for_processing(
         db,
         payload.run_id,
@@ -476,6 +498,9 @@ async fn run_worker_message(
         "claimed chunk for processing"
     );
 
+    // --- Load run context and extend lease ---
+    // The extended lease timestamp becomes the authority token for every later
+    // chunk settlement.
     let run_context = evaluator_loader
         .get_or_build_run_context(chunk.run_id)
         .await?;
@@ -503,6 +528,9 @@ async fn run_worker_message(
         "extended chunk lease for processing budget"
     );
 
+    // --- Warm evaluator components ---
+    // Warmup failures are treated as recoverable worker failures because no
+    // case state has been advanced yet.
     match evaluator_loader
         .warm_refs(&run_context.evaluator_refs)
         .await
@@ -537,12 +565,18 @@ async fn run_worker_message(
         }
     }
 
+    // --- Load chunk case batch ---
+    // Loading failure is retryable as long as this worker still owns the chunk
+    // lease.
     let batch_result = chunk_processing::load_chunk_case_batch(db, &chunk).await;
     match batch_result {
         Ok(cases) => {
             let mut succeeded = 0usize;
             let mut failed = 0usize;
 
+            // --- Process due case executions ---
+            // The execution workflow skips cases that are terminal or waiting
+            // for retry_after.
             let processed = match execution_processing::process_case_batch_execution(
                 &context,
                 db,
@@ -575,6 +609,7 @@ async fn run_worker_message(
                 }
             };
 
+            // --- Build terminal transition batch ---
             let mut terminal_transitions = Vec::with_capacity(processed.len());
             for processed in processed {
                 let completed = processed.terminal_transition.completed;
@@ -602,6 +637,9 @@ async fn run_worker_message(
                 }
             }
 
+            // --- Apply guarded terminal transitions ---
+            // Failures here are retryable worker failures because evidence may
+            // have been written, but execution state was not advanced safely.
             if let Err(err) = execution_processing::finalize_execution_terminal_transitions(
                 db,
                 chunk.run_id,
@@ -629,6 +667,9 @@ async fn run_worker_message(
                 return Ok(WorkerCycleOutcome::Processed);
             }
 
+            // --- Check for pending execution retries ---
+            // Open retry work releases the chunk and delays the message until
+            // the next retry window.
             let chunk_state =
                 execution_processing::summarize_chunk_execution_state(db, chunk.run_id, &cases)
                     .await?;
@@ -660,6 +701,9 @@ async fn run_worker_message(
                 return Ok(WorkerCycleOutcome::Processed);
             }
 
+            // --- Complete chunk and acknowledge message ---
+            // All executions in the chunk are terminal, so complete the chunk
+            // under the same lease token.
             let completed = chunk_processing::mark_chunk_completed(db, &chunk).await?;
             if completed == 0 {
                 mq.ack(message.delivery_tag()).await?;

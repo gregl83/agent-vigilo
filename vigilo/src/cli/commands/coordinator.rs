@@ -177,6 +177,9 @@ async fn run_coordinator_cycle(
     coordinator_id: Uuid,
     config: &CoordinatorRuntimeConfig,
 ) -> anyhow::Result<()> {
+    // --- Acquire cycle services ---
+    // The database handle is used for recovery/dispatch/finalization/outbox
+    // claim work; the queue handle is only needed for the final publish pass.
     debug!(coordinator_id = %coordinator_id, "starting coordinator cycle pre-flight");
 
     debug!(coordinator_id = %coordinator_id, "acquiring database context");
@@ -187,10 +190,21 @@ async fn run_coordinator_cycle(
     let mq = context.mq().await?;
     debug!(coordinator_id = %coordinator_id, "messaging context ready");
 
+    // --- Recover expired chunk leases ---
+    // Recovery runs before new dispatch so dead workers do not block
+    // finalization or leave ready work stranded.
     let recovery_stats = recover_expired_chunk_leases(db, coordinator_id, config).await?;
+
+    // --- Dispatch runnable chunk windows ---
+    // Dispatch is drained before finalization so newly-created work gets
+    // surfaced promptly.
     let dispatch_count = drain_dispatch_batch(db, coordinator_id, config).await?;
+
+    // --- Finalize terminal runs ---
     let finalized_count = drain_finalize_batch(db, coordinator_id, config).await?;
 
+    // --- Publish durable outbox events ---
+    // Failed broker publishes stay in the outbox delivery queue for retry.
     debug!(coordinator_id = %coordinator_id, "starting outbox publish pass");
     let publisher = MqEventPublisher::new(mq);
     let outbox_config = OutboxPublisherConfig {
@@ -222,6 +236,9 @@ async fn recover_expired_chunk_leases(
     coordinator_id: Uuid,
     config: &CoordinatorRuntimeConfig,
 ) -> anyhow::Result<run_dispatch::ChunkLeaseRecoveryStats> {
+    // --- Expired lease recovery pass ---
+    // The workflow returns both recovered chunks and chunks failed after
+    // exhausting recovery attempts.
     debug!(coordinator_id = %coordinator_id, "recovering expired chunk leases");
 
     let stats = run_dispatch::recover_expired_chunk_leases(
@@ -253,6 +270,9 @@ async fn drain_dispatch_batch(
     coordinator_id: Uuid,
     config: &CoordinatorRuntimeConfig,
 ) -> anyhow::Result<usize> {
+    // --- Dispatch drain pass ---
+    // Repeatedly claim one dispatchable run/window until the cycle limit is
+    // reached or no pending dispatch work remains.
     debug!(coordinator_id = %coordinator_id, "draining dispatchable run windows");
 
     let mut dispatched = 0usize;
@@ -298,6 +318,9 @@ async fn drain_finalize_batch(
     coordinator_id: Uuid,
     config: &CoordinatorRuntimeConfig,
 ) -> anyhow::Result<usize> {
+    // --- Finalization drain pass ---
+    // Repeatedly claim one finalizable run until the cycle limit is reached or
+    // no run has all chunks terminal.
     debug!(coordinator_id = %coordinator_id, "draining finalizable runs");
 
     let mut finalized = 0usize;
