@@ -15,7 +15,7 @@ keywords:
 
 Command flows for consuming run chunks, executing evaluator work, and persisting case results.
 
-These flows cover the worker process that claims ready chunks, executes case attempts with bounded chunk-local parallelism, runs Wasm evaluators behind sandbox and semaphore limits, writes case results, and releases or completes work according to persisted state guards. The worker owns execution progress, while run-level orchestration remains with the coordinator.
+These flows cover the worker process that claims ready chunks, allocates only due case attempts, executes cases with bounded chunk-local parallelism, runs Wasm evaluators behind sandbox and semaphore limits, writes case results, and releases, delays, or completes work according to persisted state guards. The worker owns execution progress and retry scheduling, while run-level orchestration remains with the coordinator.
 
 Each command page includes:
 

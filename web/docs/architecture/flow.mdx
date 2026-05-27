@@ -146,13 +146,18 @@ If an execution fails but is retryable:
 
 ```text
 execution.status = retry_scheduled
+execution.retry_after = now() + bounded exponential backoff
 ```
 
-A new attempt is created:
+The worker finishes the current chunk pass, summarizes the chunk's execution state from the database, and releases the chunk back to `pending` when any cases are still waiting for retry. The chunk-ready message is delayed until the next retry window instead of being treated as a worker failure.
+
+When the message returns, the worker reloads the chunk cases and the execution allocation query decides which cases should run:
 
 ```text
 attempt.status = pending → running
 ```
+
+Cases whose `retry_after` is still in the future are skipped for that pass and keep the chunk open. Cases whose retry window is due receive the next authoritative attempt.
 
 Older attempts may become:
 
@@ -165,15 +170,19 @@ This occurs when:
 - a worker loses its lease
 - a newer attempt supersedes it
 
+Retries are bounded by `defaults.max_attempts`. When the current attempt number has reached that limit, the worker closes the execution as failed instead of scheduling another attempt. Planned retry waits do not consume the worker-message failure retry budget; actual worker processing failures still use bounded RabbitMQ retry buckets and are quarantined or fail the chunk after exhaustion.
+
 ### 7. Run Finalization
 
 Before finalization, the coordinator recovers expired chunk leases for running runs. Recoverable chunks are reset to `pending` and receive a recovery-scoped `run.chunk.ready` event. Chunks that exceed the recovery limit are marked `failed`.
 
 The coordinator checks:
 
-> Are there any non-terminal executions remaining?
+> Are all chunks terminal?
 
-If no:
+`pending` or `leased` chunks keep a run out of finalization, including chunks waiting on execution retry windows. Once chunks are terminal, finalization rolls up terminal executions and treats missing execution coverage or failed chunks as a failed gate.
+
+If all chunks are terminal:
 
 ```text
 run.status = finalizing

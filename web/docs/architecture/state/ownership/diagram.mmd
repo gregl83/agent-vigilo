@@ -23,7 +23,7 @@ flowchart TD
     Publish[Publish outbox events]
 
     ChunkClaim[Claim and release chunks]
-    Execute[Allocate attempts and persist results]
+    Execute[Allocate attempts, schedule retries, and persist results]
     CompleteChunk[Complete chunks]
 
     GuardRun[Run status and lifecycle lease]

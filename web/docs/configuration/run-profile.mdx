@@ -67,7 +67,7 @@ defaults:
   min_execution_score: 0.85
 ```
 
-- `max_attempts` (u32)
+- `max_attempts` (u32): hard limit for case execution attempts. Failed attempts below this limit are retried with bounded backoff; once the limit is reached, the execution is failed.
 - `request_timeout_secs` (u32)
 - `fail_on_any_blocking_failure` (bool)
 - `min_execution_score` (f64)

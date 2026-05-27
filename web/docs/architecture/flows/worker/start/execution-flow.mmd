@@ -44,9 +44,16 @@ sequenceDiagram
                     Vigilo->>WASM: Execute evaluators in sandboxed stores
                 end
                 WASM-->>Vigilo: Evaluation outputs
-                Vigilo->>DB: Persist batched execution results and complete chunk
-                DB-->>Vigilo: Processing outcome
-                Vigilo->>Queue: Acknowledge message
+                Vigilo->>DB: Persist batched execution results and terminal transitions
+                Vigilo->>DB: Summarize chunk execution state
+                DB-->>Vigilo: Terminal or retry-waiting chunk state
+                alt Executions still waiting for retry
+                    Vigilo->>DB: Release chunk lease
+                    Vigilo->>Queue: Delay message until retry window
+                else All executions terminal
+                    Vigilo->>DB: Complete chunk
+                    Vigilo->>Queue: Acknowledge message
+                end
             else Invalid payload or unclaimable chunk
                 Vigilo->>Queue: Acknowledge duplicate or invalid message
             else Recoverable processing failure

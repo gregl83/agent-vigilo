@@ -28,6 +28,9 @@ CREATE TABLE executions (
     current_attempt_id UUID,
 
     last_error_message TEXT,
+    retry_after TIMESTAMPTZ,
+    retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+    last_attempt_completed_at TIMESTAMPTZ,
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     started_at TIMESTAMPTZ,
@@ -56,6 +59,10 @@ CREATE INDEX idx_executions_run_status ON executions(run_id, status);
 CREATE INDEX idx_executions_run_current_attempt_id ON executions(run_id, current_attempt_id);
 
 CREATE INDEX idx_executions_run_case_hash ON executions(run_id, case_hash);
+
+CREATE INDEX idx_executions_run_retry
+    ON executions(run_id, retry_after)
+    WHERE status = 'retry_scheduled';
 
 COMMENT ON TABLE executions IS
     'Represents a single evaluation of a dataset case against the target system. Each execution is part of a run, may have multiple attempts due to retries or failures, and is hash partitioned by run_id.';
@@ -113,6 +120,15 @@ COMMENT ON COLUMN executions.current_attempt_id IS
 
 COMMENT ON COLUMN executions.last_error_message IS
     'Most recent error encountered during execution processing. Useful for debugging failures and retry behavior.';
+
+COMMENT ON COLUMN executions.retry_after IS
+    'Earliest timestamp when a retry-scheduled execution may receive another attempt.';
+
+COMMENT ON COLUMN executions.retry_count IS
+    'Number of retry transitions scheduled for this execution after failed attempts.';
+
+COMMENT ON COLUMN executions.last_attempt_completed_at IS
+    'Timestamp when the latest authoritative attempt completed, whether terminal or retry-scheduled.';
 
 COMMENT ON COLUMN executions.created_at IS
     'Timestamp when the execution was created.';

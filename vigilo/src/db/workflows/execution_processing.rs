@@ -13,6 +13,10 @@ use std::{
     time::Instant,
 };
 
+use chrono::{
+    DateTime,
+    Utc,
+};
 use futures_util::{
     StreamExt,
     stream::FuturesUnordered,
@@ -80,6 +84,8 @@ pub(crate) type RunEvaluatorCatalog = BTreeMap<String, RunEvaluatorCatalogEntry>
 
 const CASE_EXECUTION_PARALLELISM: usize = 8;
 const EVALUATOR_EXECUTION_PARALLELISM: usize = 8;
+const EXECUTION_RETRY_BASE_SECONDS: i32 = 5;
+const EXECUTION_RETRY_MAX_SECONDS: i32 = 600;
 
 /// Terminal state transition to apply after evaluator processing finishes.
 ///
@@ -107,10 +113,19 @@ pub(crate) struct ProcessedExecution {
 struct AttemptAllocation {
     case_id: Uuid,
     execution_id: Uuid,
-    attempt_id: Uuid,
+    attempt_id: Option<Uuid>,
     attempt_no: i32,
+    should_process: bool,
+    already_terminal: bool,
+    retry_not_due: bool,
     max_attempts_exhausted: bool,
-    already_completed: bool,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub(crate) struct ChunkExecutionState {
+    pub(crate) open_execution_count: i64,
+    pub(crate) retry_scheduled_count: i64,
+    pub(crate) next_retry_after: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug)]
@@ -129,7 +144,7 @@ struct CompletedExecutionPersistence {
 
 #[derive(Debug)]
 struct CaseExecutionOutcome {
-    processed: ProcessedExecution,
+    processed: Option<ProcessedExecution>,
     persistence: Option<CompletedExecutionPersistence>,
 }
 
@@ -554,7 +569,8 @@ async fn allocate_execution_attempts_for_cases(
                 upserted.run_id,
                 executions.status,
                 executions.current_attempt_id,
-                executions.current_attempt_no
+                executions.current_attempt_no,
+                executions.retry_after
             FROM upserted
             JOIN executions
               ON executions.run_id = upserted.run_id
@@ -562,21 +578,58 @@ async fn allocate_execution_attempts_for_cases(
             JOIN input
               ON input.case_id = upserted.case_id
         ),
-        reusable_terminal AS (
+        terminal_or_closed AS (
             SELECT
                 attempt_state.case_id,
                 attempt_state.execution_id,
                 attempt_state.current_attempt_id AS attempt_id,
                 attempt_state.current_attempt_no AS attempt_no,
-                (attempt_state.status <> 'completed'::execution_status) AS max_attempts_exhausted,
-                (attempt_state.status = 'completed'::execution_status) AS already_completed,
+                true AS already_terminal,
+                false AS retry_not_due,
+                false AS max_attempts_exhausted,
                 attempt_state.input_ordinal
             FROM attempt_state, attempt_policy
-            WHERE attempt_state.current_attempt_id IS NOT NULL
-              AND (
-                  attempt_state.status = 'completed'::execution_status
-                  OR attempt_state.current_attempt_no >= attempt_policy.max_attempts
-              )
+            WHERE attempt_state.status IN (
+                    'completed'::execution_status,
+                    'failed'::execution_status,
+                    'timed_out'::execution_status,
+                    'cancelled'::execution_status
+                )
+        ),
+        retry_waiting AS (
+            SELECT
+                attempt_state.case_id,
+                attempt_state.execution_id,
+                attempt_state.current_attempt_id AS attempt_id,
+                attempt_state.current_attempt_no AS attempt_no,
+                false AS already_terminal,
+                true AS retry_not_due,
+                false AS max_attempts_exhausted,
+                attempt_state.input_ordinal
+            FROM attempt_state, attempt_policy
+            WHERE attempt_state.status = 'retry_scheduled'::execution_status
+              AND attempt_state.current_attempt_no < attempt_policy.max_attempts
+              AND attempt_state.retry_after > now()
+        ),
+        exhausted_open AS (
+            SELECT
+                attempt_state.case_id,
+                attempt_state.execution_id,
+                attempt_state.current_attempt_id AS attempt_id,
+                attempt_state.current_attempt_no AS attempt_no,
+                false AS already_terminal,
+                false AS retry_not_due,
+                true AS max_attempts_exhausted,
+                attempt_state.input_ordinal
+            FROM attempt_state, attempt_policy
+            WHERE attempt_state.status IN (
+                    'pending'::execution_status,
+                    'running'::execution_status,
+                    'awaiting_evaluators'::execution_status,
+                    'retry_scheduled'::execution_status
+                )
+              AND attempt_state.current_attempt_no >= attempt_policy.max_attempts
+              AND attempt_state.current_attempt_id IS NOT NULL
         ),
         retry_eligible AS (
             SELECT
@@ -585,8 +638,18 @@ async fn allocate_execution_attempts_for_cases(
                 attempt_state.execution_id AS id,
                 attempt_state.run_id
             FROM attempt_state, attempt_policy
-            WHERE attempt_state.status <> 'completed'::execution_status
+            WHERE attempt_state.status IN (
+                    'pending'::execution_status,
+                    'running'::execution_status,
+                    'awaiting_evaluators'::execution_status,
+                    'retry_scheduled'::execution_status
+                )
               AND attempt_state.current_attempt_no < attempt_policy.max_attempts
+              AND (
+                    attempt_state.status <> 'retry_scheduled'::execution_status
+                    OR attempt_state.retry_after IS NULL
+                    OR attempt_state.retry_after <= now()
+              )
         ),
         superseded_attempts AS (
             UPDATE execution_attempts
@@ -608,6 +671,7 @@ async fn allocate_execution_attempts_for_cases(
             SET status = 'running'::execution_status,
                 current_attempt_no = executions.current_attempt_no + 1,
                 last_error_message = NULL,
+                retry_after = NULL,
                 started_at = COALESCE(executions.started_at, now()),
                 completed_at = NULL,
                 updated_at = now()
@@ -654,8 +718,10 @@ async fn allocate_execution_attempts_for_cases(
                 inserted_attempt.execution_id,
                 inserted_attempt.attempt_id,
                 inserted_attempt.attempt_no,
+                true AS should_process,
+                false AS already_terminal,
+                false AS retry_not_due,
                 false AS max_attempts_exhausted,
-                false AS already_completed,
                 retry_eligible.input_ordinal
             FROM inserted_attempt
             JOIN retry_eligible
@@ -664,22 +730,50 @@ async fn allocate_execution_attempts_for_cases(
               ON updated_execution.id = inserted_attempt.execution_id
             UNION ALL
             SELECT
-                reusable_terminal.case_id,
-                reusable_terminal.execution_id,
-                reusable_terminal.attempt_id,
-                reusable_terminal.attempt_no,
-                reusable_terminal.max_attempts_exhausted,
-                reusable_terminal.already_completed,
-                reusable_terminal.input_ordinal
-            FROM reusable_terminal
+                terminal_or_closed.case_id,
+                terminal_or_closed.execution_id,
+                terminal_or_closed.attempt_id,
+                terminal_or_closed.attempt_no,
+                false AS should_process,
+                terminal_or_closed.already_terminal,
+                terminal_or_closed.retry_not_due,
+                terminal_or_closed.max_attempts_exhausted,
+                terminal_or_closed.input_ordinal
+            FROM terminal_or_closed
+            UNION ALL
+            SELECT
+                retry_waiting.case_id,
+                retry_waiting.execution_id,
+                retry_waiting.attempt_id,
+                retry_waiting.attempt_no,
+                false AS should_process,
+                retry_waiting.already_terminal,
+                retry_waiting.retry_not_due,
+                retry_waiting.max_attempts_exhausted,
+                retry_waiting.input_ordinal
+            FROM retry_waiting
+            UNION ALL
+            SELECT
+                exhausted_open.case_id,
+                exhausted_open.execution_id,
+                exhausted_open.attempt_id,
+                exhausted_open.attempt_no,
+                false AS should_process,
+                exhausted_open.already_terminal,
+                exhausted_open.retry_not_due,
+                exhausted_open.max_attempts_exhausted,
+                exhausted_open.input_ordinal
+            FROM exhausted_open
         )
         SELECT
             allocated.case_id,
             allocated.execution_id,
             allocated.attempt_id,
             allocated.attempt_no,
-            allocated.max_attempts_exhausted,
-            allocated.already_completed
+            allocated.should_process,
+            allocated.already_terminal,
+            allocated.retry_not_due,
+            allocated.max_attempts_exhausted
         FROM allocated
         ORDER BY allocated.input_ordinal
         "#,
@@ -710,6 +804,7 @@ async fn allocate_execution_attempts_for_cases(
 pub(crate) async fn finalize_execution_terminal_transitions(
     db: &PgPool,
     run_id: Uuid,
+    max_attempts: i32,
     transitions: &[ExecutionTerminalTransition],
 ) -> anyhow::Result<()> {
     if transitions.is_empty() {
@@ -852,7 +947,11 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                 terminal_input.attempt_no,
                 terminal_input.completed,
                 terminal_input.error_message,
-                terminal_input.overall_status
+                terminal_input.overall_status,
+                (
+                    NOT terminal_input.completed
+                    AND terminal_input.attempt_no < $7::int
+                ) AS retry_scheduled
         ),
         failed_aggregate_upsert AS (
             INSERT INTO execution_aggregates (
@@ -888,6 +987,7 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                 now()
             FROM attempt_update
             WHERE NOT attempt_update.completed
+              AND NOT attempt_update.retry_scheduled
             ON CONFLICT (run_id, execution_id) DO UPDATE
             SET attempt_id = EXCLUDED.attempt_id,
                 overall_status = EXCLUDED.overall_status,
@@ -903,6 +1003,7 @@ pub(crate) async fn finalize_execution_terminal_transitions(
             UPDATE executions
             SET status = CASE
                     WHEN attempt_update.completed THEN 'completed'::execution_status
+                    WHEN attempt_update.retry_scheduled THEN 'retry_scheduled'::execution_status
                     ELSE 'failed'::execution_status
                 END,
                 current_attempt_no = attempt_update.attempt_no,
@@ -911,7 +1012,25 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                     WHEN attempt_update.completed THEN NULL
                     ELSE attempt_update.error_message
                 END,
-                completed_at = now(),
+                retry_after = CASE
+                    WHEN attempt_update.retry_scheduled THEN
+                        now() + (
+                            LEAST(
+                                $8::int * POWER(3::numeric, GREATEST(attempt_update.attempt_no - 1, 0)),
+                                $9::int::numeric
+                            )::int * interval '1 second'
+                        )
+                    ELSE NULL
+                END,
+                retry_count = CASE
+                    WHEN attempt_update.retry_scheduled THEN executions.retry_count + 1
+                    ELSE executions.retry_count
+                END,
+                last_attempt_completed_at = now(),
+                completed_at = CASE
+                    WHEN attempt_update.retry_scheduled THEN NULL
+                    ELSE now()
+                END,
                 updated_at = now()
             FROM attempt_update
             LEFT JOIN failed_aggregate_upsert
@@ -936,6 +1055,9 @@ pub(crate) async fn finalize_execution_terminal_transitions(
     .bind(completed_flags)
     .bind(error_messages)
     .bind(run_id)
+    .bind(max_attempts)
+    .bind(EXECUTION_RETRY_BASE_SECONDS)
+    .bind(EXECUTION_RETRY_MAX_SECONDS)
     .fetch_one(db)
     .await?;
 
@@ -949,6 +1071,51 @@ pub(crate) async fn finalize_execution_terminal_transitions(
     }
 
     Ok(())
+}
+
+/// Summarizes whether a chunk's executions are terminal or still waiting for retry.
+pub(crate) async fn summarize_chunk_execution_state(
+    db: &PgPool,
+    run_id: Uuid,
+    cases: &[chunk_processing::WorkerCaseBatchItem],
+) -> anyhow::Result<ChunkExecutionState> {
+    if cases.is_empty() {
+        return Ok(ChunkExecutionState {
+            open_execution_count: 0,
+            retry_scheduled_count: 0,
+            next_retry_after: None,
+        });
+    }
+
+    let case_ids = cases.iter().map(|case| case.case_id).collect::<Vec<_>>();
+    let state = sqlx::query_as::<_, ChunkExecutionState>(
+        r#"
+        SELECT
+            COUNT(*) FILTER (
+                WHERE status IN (
+                    'pending'::execution_status,
+                    'running'::execution_status,
+                    'awaiting_evaluators'::execution_status,
+                    'retry_scheduled'::execution_status
+                )
+            )::bigint AS open_execution_count,
+            COUNT(*) FILTER (
+                WHERE status = 'retry_scheduled'::execution_status
+            )::bigint AS retry_scheduled_count,
+            MIN(retry_after) FILTER (
+                WHERE status = 'retry_scheduled'::execution_status
+            ) AS next_retry_after
+        FROM executions
+        WHERE run_id = $1::uuid
+          AND case_id = ANY($2::uuid[])
+        "#,
+    )
+    .bind(run_id)
+    .bind(&case_ids)
+    .fetch_one(db)
+    .await?;
+
+    Ok(state)
 }
 
 fn summarize_overall_status(records: &[EvaluatorExecutionRecord]) -> String {
@@ -1000,7 +1167,21 @@ async fn evaluate_case_execution(
 ) -> CaseExecutionOutcome {
     let runtime_started = Instant::now();
     let execution_id = allocation.execution_id;
-    let attempt_id = allocation.attempt_id;
+    let Some(attempt_id) = allocation.attempt_id else {
+        let failure_message = format!(
+            "case '{}' was selected for processing without an allocated attempt",
+            case.case_id
+        );
+        return CaseExecutionOutcome {
+            processed: Some(processed_terminal_failure(
+                execution_id,
+                Uuid::nil(),
+                allocation.attempt_no,
+                failure_message,
+            )),
+            persistence: None,
+        };
+    };
     let attempt_no = allocation.attempt_no;
 
     let evaluation_result: anyhow::Result<(
@@ -1270,12 +1451,12 @@ async fn evaluate_case_execution(
                 Err(err) => {
                     let failure_message = format!("case execution result count overflow: {}", err);
                     return CaseExecutionOutcome {
-                        processed: processed_terminal_failure(
+                        processed: Some(processed_terminal_failure(
                             execution_id,
                             attempt_id,
                             attempt_no,
                             failure_message,
-                        ),
+                        )),
                         persistence: None,
                     };
                 }
@@ -1311,7 +1492,7 @@ async fn evaluate_case_execution(
             };
 
             CaseExecutionOutcome {
-                processed,
+                processed: Some(processed),
                 persistence: Some(CompletedExecutionPersistence {
                     execution_id,
                     attempt_id,
@@ -1334,12 +1515,12 @@ async fn evaluate_case_execution(
                 format!("case execution processing failed: {}", error_message)
             };
             CaseExecutionOutcome {
-                processed: processed_terminal_failure(
+                processed: Some(processed_terminal_failure(
                     execution_id,
                     attempt_id,
                     attempt_no,
                     failure_message,
-                ),
+                )),
                 persistence: None,
             }
         }
@@ -1549,37 +1730,31 @@ pub(crate) async fn process_case_batch_execution(
                     );
                 }
 
-                let outcome = if allocation.max_attempts_exhausted {
-                    let failure_message = format!(
-                        "execution exhausted max_attempts={} before case could be retried",
-                        run_profile.defaults.max_attempts
-                    );
+                let outcome = if allocation.retry_not_due || allocation.already_terminal {
                     CaseExecutionOutcome {
-                        processed: processed_terminal_failure(
+                        processed: None,
+                        persistence: None,
+                    }
+                } else if allocation.max_attempts_exhausted {
+                    let attempt_id = allocation.attempt_id.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "case '{}' exhausted attempts without a current attempt id",
+                            case.case_id
+                        )
+                    })?;
+                    CaseExecutionOutcome {
+                        processed: Some(processed_terminal_failure(
                             allocation.execution_id,
-                            allocation.attempt_id,
+                            attempt_id,
                             allocation.attempt_no,
-                            failure_message,
-                        ),
+                            format!(
+                                "execution retry budget exhausted after {} attempts",
+                                allocation.attempt_no
+                            ),
+                        )),
                         persistence: None,
                     }
-                } else if allocation.already_completed {
-                    CaseExecutionOutcome {
-                        processed: ProcessedExecution {
-                            execution_id: allocation.execution_id,
-                            attempt_id: allocation.attempt_id,
-                            result_count: 0,
-                            terminal_transition: ExecutionTerminalTransition {
-                                execution_id: allocation.execution_id,
-                                attempt_id: allocation.attempt_id,
-                                attempt_no: allocation.attempt_no,
-                                completed: true,
-                                error_message: None,
-                            },
-                        },
-                        persistence: None,
-                    }
-                } else {
+                } else if allocation.should_process {
                     evaluate_case_execution(
                         context,
                         run_id,
@@ -1590,6 +1765,11 @@ pub(crate) async fn process_case_batch_execution(
                         allocation,
                     )
                     .await
+                } else {
+                    CaseExecutionOutcome {
+                        processed: None,
+                        persistence: None,
+                    }
                 };
 
                 Ok::<_, anyhow::Error>((index, outcome))
@@ -1610,7 +1790,9 @@ pub(crate) async fn process_case_batch_execution(
         if let Some(persistence) = outcome.persistence {
             completed.push(persistence);
         }
-        processed.push(outcome.processed);
+        if let Some(outcome) = outcome.processed {
+            processed.push(outcome);
+        }
     }
 
     let persistence_started = Instant::now();

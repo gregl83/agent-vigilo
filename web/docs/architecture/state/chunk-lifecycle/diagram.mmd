@@ -38,6 +38,7 @@ flowchart TD
     CompleteGuard -- Yes --> Completed
     CompleteGuard -- No --> Noop
 
+    Process -- Execution retry wait --> ReleaseGuard
     Process -- Recoverable failure --> ReleaseGuard
     ReleaseGuard -- Yes --> Requeued --> Pending
     ReleaseGuard -- No --> Noop

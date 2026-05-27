@@ -19,6 +19,8 @@ flowchart TD
     Permit[Acquire Wasm evaluation permits]
     Execute[Execute case evaluations in sandboxed stores]
     Persist[Persist terminal transitions]
+    CheckRetry{Open retry work?}
+    Delay[Release chunk and delay message until retry window]
     Complete[Mark chunk completed]
     Ack[Acknowledge message]
     Release[Release chunk lease]
@@ -58,8 +60,11 @@ flowchart TD
     Execute --> Persist
     Execute -. Processing fails .-> Release
 
-    Persist --> Complete
+    Persist --> CheckRetry
     Persist -. Persistence fails .-> Release
+
+    CheckRetry -- Yes --> Delay
+    CheckRetry -- No --> Complete
 
     Complete --> Ack
     Complete -. Completion fails .-> ServiceFail
@@ -76,8 +81,11 @@ flowchart TD
     Requeue --> Success
     Requeue -. Requeue fails .-> ServiceFail
 
+    Delay --> Success
+    Delay -. Delay publish fails .-> ServiceFail
+
     class Start command
     class Success success
-    class Loader,Consume,Payload,Claim,Context,Cases,Persist,Complete,Ack,Release,Released,Requeue system
+    class Loader,Consume,Payload,Claim,Context,Cases,Persist,CheckRetry,Delay,Complete,Ack,Release,Released,Requeue system
     class Warm,Permit,Execute component
     class ServiceFail error

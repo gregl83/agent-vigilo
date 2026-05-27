@@ -80,6 +80,12 @@ pub(crate) struct Execution {
     pub(crate) current_attempt_id: Option<Uuid>,
     /// Latest error recorded for this execution, if any.
     pub(crate) last_error_message: Option<String>,
+    /// Earliest timestamp when retry-scheduled work may run again.
+    pub(crate) retry_after: Option<DateTime<Utc>>,
+    /// Number of retry transitions scheduled after failed attempts.
+    pub(crate) retry_count: i32,
+    /// Completion time for the latest authoritative attempt.
+    pub(crate) last_attempt_completed_at: Option<DateTime<Utc>>,
     /// Time this execution row was inserted.
     pub(crate) created_at: DateTime<Utc>,
     /// Time execution processing first started.

@@ -201,3 +201,26 @@ pub(crate) async fn release_chunk_as_pending(db: &PgPool, chunk: &RunChunk) -> a
 
     Ok(result.rows_affected())
 }
+
+/// Marks a leased chunk failed if the caller still owns the lease.
+pub(crate) async fn mark_chunk_failed(db: &PgPool, chunk: &RunChunk) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        r#"
+		UPDATE run_chunks
+		SET status = 'failed',
+			leased_until = NULL,
+			updated_at = now()
+		WHERE run_id = $1::uuid
+		  AND id = $2::uuid
+		  AND status = 'leased'
+		  AND leased_until IS NOT DISTINCT FROM $3::timestamptz
+		"#,
+    )
+    .bind(chunk.run_id)
+    .bind(chunk.id)
+    .bind(chunk.leased_until)
+    .execute(db)
+    .await?;
+
+    Ok(result.rows_affected())
+}

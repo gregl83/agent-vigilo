@@ -61,6 +61,14 @@ enum WorkerCycleOutcome {
     Empty,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetrySettlement {
+    Retried,
+    Delayed,
+    AcknowledgedStale,
+    FailedExhausted,
+}
+
 #[derive(Debug)]
 struct WorkerRunContext {
     profile: RunProfile,
@@ -339,6 +347,69 @@ async fn run_worker_cycle(
     run_worker_message(context, evaluator_loader, message).await
 }
 
+async fn settle_retryable_chunk_failure(
+    db: &sqlx::PgPool,
+    mq: &crate::mq::Client,
+    message: &crate::mq::ConsumedMessage,
+    chunk: &crate::models::run_chunk::RunChunk,
+    reason: &str,
+    error_class: &str,
+) -> anyhow::Result<RetrySettlement> {
+    if mq.can_retry_worker_message(&message.raw) {
+        let released = chunk_processing::release_chunk_as_pending(db, chunk).await?;
+        if released > 0 {
+            mq.retry_worker_message(&message.raw, reason, error_class)
+                .await?;
+            Ok(RetrySettlement::Retried)
+        } else {
+            mq.ack(message.delivery_tag()).await?;
+            Ok(RetrySettlement::AcknowledgedStale)
+        }
+    } else {
+        let failed = chunk_processing::mark_chunk_failed(db, chunk).await?;
+        if failed > 0 {
+            mq.quarantine_worker_message(
+                &message.raw,
+                &format!("worker message retry budget exhausted: {}", reason),
+                error_class,
+            )
+            .await?;
+            Ok(RetrySettlement::FailedExhausted)
+        } else {
+            mq.ack(message.delivery_tag()).await?;
+            Ok(RetrySettlement::AcknowledgedStale)
+        }
+    }
+}
+
+async fn settle_chunk_waiting_for_execution_retry(
+    db: &sqlx::PgPool,
+    mq: &crate::mq::Client,
+    message: &crate::mq::ConsumedMessage,
+    chunk: &crate::models::run_chunk::RunChunk,
+    reason: &str,
+    next_retry_after: Option<chrono::DateTime<chrono::Utc>>,
+) -> anyhow::Result<RetrySettlement> {
+    let released = chunk_processing::release_chunk_as_pending(db, chunk).await?;
+    if released == 0 {
+        mq.ack(message.delivery_tag()).await?;
+        return Ok(RetrySettlement::AcknowledgedStale);
+    }
+
+    let delay_seconds = next_retry_after
+        .map(|retry_after| {
+            retry_after
+                .signed_duration_since(chrono::Utc::now())
+                .num_seconds()
+                .max(1)
+        })
+        .unwrap_or(1);
+    mq.delay_worker_message(&message.raw, delay_seconds, reason, "execution_retry")
+        .await?;
+
+    Ok(RetrySettlement::Delayed)
+}
+
 async fn run_worker_message(
     context: Context,
     evaluator_loader: &EvaluatorLoaderService,
@@ -446,18 +517,20 @@ async fn run_worker_message(
             );
         }
         Err(err) => {
-            let released = chunk_processing::release_chunk_as_pending(db, &chunk).await?;
-            if released > 0 {
-                mq.retry_worker_message(&message.raw, &err.to_string(), "evaluator_warmup")
-                    .await?;
-            } else {
-                mq.ack(message.delivery_tag()).await?;
-            }
+            let settlement = settle_retryable_chunk_failure(
+                db,
+                mq,
+                &message,
+                &chunk,
+                &err.to_string(),
+                "evaluator_warmup",
+            )
+            .await?;
             warn!(
                 run_id = %chunk.run_id,
                 chunk_id = %chunk.id,
                 error = %err,
-                chunk_released = released > 0,
+                ?settlement,
                 "failed evaluator warmup; handled claimed chunk lease"
             );
             return Ok(WorkerCycleOutcome::Processed);
@@ -482,18 +555,20 @@ async fn run_worker_message(
             {
                 Ok(processed) => processed,
                 Err(err) => {
-                    let released = chunk_processing::release_chunk_as_pending(db, &chunk).await?;
-                    if released > 0 {
-                        mq.retry_worker_message(&message.raw, &err.to_string(), "chunk_processing")
-                            .await?;
-                    } else {
-                        mq.ack(message.delivery_tag()).await?;
-                    }
+                    let settlement = settle_retryable_chunk_failure(
+                        db,
+                        mq,
+                        &message,
+                        &chunk,
+                        &err.to_string(),
+                        "chunk_processing",
+                    )
+                    .await?;
                     warn!(
                         run_id = %chunk.run_id,
                         chunk_id = %chunk.id,
                         error = %err,
-                        chunk_released = released > 0,
+                        ?settlement,
                         "failed chunk case processing; handled claimed chunk lease"
                     );
                     return Ok(WorkerCycleOutcome::Processed);
@@ -530,23 +605,57 @@ async fn run_worker_message(
             if let Err(err) = execution_processing::finalize_execution_terminal_transitions(
                 db,
                 chunk.run_id,
+                i32::try_from(run_context.profile.defaults.max_attempts)?,
                 &terminal_transitions,
             )
             .await
             {
-                let released = chunk_processing::release_chunk_as_pending(db, &chunk).await?;
-                if released > 0 {
-                    mq.retry_worker_message(&message.raw, &err.to_string(), "terminal_transition")
-                        .await?;
-                } else {
-                    mq.ack(message.delivery_tag()).await?;
-                }
+                let settlement = settle_retryable_chunk_failure(
+                    db,
+                    mq,
+                    &message,
+                    &chunk,
+                    &err.to_string(),
+                    "terminal_transition",
+                )
+                .await?;
                 warn!(
                     run_id = %chunk.run_id,
                     chunk_id = %chunk.id,
                     error = %err,
-                    chunk_released = released > 0,
+                    ?settlement,
                     "failed chunk-level execution terminal transitions; handled claimed chunk lease"
+                );
+                return Ok(WorkerCycleOutcome::Processed);
+            }
+
+            let chunk_state =
+                execution_processing::summarize_chunk_execution_state(db, chunk.run_id, &cases)
+                    .await?;
+            if chunk_state.open_execution_count > 0 {
+                let reason = format!(
+                    "chunk has {} open executions, including {} retry-scheduled executions; next_retry_after={:?}",
+                    chunk_state.open_execution_count,
+                    chunk_state.retry_scheduled_count,
+                    chunk_state.next_retry_after
+                );
+                let settlement = settle_chunk_waiting_for_execution_retry(
+                    db,
+                    mq,
+                    &message,
+                    &chunk,
+                    &reason,
+                    chunk_state.next_retry_after,
+                )
+                .await?;
+                info!(
+                    run_id = %chunk.run_id,
+                    chunk_id = %chunk.id,
+                    open_execution_count = chunk_state.open_execution_count,
+                    retry_scheduled_count = chunk_state.retry_scheduled_count,
+                    next_retry_after = ?chunk_state.next_retry_after,
+                    ?settlement,
+                    "chunk still has open execution retry work; handled claimed chunk lease"
                 );
                 return Ok(WorkerCycleOutcome::Processed);
             }
@@ -579,24 +688,26 @@ async fn run_worker_message(
             Ok(WorkerCycleOutcome::Processed)
         }
         Err(err) => {
-            let released = chunk_processing::release_chunk_as_pending(db, &chunk).await?;
-            if released > 0 {
-                mq.retry_worker_message(&message.raw, &err.to_string(), "case_batch_load")
-                    .await?;
-            } else {
-                mq.ack(message.delivery_tag()).await?;
-            }
+            let settlement = settle_retryable_chunk_failure(
+                db,
+                mq,
+                &message,
+                &chunk,
+                &err.to_string(),
+                "case_batch_load",
+            )
+            .await?;
             warn!(
                 run_id = %chunk.run_id,
                 chunk_id = %chunk.id,
                 error = %err,
-                chunk_released = released > 0,
+                ?settlement,
                 "failed to load chunk case batch; handled claimed chunk lease"
             );
             debug!(
                 delivery_tag = message.delivery_tag(),
                 chunk_id = %chunk.id,
-                chunk_released = released > 0,
+                ?settlement,
                 "chunk processing failed; handled claimed chunk lease"
             );
             Ok(WorkerCycleOutcome::Processed)

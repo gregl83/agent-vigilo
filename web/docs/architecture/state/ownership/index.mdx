@@ -24,7 +24,7 @@ Which process owns each state transition and which database guard prevents confl
 
 - CLI commands create, cancel, and read state.
 - Coordinators own expired chunk lease recovery, run dispatch, run finalization, and outbox publishing.
-- Workers own chunk leases and execution/attempt terminal transitions.
+- Workers own chunk leases, execution attempt allocation, retry scheduling, and execution/attempt terminal transitions.
 - DB guards are the authority boundary: shared run-state locks, leases, conflict keys, current-attempt checks, and outbox delivery claim tokens prevent stale writes.
 
 ## Related

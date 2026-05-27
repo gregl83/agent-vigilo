@@ -27,6 +27,7 @@ How `run_chunks.status` protects worker ownership and prevents stale workers fro
 - Coordinator recovery scans expired `leased` chunks for running runs, increments `recovery_count`, resets recoverable chunks to `pending`, and emits a recovery-scoped `run.chunk.ready` event.
 - Chunks that exceed the configured recovery limit are marked `failed` so run finalization can complete with a failed gate instead of waiting forever.
 - Workers can claim a chunk only when the owning run is `running`.
+- A chunk is completed only after all executions in its case range are terminal. If any execution is `retry_scheduled`, the worker releases the chunk and delays the chunk-ready message until the next `retry_after` window.
 - Completion and release both compare the stored lease timestamp to the worker's claimed lease.
 - Cancellation changes open chunks to `cancelled`.
 

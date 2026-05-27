@@ -558,6 +558,20 @@ impl Client {
             .unwrap_or("vigilo.worker.retry.30m")
     }
 
+    fn retry_queue_for_delay_seconds(delay_seconds: i64) -> &'static str {
+        let delay_ms = delay_seconds.max(1).saturating_mul(1_000);
+        WORKER_RETRY_BUCKETS
+            .iter()
+            .find(|(_, ttl_ms)| i64::from(*ttl_ms) >= delay_ms)
+            .or_else(|| WORKER_RETRY_BUCKETS.last())
+            .map(|(queue, _)| *queue)
+            .unwrap_or("vigilo.worker.retry.30m")
+    }
+
+    pub(crate) fn can_retry_worker_message(&self, message: &RawConsumedMessage) -> bool {
+        Self::retry_count(&message.properties) < WORKER_MAX_RETRIES
+    }
+
     fn message_headers(message: &RawConsumedMessage) -> FieldTable {
         message
             .properties
@@ -628,6 +642,28 @@ impl Client {
 
         let retry_queue = Self::retry_queue_for_attempt(next_retry_count);
         let properties = Self::retry_properties(message, next_retry_count, reason, error_class);
+        self.publish_bytes_with_properties(
+            &self.config.worker_retry_exchange,
+            retry_queue,
+            &message.body,
+            properties,
+        )
+        .await?;
+        self.ack(message.delivery_tag).await?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn delay_worker_message(
+        &self,
+        message: &RawConsumedMessage,
+        delay_seconds: i64,
+        reason: &str,
+        error_class: &str,
+    ) -> anyhow::Result<()> {
+        let retry_queue = Self::retry_queue_for_delay_seconds(delay_seconds);
+        let retry_count = Self::retry_count(&message.properties);
+        let properties = Self::retry_properties(message, retry_count, reason, error_class);
         self.publish_bytes_with_properties(
             &self.config.worker_retry_exchange,
             retry_queue,

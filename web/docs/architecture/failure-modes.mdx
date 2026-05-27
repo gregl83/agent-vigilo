@@ -30,6 +30,10 @@ RabbitMQ publishes use durable topology, persistent messages, mandatory routing,
 
 Worker persistence batches are guarded by current-attempt authority checks. If a stale worker loses authority, its final state changes are rejected rather than overwriting a newer attempt.
 
+## Execution retry waits
+
+Failed case attempts that still have retry budget are stored as `retry_scheduled` with a bounded `retry_after` timestamp. Workers do not keep spinning on those rows: they release the chunk, delay the chunk-ready message until the next retry window, and re-check the database before creating another attempt. `defaults.max_attempts` closes the execution retry loop; actual worker processing failures still use the bounded RabbitMQ failure retry budget and then quarantine or fail the chunk.
+
 ## Evaluator resource exhaustion
 
 Each Wasm evaluator invocation runs in a fresh Wasmtime store with memory, table, instance, fuel, timeout, and log-message limits. A worker-wide semaphore caps active evaluator invocations so aggregate Wasm memory and CPU exposure stay bounded. If an evaluator exceeds its budget, the worker records an evaluator runtime error and continues through the normal result persistence path.
