@@ -74,6 +74,54 @@ pub(crate) async fn claim_chunk_for_processing(
     Ok(chunk)
 }
 
+/// Extends a currently owned chunk lease and returns the updated lease token.
+///
+/// Lease ownership is represented by the `leased_until` value returned at
+/// claim/extension time. Completion and release must use the latest returned
+/// row, otherwise stale workers cannot overwrite the current owner.
+pub(crate) async fn extend_chunk_lease(
+    db: &PgPool,
+    chunk: &RunChunk,
+    lease_seconds: i32,
+) -> anyhow::Result<Option<RunChunk>> {
+    let chunk = sqlx::query_as::<_, RunChunk>(
+        r#"
+		UPDATE run_chunks
+		SET leased_until = now() + ($3::int * interval '1 second'),
+			updated_at = now()
+		WHERE run_id = $1::uuid
+		  AND id = $2::uuid
+		  AND status = 'leased'
+		  AND leased_until IS NOT DISTINCT FROM $4::timestamptz
+		  AND EXISTS (
+			SELECT 1
+			FROM runs
+			WHERE runs.id = run_chunks.run_id
+			  AND runs.status = 'running'::run_status
+		  )
+		RETURNING
+			id,
+			run_id,
+			dataset_version_id,
+			profile_group_id,
+			ordinal_start,
+			ordinal_end,
+			status,
+			leased_until,
+			created_at,
+			updated_at
+		"#,
+    )
+    .bind(chunk.run_id)
+    .bind(chunk.id)
+    .bind(lease_seconds)
+    .bind(chunk.leased_until)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(chunk)
+}
+
 /// Loads the dataset cases covered by a claimed chunk's ordinal range.
 pub(crate) async fn load_chunk_case_batch(
     db: &PgPool,

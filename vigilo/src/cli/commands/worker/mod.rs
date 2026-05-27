@@ -46,10 +46,14 @@ mod once;
 mod start;
 
 const CHUNK_LEASE_SECONDS: i32 = 60;
+const CHUNK_LEASE_SAFETY_SECONDS: i32 = 120;
+const CHUNK_LEASE_EVALUATOR_BUDGET_SECONDS_PER_CASE_BATCH: i32 = 30;
+const MAX_COMPUTED_CHUNK_LEASE_SECONDS: i32 = 86_400;
 const RUN_CONTEXT_CACHE_MAX_ENTRIES: u64 = 1024;
 const RUN_CONTEXT_CACHE_TTI_SECONDS: u64 = 900;
 const WARMUP_PARALLELISM: usize = 8;
 const WORKER_STREAM_PREFETCH: u16 = 64;
+const CASE_EXECUTION_PARALLELISM_FOR_LEASE_BUDGET: i32 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerCycleOutcome {
@@ -77,6 +81,24 @@ struct WarmupStats {
     requested: usize,
     cache_hits: usize,
     loaded: usize,
+}
+
+fn compute_chunk_processing_lease_seconds(
+    profile: &RunProfile,
+    chunk: &crate::models::run_chunk::RunChunk,
+) -> i32 {
+    let case_count = (chunk.ordinal_end - chunk.ordinal_start).max(1);
+    let case_batches = (case_count + CASE_EXECUTION_PARALLELISM_FOR_LEASE_BUDGET - 1)
+        / CASE_EXECUTION_PARALLELISM_FOR_LEASE_BUDGET;
+    let request_timeout = i32::try_from(profile.defaults.request_timeout_secs)
+        .unwrap_or(MAX_COMPUTED_CHUNK_LEASE_SECONDS);
+    let per_batch_budget =
+        request_timeout.saturating_add(CHUNK_LEASE_EVALUATOR_BUDGET_SECONDS_PER_CASE_BATCH);
+    let computed = case_batches
+        .saturating_mul(per_batch_budget)
+        .saturating_add(CHUNK_LEASE_SAFETY_SECONDS);
+
+    computed.clamp(CHUNK_LEASE_SECONDS, MAX_COMPUTED_CHUNK_LEASE_SECONDS)
 }
 
 #[derive(Clone)]
@@ -333,7 +355,7 @@ async fn run_worker_message(
         "parsed chunk-ready message payload"
     );
 
-    let Some(chunk) = chunk_processing::claim_chunk_for_processing(
+    let Some(mut chunk) = chunk_processing::claim_chunk_for_processing(
         db,
         payload.run_id,
         payload.chunk_id,
@@ -365,6 +387,29 @@ async fn run_worker_message(
     let run_context = evaluator_loader
         .get_or_build_run_context(chunk.run_id)
         .await?;
+
+    let processing_lease_seconds =
+        compute_chunk_processing_lease_seconds(&run_context.profile, &chunk);
+    let Some(extended_chunk) =
+        chunk_processing::extend_chunk_lease(db, &chunk, processing_lease_seconds).await?
+    else {
+        mq.ack(message.delivery_tag).await?;
+        warn!(
+            run_id = %chunk.run_id,
+            chunk_id = %chunk.id,
+            lease_seconds = processing_lease_seconds,
+            "chunk lease was lost before processing budget extension; acknowledged stale message"
+        );
+        return Ok(WorkerCycleOutcome::Processed);
+    };
+    chunk = extended_chunk;
+    debug!(
+        run_id = %chunk.run_id,
+        chunk_id = %chunk.id,
+        lease_seconds = processing_lease_seconds,
+        leased_until = ?chunk.leased_until,
+        "extended chunk lease for processing budget"
+    );
 
     match evaluator_loader
         .warm_refs(&run_context.evaluator_refs)

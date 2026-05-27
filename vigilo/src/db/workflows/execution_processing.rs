@@ -109,6 +109,8 @@ struct AttemptAllocation {
     execution_id: Uuid,
     attempt_id: Uuid,
     attempt_no: i32,
+    max_attempts_exhausted: bool,
+    already_completed: bool,
 }
 
 #[derive(Debug)]
@@ -392,6 +394,10 @@ async fn allocate_execution_attempts_for_cases(
     if cases.is_empty() {
         return Ok(Vec::new());
     }
+    if run_profile.defaults.max_attempts == 0 {
+        anyhow::bail!("run profile defaults.max_attempts must be greater than zero");
+    }
+    let max_attempts = i32::try_from(run_profile.defaults.max_attempts)?;
 
     if cases.len() != evaluator_bindings_by_case.len() {
         anyhow::bail!(
@@ -470,6 +476,14 @@ async fn allocate_execution_attempts_for_cases(
               AND status = 'running'::run_status
             FOR SHARE
         ),
+        attempt_policy AS (
+            SELECT
+        "#,
+    );
+    query_builder.push_bind(max_attempts);
+    query_builder.push(
+        r#"::int AS max_attempts
+        ),
         upserted AS (
             INSERT INTO executions (
                 run_id,
@@ -532,6 +546,48 @@ async fn allocate_execution_attempts_for_cases(
                 updated_at = now()
             RETURNING id, case_id, run_id
         ),
+        attempt_state AS (
+            SELECT
+                input.case_id,
+                input.input_ordinal,
+                upserted.id AS execution_id,
+                upserted.run_id,
+                executions.status,
+                executions.current_attempt_id,
+                executions.current_attempt_no
+            FROM upserted
+            JOIN executions
+              ON executions.run_id = upserted.run_id
+             AND executions.id = upserted.id
+            JOIN input
+              ON input.case_id = upserted.case_id
+        ),
+        reusable_terminal AS (
+            SELECT
+                attempt_state.case_id,
+                attempt_state.execution_id,
+                attempt_state.current_attempt_id AS attempt_id,
+                attempt_state.current_attempt_no AS attempt_no,
+                (attempt_state.status <> 'completed'::execution_status) AS max_attempts_exhausted,
+                (attempt_state.status = 'completed'::execution_status) AS already_completed,
+                attempt_state.input_ordinal
+            FROM attempt_state, attempt_policy
+            WHERE attempt_state.current_attempt_id IS NOT NULL
+              AND (
+                  attempt_state.status = 'completed'::execution_status
+                  OR attempt_state.current_attempt_no >= attempt_policy.max_attempts
+              )
+        ),
+        retry_eligible AS (
+            SELECT
+                attempt_state.case_id,
+                attempt_state.input_ordinal,
+                attempt_state.execution_id AS id,
+                attempt_state.run_id
+            FROM attempt_state, attempt_policy
+            WHERE attempt_state.status <> 'completed'::execution_status
+              AND attempt_state.current_attempt_no < attempt_policy.max_attempts
+        ),
         superseded_attempts AS (
             UPDATE execution_attempts
             SET status = 'stale'::attempt_status,
@@ -541,9 +597,9 @@ async fn allocate_execution_attempts_for_cases(
                 ),
                 completed_at = COALESCE(execution_attempts.completed_at, now()),
                 updated_at = now()
-            FROM upserted
-            WHERE execution_attempts.run_id = upserted.run_id
-              AND execution_attempts.execution_id = upserted.id
+            FROM retry_eligible
+            WHERE execution_attempts.run_id = retry_eligible.run_id
+              AND execution_attempts.execution_id = retry_eligible.id
               AND execution_attempts.status = 'running'::attempt_status
             RETURNING execution_attempts.id
         ),
@@ -555,9 +611,9 @@ async fn allocate_execution_attempts_for_cases(
                 started_at = COALESCE(executions.started_at, now()),
                 completed_at = NULL,
                 updated_at = now()
-            FROM upserted
-            WHERE executions.run_id = upserted.run_id
-              AND executions.id = upserted.id
+            FROM retry_eligible
+            WHERE executions.run_id = retry_eligible.run_id
+              AND executions.id = retry_eligible.id
             RETURNING
                 executions.id AS execution_id,
                 executions.run_id,
@@ -591,18 +647,41 @@ async fn allocate_execution_attempts_for_cases(
             WHERE executions.run_id = inserted_attempt.run_id
               AND executions.id = inserted_attempt.execution_id
             RETURNING executions.id
+        ),
+        allocated AS (
+            SELECT
+                retry_eligible.case_id,
+                inserted_attempt.execution_id,
+                inserted_attempt.attempt_id,
+                inserted_attempt.attempt_no,
+                false AS max_attempts_exhausted,
+                false AS already_completed,
+                retry_eligible.input_ordinal
+            FROM inserted_attempt
+            JOIN retry_eligible
+              ON retry_eligible.id = inserted_attempt.execution_id
+            JOIN updated_execution
+              ON updated_execution.id = inserted_attempt.execution_id
+            UNION ALL
+            SELECT
+                reusable_terminal.case_id,
+                reusable_terminal.execution_id,
+                reusable_terminal.attempt_id,
+                reusable_terminal.attempt_no,
+                reusable_terminal.max_attempts_exhausted,
+                reusable_terminal.already_completed,
+                reusable_terminal.input_ordinal
+            FROM reusable_terminal
         )
         SELECT
-            input.case_id,
-            inserted_attempt.execution_id,
-            inserted_attempt.attempt_id,
-            inserted_attempt.attempt_no
-        FROM inserted_attempt
-        JOIN upserted
-          ON upserted.id = inserted_attempt.execution_id
-        JOIN input
-          ON input.case_id = upserted.case_id
-        ORDER BY input.input_ordinal
+            allocated.case_id,
+            allocated.execution_id,
+            allocated.attempt_id,
+            allocated.attempt_no,
+            allocated.max_attempts_exhausted,
+            allocated.already_completed
+        FROM allocated
+        ORDER BY allocated.input_ordinal
         "#,
     );
 
@@ -1470,16 +1549,48 @@ pub(crate) async fn process_case_batch_execution(
                     );
                 }
 
-                let outcome = evaluate_case_execution(
-                    context,
-                    run_id,
-                    run_profile,
-                    evaluator_catalog,
-                    case,
-                    evaluator_bindings,
-                    allocation,
-                )
-                .await;
+                let outcome = if allocation.max_attempts_exhausted {
+                    let failure_message = format!(
+                        "execution exhausted max_attempts={} before case could be retried",
+                        run_profile.defaults.max_attempts
+                    );
+                    CaseExecutionOutcome {
+                        processed: processed_terminal_failure(
+                            allocation.execution_id,
+                            allocation.attempt_id,
+                            allocation.attempt_no,
+                            failure_message,
+                        ),
+                        persistence: None,
+                    }
+                } else if allocation.already_completed {
+                    CaseExecutionOutcome {
+                        processed: ProcessedExecution {
+                            execution_id: allocation.execution_id,
+                            attempt_id: allocation.attempt_id,
+                            result_count: 0,
+                            terminal_transition: ExecutionTerminalTransition {
+                                execution_id: allocation.execution_id,
+                                attempt_id: allocation.attempt_id,
+                                attempt_no: allocation.attempt_no,
+                                completed: true,
+                                error_message: None,
+                            },
+                        },
+                        persistence: None,
+                    }
+                } else {
+                    evaluate_case_execution(
+                        context,
+                        run_id,
+                        run_profile,
+                        evaluator_catalog,
+                        case,
+                        evaluator_bindings,
+                        allocation,
+                    )
+                    .await
+                };
 
                 Ok::<_, anyhow::Error>((index, outcome))
             });

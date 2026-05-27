@@ -72,6 +72,10 @@ pub(crate) async fn validate_profile_executability(
         issues.push("agent.http.timeout_secs must be greater than zero".to_string());
     }
 
+    if profile.defaults.max_attempts == 0 {
+        issues.push("defaults.max_attempts must be greater than zero".to_string());
+    }
+
     if let Err(err) = agent_client::validate_request_format(profile) {
         issues.push(err.to_string());
     }
