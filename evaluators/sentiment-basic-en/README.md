@@ -33,7 +33,7 @@ The evaluator returns a structured `output` object:
 
 The finding includes:
 
-- `dimension`: `quality`
+- `dimension`: `quality` as evaluator-reported source metadata. Run profiles choose the authoritative aggregation bucket with `evaluators[].dimension`.
 - `status`: `passed` for neutral/positive, `failed` for negative
 - `score`: normalized sentiment score (`1.0` positive, `0.5` neutral, `0.0` negative)
 - `severity`: `medium` for negative, otherwise `none`
@@ -51,4 +51,3 @@ cargo build --manifest-path evaluators/sentiment-basic-en/Cargo.toml --target wa
 ```bash
 vigilo evaluators test 'vigilo/sentiment-basic-en:0.1.0' --input-file evaluators/sentiment-basic-en/example-input.json
 ```
-

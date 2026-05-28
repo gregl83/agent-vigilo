@@ -5,7 +5,9 @@ description: Example profile that evaluates a local llama.cpp-backed Qwen sentim
 defaults:
   max_attempts: 2
   request_timeout_secs: 120
+  # Blocking findings fail the execution even when the aggregate score is high.
   fail_on_any_blocking_failure: true
+  # The execution passes only when the final aggregate score is >= this value.
   min_execution_score: 0.85
 
 persistence:
@@ -43,8 +45,12 @@ case_groups:
 
     evaluators:
       - ref: vigilo/sentiment-basic-en:0.1.0
+        # Profile-owned aggregation bucket. The evaluator also reports `quality`,
+        # but runtime aggregation uses this binding value as the authority.
         dimension: quality
+        # This example is score-gated rather than hard-gated.
         blocking: false
+        # Total contribution of this evaluator inside the quality dimension.
         weight: 1.0
         config:
           mode: example
@@ -53,5 +59,7 @@ case_groups:
       dimensions:
         quality:
           method: weighted_mean
+          # Failed findings in this dimension are recorded but do not hard-gate.
           blocking: false
+          # Quality is the only scored dimension in this minimal example.
           weight: 1.0
