@@ -69,8 +69,8 @@ defaults:
 
 - `max_attempts` (u32): hard limit for case execution attempts. Failed attempts below this limit are retried with bounded backoff; once the limit is reached, the execution is failed.
 - `request_timeout_secs` (u32)
-- `fail_on_any_blocking_failure` (bool)
-- `min_execution_score` (f64)
+- `fail_on_any_blocking_failure` (bool): when `true`, any blocking failed/error finding fails the execution even if the aggregate score is above the threshold. When `false`, blocking failures are still recorded in `blocking_failures`, but score policy determines pass/fail unless a blocking error is present.
+- `min_execution_score` (f64): finite value from `0.0` to `1.0`. The execution passes only when the final aggregate score is greater than or equal to this value and no enabled blocking gate fails.
 
 ## `persistence`
 
@@ -173,9 +173,9 @@ evaluators:
 ```
 
 - `ref` (string): fully qualified evaluator identifier `<namespace>/<name>:<version>`.
-- `dimension` (string)
-- `blocking` (bool)
-- `weight` (f64)
+- `dimension` (string): profile-owned aggregation bucket for this evaluator binding. This value controls the persisted result dimension and the `aggregation.dimensions` policy used for scoring. Evaluator-emitted dimensions remain available in raw evaluator output for audit, but they do not override the profile bucket.
+- `blocking` (bool): marks failed/error findings from this binding as blocking. The dimension policy and the evaluator finding may also declare blocking behavior; any of those sources makes the normalized finding blocking.
+- `weight` (f64): finite value greater than or equal to `0.0`. For `weighted_mean`, this is the binding's total contribution inside its dimension. When an evaluator emits multiple scoreable findings, the binding weight is divided across those findings so multi-finding evaluators do not become overweighted.
 - `config` (object, optional)
 
 ### `aggregation.dimensions`
@@ -194,8 +194,19 @@ aggregation:
 ```
 
 - `method` (enum): `min_score` | `weighted_mean`
-- `blocking` (bool)
-- `weight` (f64)
+- `blocking` (bool): marks failed/error findings in this dimension as blocking, even when the individual evaluator binding is non-blocking.
+- `weight` (f64): finite value greater than or equal to `0.0`. Dimension weights combine per-dimension scores into `aggregate_score`; `0.0` means the dimension does not affect the aggregate score, but blocking findings in that dimension can still fail the execution.
+
+Aggregation behavior:
+
+- Findings are grouped by the profile binding `dimension`, not by the evaluator-emitted finding dimension.
+- `weighted_mean` computes a weighted arithmetic mean inside each dimension using evaluator binding weights.
+- `min_score` uses the lowest normalized score among scoreable findings in that dimension.
+- `aggregate_score` combines dimension scores using `aggregation.dimensions.<dimension>.weight`.
+- Missing dimension policies default to `weighted_mean`, non-blocking, weight `1.0`.
+- `passed` and `failed` findings with normalized scores are scoreable. `skipped` and informational findings do not affect score.
+- If an execution has no scoreable findings, its aggregate status is `error`.
+- If multiple case groups match the same case, their dimension policies and duplicate evaluator bindings must be identical or non-overlapping; conflicting policies are rejected.
 
 ## Full Example
 

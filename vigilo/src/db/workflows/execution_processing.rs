@@ -39,6 +39,11 @@ use crate::{
     agent_client,
     context::Context,
     contracts::{
+        aggregation::{
+            AggregationFinding,
+            aggregate_findings,
+            evaluation_status_key,
+        },
         evaluator::{
             EvaluationDimension,
             EvaluationStatus,
@@ -48,6 +53,7 @@ use crate::{
         },
         evaluator_ref::parse_fully_qualified_evaluator,
         run::{
+            AggregationSettings,
             CaseGroupProfile,
             EvaluatorBinding,
             RunProfile,
@@ -63,12 +69,20 @@ use crate::{
 #[derive(Debug)]
 struct EvaluatorExecutionRecord {
     evaluator_id: Uuid,
-    status: String,
-    dimension: String,
+    status: EvaluationStatus,
+    binding_dimension: String,
+    source_dimension: Option<String>,
     normalized_score: Option<f64>,
     blocking: bool,
+    binding_weight: f64,
     failure_category: Option<String>,
     reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CaseEvaluationPlan {
+    evaluator_bindings: Vec<EvaluatorBinding>,
+    aggregation: AggregationSettings,
 }
 
 /// Runtime metadata needed to execute one evaluator binding for a run.
@@ -384,25 +398,90 @@ fn matching_groups_for_case<'a>(
         .collect()
 }
 
-/// Selects evaluator bindings from the run profile for one dataset case.
-///
-/// Database behavior: none. Explicit `case_group` on a case is treated as a
-/// direct profile-group selection; otherwise task type and tag predicates are
-/// applied locally to match run-profile validation.
-fn evaluator_bindings_for_case(
-    profile: &RunProfile,
-    case: &chunk_processing::WorkerCaseBatchItem,
-) -> Vec<EvaluatorBinding> {
-    let mut unique = BTreeMap::new();
-    for group in matching_groups_for_case(profile, case) {
-        for binding in &group.evaluators {
-            unique
-                .entry(binding.evaluator_ref.clone())
-                .or_insert_with(|| binding.clone());
+fn merge_aggregation_settings(
+    case_id: Uuid,
+    groups: &[&CaseGroupProfile],
+) -> anyhow::Result<AggregationSettings> {
+    let mut merged = AggregationSettings {
+        dimensions: BTreeMap::new(),
+    };
+
+    for group in groups {
+        for (dimension, policy) in &group.aggregation.dimensions {
+            if let Some(existing) = merged.dimensions.get(dimension) {
+                if existing != policy {
+                    anyhow::bail!(
+                        "case '{}' matched conflicting aggregation policy for dimension '{}' across case_groups",
+                        case_id,
+                        dimension
+                    );
+                }
+                continue;
+            }
+
+            merged.dimensions.insert(dimension.clone(), policy.clone());
         }
     }
 
-    unique.into_values().collect()
+    Ok(merged)
+}
+
+fn equivalent_evaluator_binding(left: &EvaluatorBinding, right: &EvaluatorBinding) -> bool {
+    left.dimension == right.dimension
+        && left.blocking == right.blocking
+        && left.weight == right.weight
+        && left.config == right.config
+}
+
+/// Resolves evaluator bindings and aggregation policy for one dataset case.
+///
+/// Database behavior: none. Runtime aggregation is driven by the profile
+/// case-group policies that selected the evaluator bindings. When multiple
+/// groups match the same case, non-overlapping or identical dimension policies
+/// are merged; conflicting policies are rejected rather than guessed.
+fn evaluation_plan_for_case(
+    profile: &RunProfile,
+    case: &chunk_processing::WorkerCaseBatchItem,
+) -> anyhow::Result<CaseEvaluationPlan> {
+    let matching_groups = matching_groups_for_case(profile, case);
+    if matching_groups.is_empty() {
+        anyhow::bail!(
+            "case '{}' did not match any evaluator bindings in run profile",
+            case.case_id
+        );
+    }
+
+    let aggregation = merge_aggregation_settings(case.case_id, &matching_groups)?;
+    let mut unique = BTreeMap::new();
+    for group in matching_groups {
+        for binding in &group.evaluators {
+            if let Some(existing) = unique.get(&binding.evaluator_ref) {
+                if !equivalent_evaluator_binding(existing, binding) {
+                    anyhow::bail!(
+                        "case '{}' matched conflicting evaluator binding for '{}' across case_groups",
+                        case.case_id,
+                        binding.evaluator_ref
+                    );
+                }
+                continue;
+            }
+
+            unique.insert(binding.evaluator_ref.clone(), binding.clone());
+        }
+    }
+
+    let evaluator_bindings = unique.into_values().collect::<Vec<_>>();
+    if evaluator_bindings.is_empty() {
+        anyhow::bail!(
+            "case '{}' matched run profile groups with no evaluator bindings",
+            case.case_id
+        );
+    }
+
+    Ok(CaseEvaluationPlan {
+        evaluator_bindings,
+        aggregation,
+    })
 }
 
 /// Converts a persisted chunk case row into the evaluator contract shape.
@@ -1230,32 +1309,8 @@ pub(crate) async fn summarize_chunk_execution_state(
     Ok(state)
 }
 
-fn summarize_overall_status(records: &[EvaluatorExecutionRecord]) -> String {
-    if records
-        .iter()
-        .any(|record| record.blocking && (record.status == "failed" || record.status == "error"))
-    {
-        return "failed".to_string();
-    }
-
-    if records.iter().any(|record| record.status == "error") {
-        return "error".to_string();
-    }
-
-    if records.iter().any(|record| record.status == "failed") {
-        return "failed".to_string();
-    }
-
-    "passed".to_string()
-}
-
 fn map_evaluation_status(status: &EvaluationStatus) -> &'static str {
-    match status {
-        EvaluationStatus::Passed => "passed",
-        EvaluationStatus::Failed => "failed",
-        EvaluationStatus::Error => "error",
-        EvaluationStatus::Skipped => "skipped",
-    }
+    evaluation_status_key(status)
 }
 
 fn map_evaluation_dimension(dimension: &EvaluationDimension) -> String {
@@ -1289,6 +1344,7 @@ async fn evaluate_case_execution(
     evaluator_catalog: &RunEvaluatorCatalog,
     case: &chunk_processing::WorkerCaseBatchItem,
     evaluator_bindings: &[EvaluatorBinding],
+    aggregation: &AggregationSettings,
     allocation: &AttemptAllocation,
 ) -> CaseExecutionOutcome {
     let runtime_started = Instant::now();
@@ -1356,6 +1412,11 @@ async fn evaluate_case_execution(
                             binding.evaluator_ref
                         )
                     })?;
+                let dimension_policy_blocking = aggregation
+                    .dimensions
+                    .get(&binding.dimension)
+                    .map(|policy| policy.blocking)
+                    .unwrap_or(false);
                 let context = context.clone();
                 let test_case = test_case.clone();
                 let agent_output = agent_output.clone();
@@ -1392,7 +1453,7 @@ async fn evaluate_case_execution(
                             let normalized = evaluator_output.normalize();
 
                             if normalized.is_empty() {
-                                let status = "error".to_string();
+                                let status = EvaluationStatus::Error;
                                 let failure_category = Some("empty_output".to_string());
                                 let reason = Some("evaluator returned no findings".to_string());
                                 rows.push(evaluator_results::EvaluatorResultInsertRow {
@@ -1412,8 +1473,8 @@ async fn evaluate_case_execution(
                                         .evaluator_runtime_version
                                         .clone(),
                                     dimension: binding.dimension.clone(),
-                                    status: status.clone(),
-                                    blocking: binding.blocking,
+                                    status: map_evaluation_status(&status).to_string(),
+                                    blocking: binding.blocking || dimension_policy_blocking,
                                     score_kind: "informational".to_string(),
                                     raw_score: None,
                                     raw_score_min: None,
@@ -1429,19 +1490,24 @@ async fn evaluate_case_execution(
                                 records.push(EvaluatorExecutionRecord {
                                     evaluator_id: evaluator_entry.evaluator_id,
                                     status,
-                                    dimension: binding.dimension,
+                                    binding_dimension: binding.dimension,
+                                    source_dimension: None,
                                     normalized_score: None,
-                                    blocking: binding.blocking,
+                                    blocking: binding.blocking || dimension_policy_blocking,
+                                    binding_weight: binding.weight,
                                     failure_category,
                                     reason,
                                 });
                             } else {
                                 for (finding_index, finding) in normalized.into_iter().enumerate() {
                                     let finding_index = i32::try_from(finding_index)?;
-                                    let status =
-                                        map_evaluation_status(&finding.status).to_string();
-                                    let dimension = map_evaluation_dimension(&finding.dimension);
-                                    let blocking = binding.blocking || finding.blocking;
+                                    let status = finding.status;
+                                    let source_dimension =
+                                        map_evaluation_dimension(&finding.dimension);
+                                    let dimension = binding.dimension.clone();
+                                    let blocking = binding.blocking
+                                        || dimension_policy_blocking
+                                        || finding.blocking;
                                     let severity = map_severity(&finding.severity).to_string();
                                     let failure_category = finding.failure_category.clone();
                                     let reason = finding.reason.clone();
@@ -1464,7 +1530,7 @@ async fn evaluate_case_execution(
                                             .evaluator_runtime_version
                                             .clone(),
                                         dimension: dimension.clone(),
-                                        status: status.clone(),
+                                        status: map_evaluation_status(&status).to_string(),
                                         blocking,
                                         score_kind: finding.score_kind,
                                         raw_score: finding.raw_score,
@@ -1481,9 +1547,11 @@ async fn evaluate_case_execution(
                                     records.push(EvaluatorExecutionRecord {
                                         evaluator_id: evaluator_entry.evaluator_id,
                                         status,
-                                        dimension,
+                                        binding_dimension: dimension,
+                                        source_dimension: Some(source_dimension),
                                         normalized_score,
                                         blocking,
+                                        binding_weight: binding.weight,
                                         failure_category,
                                         reason,
                                     });
@@ -1491,7 +1559,7 @@ async fn evaluate_case_execution(
                             }
                         }
                         Err(err) => {
-                            let status = "error".to_string();
+                            let status = EvaluationStatus::Error;
                             let failure_category = Some("evaluator_runtime_error".to_string());
                             let reason = Some(err.to_string());
                             rows.push(evaluator_results::EvaluatorResultInsertRow {
@@ -1508,8 +1576,8 @@ async fn evaluate_case_execution(
                                     .evaluator_interface_version,
                                 evaluator_runtime_version: evaluator_entry.evaluator_runtime_version,
                                 dimension: binding.dimension.clone(),
-                                status: status.clone(),
-                                blocking: binding.blocking,
+                                status: map_evaluation_status(&status).to_string(),
+                                blocking: binding.blocking || dimension_policy_blocking,
                                 score_kind: "informational".to_string(),
                                 raw_score: None,
                                 raw_score_min: None,
@@ -1527,9 +1595,11 @@ async fn evaluate_case_execution(
                             records.push(EvaluatorExecutionRecord {
                                 evaluator_id: evaluator_entry.evaluator_id,
                                 status,
-                                dimension: binding.dimension,
+                                binding_dimension: binding.dimension,
+                                source_dimension: None,
                                 normalized_score: None,
-                                blocking: binding.blocking,
+                                blocking: binding.blocking || dimension_policy_blocking,
+                                binding_weight: binding.weight,
                                 failure_category,
                                 reason,
                             });
@@ -1560,53 +1630,26 @@ async fn evaluate_case_execution(
     match evaluation_result {
         Ok((records, result_rows)) => {
             let runtime_ms = runtime_started.elapsed().as_millis() as u64;
-            let overall_status = summarize_overall_status(&records);
-
-            let mut by_dimension: BTreeMap<String, (f64, usize)> = BTreeMap::new();
-            for record in &records {
-                if let Some(score) = record.normalized_score {
-                    let entry = by_dimension
-                        .entry(record.dimension.clone())
-                        .or_insert((0.0, 0));
-                    entry.0 += score;
-                    entry.1 += 1;
-                }
-            }
-
-            let mut dimension_scores = serde_json::Map::new();
-            for (dimension, (score_sum, score_count)) in by_dimension {
-                if score_count > 0 {
-                    dimension_scores.insert(dimension, json!(score_sum / score_count as f64));
-                }
-            }
-
-            let blocking_failures = records
+            let aggregation_findings = records
                 .iter()
-                .filter(|record| {
-                    record.blocking && (record.status == "failed" || record.status == "error")
-                })
-                .map(|record| {
-                    json!({
-                        "evaluator_id": record.evaluator_id,
-                        "dimension": record.dimension,
-                        "status": record.status,
-                        "failure_category": record.failure_category,
-                        "reason": record.reason,
-                    })
+                .map(|record| AggregationFinding {
+                    evaluator_id: record.evaluator_id,
+                    binding_dimension: record.binding_dimension.clone(),
+                    source_dimension: record.source_dimension.clone(),
+                    status: record.status.clone(),
+                    normalized_score: record.normalized_score,
+                    blocking: record.blocking,
+                    binding_weight: record.binding_weight,
+                    failure_category: record.failure_category.clone(),
+                    reason: record.reason.clone(),
                 })
                 .collect::<Vec<_>>();
-
-            let aggregate_score = {
-                let scores: Vec<f64> = records
-                    .iter()
-                    .filter_map(|record| record.normalized_score)
-                    .collect();
-                if scores.is_empty() {
-                    None
-                } else {
-                    Some(scores.iter().sum::<f64>() / scores.len() as f64)
-                }
-            };
+            let aggregate = aggregate_findings(
+                &run_profile.defaults,
+                aggregation,
+                attempt_id,
+                &aggregation_findings,
+            );
 
             let evaluator_result_count = match i32::try_from(records.len()) {
                 Ok(count) => count,
@@ -1623,12 +1666,6 @@ async fn evaluate_case_execution(
                     };
                 }
             };
-
-            let summary = json!({
-                "attempt_id": attempt_id,
-                "result_count": records.len(),
-                "overall_status": overall_status,
-            });
 
             debug!(
                 run_id = %run_id,
@@ -1660,12 +1697,12 @@ async fn evaluate_case_execution(
                     attempt_id,
                     attempt_no,
                     result_rows,
-                    overall_status,
-                    aggregate_score,
+                    overall_status: aggregate.overall_status,
+                    aggregate_score: aggregate.aggregate_score,
                     evaluator_result_count,
-                    dimension_scores: serde_json::Value::Object(dimension_scores),
-                    blocking_failures: serde_json::Value::Array(blocking_failures),
-                    summary,
+                    dimension_scores: aggregate.dimension_scores,
+                    blocking_failures: aggregate.blocking_failures,
+                    summary: aggregate.summary,
                 }),
             }
         }
@@ -1875,19 +1912,14 @@ pub(crate) async fn process_case_batch_execution(
     }
 
     let setup_started = Instant::now();
-    let evaluator_bindings_by_case = cases
+    let evaluation_plans_by_case = cases
         .iter()
-        .map(|case| {
-            let evaluator_bindings = evaluator_bindings_for_case(run_profile, case);
-            if evaluator_bindings.is_empty() {
-                anyhow::bail!(
-                    "case '{}' did not match any evaluator bindings in run profile",
-                    case.case_id
-                );
-            }
-            Ok(evaluator_bindings)
-        })
+        .map(|case| evaluation_plan_for_case(run_profile, case))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let evaluator_bindings_by_case = evaluation_plans_by_case
+        .iter()
+        .map(|plan| plan.evaluator_bindings.clone())
+        .collect::<Vec<_>>();
 
     let allocations = allocate_execution_attempts_for_cases(
         db,
@@ -1918,7 +1950,7 @@ pub(crate) async fn process_case_batch_execution(
             next_index += 1;
 
             let case = &cases[index];
-            let evaluator_bindings = &evaluator_bindings_by_case[index];
+            let evaluation_plan = &evaluation_plans_by_case[index];
             let allocation = &allocations[index];
             pending.push(async move {
                 if allocation.case_id != case.case_id {
@@ -1961,7 +1993,8 @@ pub(crate) async fn process_case_batch_execution(
                         run_profile,
                         evaluator_catalog,
                         case,
-                        evaluator_bindings,
+                        &evaluation_plan.evaluator_bindings,
+                        &evaluation_plan.aggregation,
                         allocation,
                     )
                     .await

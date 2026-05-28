@@ -226,7 +226,7 @@ pub(crate) struct AggregationSettings {
 }
 
 /// Aggregation strategy for one dimension.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct DimensionAggregation {
     /// Scoring method used to combine evaluator outputs.
     pub(crate) method: AggregationMethod,
@@ -239,7 +239,7 @@ pub(crate) struct DimensionAggregation {
 }
 
 /// Supported dimension aggregation methods.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AggregationMethod {
     /// Use the minimum score among contributors.

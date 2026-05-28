@@ -5,7 +5,10 @@
 //! published evaluator state, and case-to-group matching so failures are caught
 //! before chunks are dispatched.
 
-use std::collections::HashMap;
+use std::collections::{
+    HashMap,
+    HashSet,
+};
 
 use sqlx::PgPool;
 
@@ -56,38 +59,7 @@ pub(crate) async fn validate_profile_executability(
 ) -> anyhow::Result<ProfileExecutabilitySummary> {
     let mut runnable_by_ref: HashMap<String, bool> = HashMap::new();
     let mut parsed_refs: Vec<(String, String, EvaluatorIdentity)> = Vec::new();
-    let mut issues = Vec::new();
-
-    if profile.agent.provider.trim().is_empty() {
-        issues.push("agent.provider must not be empty".to_string());
-    }
-
-    if profile.agent.name.trim().is_empty() {
-        issues.push("agent.name must not be empty".to_string());
-    }
-
-    if let Err(err) = reqwest::Url::parse(&profile.agent.http.url) {
-        issues.push(format!("agent.http.url is invalid: {}", err));
-    }
-
-    if let Err(err) = profile.agent.http.method.parse::<reqwest::Method>() {
-        issues.push(format!(
-            "agent.http.method '{}' is invalid: {}",
-            profile.agent.http.method, err
-        ));
-    }
-
-    if profile.agent.http.timeout_secs == Some(0) {
-        issues.push("agent.http.timeout_secs must be greater than zero".to_string());
-    }
-
-    if profile.defaults.max_attempts == 0 {
-        issues.push("defaults.max_attempts must be greater than zero".to_string());
-    }
-
-    if let Err(err) = agent_client::validate_request_format(profile) {
-        issues.push(err.to_string());
-    }
+    let mut issues = collect_static_profile_config_issues(profile);
 
     for group in &profile.case_groups {
         for binding in &group.evaluators {
@@ -215,6 +187,79 @@ pub(crate) async fn validate_profile_executability(
     })
 }
 
+fn collect_static_profile_config_issues(profile: &RunProfile) -> Vec<String> {
+    let mut issues = Vec::new();
+
+    if profile.agent.provider.trim().is_empty() {
+        issues.push("agent.provider must not be empty".to_string());
+    }
+
+    if profile.agent.name.trim().is_empty() {
+        issues.push("agent.name must not be empty".to_string());
+    }
+
+    if let Err(err) = reqwest::Url::parse(&profile.agent.http.url) {
+        issues.push(format!("agent.http.url is invalid: {}", err));
+    }
+
+    if let Err(err) = profile.agent.http.method.parse::<reqwest::Method>() {
+        issues.push(format!(
+            "agent.http.method '{}' is invalid: {}",
+            profile.agent.http.method, err
+        ));
+    }
+
+    if profile.agent.http.timeout_secs == Some(0) {
+        issues.push("agent.http.timeout_secs must be greater than zero".to_string());
+    }
+
+    if profile.defaults.max_attempts == 0 {
+        issues.push("defaults.max_attempts must be greater than zero".to_string());
+    }
+
+    if !profile.defaults.min_execution_score.is_finite()
+        || !(0.0..=1.0).contains(&profile.defaults.min_execution_score)
+    {
+        issues.push(
+            "defaults.min_execution_score must be finite and between 0.0 and 1.0".to_string(),
+        );
+    }
+
+    if let Err(err) = agent_client::validate_request_format(profile) {
+        issues.push(err.to_string());
+    }
+
+    for group in &profile.case_groups {
+        let mut evaluator_refs = HashSet::new();
+        for binding in &group.evaluators {
+            if !binding.weight.is_finite() || binding.weight < 0.0 {
+                issues.push(format!(
+                    "case_group '{}' evaluator '{}' weight must be finite and greater than or equal to 0.0",
+                    group.id, binding.evaluator_ref
+                ));
+            }
+
+            if !evaluator_refs.insert(binding.evaluator_ref.clone()) {
+                issues.push(format!(
+                    "case_group '{}' contains duplicate evaluator ref '{}'; split it into a separate versioned evaluator or case_group",
+                    group.id, binding.evaluator_ref
+                ));
+            }
+        }
+
+        for (dimension, policy) in &group.aggregation.dimensions {
+            if !policy.weight.is_finite() || policy.weight < 0.0 {
+                issues.push(format!(
+                    "case_group '{}' aggregation dimension '{}' weight must be finite and greater than or equal to 0.0",
+                    group.id, dimension
+                ));
+            }
+        }
+    }
+
+    issues
+}
+
 /// Returns the case groups that should evaluate one dataset case.
 ///
 /// Database behavior: none. Explicit `case_group` ids bypass task/tag matching;
@@ -282,10 +327,13 @@ mod tests {
         contracts::run::{
             AgentHttpConfig,
             AgentProfile,
+            AggregationMethod,
             AggregationSettings,
             AppliesTo,
             CaseGroupProfile,
             DatasetCase,
+            DimensionAggregation,
+            EvaluatorBinding,
             PersistRawOutputsMode,
             PersistenceMode,
             PersistenceSettings,
@@ -378,5 +426,71 @@ mod tests {
         let groups = matching_groups_for_case(&profile, &case);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].id, "classification");
+    }
+
+    #[test]
+    fn profile_rejects_out_of_range_min_execution_score() {
+        let mut profile = profile();
+        profile.defaults.min_execution_score = 1.1;
+
+        let issues = super::collect_static_profile_config_issues(&profile);
+
+        assert!(issues.iter().any(|issue| issue.contains("min_execution_score")));
+    }
+
+    #[test]
+    fn profile_rejects_negative_evaluator_weight() {
+        let mut profile = profile();
+        profile.case_groups[0].evaluators.push(EvaluatorBinding {
+            evaluator_ref: "core/json-schema:1.0.0".to_string(),
+            dimension: "format".to_string(),
+            blocking: true,
+            weight: -1.0,
+            config: serde_json::json!({}),
+        });
+
+        let issues = super::collect_static_profile_config_issues(&profile);
+
+        assert!(issues.iter().any(|issue| issue.contains("weight")));
+    }
+
+    #[test]
+    fn profile_rejects_negative_dimension_weight() {
+        let mut profile = profile();
+        profile.case_groups[0].aggregation.dimensions.insert(
+            "quality".to_string(),
+            DimensionAggregation {
+                method: AggregationMethod::WeightedMean,
+                blocking: false,
+                weight: -1.0,
+            },
+        );
+
+        let issues = super::collect_static_profile_config_issues(&profile);
+
+        assert!(issues.iter().any(|issue| issue.contains("dimension 'quality' weight")));
+    }
+
+    #[test]
+    fn profile_rejects_duplicate_evaluator_ref_within_group() {
+        let mut profile = profile();
+        profile.case_groups[0].evaluators.push(EvaluatorBinding {
+            evaluator_ref: "core/json-schema:1.0.0".to_string(),
+            dimension: "format".to_string(),
+            blocking: true,
+            weight: 1.0,
+            config: serde_json::json!({}),
+        });
+        profile.case_groups[0].evaluators.push(EvaluatorBinding {
+            evaluator_ref: "core/json-schema:1.0.0".to_string(),
+            dimension: "quality".to_string(),
+            blocking: false,
+            weight: 1.0,
+            config: serde_json::json!({}),
+        });
+
+        let issues = super::collect_static_profile_config_issues(&profile);
+
+        assert!(issues.iter().any(|issue| issue.contains("duplicate evaluator ref")));
     }
 }

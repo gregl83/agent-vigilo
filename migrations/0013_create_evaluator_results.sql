@@ -123,7 +123,7 @@ COMMENT ON COLUMN evaluator_results.status IS
     'Result of the evaluator for this execution. Used as input to aggregation and policy decisions.';
 
 COMMENT ON COLUMN evaluator_results.blocking IS
-    'Indicates whether a failure from this evaluator should be treated as blocking (i.e., immediately causing execution or run failure regardless of score).';
+    'Indicates whether this finding is blocking after applying evaluator binding, dimension policy, and evaluator-emitted blocking metadata.';
 
 COMMENT ON COLUMN evaluator_results.score_kind IS
     'Type of scoring produced by the evaluator (e.g., binary, scalar, categorical). Used to interpret raw and normalized scores.';

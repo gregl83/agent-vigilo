@@ -70,10 +70,10 @@ COMMENT ON COLUMN execution_aggregates.evaluator_result_count IS
     'Number of evaluator result records used to compute this aggregate.';
 
 COMMENT ON COLUMN execution_aggregates.dimension_scores IS
-    'Structured map of per-dimension aggregate scores (e.g., correctness, safety, quality) derived from evaluator results.';
+    'Structured map of per-dimension aggregate scores (e.g., correctness, safety, quality) derived from profile aggregation policy and evaluator findings.';
 
 COMMENT ON COLUMN execution_aggregates.blocking_failures IS
-    'Structured list of blocking failures that affected the execution outcome, if any.';
+    'Structured list of blocking failed/error findings that affected or were recorded by execution gate policy.';
 
 COMMENT ON COLUMN execution_aggregates.summary IS
     'Compact execution-level summary including derived metrics, failure counts, and other aggregation outputs used for reporting and debugging.';
