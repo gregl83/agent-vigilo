@@ -1,6 +1,6 @@
 //! Evaluator result table access.
 //!
-//! Evaluator results are the per-evaluator evidence rows for a single execution
+//! Evaluator results are the per-finding evidence rows for a single execution
 //! attempt. The batch insert path is used by execution processing and is kept
 //! chunked so large runs do not build oversized SQL statements.
 
@@ -26,6 +26,7 @@ pub(crate) struct EvaluatorResultInsertRow {
     pub(crate) execution_id: Uuid,
     pub(crate) attempt_id: Uuid,
     pub(crate) evaluator_id: Uuid,
+    pub(crate) finding_index: i32,
     pub(crate) evaluator_version: String,
     pub(crate) evaluator_profile_id: String,
     pub(crate) evaluator_profile_version: String,
@@ -47,10 +48,11 @@ pub(crate) struct EvaluatorResultInsertRow {
     pub(crate) raw_evaluator_output: serde_json::Value,
 }
 
-/// Inserts evaluator result rows for an attempt in bounded batches.
+/// Inserts evaluator finding rows for an attempt in bounded batches.
 ///
-/// Conflicts on `(run_id, run_shard, attempt_id, evaluator_id)` are ignored to
-/// keep retries idempotent when the same authoritative attempt is observed again.
+/// Conflicts on `(run_id, run_shard, attempt_id, evaluator_id, finding_index)`
+/// are ignored to keep retries idempotent when the same authoritative attempt
+/// is observed again.
 pub(crate) async fn insert_evaluator_results_batch(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     rows: &[EvaluatorResultInsertRow],
@@ -69,6 +71,7 @@ pub(crate) async fn insert_evaluator_results_batch(
                 execution_id,
                 attempt_id,
                 evaluator_id,
+                finding_index,
                 evaluator_version,
                 evaluator_profile_id,
                 evaluator_profile_version,
@@ -98,6 +101,7 @@ pub(crate) async fn insert_evaluator_results_batch(
                 .push_bind(row.execution_id)
                 .push_bind(row.attempt_id)
                 .push_bind(row.evaluator_id)
+                .push_bind(row.finding_index)
                 .push_bind(&row.evaluator_version)
                 .push_bind(&row.evaluator_profile_id)
                 .push_bind(&row.evaluator_profile_version)
@@ -123,7 +127,7 @@ pub(crate) async fn insert_evaluator_results_batch(
 
         qb.push(
             r#"
-            ON CONFLICT (run_id, run_shard, attempt_id, evaluator_id) DO NOTHING
+            ON CONFLICT (run_id, run_shard, attempt_id, evaluator_id, finding_index) DO NOTHING
             "#,
         );
 
@@ -134,7 +138,7 @@ pub(crate) async fn insert_evaluator_results_batch(
     Ok(total_rows_affected)
 }
 
-/// Inserts one evaluator result row and returns the persisted model.
+/// Inserts one evaluator finding row and returns the persisted model.
 pub(crate) async fn insert_evaluator_result(
     db: &PgPool,
     draft: &EvaluatorResultDraft,
@@ -143,7 +147,7 @@ pub(crate) async fn insert_evaluator_result(
         r#"
         INSERT INTO evaluator_results (
             run_id, run_shard, execution_id, attempt_id,
-            evaluator_id, evaluator_version,
+            evaluator_id, finding_index, evaluator_version,
             evaluator_profile_id, evaluator_profile_version,
             evaluator_interface_version, evaluator_runtime_version,
             dimension, status, blocking, score_kind,
@@ -163,17 +167,18 @@ pub(crate) async fn insert_evaluator_result(
             $9,
             $10,
             $11,
-            $12::evaluation_status,
-            $13,
+            $12,
+            $13::evaluation_status,
             $14,
             $15,
             $16,
             $17,
             $18,
             $19,
-            $20::severity,
-            $21,
-            $22
+            $20,
+            $21::severity,
+            $22,
+            $23
         )
         RETURNING
             id,
@@ -182,6 +187,7 @@ pub(crate) async fn insert_evaluator_result(
             execution_id,
             attempt_id,
             evaluator_id,
+            finding_index,
             evaluator_version,
             evaluator_profile_id,
             evaluator_profile_version,
@@ -209,6 +215,7 @@ pub(crate) async fn insert_evaluator_result(
     .bind(draft.execution_id)
     .bind(draft.attempt_id)
     .bind(draft.evaluator_id)
+    .bind(draft.finding_index)
     .bind(&draft.evaluator_version)
     .bind(&draft.evaluator_profile_id)
     .bind(&draft.evaluator_profile_version)
@@ -248,6 +255,7 @@ pub(crate) async fn select_evaluator_result_by_id(
             execution_id,
             attempt_id,
             evaluator_id,
+            finding_index,
             evaluator_version,
             evaluator_profile_id,
             evaluator_profile_version,
@@ -283,7 +291,7 @@ pub(crate) async fn select_evaluator_result_by_id(
     Ok(result)
 }
 
-/// Lists all evaluator results written for an execution attempt.
+/// Lists all evaluator finding rows written for an execution attempt.
 pub(crate) async fn list_evaluator_results_by_attempt_id(
     db: &PgPool,
     run_id: Uuid,
@@ -299,6 +307,7 @@ pub(crate) async fn list_evaluator_results_by_attempt_id(
             execution_id,
             attempt_id,
             evaluator_id,
+            finding_index,
             evaluator_version,
             evaluator_profile_id,
             evaluator_profile_version,
@@ -323,7 +332,7 @@ pub(crate) async fn list_evaluator_results_by_attempt_id(
         WHERE run_id = $1::uuid
           AND run_shard = $2
           AND attempt_id = $3::uuid
-        ORDER BY created_at ASC
+        ORDER BY evaluator_id ASC, finding_index ASC, created_at ASC
         "#,
     )
     .bind(run_id)
@@ -349,6 +358,7 @@ pub(crate) async fn list_evaluator_results_by_run_id(
             execution_id,
             attempt_id,
             evaluator_id,
+            finding_index,
             evaluator_version,
             evaluator_profile_id,
             evaluator_profile_version,
@@ -371,7 +381,7 @@ pub(crate) async fn list_evaluator_results_by_run_id(
             created_at
         FROM evaluator_results
         WHERE run_id = $1::uuid
-        ORDER BY execution_id ASC, attempt_id ASC, created_at ASC
+        ORDER BY execution_id ASC, attempt_id ASC, evaluator_id ASC, finding_index ASC, created_at ASC
         "#,
     )
     .bind(run_id)
@@ -404,6 +414,7 @@ pub(crate) async fn update_evaluator_result_reason(
             execution_id,
             attempt_id,
             evaluator_id,
+            finding_index,
             evaluator_version,
             evaluator_profile_id,
             evaluator_profile_version,

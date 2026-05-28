@@ -44,7 +44,7 @@ An execution represents one dataset case evaluated against the target system.
 An attempt represents a single worker’s effort to process an execution. Multiple attempts may exist due to retries or failures.
 
 ### Evaluator Result
-An append-only record representing the outcome of a single evaluator.
+An append-only evidence row representing one finding emitted by an evaluator invocation.
 
 ---
 
@@ -116,9 +116,9 @@ After a successful agent response:
 - evaluators are executed
 - Wasm evaluator invocations acquire a worker-local semaphore permit
 - each evaluator runs in a fresh Wasmtime store with memory, table, instance, fuel, timeout, and log-message limits
-- results are appended to evaluator_results
+- each normalized evaluator finding is appended to evaluator_results
 
-Each evaluator produces:
+Each evaluator finding records:
 
 - status (passed / failed / error / skipped)
 - severity
@@ -261,7 +261,7 @@ pending → running → completed
 
 ### 1. Append-only evaluator results
 
-Evaluator outputs are never updated, only inserted. This provides:
+Evaluator findings are never updated, only inserted. This provides:
 
 - auditability
 - reproducibility

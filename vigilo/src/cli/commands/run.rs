@@ -1011,6 +1011,7 @@ mod tests {
             execution_id,
             attempt_id,
             evaluator_id: Uuid::now_v7(),
+            finding_index: 0,
             evaluator_version: "1.0.0".to_string(),
             evaluator_profile_id: "profile".to_string(),
             evaluator_profile_version: "v1".to_string(),

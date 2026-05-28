@@ -7,6 +7,7 @@ CREATE TABLE evaluator_results (
     attempt_id UUID NOT NULL,
 
     evaluator_id UUID NOT NULL,
+    finding_index INTEGER NOT NULL DEFAULT 0 CHECK (finding_index >= 0),
     evaluator_version TEXT NOT NULL,
     evaluator_profile_id TEXT NOT NULL,
     evaluator_profile_version TEXT NOT NULL,
@@ -47,7 +48,7 @@ CREATE TABLE evaluator_results (
     CONSTRAINT chk_normalized_score_range
        CHECK (normalized_score IS NULL OR (normalized_score >= 0.0 AND normalized_score <= 1.0)),
 
-    CONSTRAINT uq_attempt_evaluator UNIQUE (run_id, run_shard, attempt_id, evaluator_id)
+    CONSTRAINT uq_attempt_evaluator_finding UNIQUE (run_id, run_shard, attempt_id, evaluator_id, finding_index)
 ) PARTITION BY LIST (run_shard);
 
 DO $$
@@ -74,8 +75,10 @@ CREATE INDEX idx_evaluator_results_run_failure_category
 
 CREATE INDEX idx_evaluator_results_run_evaluator_id ON evaluator_results(run_id, run_shard, evaluator_id);
 
+CREATE INDEX idx_evaluator_results_run_attempt ON evaluator_results(run_id, run_shard, attempt_id);
+
 COMMENT ON TABLE evaluator_results IS
-    'Append-only records representing the outcome of individual evaluators applied to execution attempts. These rows are list partitioned by run_shard and form the canonical evidence used for aggregation, scoring, and policy decisions.';
+    'Append-only records representing individual findings emitted by evaluators applied to execution attempts. These rows are list partitioned by run_shard and form the canonical evidence used for aggregation, scoring, and policy decisions.';
 
 COMMENT ON COLUMN evaluator_results.id IS
     'Unique identifier for the evaluator result record.';
@@ -94,6 +97,9 @@ COMMENT ON COLUMN evaluator_results.attempt_id IS
 
 COMMENT ON COLUMN evaluator_results.evaluator_id IS
     'Identifier of the evaluator that produced this result.';
+
+COMMENT ON COLUMN evaluator_results.finding_index IS
+    'Zero-based ordinal of the finding within one evaluator invocation. Included in the idempotency key so one evaluator can emit multiple findings for the same attempt.';
 
 COMMENT ON COLUMN evaluator_results.evaluator_version IS
     'Version of the evaluator used to produce this result, ensuring reproducibility.';

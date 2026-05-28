@@ -165,6 +165,7 @@ async fn select_run_export_batch_for_executions(
                 execution_id,
                 attempt_id,
                 evaluator_id,
+                finding_index,
                 evaluator_version,
                 evaluator_profile_id,
                 evaluator_profile_version,
@@ -189,7 +190,7 @@ async fn select_run_export_batch_for_executions(
             WHERE run_id = $1::uuid
               AND attempt_id = ANY($2::uuid[])
               AND run_shard = ANY($3::int2[])
-            ORDER BY execution_id, attempt_id, created_at, id
+            ORDER BY execution_id, attempt_id, evaluator_id, finding_index, created_at, id
             "#,
         )
         .bind(run_id)

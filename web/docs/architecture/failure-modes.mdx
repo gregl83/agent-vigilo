@@ -17,7 +17,7 @@ Chunk messages are delivered at least once. A worker holds the RabbitMQ delivery
 
 ## Duplicate delivery
 
-Duplicate broker deliveries are allowed. Exactly-once effects are managed in the database: chunks can only be claimed from an open or expired lease, recovered chunk-ready events carry unique recovery dedupe keys, executions only accept terminal transitions from the current attempt id and attempt number, and evaluator results are unique per run, attempt, and evaluator.
+Duplicate broker deliveries are allowed. Exactly-once effects are managed in the database: chunks can only be claimed from an open or expired lease, recovered chunk-ready events carry unique recovery dedupe keys, executions only accept terminal transitions from the current attempt id and attempt number, and evaluator findings are unique per run, attempt, evaluator, and finding index.
 
 ## Outbox publisher crash
 

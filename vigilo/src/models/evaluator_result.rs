@@ -1,6 +1,6 @@
 //! Evaluator result persistence models.
 //!
-//! Evaluator results are append-oriented evidence rows produced when an
+//! Evaluator results are append-oriented finding evidence rows produced when an
 //! evaluator scores an execution attempt. They are shard-partitioned in the
 //! database and feed execution aggregates, run summaries, and gate decisions.
 
@@ -14,7 +14,7 @@ use serde::{
 };
 use uuid::Uuid;
 
-/// Insert payload for one evaluator outcome on an execution attempt.
+/// Insert payload for one evaluator finding on an execution attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct EvaluatorResultDraft {
     /// Parent run id.
@@ -27,6 +27,8 @@ pub(crate) struct EvaluatorResultDraft {
     pub(crate) attempt_id: Uuid,
     /// Evaluator catalog id.
     pub(crate) evaluator_id: Uuid,
+    /// Zero-based finding ordinal within one evaluator invocation.
+    pub(crate) finding_index: i32,
     /// Evaluator version captured at execution time.
     pub(crate) evaluator_version: String,
     /// Evaluation profile id that selected this evaluator.
@@ -72,7 +74,7 @@ pub(crate) struct EvaluatorResultPatch {
     pub(crate) failure_category: Option<String>,
 }
 
-/// Persisted evaluator result row.
+/// Persisted evaluator finding row.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub(crate) struct EvaluatorResult {
     /// Result row id, unique within the run and shard key.
@@ -87,6 +89,8 @@ pub(crate) struct EvaluatorResult {
     pub(crate) attempt_id: Uuid,
     /// Evaluator catalog id.
     pub(crate) evaluator_id: Uuid,
+    /// Zero-based finding ordinal within one evaluator invocation.
+    pub(crate) finding_index: i32,
     /// Evaluator version captured at execution time.
     pub(crate) evaluator_version: String,
     /// Evaluation profile id that selected this evaluator.

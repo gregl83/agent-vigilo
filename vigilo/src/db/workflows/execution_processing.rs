@@ -40,6 +40,7 @@ use crate::{
     context::Context,
     contracts::{
         evaluator::{
+            EvaluationDimension,
             EvaluationStatus,
             EvaluatorInput,
             Severity,
@@ -1257,6 +1258,19 @@ fn map_evaluation_status(status: &EvaluationStatus) -> &'static str {
     }
 }
 
+fn map_evaluation_dimension(dimension: &EvaluationDimension) -> String {
+    match dimension {
+        EvaluationDimension::Correctness => "correctness".to_string(),
+        EvaluationDimension::Format => "format".to_string(),
+        EvaluationDimension::Safety => "safety".to_string(),
+        EvaluationDimension::Quality => "quality".to_string(),
+        EvaluationDimension::Latency => "latency".to_string(),
+        EvaluationDimension::ToolUse => "tool_use".to_string(),
+        EvaluationDimension::Calibration => "calibration".to_string(),
+        EvaluationDimension::Other(value) => value.clone(),
+    }
+}
+
 fn map_severity(severity: &Severity) -> &'static str {
     match severity {
         Severity::None => "none",
@@ -1322,8 +1336,8 @@ async fn evaluate_case_execution(
         let mut tasks = JoinSet::<
             anyhow::Result<(
                 usize,
-                EvaluatorExecutionRecord,
-                evaluator_results::EvaluatorResultInsertRow,
+                Vec<EvaluatorExecutionRecord>,
+                Vec<evaluator_results::EvaluatorResultInsertRow>,
             )>,
         >::new();
 
@@ -1369,125 +1383,160 @@ async fn evaluate_case_execution(
                         anyhow::anyhow!("evaluator blocking task join failed: {}", err)
                     })?;
 
-                    let (
-                        status,
-                        score_kind,
-                        raw_score,
-                        raw_score_min,
-                        raw_score_max,
-                        normalized_score,
-                        severity,
-                        failure_category,
-                        reason,
-                        evidence,
-                        raw_evaluator_output,
-                    ) = match output {
+                    let mut records = Vec::new();
+                    let mut rows = Vec::new();
+
+                    match output {
                         Ok(evaluator_output) => {
                             let serialized_output = serde_json::to_value(&evaluator_output)?;
                             let normalized = evaluator_output.normalize();
 
-                            if let Some(primary) = normalized.first() {
-                                let mut reason = primary.reason.clone();
-                                if normalized.len() > 1 {
-                                    let suffix = format!(
-                                        " (worker persisted only the first finding out of {})",
-                                        normalized.len()
-                                    );
-                                    reason = Some(match reason {
-                                        Some(existing) => format!("{}{}", existing, suffix),
-                                        None => {
-                                            format!(
-                                                "multiple evaluator findings returned{}",
-                                                suffix
-                                            )
-                                        }
+                            if normalized.is_empty() {
+                                let status = "error".to_string();
+                                let failure_category = Some("empty_output".to_string());
+                                let reason = Some("evaluator returned no findings".to_string());
+                                rows.push(evaluator_results::EvaluatorResultInsertRow {
+                                    run_id,
+                                    run_shard,
+                                    execution_id,
+                                    attempt_id,
+                                    evaluator_id: evaluator_entry.evaluator_id,
+                                    finding_index: 0,
+                                    evaluator_version: evaluator_entry.evaluator_version.clone(),
+                                    evaluator_profile_id: profile_id.clone(),
+                                    evaluator_profile_version: profile_version.clone(),
+                                    evaluator_interface_version: evaluator_entry
+                                        .evaluator_interface_version
+                                        .clone(),
+                                    evaluator_runtime_version: evaluator_entry
+                                        .evaluator_runtime_version
+                                        .clone(),
+                                    dimension: binding.dimension.clone(),
+                                    status: status.clone(),
+                                    blocking: binding.blocking,
+                                    score_kind: "informational".to_string(),
+                                    raw_score: None,
+                                    raw_score_min: None,
+                                    raw_score_max: None,
+                                    normalized_score: None,
+                                    weight: binding.weight,
+                                    severity: "high".to_string(),
+                                    failure_category: failure_category.clone(),
+                                    reason: reason.clone(),
+                                    evidence: json!({}),
+                                    raw_evaluator_output: serialized_output,
+                                });
+                                records.push(EvaluatorExecutionRecord {
+                                    evaluator_id: evaluator_entry.evaluator_id,
+                                    status,
+                                    dimension: binding.dimension,
+                                    normalized_score: None,
+                                    blocking: binding.blocking,
+                                    failure_category,
+                                    reason,
+                                });
+                            } else {
+                                for (finding_index, finding) in normalized.into_iter().enumerate() {
+                                    let finding_index = i32::try_from(finding_index)?;
+                                    let status =
+                                        map_evaluation_status(&finding.status).to_string();
+                                    let dimension = map_evaluation_dimension(&finding.dimension);
+                                    let blocking = binding.blocking || finding.blocking;
+                                    let severity = map_severity(&finding.severity).to_string();
+                                    let failure_category = finding.failure_category.clone();
+                                    let reason = finding.reason.clone();
+                                    let normalized_score = finding.normalized_score;
+
+                                    rows.push(evaluator_results::EvaluatorResultInsertRow {
+                                        run_id,
+                                        run_shard,
+                                        execution_id,
+                                        attempt_id,
+                                        evaluator_id: evaluator_entry.evaluator_id,
+                                        finding_index,
+                                        evaluator_version: evaluator_entry.evaluator_version.clone(),
+                                        evaluator_profile_id: profile_id.clone(),
+                                        evaluator_profile_version: profile_version.clone(),
+                                        evaluator_interface_version: evaluator_entry
+                                            .evaluator_interface_version
+                                            .clone(),
+                                        evaluator_runtime_version: evaluator_entry
+                                            .evaluator_runtime_version
+                                            .clone(),
+                                        dimension: dimension.clone(),
+                                        status: status.clone(),
+                                        blocking,
+                                        score_kind: finding.score_kind,
+                                        raw_score: finding.raw_score,
+                                        raw_score_min: finding.raw_score_min,
+                                        raw_score_max: finding.raw_score_max,
+                                        normalized_score,
+                                        weight: binding.weight,
+                                        severity,
+                                        failure_category: failure_category.clone(),
+                                        reason: reason.clone(),
+                                        evidence: finding.evidence,
+                                        raw_evaluator_output: serialized_output.clone(),
+                                    });
+                                    records.push(EvaluatorExecutionRecord {
+                                        evaluator_id: evaluator_entry.evaluator_id,
+                                        status,
+                                        dimension,
+                                        normalized_score,
+                                        blocking,
+                                        failure_category,
+                                        reason,
                                     });
                                 }
-
-                                (
-                                    map_evaluation_status(&primary.status).to_string(),
-                                    primary.score_kind.clone(),
-                                    primary.raw_score,
-                                    primary.raw_score_min,
-                                    primary.raw_score_max,
-                                    primary.normalized_score,
-                                    map_severity(&primary.severity).to_string(),
-                                    primary.failure_category.clone(),
-                                    reason,
-                                    primary.evidence.clone(),
-                                    serialized_output,
-                                )
-                            } else {
-                                (
-                                    "error".to_string(),
-                                    "informational".to_string(),
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    "high".to_string(),
-                                    Some("empty_output".to_string()),
-                                    Some("evaluator returned no findings".to_string()),
-                                    json!({}),
-                                    serialized_output,
-                                )
                             }
                         }
-                        Err(err) => (
-                            "error".to_string(),
-                            "informational".to_string(),
-                            None,
-                            None,
-                            None,
-                            None,
-                            "high".to_string(),
-                            Some("evaluator_runtime_error".to_string()),
-                            Some(err.to_string()),
-                            json!({}),
-                            json!({
-                                "error": err.to_string()
-                            }),
-                        ),
-                    };
+                        Err(err) => {
+                            let status = "error".to_string();
+                            let failure_category = Some("evaluator_runtime_error".to_string());
+                            let reason = Some(err.to_string());
+                            rows.push(evaluator_results::EvaluatorResultInsertRow {
+                                run_id,
+                                run_shard,
+                                execution_id,
+                                attempt_id,
+                                evaluator_id: evaluator_entry.evaluator_id,
+                                finding_index: 0,
+                                evaluator_version: evaluator_entry.evaluator_version,
+                                evaluator_profile_id: profile_id,
+                                evaluator_profile_version: profile_version,
+                                evaluator_interface_version: evaluator_entry
+                                    .evaluator_interface_version,
+                                evaluator_runtime_version: evaluator_entry.evaluator_runtime_version,
+                                dimension: binding.dimension.clone(),
+                                status: status.clone(),
+                                blocking: binding.blocking,
+                                score_kind: "informational".to_string(),
+                                raw_score: None,
+                                raw_score_min: None,
+                                raw_score_max: None,
+                                normalized_score: None,
+                                weight: binding.weight,
+                                severity: "high".to_string(),
+                                failure_category: failure_category.clone(),
+                                reason: reason.clone(),
+                                evidence: json!({}),
+                                raw_evaluator_output: json!({
+                                    "error": err.to_string()
+                                }),
+                            });
+                            records.push(EvaluatorExecutionRecord {
+                                evaluator_id: evaluator_entry.evaluator_id,
+                                status,
+                                dimension: binding.dimension,
+                                normalized_score: None,
+                                blocking: binding.blocking,
+                                failure_category,
+                                reason,
+                            });
+                        }
+                    }
 
-                    let row = evaluator_results::EvaluatorResultInsertRow {
-                        run_id,
-                        run_shard,
-                        execution_id,
-                        attempt_id,
-                        evaluator_id: evaluator_entry.evaluator_id,
-                        evaluator_version: evaluator_entry.evaluator_version,
-                        evaluator_profile_id: profile_id,
-                        evaluator_profile_version: profile_version,
-                        evaluator_interface_version: evaluator_entry.evaluator_interface_version,
-                        evaluator_runtime_version: evaluator_entry.evaluator_runtime_version,
-                        dimension: binding.dimension.clone(),
-                        status: status.clone(),
-                        blocking: binding.blocking,
-                        score_kind,
-                        raw_score,
-                        raw_score_min,
-                        raw_score_max,
-                        normalized_score,
-                        weight: binding.weight,
-                        severity,
-                        failure_category: failure_category.clone(),
-                        reason: reason.clone(),
-                        evidence,
-                        raw_evaluator_output,
-                    };
-
-                    let record = EvaluatorExecutionRecord {
-                        evaluator_id: evaluator_entry.evaluator_id,
-                        status,
-                        dimension: binding.dimension,
-                        normalized_score,
-                        blocking: binding.blocking,
-                        failure_category,
-                        reason,
-                    };
-
-                    Ok((index, record, row))
+                    Ok((index, records, rows))
                 });
             }
 
@@ -1502,8 +1551,8 @@ async fn evaluate_case_execution(
         }
 
         Ok((
-            ordered_records.into_values().collect(),
-            ordered_rows.into_values().collect(),
+            ordered_records.into_values().flatten().collect(),
+            ordered_rows.into_values().flatten().collect(),
         ))
     }
     .await;
