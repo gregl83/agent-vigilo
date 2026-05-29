@@ -1,0 +1,31 @@
+#!/usr/bin/env sh
+set -u
+
+failures=0
+
+warn() {
+  printf '%s\n' "pre-commit: warning: $*" >&2
+}
+
+run_check() {
+  printf '%s\n' "pre-commit: running $*"
+  "$@"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    failures=$((failures + 1))
+    printf '%s\n' "pre-commit: failed: $*" >&2
+  fi
+}
+
+if command -v cargo >/dev/null 2>&1; then
+  run_check cargo +nightly fmt --all -- --check
+else
+  warn "cargo not found; skipping Rust formatting locally. GitHub Actions will enforce it."
+fi
+
+if [ "$failures" -ne 0 ]; then
+  printf '%s\n' "pre-commit: $failures check(s) failed." >&2
+  exit 1
+fi
+
+printf '%s\n' "pre-commit: all local checks passed."

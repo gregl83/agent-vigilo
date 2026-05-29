@@ -29,6 +29,18 @@ This repository supports AI-assisted development, but generated changes must fol
 - Keep build/test commands on stable unless a task explicitly requires otherwise.
 - Do not remove or downgrade rustfmt settings to avoid nightly usage unless explicitly requested.
 
+## Pre-PR Checks
+
+- Before opening or updating a PR that touches Rust code, CI, migrations, evaluator crates, or workflow files, run:
+  - `cargo +nightly fmt --all -- --check`
+  - `cargo clippy --workspace --all-targets --locked -- -D warnings`
+  - `cargo test --workspace --locked`
+- If migrations changed, run the setup/migration path against a fresh local PostgreSQL database.
+- If web docs changed, run `npm --prefix web run typecheck` and `npm --prefix web run build`.
+- If local tooling is unavailable, say so explicitly and treat GitHub Actions as the first verification pass.
+- Optional repository hooks can be installed with `chmod +x scripts/hooks/pre-commit scripts/hooks/pre-push` and `git config core.hooksPath scripts/hooks`.
+- The pre-commit hook is intentionally light and runs formatting only. The pre-push hook runs clippy, tests, and web typecheck.
+
 ## Change Hygiene
 
 - Make focused commits by concern (contracts, runtime, docs, examples).

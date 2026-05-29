@@ -1,0 +1,40 @@
+#!/usr/bin/env sh
+set -u
+
+failures=0
+
+warn() {
+  printf '%s\n' "pre-push: warning: $*" >&2
+}
+
+run_check() {
+  printf '%s\n' "pre-push: running $*"
+  "$@"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    failures=$((failures + 1))
+    printf '%s\n' "pre-push: failed: $*" >&2
+  fi
+}
+
+if command -v cargo >/dev/null 2>&1; then
+  run_check cargo clippy --workspace --all-targets --locked -- -D warnings
+  run_check cargo test --workspace --locked
+else
+  warn "cargo not found; skipping Rust checks locally. GitHub Actions will enforce them."
+fi
+
+if [ -f web/package.json ]; then
+  if command -v npm >/dev/null 2>&1; then
+    run_check npm --prefix web run typecheck
+  else
+    warn "npm not found; skipping web typecheck locally. GitHub Actions will enforce it."
+  fi
+fi
+
+if [ "$failures" -ne 0 ]; then
+  printf '%s\n' "pre-push: $failures check(s) failed." >&2
+  exit 1
+fi
+
+printf '%s\n' "pre-push: all local checks passed."

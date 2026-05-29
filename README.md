@@ -40,6 +40,17 @@ A run can fail operationally because work did not complete, or complete with a f
 
 Rust, Tokio, PostgreSQL, SQLx, RabbitMQ, Wasmtime, WASI Preview 2, WIT, Docusaurus.
 
+## Development Checks
+
+GitHub Actions is the source of truth for build verification. To install the optional local Git hooks:
+
+```bash
+chmod +x scripts/hooks/pre-commit scripts/hooks/pre-push
+git config core.hooksPath scripts/hooks
+```
+
+The pre-commit hook runs nightly rustfmt only. The pre-push hook runs clippy, Rust tests, and the web typecheck. Migration smoke checks, evaluator Wasm builds, and the web production build run in CI.
+
 ## Project Status
 
 Agent Vigilo is an active systems project focused on reliable AI evaluation, LLM evaluation workflows, agent testing, and deployment gates. The implementation favors explicit contracts, durable state transitions, and operational diagrams over black-box orchestration.
