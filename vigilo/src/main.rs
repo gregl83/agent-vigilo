@@ -103,10 +103,10 @@ async fn main() -> ExitCode {
             }
 
             for (kind, value) in e.context() {
-                if let Some(kind) = kind.as_str() {
-                    if !kind.is_empty() {
-                        error!("command failed: {}: {}", kind, value);
-                    }
+                if let Some(kind) = kind.as_str()
+                    && !kind.is_empty()
+                {
+                    error!("command failed: {}: {}", kind, value);
                 }
             }
 

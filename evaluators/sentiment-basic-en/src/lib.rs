@@ -70,10 +70,10 @@ fn extract_text(raw: &str) -> Result<String, String> {
 }
 
 fn extract_text_from_input(input: &Input) -> Result<String, String> {
-    if let Some(text) = input.actual.text.as_deref() {
-        if let Ok(parsed) = extract_text(text) {
-            return Ok(parsed);
-        }
+    if let Some(text) = input.actual.text.as_deref()
+        && let Ok(parsed) = extract_text(text)
+    {
+        return Ok(parsed);
     }
 
     let input_json: serde_json::Value = serde_json::from_str(&input.test_case.input_json)

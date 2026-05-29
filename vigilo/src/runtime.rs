@@ -108,6 +108,7 @@ impl ServiceRunner<NoShutdownHook> {
     ///         Ok(())
     ///     });
     /// ```
+    #[allow(dead_code)]
     pub fn on_shutdown<Hook, HookFut>(self, shutdown_hook: Hook) -> ServiceRunner<Hook>
     where
         Hook: FnOnce() -> HookFut,
@@ -127,6 +128,7 @@ where
     ShutdownHook: ShutdownCallback,
 {
     /// Sets the maximum time to wait for cooperative shutdown before aborting.
+    #[allow(dead_code)]
     pub fn shutdown_timeout(mut self, shutdown_timeout: Duration) -> Self {
         self.shutdown_timeout = shutdown_timeout;
         self

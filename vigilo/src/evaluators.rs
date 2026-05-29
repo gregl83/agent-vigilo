@@ -213,7 +213,7 @@ async fn build_release_evaluator(evaluator_path: &Path) -> anyhow::Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("<unknown>");
-    let manifest = read_manifest(&evaluator_path.to_path_buf())?;
+    let manifest = read_manifest(evaluator_path)?;
     let manifest_path = evaluator_path.join(&manifest.package.manifest);
 
     info!("evaluator {}: building release wasm", evaluator_label);

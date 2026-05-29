@@ -612,7 +612,7 @@ async fn allocate_execution_attempts_for_cases(
     );
 
     query_builder.push_values(inputs.iter(), |mut b, row| {
-        b.push_bind(&row.case.case_id)
+        b.push_bind(row.case.case_id)
             .push_bind(&row.case.case_hash)
             .push_bind(&row.case.task_type)
             .push_bind(&row.case.tags)
@@ -1356,6 +1356,7 @@ fn map_severity(severity: &Severity) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn evaluate_case_execution(
     context: &Context,
     run_id: Uuid,
@@ -1920,6 +1921,7 @@ async fn persist_completed_execution_results_batch(
 ///   loops cannot continue indefinitely.
 /// - Persist successful evaluator evidence before returning terminal
 ///   transitions for authority-checked status updates.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_case_batch_execution(
     context: &Context,
     db: &PgPool,

@@ -425,17 +425,17 @@ impl Client {
         let publish_result = self
             .publish_bytes_with_properties_once(exchange, routing_key, body, properties.clone())
             .await;
-        if let Err(err) = &publish_result {
-            if Self::is_reconnectable_anyhow_error(err) {
-                warn!(
-                    error = %err,
-                    "rabbitmq publish failed on current session; reconnecting and retrying once"
-                );
-                self.invalidate_session().await;
-                return self
-                    .publish_bytes_with_properties_once(exchange, routing_key, body, properties)
-                    .await;
-            }
+        if let Err(err) = &publish_result
+            && Self::is_reconnectable_anyhow_error(err)
+        {
+            warn!(
+                error = %err,
+                "rabbitmq publish failed on current session; reconnecting and retrying once"
+            );
+            self.invalidate_session().await;
+            return self
+                .publish_bytes_with_properties_once(exchange, routing_key, body, properties)
+                .await;
         }
 
         publish_result
@@ -527,15 +527,15 @@ impl Client {
         &self,
     ) -> anyhow::Result<Option<RawConsumedMessage>> {
         let consume_result = self.consume_worker_message_once().await;
-        if let Err(err) = &consume_result {
-            if Self::is_reconnectable_anyhow_error(err) {
-                warn!(
-                    error = %err,
-                    "rabbitmq basic_get failed on current session; reconnecting and retrying once"
-                );
-                self.invalidate_session().await;
-                return self.consume_worker_message_once().await;
-            }
+        if let Err(err) = &consume_result
+            && Self::is_reconnectable_anyhow_error(err)
+        {
+            warn!(
+                error = %err,
+                "rabbitmq basic_get failed on current session; reconnecting and retrying once"
+            );
+            self.invalidate_session().await;
+            return self.consume_worker_message_once().await;
         }
 
         consume_result
@@ -574,17 +574,17 @@ impl Client {
         let stream_result = self
             .consume_worker_stream_once(consumer_tag_prefix, prefetch)
             .await;
-        if let Err(err) = &stream_result {
-            if Self::is_reconnectable_anyhow_error(err) {
-                warn!(
-                    error = %err,
-                    "rabbitmq consumer creation failed on current session; reconnecting and retrying once"
-                );
-                self.invalidate_session().await;
-                return self
-                    .consume_worker_stream_once(consumer_tag_prefix, prefetch)
-                    .await;
-            }
+        if let Err(err) = &stream_result
+            && Self::is_reconnectable_anyhow_error(err)
+        {
+            warn!(
+                error = %err,
+                "rabbitmq consumer creation failed on current session; reconnecting and retrying once"
+            );
+            self.invalidate_session().await;
+            return self
+                .consume_worker_stream_once(consumer_tag_prefix, prefetch)
+                .await;
         }
 
         stream_result

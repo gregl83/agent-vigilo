@@ -8,7 +8,7 @@
 use std::{
     collections::HashMap,
     fs,
-    path::PathBuf,
+    path::Path,
 };
 
 use anyhow::anyhow;
@@ -72,7 +72,7 @@ impl Manifest {
 }
 
 /// Reads and parses `Vigilo.toml` from an evaluator crate directory.
-pub(crate) fn read_manifest(crate_path: &PathBuf) -> anyhow::Result<Manifest> {
+pub(crate) fn read_manifest(crate_path: &Path) -> anyhow::Result<Manifest> {
     let content = fs::read_to_string(crate_path.join("Vigilo.toml"))?;
     let manifest: Manifest = toml::from_str(&content)?;
     Ok(manifest)

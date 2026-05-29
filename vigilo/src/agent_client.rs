@@ -161,13 +161,12 @@ fn build_openai_compatible_chat_messages(
         .config
         .get("system_prompt")
         .and_then(Value::as_str)
+        && !system_prompt.trim().is_empty()
     {
-        if !system_prompt.trim().is_empty() {
-            messages.push(json!({
-                "role": "system",
-                "content": system_prompt,
-            }));
-        }
+        messages.push(json!({
+            "role": "system",
+            "content": system_prompt,
+        }));
     }
 
     if let Some(input_messages) = test_case.input.get("messages").and_then(Value::as_array) {

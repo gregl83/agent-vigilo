@@ -271,18 +271,18 @@ pub(crate) async fn update_outbox_event_status(
     .fetch_optional(&mut *tx)
     .await?;
 
-    if let Some(event_id) = event_id {
-        if patch.status == "published" || patch.status == "failed" {
-            sqlx::query(
-                r#"
-                DELETE FROM outbox_delivery_queue
-                WHERE event_id = $1::uuid
-                "#,
-            )
-            .bind(event_id)
-            .execute(&mut *tx)
-            .await?;
-        }
+    if let Some(event_id) = event_id
+        && (patch.status == "published" || patch.status == "failed")
+    {
+        sqlx::query(
+            r#"
+            DELETE FROM outbox_delivery_queue
+            WHERE event_id = $1::uuid
+            "#,
+        )
+        .bind(event_id)
+        .execute(&mut *tx)
+        .await?;
     }
 
     tx.commit().await?;

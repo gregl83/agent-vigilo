@@ -7,7 +7,10 @@ use std::{
         Hasher,
     },
     io::ErrorKind,
-    path::PathBuf,
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
     thread,
     time::{
@@ -412,18 +415,18 @@ fn read_embedded_package_metadata(
     wasm_bytes: &[u8],
 ) -> anyhow::Result<Option<EmbeddedPackageMetadata>> {
     for payload in Parser::new(0).parse_all(wasm_bytes) {
-        if let Payload::CustomSection(section) = payload? {
-            if section.name() == PACKAGE_METADATA_SECTION {
-                let metadata = serde_json::from_slice::<EmbeddedPackageMetadata>(section.data())
-                    .map_err(|err| {
-                        anyhow::anyhow!(
-                            "failed to decode {} metadata: {}",
-                            PACKAGE_METADATA_SECTION,
-                            err
-                        )
-                    })?;
-                return Ok(Some(metadata));
-            }
+        if let Payload::CustomSection(section) = payload?
+            && section.name() == PACKAGE_METADATA_SECTION
+        {
+            let metadata = serde_json::from_slice::<EmbeddedPackageMetadata>(section.data())
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "failed to decode {} metadata: {}",
+                        PACKAGE_METADATA_SECTION,
+                        err
+                    )
+                })?;
+            return Ok(Some(metadata));
         }
     }
 
@@ -614,7 +617,7 @@ fn parse_wit_file(path: &PathBuf) -> anyhow::Result<WitDocument> {
 
 /// Resolve wit file metadata and return as struct.
 fn resolve_wit_metadata(
-    package_path: &PathBuf,
+    package_path: &Path,
     manifest_wit: Option<&Wit>,
 ) -> anyhow::Result<WitMetadata> {
     let Some(wit) = manifest_wit else {
@@ -721,10 +724,10 @@ fn resolve_evaluator_metadata(
 
 /// Get metadata from package manifest defined in Vigilo.toml.
 fn get_package_metadata(
-    package_path: &PathBuf,
-    manifest_file: &String,
+    package_path: &Path,
+    manifest_file: &str,
 ) -> anyhow::Result<PackageMetadata> {
-    match manifest_file.as_str() {
+    match manifest_file {
         "Cargo.toml" => {
             let manifest_path = package_path.join(manifest_file);
             let manifest_content = fs::read_to_string(&manifest_path)?;
@@ -826,9 +829,11 @@ pub struct Component {
     pub runtime: String,
     pub runtime_version: String,
     pub runtime_fingerprint: String,
+    #[allow(dead_code)]
     pub component: component::Component,
     pub wasm_hash: String,
     pub wasm_bytes: Vec<u8>,
+    #[allow(dead_code)]
     pub serialized: Vec<u8>,
 }
 
@@ -1130,7 +1135,7 @@ impl Context {
         self.cell
             .get_or_try_init(|| async {
                 debug!("initializing wasm engine");
-                Ok(Wasm::new(self.config.clone())?)
+                Wasm::new(self.config.clone())
             })
             .await
     }

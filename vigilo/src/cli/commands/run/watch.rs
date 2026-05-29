@@ -39,10 +39,8 @@ pub(super) async fn exec(
                 anyhow::bail!(reason);
             }
 
-            if fail_on_gate {
-                if let Some(reason) = run_gate_failure_reason(&run) {
-                    anyhow::bail!(reason);
-                }
+            if fail_on_gate && let Some(reason) = run_gate_failure_reason(&run) {
+                anyhow::bail!(reason);
             }
             return Ok(());
         }

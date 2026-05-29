@@ -4,6 +4,8 @@
 //! separate from evaluator execution contracts so persistence concerns do not
 //! leak into the evaluator ABI.
 
+#![allow(dead_code)]
+
 pub(crate) mod case_blob;
 pub(crate) mod dataset_version_case;
 pub(crate) mod evaluator;

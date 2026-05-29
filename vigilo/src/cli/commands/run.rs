@@ -212,7 +212,7 @@ fn build_case_plans(
         });
 
         dataset_cases.push(DatasetVersionCaseDraft {
-            case_id: case.id.clone(),
+            case_id: case.id,
             case_ordinal: idx as i32,
             case_hash,
         });

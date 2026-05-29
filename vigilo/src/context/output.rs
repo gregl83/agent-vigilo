@@ -212,7 +212,7 @@ impl Buffer {
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        if let Err(_) = self.flush() {
+        if self.flush().is_err() {
             error!("error flushing output buffer during drop");
         } else {
             debug!("output buffer flushed successfully on drop");

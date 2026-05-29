@@ -5,6 +5,8 @@
 //! transactional SQL where correctness depends on several tables changing
 //! together.
 
+#![allow(dead_code)]
+
 pub(crate) mod evaluator_results;
 pub(crate) mod evaluators;
 pub(crate) mod execution_aggregates;

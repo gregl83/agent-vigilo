@@ -425,6 +425,7 @@ impl EvaluatorOutput {
 ///
 /// Groups normalized results by evaluator-reported dimension while preserving
 /// insertion order of results within each dimension bucket.
+#[allow(dead_code)]
 pub(crate) fn group_by_dimension(
     results: &[NormalizedEvaluatorResult],
 ) -> BTreeMap<EvaluationDimension, Vec<&NormalizedEvaluatorResult>> {
