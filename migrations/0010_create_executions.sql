@@ -92,7 +92,7 @@ COMMENT ON COLUMN executions.case_hash IS
     'Content hash of the immutable case payload used for this execution, enabling reproducibility and regression comparability.';
 
 COMMENT ON COLUMN executions.profile_group_id IS
-    'Resolved profile group identifier applied to this execution at processing time.';
+    'Resolved profile case-group id applied to this execution. Multiple automatic matches are stored as a deterministic comma-separated id list.';
 
 COMMENT ON COLUMN executions.task_type IS
     'Logical task category for the execution (e.g., classification, generation, tool-use). Used for routing or conditional evaluation.';

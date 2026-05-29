@@ -62,7 +62,7 @@ COMMENT ON COLUMN run_chunks.dataset_version_id IS
     'Dataset version identifier used to resolve chunk case membership.';
 
 COMMENT ON COLUMN run_chunks.profile_group_id IS
-    'Resolved profile group identifier associated with this chunk.';
+    'Chunk scheduling label. Per-case profile group routing is resolved from case_blobs.case_group and run profile matching during worker execution.';
 
 COMMENT ON COLUMN run_chunks.ordinal_start IS
     'Inclusive starting dataset ordinal for this chunk.';

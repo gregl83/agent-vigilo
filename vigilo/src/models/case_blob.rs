@@ -20,6 +20,8 @@ pub(crate) struct CaseBlobDraft {
     pub(crate) case_hash: String,
     /// Task type used to match the case to compatible evaluator groups.
     pub(crate) task_type: String,
+    /// Optional explicit profile case-group routing override.
+    pub(crate) case_group: Option<String>,
     /// Model input payload provided to the agent under evaluation.
     pub(crate) input_payload: serde_json::Value,
     /// Expected output or reference answer used by evaluators.
@@ -39,6 +41,8 @@ pub(crate) struct CaseBlob {
     pub(crate) case_hash: String,
     /// Task type used to match the case to compatible evaluator groups.
     pub(crate) task_type: String,
+    /// Optional explicit profile case-group routing override.
+    pub(crate) case_group: Option<String>,
     /// Model input payload provided to the agent under evaluation.
     pub(crate) input_payload: serde_json::Value,
     /// Expected output or reference answer used by evaluators.

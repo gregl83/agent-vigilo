@@ -27,7 +27,7 @@ pub(crate) struct RunChunkDraft {
     pub(crate) chunk_id: Uuid,
     /// Logical shard assigned to this chunk.
     pub(crate) run_shard: i16,
-    /// Evaluation profile group applied to cases in this chunk.
+    /// Chunk scheduling label; per-case profile routing is resolved at runtime.
     pub(crate) profile_group_id: String,
     /// Inclusive start ordinal in the dataset version.
     pub(crate) ordinal_start: i32,
@@ -46,7 +46,7 @@ pub(crate) struct RunChunk {
     pub(crate) run_shard: i16,
     /// Dataset version whose cases are covered by this chunk.
     pub(crate) dataset_version_id: Uuid,
-    /// Evaluation profile group applied to cases in this chunk.
+    /// Chunk scheduling label; per-case profile routing is resolved at runtime.
     pub(crate) profile_group_id: String,
     /// Inclusive start ordinal in the dataset version.
     pub(crate) ordinal_start: i32,

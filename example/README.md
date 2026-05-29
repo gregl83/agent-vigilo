@@ -11,6 +11,8 @@ The profile points at `http://agent_vigilo_agent:8080/v1/chat/completions`, the 
 
 The example uses one score-gated `quality` dimension. The profile binding `dimension` is the authoritative aggregation bucket; evaluator-emitted dimensions are retained as evaluator output evidence but do not override the profile. The run passes only when the weighted aggregate score is at least `defaults.min_execution_score`.
 
+Each example dataset case sets `case_group: sentiment_classification`, which explicitly routes the case to the matching profile case group. If `case_group` is omitted, Vigilo falls back to `task_type` and tag matching.
+
 ## Model
 
 Place the GGUF model at:

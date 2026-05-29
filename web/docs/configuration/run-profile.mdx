@@ -159,6 +159,12 @@ case_groups:
 - `tags_any` (string[], optional)
 - `tags_all` (string[], optional)
 
+Selection behavior:
+
+- If a dataset case supplies `case_group`, Vigilo selects the case group whose `id` exactly matches that value. The `applies_to` task/tag rules are bypassed for that case.
+- If a dataset case omits `case_group`, Vigilo evaluates `applies_to`: `task_type` must match, `tags_any` requires at least one matching tag when present, and `tags_all` requires every listed tag.
+- An unknown explicit `case_group` is an error; it does not fall back to automatic matching.
+
 ### `evaluators[]`
 
 ```yaml
@@ -207,6 +213,29 @@ Aggregation behavior:
 - `passed` and `failed` findings with normalized scores are scoreable. `skipped` and informational findings do not affect score.
 - If an execution has no scoreable findings, its aggregate status is `error`.
 - If multiple case groups match the same case, their dimension policies and duplicate evaluator bindings must be identical or non-overlapping; conflicting policies are rejected.
+
+## Evaluation Plan Resolution
+
+For every dataset case, Vigilo resolves an evaluation plan before invoking the target agent. The plan determines:
+
+- the profile case group or groups applied to the case
+- the evaluator bindings to run
+- the evaluator-specific config passed into each evaluator
+- the profile-owned dimensions used for persisted findings
+- the aggregation policy used for the execution aggregate
+
+Resolution order:
+
+1. If `cases[].case_group` is supplied, Vigilo selects `case_groups[].id` with that exact value.
+2. If the supplied `case_group` does not exist, the case is invalid for this profile and Vigilo does not fall back to `applies_to`.
+3. If `cases[].case_group` is omitted, Vigilo evaluates every profile `case_groups[].applies_to` block.
+4. Automatic matching requires `task_type` equality.
+5. When `tags_any` is present, at least one listed tag must appear on the case.
+6. When `tags_all` is present, every listed tag must appear on the case.
+7. All automatically matching groups contribute evaluator bindings and aggregation settings.
+8. Duplicate evaluator refs and duplicate dimension policies across matching groups must be identical; conflicting policies are rejected.
+
+The resolved plan is snapshotted on the execution through `evaluator_manifest`, `expected_evaluator_count`, and `profile_group_id`. Dataset `case_group` is also retained in evaluator input so evaluators can inspect the original routing label.
 
 ## Full Example
 

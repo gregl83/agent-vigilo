@@ -1,6 +1,7 @@
 CREATE TABLE case_blobs (
     case_hash TEXT PRIMARY KEY,
     task_type TEXT NOT NULL,
+    case_group TEXT,
     input_payload JSONB NOT NULL,
     expected_output JSONB NOT NULL,
     context_payload JSONB NOT NULL DEFAULT 'null'::jsonb,
@@ -17,6 +18,9 @@ COMMENT ON COLUMN case_blobs.case_hash IS
 
 COMMENT ON COLUMN case_blobs.task_type IS
     'Canonical task type for the case blob. Included in the content hash for comparability and routing reproducibility.';
+
+COMMENT ON COLUMN case_blobs.case_group IS
+    'Optional explicit profile case-group routing override for this immutable case. Included in the content hash because it changes evaluator selection.';
 
 COMMENT ON COLUMN case_blobs.input_payload IS
     'Canonicalized case input payload used by worker processing. Shared across dataset versions when unchanged.';

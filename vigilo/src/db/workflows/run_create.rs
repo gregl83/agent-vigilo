@@ -38,12 +38,13 @@ pub(crate) async fn bulk_insert_case_blobs(
 
     for chunk in case_blobs.chunks(CASE_BLOB_INSERT_CHUNK_SIZE) {
         let mut query_builder = QueryBuilder::<Postgres>::new(
-            "INSERT INTO case_blobs (case_hash, task_type, input_payload, expected_output, context_payload, tags, metadata) ",
+            "INSERT INTO case_blobs (case_hash, task_type, case_group, input_payload, expected_output, context_payload, tags, metadata) ",
         );
 
         query_builder.push_values(chunk, |mut b, row| {
             b.push_bind(&row.case_hash)
                 .push_bind(&row.task_type)
+                .push_bind(&row.case_group)
                 .push_bind(&row.input_payload)
                 .push_bind(&row.expected_output)
                 .push_bind(&row.context_payload)

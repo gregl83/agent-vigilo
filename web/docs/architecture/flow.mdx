@@ -92,6 +92,16 @@ Each attempt is associated with:
 - a lease (for failure detection)
 - an attempt number
 
+For each loaded case, workers resolve the evaluation plan from the run profile. An explicit dataset `case_group` selects the profile group with the same id. When `case_group` is omitted, workers use the profile group's `applies_to` task and tag rules.
+
+The resolved evaluation plan is stored on the execution before the attempt runs:
+
+- `profile_group_id`: the selected profile group id, or a deterministic comma-separated id list for multiple automatic matches
+- `evaluator_manifest`: the resolved evaluator bindings and evaluator configs
+- `expected_evaluator_count`: the number of evaluator invocations expected for the execution
+
+The dataset `case_group` value is part of immutable case content. It is loaded from `case_blobs`, passed into evaluator input, and affects the case hash because changing it changes evaluator routing.
+
 ### 3. Agent Invocation
 
 The worker invokes the configured agent target:

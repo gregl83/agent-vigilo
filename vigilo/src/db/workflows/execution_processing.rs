@@ -81,6 +81,7 @@ struct EvaluatorExecutionRecord {
 
 #[derive(Debug, Clone)]
 struct CaseEvaluationPlan {
+    profile_group_id: String,
     evaluator_bindings: Vec<EvaluatorBinding>,
     aggregation: AggregationSettings,
 }
@@ -364,6 +365,14 @@ fn matching_groups_for_case<'a>(
     profile: &'a RunProfile,
     case: &chunk_processing::WorkerCaseBatchItem,
 ) -> Vec<&'a CaseGroupProfile> {
+    if let Some(group_id) = case.case_group.as_deref() {
+        return profile
+            .case_groups
+            .iter()
+            .filter(|group| group.id == group_id)
+            .collect();
+    }
+
     let case_tags = tags_from_case_row(&case.tags);
 
     profile
@@ -451,6 +460,11 @@ fn evaluation_plan_for_case(
         );
     }
 
+    let profile_group_id = matching_groups
+        .iter()
+        .map(|group| group.id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
     let aggregation = merge_aggregation_settings(case.case_id, &matching_groups)?;
     let mut unique = BTreeMap::new();
     for group in matching_groups {
@@ -479,6 +493,7 @@ fn evaluation_plan_for_case(
     }
 
     Ok(CaseEvaluationPlan {
+        profile_group_id,
         evaluator_bindings,
         aggregation,
     })
@@ -492,7 +507,7 @@ fn make_test_case(case: &chunk_processing::WorkerCaseBatchItem) -> anyhow::Resul
     Ok(TestCase {
         id: case.case_id.to_string(),
         task_type: case.task_type.clone(),
-        case_group: None,
+        case_group: case.case_group.clone(),
         input: case.input_payload.clone(),
         expected: Some(case.expected_output.clone()),
         context: Some(case.context_payload.clone()),
@@ -524,7 +539,7 @@ async fn allocate_execution_attempts_for_cases(
     chunk_id: Uuid,
     run_profile: &RunProfile,
     cases: &[chunk_processing::WorkerCaseBatchItem],
-    evaluator_bindings_by_case: &[Vec<EvaluatorBinding>],
+    evaluation_plans_by_case: &[CaseEvaluationPlan],
 ) -> anyhow::Result<Vec<AttemptAllocation>> {
     if cases.is_empty() {
         return Ok(Vec::new());
@@ -534,16 +549,17 @@ async fn allocate_execution_attempts_for_cases(
     }
     let max_attempts = i32::try_from(run_profile.defaults.max_attempts)?;
 
-    if cases.len() != evaluator_bindings_by_case.len() {
+    if cases.len() != evaluation_plans_by_case.len() {
         anyhow::bail!(
-            "case batch has {} cases but {} evaluator binding sets",
+            "case batch has {} cases but {} evaluation plans",
             cases.len(),
-            evaluator_bindings_by_case.len()
+            evaluation_plans_by_case.len()
         );
     }
 
     struct AllocationInput<'a> {
         case: &'a chunk_processing::WorkerCaseBatchItem,
+        profile_group_id: &'a str,
         evaluator_manifest: serde_json::Value,
         expected_evaluator_count: i32,
         input_ordinal: i32,
@@ -551,13 +567,14 @@ async fn allocate_execution_attempts_for_cases(
 
     let inputs = cases
         .iter()
-        .zip(evaluator_bindings_by_case)
+        .zip(evaluation_plans_by_case)
         .enumerate()
-        .map(|(index, (case, evaluator_bindings))| {
+        .map(|(index, (case, plan))| {
             Ok(AllocationInput {
                 case,
-                evaluator_manifest: serde_json::to_value(evaluator_bindings)?,
-                expected_evaluator_count: i32::try_from(evaluator_bindings.len())?,
+                profile_group_id: &plan.profile_group_id,
+                evaluator_manifest: serde_json::to_value(&plan.evaluator_bindings)?,
+                expected_evaluator_count: i32::try_from(plan.evaluator_bindings.len())?,
                 input_ordinal: i32::try_from(index)?,
             })
         })
@@ -586,6 +603,7 @@ async fn allocate_execution_attempts_for_cases(
             input_payload,
             expected_output,
             case_metadata,
+            profile_group_id,
             evaluator_manifest,
             expected_evaluator_count,
             input_ordinal
@@ -601,6 +619,7 @@ async fn allocate_execution_attempts_for_cases(
             .push_bind(&row.case.input_payload)
             .push_bind(&row.case.expected_output)
             .push_bind(&row.case.metadata)
+            .push_bind(row.profile_group_id)
             .push_bind(&row.evaluator_manifest)
             .push_bind(row.expected_evaluator_count)
             .push_bind(row.input_ordinal);
@@ -668,7 +687,7 @@ async fn allocate_execution_attempts_for_cases(
         r#"::uuid,
                 input.case_id,
                 input.case_hash,
-                'default',
+                input.profile_group_id,
                 input.task_type,
                 input.tags::jsonb,
                 input.input_payload::jsonb,
@@ -691,6 +710,7 @@ async fn allocate_execution_attempts_for_cases(
               ON true
             ON CONFLICT (run_id, run_shard, case_id) DO UPDATE
             SET case_hash = EXCLUDED.case_hash,
+                profile_group_id = EXCLUDED.profile_group_id,
                 task_type = EXCLUDED.task_type,
                 tags = EXCLUDED.tags,
                 input_payload = EXCLUDED.input_payload,
@@ -1916,10 +1936,6 @@ pub(crate) async fn process_case_batch_execution(
         .iter()
         .map(|case| evaluation_plan_for_case(run_profile, case))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let evaluator_bindings_by_case = evaluation_plans_by_case
-        .iter()
-        .map(|plan| plan.evaluator_bindings.clone())
-        .collect::<Vec<_>>();
 
     let allocations = allocate_execution_attempts_for_cases(
         db,
@@ -1928,7 +1944,7 @@ pub(crate) async fn process_case_batch_execution(
         chunk_id,
         run_profile,
         cases,
-        &evaluator_bindings_by_case,
+        &evaluation_plans_by_case,
     )
     .await?;
 
@@ -2052,4 +2068,232 @@ pub(crate) fn is_runnable_evaluator_state(state: &EvaluatorState) -> bool {
         state,
         EvaluatorState::Active | EvaluatorState::Deprecated | EvaluatorState::Yanked
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::{
+        evaluation_plan_for_case,
+        make_test_case,
+        matching_groups_for_case,
+    };
+    use crate::{
+        contracts::run::{
+            AgentHttpConfig,
+            AgentProfile,
+            AggregationMethod,
+            AggregationSettings,
+            AppliesTo,
+            CaseGroupProfile,
+            DimensionAggregation,
+            EvaluatorBinding,
+            PersistRawOutputsMode,
+            PersistenceMode,
+            PersistenceSettings,
+            RunDefaults,
+            RunProfile,
+        },
+        db::workflows::chunk_processing::WorkerCaseBatchItem,
+    };
+
+    fn evaluator_binding(evaluator_ref: &str, dimension: &str) -> EvaluatorBinding {
+        EvaluatorBinding {
+            evaluator_ref: evaluator_ref.to_string(),
+            dimension: dimension.to_string(),
+            blocking: false,
+            weight: 1.0,
+            config: json!({}),
+        }
+    }
+
+    fn aggregation(method: AggregationMethod) -> AggregationSettings {
+        AggregationSettings {
+            dimensions: [(
+                "quality".to_string(),
+                DimensionAggregation {
+                    method,
+                    blocking: false,
+                    weight: 1.0,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    fn case_group(
+        id: &str,
+        task_type: &str,
+        tags_any: Vec<&str>,
+        evaluator_ref: &str,
+        method: AggregationMethod,
+    ) -> CaseGroupProfile {
+        CaseGroupProfile {
+            id: id.to_string(),
+            description: format!("{id} group"),
+            applies_to: AppliesTo {
+                task_type: task_type.to_string(),
+                tags_any: tags_any.into_iter().map(ToOwned::to_owned).collect(),
+                tags_all: vec![],
+            },
+            evaluators: vec![evaluator_binding(evaluator_ref, "quality")],
+            aggregation: aggregation(method),
+        }
+    }
+
+    fn run_profile(groups: Vec<CaseGroupProfile>) -> RunProfile {
+        RunProfile {
+            profile_id: "profile".to_string(),
+            profile_version: "1.0.0".to_string(),
+            description: "test profile".to_string(),
+            defaults: RunDefaults {
+                max_attempts: 1,
+                request_timeout_secs: 30,
+                fail_on_any_blocking_failure: true,
+                min_execution_score: 0.8,
+            },
+            persistence: PersistenceSettings {
+                mode: PersistenceMode::Full,
+                persist_raw_outputs: PersistRawOutputsMode::All,
+                persist_evaluator_evidence: true,
+            },
+            agent: AgentProfile {
+                provider: "example".to_string(),
+                name: "agent".to_string(),
+                version: None,
+                model: None,
+                prompt_config_id: None,
+                prompt_config_version: None,
+                http: AgentHttpConfig {
+                    url: "http://127.0.0.1:8787/v1/agent/invoke".to_string(),
+                    method: "POST".to_string(),
+                    headers: Default::default(),
+                    timeout_secs: None,
+                },
+                config: json!({}),
+            },
+            case_groups: groups,
+        }
+    }
+
+    fn worker_case(case_group: Option<&str>) -> WorkerCaseBatchItem {
+        WorkerCaseBatchItem {
+            case_id: Uuid::parse_str("018f1111-1111-7111-8111-111111111101").unwrap(),
+            case_hash: "case-hash".to_string(),
+            case_ordinal: 0,
+            task_type: "classification".to_string(),
+            case_group: case_group.map(ToOwned::to_owned),
+            input_payload: json!({"user_message": "I love this product."}),
+            expected_output: json!({"label": "positive"}),
+            context_payload: serde_json::Value::Null,
+            tags: json!(["sentiment"]),
+            metadata: json!({}),
+        }
+    }
+
+    fn routing_profile() -> RunProfile {
+        run_profile(vec![
+            case_group(
+                "sentiment_classification",
+                "classification",
+                vec!["sentiment"],
+                "vigilo/sentiment-basic-en:0.1.0",
+                AggregationMethod::WeightedMean,
+            ),
+            case_group(
+                "json_contract",
+                "json_contract",
+                vec![],
+                "core/json-schema:1.0.0",
+                AggregationMethod::MinScore,
+            ),
+        ])
+    }
+
+    #[test]
+    fn explicit_case_group_bypasses_task_and_tag_matching() {
+        let profile = routing_profile();
+        let case = worker_case(Some("json_contract"));
+
+        let groups = matching_groups_for_case(&profile, &case);
+        let plan = evaluation_plan_for_case(&profile, &case).unwrap();
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, "json_contract");
+        assert_eq!(plan.profile_group_id, "json_contract");
+        assert_eq!(plan.evaluator_bindings.len(), 1);
+        assert_eq!(
+            plan.evaluator_bindings[0].evaluator_ref,
+            "core/json-schema:1.0.0"
+        );
+    }
+
+    #[test]
+    fn omitted_case_group_uses_task_and_tag_matching() {
+        let profile = routing_profile();
+        let case = worker_case(None);
+
+        let groups = matching_groups_for_case(&profile, &case);
+        let plan = evaluation_plan_for_case(&profile, &case).unwrap();
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, "sentiment_classification");
+        assert_eq!(plan.profile_group_id, "sentiment_classification");
+        assert_eq!(
+            plan.evaluator_bindings[0].evaluator_ref,
+            "vigilo/sentiment-basic-en:0.1.0"
+        );
+    }
+
+    #[test]
+    fn unknown_explicit_case_group_does_not_fall_back_to_task_tags() {
+        let profile = routing_profile();
+        let case = worker_case(Some("missing_group"));
+
+        let groups = matching_groups_for_case(&profile, &case);
+        let err = evaluation_plan_for_case(&profile, &case).unwrap_err();
+
+        assert!(groups.is_empty());
+        assert!(err.to_string().contains("did not match any evaluator bindings"));
+    }
+
+    #[test]
+    fn automatic_matching_rejects_conflicting_case_group_policies() {
+        let profile = run_profile(vec![
+            case_group(
+                "quality_weighted",
+                "classification",
+                vec![],
+                "core/quality-a:1.0.0",
+                AggregationMethod::WeightedMean,
+            ),
+            case_group(
+                "quality_min",
+                "classification",
+                vec![],
+                "core/quality-b:1.0.0",
+                AggregationMethod::MinScore,
+            ),
+        ]);
+        let case = worker_case(None);
+
+        let err = evaluation_plan_for_case(&profile, &case).unwrap_err();
+
+        assert!(err.to_string().contains("conflicting aggregation policy"));
+    }
+
+    #[test]
+    fn make_test_case_preserves_case_group_for_evaluator_input() {
+        let case = worker_case(Some("sentiment_classification"));
+
+        let test_case = make_test_case(&case).unwrap();
+
+        assert_eq!(
+            test_case.case_group.as_deref(),
+            Some("sentiment_classification")
+        );
+    }
 }

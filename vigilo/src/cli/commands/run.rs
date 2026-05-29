@@ -190,6 +190,7 @@ fn build_case_plans(
 
         let blob_payload = json!({
             "task_type": case.task_type.clone(),
+            "case_group": case.case_group.clone(),
             "input": input_payload,
             "expected_output": expected_output,
             "context": context_payload,
@@ -202,6 +203,7 @@ fn build_case_plans(
         case_blobs.push(CaseBlobDraft {
             case_hash: case_hash.clone(),
             task_type: case.task_type.clone(),
+            case_group: case.case_group.clone(),
             input_payload: blob_payload["input"].clone(),
             expected_output: blob_payload["expected_output"].clone(),
             context_payload: blob_payload["context"].clone(),
@@ -259,6 +261,9 @@ fn compute_aggregation_policy_hash(profile: &RunProfile) -> anyhow::Result<Strin
 }
 
 /// Builds run chunk drafts from total case count and requested chunk size.
+///
+/// Chunks are ordinal scheduling ranges and may contain mixed case groups.
+/// Per-case profile routing is resolved later by workers from stored case data.
 fn build_chunks(total_cases: usize, chunk_size: usize) -> Vec<RunChunkDraft> {
     let mut chunks = Vec::new();
     let mut start = 0usize;
@@ -673,6 +678,8 @@ impl Executable for Command {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use chrono::Utc;
     use serde_json::json;
     use uuid::Uuid;
@@ -681,6 +688,7 @@ mod tests {
         EXPORT_EXECUTION_BATCH_SIZE,
         RunExportFormat,
         RunResultsSummary,
+        build_case_plans,
         build_chunks,
         cancel,
         canonical_json,
@@ -701,6 +709,10 @@ mod tests {
             Context,
             output::OutputFormat,
             wasm,
+        },
+        contracts::run::{
+            DatasetCase,
+            RunDataset,
         },
         models::{
             evaluator_result::EvaluatorResult,
@@ -753,6 +765,46 @@ mod tests {
         assert_eq!(chunks[0].run_shard, 0);
         assert_eq!(chunks[127].run_shard, 127);
         assert_eq!(chunks[128].run_shard, 0);
+    }
+
+    fn run_dataset_with_case_group(case_group: Option<&str>) -> RunDataset {
+        RunDataset {
+            dataset_id: Uuid::parse_str("018f1111-1111-7111-8111-111111111111").unwrap(),
+            dataset_version: Some("1.0.0".to_string()),
+            cases: vec![DatasetCase {
+                id: Uuid::parse_str("018f1111-1111-7111-8111-111111111101").unwrap(),
+                task_type: "classification".to_string(),
+                case_group: case_group.map(ToOwned::to_owned),
+                input: json!({"user_message": "I love this product."}),
+                expected: Some(json!({"label": "positive"})),
+                context: None,
+                tags: vec!["sentiment".to_string()],
+                metadata: BTreeMap::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn build_case_plans_persists_case_group_override() {
+        let dataset = run_dataset_with_case_group(Some("sentiment_classification"));
+
+        let (case_blobs, _) = build_case_plans(&dataset).unwrap();
+
+        assert_eq!(
+            case_blobs[0].case_group.as_deref(),
+            Some("sentiment_classification")
+        );
+    }
+
+    #[test]
+    fn build_case_plans_hash_changes_when_only_case_group_changes() {
+        let with_group = run_dataset_with_case_group(Some("sentiment_classification"));
+        let without_group = run_dataset_with_case_group(None);
+
+        let (with_group_blobs, _) = build_case_plans(&with_group).unwrap();
+        let (without_group_blobs, _) = build_case_plans(&without_group).unwrap();
+
+        assert_ne!(with_group_blobs[0].case_hash, without_group_blobs[0].case_hash);
     }
 
     fn run_with_status(status: &str, gate_status: &str) -> Run {
