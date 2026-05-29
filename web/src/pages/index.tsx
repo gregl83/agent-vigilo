@@ -37,8 +37,8 @@ function HomepageHeader() {
         </Heading>
         <p className={styles.heroSubtitle}>{siteConfig.tagline}</p>
         <p className={styles.heroText}>
-          Publish versioned WASM evaluators, run durable agent evaluations, and
-          gate releases with structured results your automation can trust.
+          Publish versioned WASM evaluators, turn findings into total aggregate scores,
+          and gate releases on explicit thresholds and blocking failures.
         </p>
         <div className={styles.buttons}>
           <Link className={styles.primaryButton} to="/docs/guides/getting-started">

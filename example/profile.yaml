@@ -5,9 +5,9 @@ description: Example profile that evaluates a local llama.cpp-backed Qwen sentim
 defaults:
   max_attempts: 2
   request_timeout_secs: 120
-  # Blocking findings fail the execution even when the aggregate score is high.
+  # Hard blocking findings can fail the execution even when aggregate_score is high.
   fail_on_any_blocking_failure: true
-  # The execution passes only when the final aggregate score is >= this value.
+  # Overall score gate for the total execution aggregate_score.
   min_execution_score: 0.85
 
 persistence:
@@ -48,7 +48,7 @@ case_groups:
         # Profile-owned aggregation bucket. The evaluator also reports `quality`,
         # but runtime aggregation uses this binding value as the authority.
         dimension: quality
-        # This example is score-gated rather than hard-gated.
+        # This example uses the overall score gate rather than a hard blocker.
         blocking: false
         # Total contribution of this evaluator inside the quality dimension.
         weight: 1.0
@@ -59,7 +59,7 @@ case_groups:
       dimensions:
         quality:
           method: weighted_mean
-          # Failed findings in this dimension are recorded but do not hard-gate.
+          # Failed findings in this dimension are recorded but are not hard blockers.
           blocking: false
-          # Quality is the only scored dimension in this minimal example.
+          # Quality contributes to the total execution aggregate_score.
           weight: 1.0

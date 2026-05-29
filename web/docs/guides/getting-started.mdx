@@ -42,6 +42,35 @@ run outcome: completed/pass, completed/fail, running, cancelled, or failed
 
 A profile describes the agent, request format, evaluator set, aggregation, and gate rules. A dataset supplies the cases. Vigilo turns those files into a durable run that can be watched, queried, exported, and used as a deployment gate.
 
+## How Results Are Calculated
+
+Vigilo calculates results in this order:
+
+```text
+finding score -> dimension_scores -> aggregate_score -> execution status -> run gate_status
+```
+
+- Evaluators emit findings with a status, score, optional blocking flag, and source dimension.
+- The run profile decides which dimension each evaluator contributes to.
+- `dimension_scores` are per-dimension scores.
+- `aggregate_score` is one total score for the execution, calculated across scored dimensions.
+- `defaults.min_execution_score` is an overall score gate for `aggregate_score`, not a per-dimension threshold.
+- An execution passes when `aggregate_score >= defaults.min_execution_score` and no hard blocking finding fails or errors.
+- A run passes when every expected execution has an aggregate, no chunk failed or was cancelled, and no execution failed or errored.
+
+A finding is blocking if the evaluator finding, evaluator binding, or dimension policy says `blocking: true`. Use blocking for hard requirements that should not be averaged away. `defaults.fail_on_any_blocking_failure` controls whether blocking failed findings hard-fail the execution; blocking errors always error the execution.
+
+## Where Failure Happens
+
+```text
+case attempt -> execution -> run -> gate
+```
+
+- Attempts can fail because the agent call, evaluator runtime, persistence, or retry budget failed.
+- Executions can fail because the total `aggregate_score` is below the overall score gate or a hard blocking finding failed.
+- Runs can fail operationally because chunks failed, coverage is incomplete, aggregates are missing, or executions errored.
+- Gates fail when the run completes but `gate_status` is `fail`.
+
 ## Prerequisites
 
 You need:

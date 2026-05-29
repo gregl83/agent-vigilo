@@ -20,6 +20,31 @@ Use this profile with:
 vigilo run test --profile-file <profile.yaml> --dataset-file <dataset.yaml>
 ```
 
+## Result Calculation
+
+```text
+finding score -> dimension_scores -> aggregate_score -> execution status -> run gate_status
+```
+
+`dimension_scores` are per-dimension scores. `aggregate_score` is one total score for a single execution across all scored dimensions.
+
+The `dimension` on an evaluator binding is the profile-owned aggregation bucket. Evaluator-emitted dimensions are preserved as source metadata, but they do not choose the scoring bucket.
+
+Dimension scores are calculated with:
+
+- `weighted_mean`: weighted average of scoreable findings in that profile dimension.
+- `min_score`: lowest scoreable finding in that profile dimension.
+
+`aggregate_score` is the weighted average of `dimension_scores` using dimension weights. `defaults.min_execution_score` is an overall score gate for that total; it is not a per-dimension threshold. Dimensions with `weight: 0.0` do not affect `aggregate_score`, but can still block when `blocking: true`.
+
+An execution passes when:
+
+- `aggregate_score >= defaults.min_execution_score`
+- no hard blocking finding fails or errors
+- at least one scoreable finding exists
+
+A run passes when every expected execution has an aggregate, no chunk failed or was cancelled, and no execution failed or errored. Check both `runs.status` for operational lifecycle and `runs.gate_status` for policy outcome; a terminal run is not necessarily a passing run.
+
 ## File Format
 
 The CLI accepts YAML or JSON.
@@ -69,8 +94,8 @@ defaults:
 
 - `max_attempts` (u32): hard limit for case execution attempts. Failed attempts below this limit are retried with bounded backoff; once the limit is reached, the execution is failed.
 - `request_timeout_secs` (u32)
-- `fail_on_any_blocking_failure` (bool): when `true`, any blocking failed/error finding fails the execution even if the aggregate score is above the threshold. When `false`, blocking failures are still recorded in `blocking_failures`, but score policy determines pass/fail unless a blocking error is present.
-- `min_execution_score` (f64): finite value from `0.0` to `1.0`. The execution passes only when the final aggregate score is greater than or equal to this value and no enabled blocking gate fails.
+- `fail_on_any_blocking_failure` (bool): when `true`, any blocking failed finding fails the execution even if the total `aggregate_score` is above the threshold. When `false`, blocking failures are still recorded in `blocking_failures`, but the overall score gate determines pass/fail. Blocking errors always error the execution.
+- `min_execution_score` (f64): finite value from `0.0` to `1.0`. This is the overall score gate for the total execution `aggregate_score`; it does not set per-dimension thresholds.
 
 ## `persistence`
 
@@ -201,13 +226,32 @@ aggregation:
 
 - `method` (enum): `min_score` | `weighted_mean`
 - `blocking` (bool): marks failed/error findings in this dimension as blocking, even when the individual evaluator binding is non-blocking.
-- `weight` (f64): finite value greater than or equal to `0.0`. Dimension weights combine per-dimension scores into `aggregate_score`; `0.0` means the dimension does not affect the aggregate score, but blocking findings in that dimension can still fail the execution.
+- `weight` (f64): finite value greater than or equal to `0.0`. Dimension weights combine `dimension_scores` into the total execution `aggregate_score`; `0.0` means the dimension does not affect the total score, but blocking findings in that dimension can still fail the execution.
+
+A common pattern is a hard format gate plus a scored quality dimension:
+
+```yaml
+aggregation:
+  dimensions:
+    format:
+      method: min_score
+      blocking: true
+      weight: 0.0
+    quality:
+      method: weighted_mean
+      blocking: false
+      weight: 1.0
+```
+
+Here, `format` can fail the execution but does not change `aggregate_score`; `quality` determines the total score in this minimal profile.
 
 Aggregation behavior:
 
 - Findings are grouped by the profile binding `dimension`, not by the evaluator-emitted finding dimension.
 - `weighted_mean` computes a weighted arithmetic mean inside each dimension using evaluator binding weights.
 - `min_score` uses the lowest normalized score among scoreable findings in that dimension.
+- `dimension_scores` are per-dimension scores.
+- `aggregate_score` is the total score for one execution across all scored dimensions.
 - `aggregate_score` combines dimension scores using `aggregation.dimensions.<dimension>.weight`.
 - Missing dimension policies default to `weighted_mean`, non-blocking, weight `1.0`.
 - `passed` and `failed` findings with normalized scores are scoreable. `skipped` and informational findings do not affect score.
