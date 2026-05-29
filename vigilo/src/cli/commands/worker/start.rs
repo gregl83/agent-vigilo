@@ -1,5 +1,36 @@
 use super::*;
 
+async fn open_worker_consumer(
+    mq: &crate::mq::Client,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<Option<lapin::Consumer>> {
+    let mut delay = Duration::from_millis(WORKER_MQ_RECONNECT_INITIAL_DELAY_MS);
+
+    loop {
+        match mq
+            .consume_worker_stream("vigilo-worker", WORKER_STREAM_PREFETCH)
+            .await
+        {
+            Ok(consumer) => return Ok(Some(consumer)),
+            Err(err) => {
+                mq.invalidate_session().await;
+                warn!(
+                    error = %err,
+                    retry_after_ms = delay.as_millis() as u64,
+                    "failed to open worker consumer; retrying after backoff"
+                );
+
+                tokio::select! {
+                    _ = shutdown.cancelled() => return Ok(None),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+
+                delay = (delay * 2).min(Duration::from_millis(WORKER_MQ_RECONNECT_MAX_DELAY_MS));
+            }
+        }
+    }
+}
+
 /// Starts the long-running worker loop.
 pub(super) async fn exec(context: Context) -> anyhow::Result<()> {
     let evaluator_loader = EvaluatorLoaderService::new(context.clone());
@@ -9,11 +40,14 @@ pub(super) async fn exec(context: Context) -> anyhow::Result<()> {
             let evaluator_loader = evaluator_loader.clone();
             async move {
                 // --- Open consumer stream ---
-                // The stream is reopened below if RabbitMQ closes it cleanly.
+                // The stream is reopened below if RabbitMQ closes it or reports
+                // a transient delivery failure.
                 let mq = context.mq().await?;
-                let mut consumer = mq
-                    .consume_worker_stream("vigilo-worker", WORKER_STREAM_PREFETCH)
-                    .await?;
+                let Some(mut consumer) = open_worker_consumer(mq, &shutdown).await? else {
+                    return Ok(());
+                };
+                let mut reconnect_delay =
+                    Duration::from_millis(WORKER_MQ_RECONNECT_INITIAL_DELAY_MS);
 
                 loop {
                     tokio::select! {
@@ -25,21 +59,56 @@ pub(super) async fn exec(context: Context) -> anyhow::Result<()> {
                                 // --- Reopen closed stream ---
                                 // Recover from a closed delivery stream without
                                 // exiting the worker service.
-                                warn!("worker consumer stream closed; reopening consumer");
-                                consumer = mq
-                                    .consume_worker_stream("vigilo-worker", WORKER_STREAM_PREFETCH)
-                                    .await?;
+                                mq.invalidate_session().await;
+                                warn!(
+                                    retry_after_ms = reconnect_delay.as_millis() as u64,
+                                    "worker consumer stream closed; reopening consumer after backoff"
+                                );
+                                tokio::select! {
+                                    _ = shutdown.cancelled() => return Ok(()),
+                                    _ = tokio::time::sleep(reconnect_delay) => {}
+                                }
+                                let Some(reopened) = open_worker_consumer(mq, &shutdown).await? else {
+                                    return Ok(());
+                                };
+                                consumer = reopened;
+                                reconnect_delay = (reconnect_delay * 2)
+                                    .min(Duration::from_millis(WORKER_MQ_RECONNECT_MAX_DELAY_MS));
                                 continue;
                             };
 
-                            let delivery = delivery_result
-                                .map_err(|err| anyhow::anyhow!("worker consumer delivery failed: {}", err))?;
+                            let delivery = match delivery_result {
+                                Ok(delivery) => {
+                                    reconnect_delay = Duration::from_millis(WORKER_MQ_RECONNECT_INITIAL_DELAY_MS);
+                                    delivery
+                                }
+                                Err(err) => {
+                                    mq.invalidate_session().await;
+                                    warn!(
+                                        error = %err,
+                                        retry_after_ms = reconnect_delay.as_millis() as u64,
+                                        "worker consumer delivery failed; reopening consumer after backoff"
+                                    );
+                                    tokio::select! {
+                                        _ = shutdown.cancelled() => return Ok(()),
+                                        _ = tokio::time::sleep(reconnect_delay) => {}
+                                    }
+                                    let Some(reopened) = open_worker_consumer(mq, &shutdown).await? else {
+                                        return Ok(());
+                                    };
+                                    consumer = reopened;
+                                    reconnect_delay = (reconnect_delay * 2)
+                                        .min(Duration::from_millis(WORKER_MQ_RECONNECT_MAX_DELAY_MS));
+                                    continue;
+                                }
+                            };
 
                             // --- Normalize AMQP delivery ---
                             // Convert stream deliveries into the same message
                             // type used by one-shot worker mode.
                             let raw_message = crate::mq::RawConsumedMessage {
                                 delivery_tag: delivery.delivery_tag,
+                                acker: delivery.acker.clone(),
                                 body: delivery.data.clone(),
                                 properties: delivery.properties.clone(),
                                 exchange: delivery.exchange.to_string(),

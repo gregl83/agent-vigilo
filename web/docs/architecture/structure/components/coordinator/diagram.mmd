@@ -75,7 +75,7 @@ flowchart TD
     CycleOrchestrator -->|"Finally publishes with"| OutboxPublisher
     OutboxPublisher -->|"Claims delivery rows, marks ledgers, deletes completed rows, and reschedules retries in <br> <small>[SQL/TCP]</small>"| Database
     OutboxPublisher -->|"Publishes claimed events concurrently through"| EventPublisher
-    EventPublisher -->|"Uses production transport"| MqPublisher
+    EventPublisher -->|"Uses AMQP transport"| MqPublisher
     MqPublisher -->|"Publishes persistent routed run events to <br> <small>[JSON/AMQP]</small>"| Queue
     Queue -->|"Streams run.chunk.ready events to"| Worker
 

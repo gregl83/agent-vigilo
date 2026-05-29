@@ -17,7 +17,7 @@ import decisionFlowDiagram from './decision-flow.mmd';
 
 # Worker Start Command
 
-How `vigilo worker start` runs a long-lived worker consumer that processes chunk-ready messages until shutdown or service failure.
+How `vigilo worker start` runs a long-lived worker consumer that processes chunk-ready messages until shutdown, reopening the broker consumer after transient RabbitMQ interruptions.
 
 Chunk-ready messages carry `run_id`, `run_shard`, and `chunk_id`. The worker uses that tuple to claim a partition-local chunk and to keep execution, attempt, aggregate, and evaluator-result writes on the same logical shard.
 

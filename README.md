@@ -6,11 +6,11 @@
 
 # Agent Vigilo
 
-**Distributed AI evaluation infrastructure and deployment gating for generative AI systems.**
+**Distributed AI evaluation infrastructure and deployment gating experiments for generative AI systems.**
 
-Agent Vigilo turns LLM and agent evaluation into a production runtime: versioned WASM evaluators, durable evaluation runs, worker/coordinator execution, normalized results, and pass/fail gates that can sit in CI or release workflows.
+Agent Vigilo explores what LLM and agent evaluation infrastructure can look like beyond ad hoc scripts: versioned WASM evaluators, durable evaluation runs, worker/coordinator execution, normalized results, and pass/fail gates that can sit in CI or release workflows.
 
-It is built for the parts of AI evaluation that become hard at scale: idempotent distributed work, durable event delivery, evaluator isolation, retry-safe persistence, and auditable results.
+It focuses on the parts of AI evaluation that become hard as systems grow: idempotent distributed work, durable event delivery, evaluator isolation, retry-safe persistence, and auditable results.
 
 ## Why It Matters
 

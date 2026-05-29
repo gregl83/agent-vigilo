@@ -54,6 +54,8 @@ const RUN_CONTEXT_CACHE_TTI_SECONDS: u64 = 900;
 const WARMUP_PARALLELISM: usize = 8;
 const WORKER_STREAM_PREFETCH: u16 = 64;
 const CASE_EXECUTION_PARALLELISM_FOR_LEASE_BUDGET: i32 = 8;
+const WORKER_MQ_RECONNECT_INITIAL_DELAY_MS: u64 = 250;
+const WORKER_MQ_RECONNECT_MAX_DELAY_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerCycleOutcome {
@@ -373,7 +375,7 @@ async fn settle_retryable_chunk_failure(
                 .await?;
             Ok(RetrySettlement::Retried)
         } else {
-            mq.ack(message.delivery_tag()).await?;
+            mq.ack(&message.raw).await?;
             Ok(RetrySettlement::AcknowledgedStale)
         }
     } else {
@@ -387,7 +389,7 @@ async fn settle_retryable_chunk_failure(
             .await?;
             Ok(RetrySettlement::FailedExhausted)
         } else {
-            mq.ack(message.delivery_tag()).await?;
+            mq.ack(&message.raw).await?;
             Ok(RetrySettlement::AcknowledgedStale)
         }
     }
@@ -406,7 +408,7 @@ async fn settle_chunk_waiting_for_execution_retry(
     // retry count; the database retry_after field remains the source of truth.
     let released = chunk_processing::release_chunk_as_pending(db, chunk).await?;
     if released == 0 {
-        mq.ack(message.delivery_tag()).await?;
+        mq.ack(&message.raw).await?;
         return Ok(RetrySettlement::AcknowledgedStale);
     }
 
@@ -480,7 +482,7 @@ async fn run_worker_message(
     )
     .await?
     else {
-        mq.ack(message.delivery_tag()).await?;
+        mq.ack(&message.raw).await?;
         info!(
             chunk_id = %payload.chunk_id,
             run_id = %payload.run_id,
@@ -514,7 +516,7 @@ async fn run_worker_message(
     let Some(extended_chunk) =
         chunk_processing::extend_chunk_lease(db, &chunk, processing_lease_seconds).await?
     else {
-        mq.ack(message.delivery_tag()).await?;
+        mq.ack(&message.raw).await?;
         warn!(
             run_id = %chunk.run_id,
             chunk_id = %chunk.id,
@@ -717,7 +719,7 @@ async fn run_worker_message(
             // under the same lease token.
             let completed = chunk_processing::mark_chunk_completed(db, &chunk).await?;
             if completed == 0 {
-                mq.ack(message.delivery_tag()).await?;
+                mq.ack(&message.raw).await?;
                 warn!(
                     run_id = %chunk.run_id,
                     chunk_id = %chunk.id,
@@ -726,7 +728,7 @@ async fn run_worker_message(
                 return Ok(WorkerCycleOutcome::Processed);
             }
 
-            mq.ack(message.delivery_tag()).await?;
+            mq.ack(&message.raw).await?;
             info!(
                 run_id = %chunk.run_id,
                 chunk_id = %chunk.id,

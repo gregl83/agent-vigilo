@@ -1,17 +1,20 @@
 //! RabbitMQ client wrapper used by coordinators and workers.
 //!
-//! The client lazily opens one connection and one channel per process context,
-//! declares the durable topic exchange on first use, and provides the small set
-//! of operations the runtime needs: publish JSON events, fetch one worker
-//! message, acknowledge deliveries, and route failed worker messages through
-//! retry buckets or quarantine.
+//! The client lazily opens a broker session with a publish channel, declares
+//! topology for each fresh session, and recreates the session after connection
+//! or channel loss. Long-lived worker consumers use their own channel while
+//! delivery acknowledgements use the message's channel-scoped acker.
+
+use std::sync::Arc;
 
 use lapin::{
     BasicProperties,
     Channel,
     Connection,
     ConnectionProperties,
+    Error as LapinError,
     ExchangeKind,
+    acker::Acker,
     options::{
         BasicAckOptions,
         BasicConsumeOptions,
@@ -32,8 +35,11 @@ use lapin::{
     },
 };
 use serde_json::Value;
-use tokio::sync::OnceCell;
-use tracing::debug;
+use tokio::sync::Mutex;
+use tracing::{
+    debug,
+    warn,
+};
 use uuid::Uuid;
 
 const WORKER_ROUTING_KEY: &str = "run.chunk.ready";
@@ -89,6 +95,7 @@ impl Config {
 /// Raw RabbitMQ worker delivery with payload bytes and delivery metadata.
 pub(crate) struct RawConsumedMessage {
     pub(crate) delivery_tag: u64,
+    pub(crate) acker: Acker,
     pub(crate) body: Vec<u8>,
     pub(crate) properties: BasicProperties,
     pub(crate) exchange: String,
@@ -111,15 +118,20 @@ impl ConsumedMessage {
     }
 }
 
-/// Lazily initialized RabbitMQ connection and channel.
+/// Lazily initialized RabbitMQ broker session.
 ///
 /// The client owns connection setup and broker declarations so command code can
-/// work in terms of application events instead of `lapin` primitives.
+/// work in terms of application events instead of `lapin` primitives. The
+/// cached session is invalidated after connection/channel loss and rebuilt by
+/// the next broker operation.
 pub(crate) struct Client {
     config: Config,
-    connection: OnceCell<Connection>,
-    channel: OnceCell<Channel>,
-    topology_ready: OnceCell<()>,
+    session: Mutex<Option<Arc<BrokerSession>>>,
+}
+
+struct BrokerSession {
+    connection: Connection,
+    publish_channel: Channel,
 }
 
 impl Client {
@@ -127,270 +139,280 @@ impl Client {
     pub(crate) fn new(config: Config) -> Self {
         Self {
             config,
-            connection: OnceCell::new(),
-            channel: OnceCell::new(),
-            topology_ready: OnceCell::new(),
+            session: Mutex::new(None),
         }
     }
 
-    /// Ensures durable queues, bindings, and publisher confirms are enabled.
-    async fn ensure_topology(&self) -> anyhow::Result<()> {
-        self.topology_ready
-            .get_or_try_init(|| async {
-                let channel = self.channel().await?;
+    fn is_reconnectable_lapin_error(err: &LapinError) -> bool {
+        matches!(
+            err,
+            LapinError::InvalidChannel(_)
+                | LapinError::InvalidChannelState(_)
+                | LapinError::InvalidConnectionState(_)
+                | LapinError::IOError(_)
+                | LapinError::MissingHeartbeatError
+        )
+    }
 
-                channel
-                    .queue_declare(
-                        &self.config.event_queue,
-                        QueueDeclareOptions {
-                            passive: false,
-                            durable: true,
-                            exclusive: false,
-                            auto_delete: false,
-                            nowait: false,
-                        },
-                        FieldTable::default(),
+    fn is_reconnectable_anyhow_error(err: &anyhow::Error) -> bool {
+        let message = err.to_string().to_ascii_lowercase();
+        message.contains("invalid channel")
+            || message.contains("invalid connection")
+            || message.contains("io error")
+            || message.contains("heartbeat")
+            || message.contains("connection closed")
+            || message.contains("channel closed")
+    }
+
+    /// Drops the cached broker session so the next operation reconnects and
+    /// re-declares topology.
+    pub(crate) async fn invalidate_session(&self) {
+        let mut session = self.session.lock().await;
+        if session.take().is_some() {
+            warn!("invalidated rabbitmq session; next operation will reconnect");
+        }
+    }
+
+    async fn get_or_connect_session(&self) -> anyhow::Result<Arc<BrokerSession>> {
+        let mut session = self.session.lock().await;
+        if let Some(existing) = session.as_ref() {
+            return Ok(existing.clone());
+        }
+
+        let connected = Arc::new(self.connect_session().await?);
+        *session = Some(connected.clone());
+        Ok(connected)
+    }
+
+    async fn connect_session(&self) -> anyhow::Result<BrokerSession> {
+        debug!("initializing rabbitmq connection");
+        let connection = Connection::connect(&self.config.uri, ConnectionProperties::default())
+            .await
+            .map_err(|err| anyhow::anyhow!("rabbitmq connection failed: {}", err))?;
+        let publish_channel = connection
+            .create_channel()
+            .await
+            .map_err(|err| anyhow::anyhow!("rabbitmq channel creation failed: {}", err))?;
+
+        self.declare_topology(&publish_channel).await?;
+        publish_channel
+            .confirm_select(ConfirmSelectOptions::default())
+            .await
+            .map_err(|err| anyhow::anyhow!("rabbitmq confirm-select failed: {}", err))?;
+
+        Ok(BrokerSession {
+            connection,
+            publish_channel,
+        })
+    }
+
+    /// Ensures durable queues and bindings exist on the provided channel.
+    async fn declare_topology(&self, channel: &Channel) -> anyhow::Result<()> {
+        channel
+            .exchange_declare(
+                &self.config.exchange,
+                ExchangeKind::Topic,
+                ExchangeDeclareOptions {
+                    durable: true,
+                    auto_delete: false,
+                    internal: false,
+                    nowait: false,
+                    passive: false,
+                },
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("rabbitmq exchange declaration failed: {}", err))?;
+
+        channel
+            .queue_declare(
+                &self.config.event_queue,
+                QueueDeclareOptions {
+                    passive: false,
+                    durable: true,
+                    exclusive: false,
+                    auto_delete: false,
+                    nowait: false,
+                },
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("rabbitmq event queue declaration failed: {}", err))?;
+
+        channel
+            .queue_bind(
+                &self.config.event_queue,
+                &self.config.exchange,
+                "run.*",
+                QueueBindOptions::default(),
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("rabbitmq event queue binding failed: {}", err))?;
+
+        channel
+            .queue_declare(
+                &self.config.worker_queue,
+                QueueDeclareOptions {
+                    passive: false,
+                    durable: true,
+                    exclusive: false,
+                    auto_delete: false,
+                    nowait: false,
+                },
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("rabbitmq queue declaration failed: {}", err))?;
+
+        channel
+            .queue_bind(
+                &self.config.worker_queue,
+                &self.config.exchange,
+                WORKER_ROUTING_KEY,
+                QueueBindOptions::default(),
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("rabbitmq queue binding failed: {}", err))?;
+
+        channel
+            .exchange_declare(
+                &self.config.worker_retry_exchange,
+                ExchangeKind::Direct,
+                ExchangeDeclareOptions {
+                    durable: true,
+                    auto_delete: false,
+                    internal: false,
+                    nowait: false,
+                    passive: false,
+                },
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("rabbitmq worker retry exchange declaration failed: {}", err)
+            })?;
+
+        channel
+            .queue_bind(
+                &self.config.worker_queue,
+                &self.config.worker_retry_exchange,
+                WORKER_ROUTING_KEY,
+                QueueBindOptions::default(),
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("rabbitmq worker retry return binding failed: {}", err)
+            })?;
+
+        for (queue_name, ttl_ms) in WORKER_RETRY_BUCKETS {
+            let mut retry_args = FieldTable::default();
+            retry_args.insert("x-message-ttl".into(), AMQPValue::LongInt(ttl_ms));
+            retry_args.insert(
+                "x-dead-letter-exchange".into(),
+                AMQPValue::LongString(LongString::from(self.config.worker_retry_exchange.clone())),
+            );
+            retry_args.insert(
+                "x-dead-letter-routing-key".into(),
+                AMQPValue::LongString(LongString::from(WORKER_ROUTING_KEY)),
+            );
+
+            channel
+                .queue_declare(
+                    queue_name,
+                    QueueDeclareOptions {
+                        passive: false,
+                        durable: true,
+                        exclusive: false,
+                        auto_delete: false,
+                        nowait: false,
+                    },
+                    retry_args,
+                )
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "rabbitmq worker retry queue declaration failed for '{}': {}",
+                        queue_name,
+                        err
                     )
-                    .await
-                    .map_err(|err| {
-                        anyhow::anyhow!("rabbitmq event queue declaration failed: {}", err)
-                    })?;
+                })?;
 
-                channel
-                    .queue_bind(
-                        &self.config.event_queue,
-                        &self.config.exchange,
-                        "run.*",
-                        QueueBindOptions::default(),
-                        FieldTable::default(),
+            channel
+                .queue_bind(
+                    queue_name,
+                    &self.config.worker_retry_exchange,
+                    queue_name,
+                    QueueBindOptions::default(),
+                    FieldTable::default(),
+                )
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "rabbitmq worker retry queue binding failed for '{}': {}",
+                        queue_name,
+                        err
                     )
-                    .await
-                    .map_err(|err| {
-                        anyhow::anyhow!("rabbitmq event queue binding failed: {}", err)
-                    })?;
+                })?;
+        }
 
-                channel
-                    .queue_declare(
-                        &self.config.worker_queue,
-                        QueueDeclareOptions {
-                            passive: false,
-                            durable: true,
-                            exclusive: false,
-                            auto_delete: false,
-                            nowait: false,
-                        },
-                        FieldTable::default(),
-                    )
-                    .await
-                    .map_err(|err| anyhow::anyhow!("rabbitmq queue declaration failed: {}", err))?;
+        channel
+            .exchange_declare(
+                &self.config.worker_quarantine_exchange,
+                ExchangeKind::Direct,
+                ExchangeDeclareOptions {
+                    durable: true,
+                    auto_delete: false,
+                    internal: false,
+                    nowait: false,
+                    passive: false,
+                },
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "rabbitmq worker quarantine exchange declaration failed: {}",
+                    err
+                )
+            })?;
 
-                channel
-                    .queue_bind(
-                        &self.config.worker_queue,
-                        &self.config.exchange,
-                        WORKER_ROUTING_KEY,
-                        QueueBindOptions::default(),
-                        FieldTable::default(),
-                    )
-                    .await
-                    .map_err(|err| anyhow::anyhow!("rabbitmq queue binding failed: {}", err))?;
+        channel
+            .queue_declare(
+                &self.config.worker_quarantine_queue,
+                QueueDeclareOptions {
+                    passive: false,
+                    durable: true,
+                    exclusive: false,
+                    auto_delete: false,
+                    nowait: false,
+                },
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "rabbitmq worker quarantine queue declaration failed: {}",
+                    err
+                )
+            })?;
 
-                channel
-                    .exchange_declare(
-                        &self.config.worker_retry_exchange,
-                        ExchangeKind::Direct,
-                        ExchangeDeclareOptions {
-                            durable: true,
-                            auto_delete: false,
-                            internal: false,
-                            nowait: false,
-                            passive: false,
-                        },
-                        FieldTable::default(),
-                    )
-                    .await
-                    .map_err(|err| {
-                        anyhow::anyhow!(
-                            "rabbitmq worker retry exchange declaration failed: {}",
-                            err
-                        )
-                    })?;
-
-                channel
-                    .queue_bind(
-                        &self.config.worker_queue,
-                        &self.config.worker_retry_exchange,
-                        WORKER_ROUTING_KEY,
-                        QueueBindOptions::default(),
-                        FieldTable::default(),
-                    )
-                    .await
-                    .map_err(|err| {
-                        anyhow::anyhow!("rabbitmq worker retry return binding failed: {}", err)
-                    })?;
-
-                for (queue_name, ttl_ms) in WORKER_RETRY_BUCKETS {
-                    let mut retry_args = FieldTable::default();
-                    retry_args.insert("x-message-ttl".into(), AMQPValue::LongInt(ttl_ms));
-                    retry_args.insert(
-                        "x-dead-letter-exchange".into(),
-                        AMQPValue::LongString(LongString::from(
-                            self.config.worker_retry_exchange.clone(),
-                        )),
-                    );
-                    retry_args.insert(
-                        "x-dead-letter-routing-key".into(),
-                        AMQPValue::LongString(LongString::from(WORKER_ROUTING_KEY)),
-                    );
-
-                    channel
-                        .queue_declare(
-                            queue_name,
-                            QueueDeclareOptions {
-                                passive: false,
-                                durable: true,
-                                exclusive: false,
-                                auto_delete: false,
-                                nowait: false,
-                            },
-                            retry_args,
-                        )
-                        .await
-                        .map_err(|err| {
-                            anyhow::anyhow!(
-                                "rabbitmq worker retry queue declaration failed for '{}': {}",
-                                queue_name,
-                                err
-                            )
-                        })?;
-
-                    channel
-                        .queue_bind(
-                            queue_name,
-                            &self.config.worker_retry_exchange,
-                            queue_name,
-                            QueueBindOptions::default(),
-                            FieldTable::default(),
-                        )
-                        .await
-                        .map_err(|err| {
-                            anyhow::anyhow!(
-                                "rabbitmq worker retry queue binding failed for '{}': {}",
-                                queue_name,
-                                err
-                            )
-                        })?;
-                }
-
-                channel
-                    .exchange_declare(
-                        &self.config.worker_quarantine_exchange,
-                        ExchangeKind::Direct,
-                        ExchangeDeclareOptions {
-                            durable: true,
-                            auto_delete: false,
-                            internal: false,
-                            nowait: false,
-                            passive: false,
-                        },
-                        FieldTable::default(),
-                    )
-                    .await
-                    .map_err(|err| {
-                        anyhow::anyhow!(
-                            "rabbitmq worker quarantine exchange declaration failed: {}",
-                            err
-                        )
-                    })?;
-
-                channel
-                    .queue_declare(
-                        &self.config.worker_quarantine_queue,
-                        QueueDeclareOptions {
-                            passive: false,
-                            durable: true,
-                            exclusive: false,
-                            auto_delete: false,
-                            nowait: false,
-                        },
-                        FieldTable::default(),
-                    )
-                    .await
-                    .map_err(|err| {
-                        anyhow::anyhow!(
-                            "rabbitmq worker quarantine queue declaration failed: {}",
-                            err
-                        )
-                    })?;
-
-                channel
-                    .queue_bind(
-                        &self.config.worker_quarantine_queue,
-                        &self.config.worker_quarantine_exchange,
-                        &self.config.worker_quarantine_queue,
-                        QueueBindOptions::default(),
-                        FieldTable::default(),
-                    )
-                    .await
-                    .map_err(|err| {
-                        anyhow::anyhow!("rabbitmq worker quarantine queue binding failed: {}", err)
-                    })?;
-
-                channel
-                    .confirm_select(ConfirmSelectOptions::default())
-                    .await
-                    .map_err(|err| anyhow::anyhow!("rabbitmq confirm-select failed: {}", err))?;
-
-                Ok::<(), anyhow::Error>(())
-            })
-            .await?;
+        channel
+            .queue_bind(
+                &self.config.worker_quarantine_queue,
+                &self.config.worker_quarantine_exchange,
+                &self.config.worker_quarantine_queue,
+                QueueBindOptions::default(),
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("rabbitmq worker quarantine queue binding failed: {}", err)
+            })?;
 
         Ok(())
-    }
-
-    /// Returns the process-local RabbitMQ connection, opening it if needed.
-    async fn connection(&self) -> anyhow::Result<&Connection> {
-        self.connection
-            .get_or_try_init(|| async {
-                debug!("initializing rabbitmq connection");
-                Connection::connect(&self.config.uri, ConnectionProperties::default())
-                    .await
-                    .map_err(|err| anyhow::anyhow!("rabbitmq connection failed: {}", err))
-            })
-            .await
-    }
-
-    /// Returns the process-local channel and ensures the topic exchange exists.
-    async fn channel(&self) -> anyhow::Result<&Channel> {
-        self.channel
-            .get_or_try_init(|| async {
-                let connection = self.connection().await?;
-                let channel = connection
-                    .create_channel()
-                    .await
-                    .map_err(|err| anyhow::anyhow!("rabbitmq channel creation failed: {}", err))?;
-
-                channel
-                    .exchange_declare(
-                        &self.config.exchange,
-                        ExchangeKind::Topic,
-                        ExchangeDeclareOptions {
-                            durable: true,
-                            auto_delete: false,
-                            internal: false,
-                            nowait: false,
-                            passive: false,
-                        },
-                        FieldTable::default(),
-                    )
-                    .await
-                    .map_err(|err| {
-                        anyhow::anyhow!("rabbitmq exchange declaration failed: {}", err)
-                    })?;
-
-                Ok(channel)
-            })
-            .await
     }
 
     async fn publish_bytes_with_properties(
@@ -400,9 +422,34 @@ impl Client {
         body: &[u8],
         properties: BasicProperties,
     ) -> anyhow::Result<()> {
-        self.ensure_topology().await?;
+        let publish_result = self
+            .publish_bytes_with_properties_once(exchange, routing_key, body, properties.clone())
+            .await;
+        if let Err(err) = &publish_result {
+            if Self::is_reconnectable_anyhow_error(err) {
+                warn!(
+                    error = %err,
+                    "rabbitmq publish failed on current session; reconnecting and retrying once"
+                );
+                self.invalidate_session().await;
+                return self
+                    .publish_bytes_with_properties_once(exchange, routing_key, body, properties)
+                    .await;
+            }
+        }
 
-        let channel = self.channel().await?;
+        publish_result
+    }
+
+    async fn publish_bytes_with_properties_once(
+        &self,
+        exchange: &str,
+        routing_key: &str,
+        body: &[u8],
+        properties: BasicProperties,
+    ) -> anyhow::Result<()> {
+        let session = self.get_or_connect_session().await?;
+        let channel = &session.publish_channel;
         let confirmation = channel
             .basic_publish(
                 exchange,
@@ -457,8 +504,6 @@ impl Client {
         payload: &Value,
         message_id: &str,
     ) -> anyhow::Result<()> {
-        self.ensure_topology().await?;
-
         let body = serde_json::to_vec(payload)
             .map_err(|err| anyhow::anyhow!("failed to serialize message payload: {}", err))?;
 
@@ -481,8 +526,24 @@ impl Client {
     pub(crate) async fn consume_worker_message(
         &self,
     ) -> anyhow::Result<Option<RawConsumedMessage>> {
-        self.ensure_topology().await?;
-        let channel = self.channel().await?;
+        let consume_result = self.consume_worker_message_once().await;
+        if let Err(err) = &consume_result {
+            if Self::is_reconnectable_anyhow_error(err) {
+                warn!(
+                    error = %err,
+                    "rabbitmq basic_get failed on current session; reconnecting and retrying once"
+                );
+                self.invalidate_session().await;
+                return self.consume_worker_message_once().await;
+            }
+        }
+
+        consume_result
+    }
+
+    async fn consume_worker_message_once(&self) -> anyhow::Result<Option<RawConsumedMessage>> {
+        let session = self.get_or_connect_session().await?;
+        let channel = &session.publish_channel;
 
         let maybe_delivery = channel
             .basic_get(&self.config.worker_queue, BasicGetOptions::default())
@@ -495,6 +556,7 @@ impl Client {
 
         Ok(Some(RawConsumedMessage {
             delivery_tag: delivery.delivery_tag,
+            acker: delivery.acker.clone(),
             body: delivery.data.clone(),
             properties: delivery.properties.clone(),
             exchange: delivery.exchange.to_string(),
@@ -509,9 +571,36 @@ impl Client {
         consumer_tag_prefix: &str,
         prefetch: u16,
     ) -> anyhow::Result<lapin::Consumer> {
-        self.ensure_topology().await?;
+        let stream_result = self
+            .consume_worker_stream_once(consumer_tag_prefix, prefetch)
+            .await;
+        if let Err(err) = &stream_result {
+            if Self::is_reconnectable_anyhow_error(err) {
+                warn!(
+                    error = %err,
+                    "rabbitmq consumer creation failed on current session; reconnecting and retrying once"
+                );
+                self.invalidate_session().await;
+                return self
+                    .consume_worker_stream_once(consumer_tag_prefix, prefetch)
+                    .await;
+            }
+        }
 
-        let channel = self.channel().await?;
+        stream_result
+    }
+
+    async fn consume_worker_stream_once(
+        &self,
+        consumer_tag_prefix: &str,
+        prefetch: u16,
+    ) -> anyhow::Result<lapin::Consumer> {
+        let session = self.get_or_connect_session().await?;
+        let channel =
+            session.connection.create_channel().await.map_err(|err| {
+                anyhow::anyhow!("rabbitmq consumer channel creation failed: {}", err)
+            })?;
+        self.declare_topology(&channel).await?;
         channel
             .basic_qos(prefetch, BasicQosOptions { global: false })
             .await
@@ -530,13 +619,20 @@ impl Client {
     }
 
     /// Acknowledges successful processing of one delivery.
-    pub(crate) async fn ack(&self, delivery_tag: u64) -> anyhow::Result<()> {
-        let channel = self.channel().await?;
-        channel
-            .basic_ack(delivery_tag, BasicAckOptions::default())
-            .await
-            .map_err(|err| anyhow::anyhow!("rabbitmq ack failed: {}", err))?;
-        Ok(())
+    pub(crate) async fn ack(&self, message: &RawConsumedMessage) -> anyhow::Result<()> {
+        match message.acker.ack(BasicAckOptions::default()).await {
+            Ok(()) => Ok(()),
+            Err(err) if Self::is_reconnectable_lapin_error(&err) => {
+                warn!(
+                    delivery_tag = message.delivery_tag,
+                    error = %err,
+                    "rabbitmq ack failed after connection/channel loss; message may redeliver"
+                );
+                self.invalidate_session().await;
+                Ok(())
+            }
+            Err(err) => Err(anyhow::anyhow!("rabbitmq ack failed: {}", err)),
+        }
     }
 
     fn retry_count(properties: &BasicProperties) -> i32 {
@@ -649,7 +745,7 @@ impl Client {
             properties,
         )
         .await?;
-        self.ack(message.delivery_tag).await?;
+        self.ack(message).await?;
 
         Ok(())
     }
@@ -671,7 +767,7 @@ impl Client {
             properties,
         )
         .await?;
-        self.ack(message.delivery_tag).await?;
+        self.ack(message).await?;
 
         Ok(())
     }
@@ -720,7 +816,7 @@ impl Client {
                 .with_headers(headers),
         )
         .await?;
-        self.ack(message.delivery_tag).await?;
+        self.ack(message).await?;
 
         Ok(())
     }

@@ -25,7 +25,7 @@ Outbox claims assign a `claim_token` and future availability window on `outbox_d
 
 ## Broker routing failure
 
-RabbitMQ publishes use durable topology, persistent messages, mandatory routing, and publisher confirms. Unroutable or negatively acknowledged publishes leave the delivery row pending for retry instead of marking the ledger event published.
+RabbitMQ publishes use durable topology, persistent messages, mandatory routing, and publisher confirms. Broker sessions are recreated after connection or channel loss, and publish operations retry once on a fresh session before returning failure. Unroutable or negatively acknowledged publishes leave the delivery row pending for retry instead of marking the ledger event published.
 
 ## Partial persistence
 
