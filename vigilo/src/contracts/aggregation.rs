@@ -175,7 +175,10 @@ pub(crate) fn aggregate_findings(
                 .map(|accumulator| accumulator.policy.blocking)
                 .unwrap_or(false);
             (finding.blocking || dimension_blocking)
-                && matches!(finding.status, EvaluationStatus::Failed | EvaluationStatus::Error)
+                && matches!(
+                    finding.status,
+                    EvaluationStatus::Failed | EvaluationStatus::Error
+                )
         })
         .map(|(index, finding)| {
             json!({
@@ -191,18 +194,16 @@ pub(crate) fn aggregate_findings(
         .collect::<Vec<_>>();
 
     let has_blocking_failure = !blocking_failures.is_empty();
-    let has_blocking_error = findings
-        .iter()
-        .any(|finding| {
-            let dimension_blocking = dimensions
-                .get(&finding.binding_dimension)
-                .map(|accumulator| accumulator.policy.blocking)
-                .unwrap_or(false);
-            (finding.blocking || dimension_blocking) && finding.status == EvaluationStatus::Error
-        });
-    let has_scoreable_finding = findings.iter().any(|finding| {
-        scoreable_status(&finding.status) && finding.normalized_score.is_some()
+    let has_blocking_error = findings.iter().any(|finding| {
+        let dimension_blocking = dimensions
+            .get(&finding.binding_dimension)
+            .map(|accumulator| accumulator.policy.blocking)
+            .unwrap_or(false);
+        (finding.blocking || dimension_blocking) && finding.status == EvaluationStatus::Error
     });
+    let has_scoreable_finding = findings
+        .iter()
+        .any(|finding| scoreable_status(&finding.status) && finding.normalized_score.is_some());
 
     let overall_status = if has_blocking_error {
         "error"
@@ -220,12 +221,14 @@ pub(crate) fn aggregate_findings(
     }
     .to_string();
 
-    let result_status_counts = findings.iter().fold(BTreeMap::new(), |mut counts, finding| {
-        *counts
-            .entry(evaluation_status_key(&finding.status).to_string())
-            .or_insert(0usize) += 1;
-        counts
-    });
+    let result_status_counts = findings
+        .iter()
+        .fold(BTreeMap::new(), |mut counts, finding| {
+            *counts
+                .entry(evaluation_status_key(&finding.status).to_string())
+                .or_insert(0usize) += 1;
+            counts
+        });
 
     AggregationOutcome {
         overall_status: overall_status.clone(),
@@ -322,8 +325,22 @@ mod tests {
             )]),
             Uuid::nil(),
             &[
-                finding(id_a, "quality", EvaluationStatus::Passed, Some(1.0), false, 3.0),
-                finding(id_b, "quality", EvaluationStatus::Failed, Some(0.0), false, 1.0),
+                finding(
+                    id_a,
+                    "quality",
+                    EvaluationStatus::Passed,
+                    Some(1.0),
+                    false,
+                    3.0,
+                ),
+                finding(
+                    id_b,
+                    "quality",
+                    EvaluationStatus::Failed,
+                    Some(0.0),
+                    false,
+                    1.0,
+                ),
             ],
         );
 
@@ -346,9 +363,30 @@ mod tests {
             )]),
             Uuid::nil(),
             &[
-                finding(id_a, "quality", EvaluationStatus::Passed, Some(1.0), false, 1.0),
-                finding(id_a, "quality", EvaluationStatus::Failed, Some(0.0), false, 1.0),
-                finding(id_b, "quality", EvaluationStatus::Passed, Some(1.0), false, 1.0),
+                finding(
+                    id_a,
+                    "quality",
+                    EvaluationStatus::Passed,
+                    Some(1.0),
+                    false,
+                    1.0,
+                ),
+                finding(
+                    id_a,
+                    "quality",
+                    EvaluationStatus::Failed,
+                    Some(0.0),
+                    false,
+                    1.0,
+                ),
+                finding(
+                    id_b,
+                    "quality",
+                    EvaluationStatus::Passed,
+                    Some(1.0),
+                    false,
+                    1.0,
+                ),
             ],
         );
 
@@ -362,8 +400,22 @@ mod tests {
             &settings(vec![("safety", AggregationMethod::MinScore, true, 1.0)]),
             Uuid::nil(),
             &[
-                finding(Uuid::nil(), "safety", EvaluationStatus::Passed, Some(0.9), false, 1.0),
-                finding(Uuid::from_u128(1), "safety", EvaluationStatus::Failed, Some(0.2), false, 1.0),
+                finding(
+                    Uuid::nil(),
+                    "safety",
+                    EvaluationStatus::Passed,
+                    Some(0.9),
+                    false,
+                    1.0,
+                ),
+                finding(
+                    Uuid::from_u128(1),
+                    "safety",
+                    EvaluationStatus::Failed,
+                    Some(0.2),
+                    false,
+                    1.0,
+                ),
             ],
         );
 
@@ -381,8 +433,22 @@ mod tests {
             ]),
             Uuid::nil(),
             &[
-                finding(Uuid::nil(), "quality", EvaluationStatus::Passed, Some(1.0), false, 1.0),
-                finding(Uuid::from_u128(1), "safety", EvaluationStatus::Failed, Some(0.0), false, 1.0),
+                finding(
+                    Uuid::nil(),
+                    "quality",
+                    EvaluationStatus::Passed,
+                    Some(1.0),
+                    false,
+                    1.0,
+                ),
+                finding(
+                    Uuid::from_u128(1),
+                    "safety",
+                    EvaluationStatus::Failed,
+                    Some(0.0),
+                    false,
+                    1.0,
+                ),
             ],
         );
 
@@ -399,8 +465,22 @@ mod tests {
             ]),
             Uuid::nil(),
             &[
-                finding(Uuid::nil(), "format", EvaluationStatus::Failed, Some(0.0), false, 1.0),
-                finding(Uuid::from_u128(1), "quality", EvaluationStatus::Passed, Some(1.0), false, 1.0),
+                finding(
+                    Uuid::nil(),
+                    "format",
+                    EvaluationStatus::Failed,
+                    Some(0.0),
+                    false,
+                    1.0,
+                ),
+                finding(
+                    Uuid::from_u128(1),
+                    "quality",
+                    EvaluationStatus::Passed,
+                    Some(1.0),
+                    false,
+                    1.0,
+                ),
             ],
         );
 
@@ -421,7 +501,14 @@ mod tests {
                 1.0,
             )]),
             Uuid::nil(),
-            &[finding(Uuid::nil(), "quality", EvaluationStatus::Passed, Some(0.75), false, 1.0)],
+            &[finding(
+                Uuid::nil(),
+                "quality",
+                EvaluationStatus::Passed,
+                Some(0.75),
+                false,
+                1.0,
+            )],
         );
 
         assert_eq!(outcome.overall_status, "passed");
@@ -440,7 +527,14 @@ mod tests {
                 1.0,
             )]),
             Uuid::nil(),
-            &[finding(Uuid::nil(), "quality", EvaluationStatus::Failed, Some(0.75), false, 1.0)],
+            &[finding(
+                Uuid::nil(),
+                "quality",
+                EvaluationStatus::Failed,
+                Some(0.75),
+                false,
+                1.0,
+            )],
         );
 
         assert_eq!(outcome.overall_status, "passed");
@@ -453,9 +547,21 @@ mod tests {
         defaults.min_execution_score = 0.7;
         let outcome = aggregate_findings(
             &defaults,
-            &settings(vec![("quality", AggregationMethod::WeightedMean, true, 1.0)]),
+            &settings(vec![(
+                "quality",
+                AggregationMethod::WeightedMean,
+                true,
+                1.0,
+            )]),
             Uuid::nil(),
-            &[finding(Uuid::nil(), "quality", EvaluationStatus::Failed, Some(0.75), true, 1.0)],
+            &[finding(
+                Uuid::nil(),
+                "quality",
+                EvaluationStatus::Failed,
+                Some(0.75),
+                true,
+                1.0,
+            )],
         );
 
         assert_eq!(outcome.overall_status, "passed");
@@ -466,9 +572,21 @@ mod tests {
     fn blocking_error_returns_error() {
         let outcome = aggregate_findings(
             &defaults(),
-            &settings(vec![("quality", AggregationMethod::WeightedMean, true, 1.0)]),
+            &settings(vec![(
+                "quality",
+                AggregationMethod::WeightedMean,
+                true,
+                1.0,
+            )]),
             Uuid::nil(),
-            &[finding(Uuid::nil(), "quality", EvaluationStatus::Error, None, false, 1.0)],
+            &[finding(
+                Uuid::nil(),
+                "quality",
+                EvaluationStatus::Error,
+                None,
+                false,
+                1.0,
+            )],
         );
 
         assert_eq!(outcome.overall_status, "error");
@@ -486,8 +604,22 @@ mod tests {
             )]),
             Uuid::nil(),
             &[
-                finding(Uuid::nil(), "quality", EvaluationStatus::Error, None, false, 1.0),
-                finding(Uuid::from_u128(1), "quality", EvaluationStatus::Passed, Some(1.0), false, 1.0),
+                finding(
+                    Uuid::nil(),
+                    "quality",
+                    EvaluationStatus::Error,
+                    None,
+                    false,
+                    1.0,
+                ),
+                finding(
+                    Uuid::from_u128(1),
+                    "quality",
+                    EvaluationStatus::Passed,
+                    Some(1.0),
+                    false,
+                    1.0,
+                ),
             ],
         );
 
@@ -507,8 +639,22 @@ mod tests {
             )]),
             Uuid::nil(),
             &[
-                finding(Uuid::nil(), "quality", EvaluationStatus::Skipped, None, false, 1.0),
-                finding(Uuid::from_u128(1), "quality", EvaluationStatus::Passed, Some(0.9), false, 1.0),
+                finding(
+                    Uuid::nil(),
+                    "quality",
+                    EvaluationStatus::Skipped,
+                    None,
+                    false,
+                    1.0,
+                ),
+                finding(
+                    Uuid::from_u128(1),
+                    "quality",
+                    EvaluationStatus::Passed,
+                    Some(0.9),
+                    false,
+                    1.0,
+                ),
             ],
         );
 
@@ -527,7 +673,14 @@ mod tests {
                 1.0,
             )]),
             Uuid::nil(),
-            &[finding(Uuid::nil(), "quality", EvaluationStatus::Skipped, None, false, 1.0)],
+            &[finding(
+                Uuid::nil(),
+                "quality",
+                EvaluationStatus::Skipped,
+                None,
+                false,
+                1.0,
+            )],
         );
 
         assert_eq!(outcome.aggregate_score, None);
@@ -542,7 +695,14 @@ mod tests {
                 dimensions: BTreeMap::new(),
             },
             Uuid::nil(),
-            &[finding(Uuid::nil(), "quality", EvaluationStatus::Passed, Some(0.9), false, 1.0)],
+            &[finding(
+                Uuid::nil(),
+                "quality",
+                EvaluationStatus::Passed,
+                Some(0.9),
+                false,
+                1.0,
+            )],
         );
 
         assert_eq!(outcome.aggregate_score, Some(0.9));
@@ -590,7 +750,12 @@ mod tests {
 
         let outcome = aggregate_findings(
             &defaults(),
-            &settings(vec![("profile_safety", AggregationMethod::MinScore, true, 1.0)]),
+            &settings(vec![(
+                "profile_safety",
+                AggregationMethod::MinScore,
+                true,
+                1.0,
+            )]),
             Uuid::nil(),
             &[record],
         );
@@ -613,8 +778,22 @@ mod tests {
             )]),
             Uuid::nil(),
             &[
-                finding(Uuid::nil(), "quality", EvaluationStatus::Passed, Some(1.0), false, 1.0),
-                finding(Uuid::nil(), "quality", EvaluationStatus::Failed, Some(0.0), false, 1.0),
+                finding(
+                    Uuid::nil(),
+                    "quality",
+                    EvaluationStatus::Passed,
+                    Some(1.0),
+                    false,
+                    1.0,
+                ),
+                finding(
+                    Uuid::nil(),
+                    "quality",
+                    EvaluationStatus::Failed,
+                    Some(0.0),
+                    false,
+                    1.0,
+                ),
             ],
         );
 

@@ -804,7 +804,10 @@ mod tests {
         let (with_group_blobs, _) = build_case_plans(&with_group).unwrap();
         let (without_group_blobs, _) = build_case_plans(&without_group).unwrap();
 
-        assert_ne!(with_group_blobs[0].case_hash, without_group_blobs[0].case_hash);
+        assert_ne!(
+            with_group_blobs[0].case_hash,
+            without_group_blobs[0].case_hash
+        );
     }
 
     fn run_with_status(status: &str, gate_status: &str) -> Run {

@@ -435,7 +435,11 @@ mod tests {
 
         let issues = super::collect_static_profile_config_issues(&profile);
 
-        assert!(issues.iter().any(|issue| issue.contains("min_execution_score")));
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("min_execution_score"))
+        );
     }
 
     #[test]
@@ -468,7 +472,11 @@ mod tests {
 
         let issues = super::collect_static_profile_config_issues(&profile);
 
-        assert!(issues.iter().any(|issue| issue.contains("dimension 'quality' weight")));
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("dimension 'quality' weight"))
+        );
     }
 
     #[test]
@@ -491,6 +499,10 @@ mod tests {
 
         let issues = super::collect_static_profile_config_issues(&profile);
 
-        assert!(issues.iter().any(|issue| issue.contains("duplicate evaluator ref")));
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("duplicate evaluator ref"))
+        );
     }
 }

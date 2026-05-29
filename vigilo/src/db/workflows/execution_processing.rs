@@ -1540,7 +1540,9 @@ async fn evaluate_case_execution(
                                         attempt_id,
                                         evaluator_id: evaluator_entry.evaluator_id,
                                         finding_index,
-                                        evaluator_version: evaluator_entry.evaluator_version.clone(),
+                                        evaluator_version: evaluator_entry
+                                            .evaluator_version
+                                            .clone(),
                                         evaluator_profile_id: profile_id.clone(),
                                         evaluator_profile_version: profile_version.clone(),
                                         evaluator_interface_version: evaluator_entry
@@ -1594,7 +1596,8 @@ async fn evaluate_case_execution(
                                 evaluator_profile_version: profile_version,
                                 evaluator_interface_version: evaluator_entry
                                     .evaluator_interface_version,
-                                evaluator_runtime_version: evaluator_entry.evaluator_runtime_version,
+                                evaluator_runtime_version: evaluator_entry
+                                    .evaluator_runtime_version,
                                 dimension: binding.dimension.clone(),
                                 status: map_evaluation_status(&status).to_string(),
                                 blocking: binding.blocking || dimension_policy_blocking,
@@ -2257,7 +2260,10 @@ mod tests {
         let err = evaluation_plan_for_case(&profile, &case).unwrap_err();
 
         assert!(groups.is_empty());
-        assert!(err.to_string().contains("did not match any evaluator bindings"));
+        assert!(
+            err.to_string()
+                .contains("did not match any evaluator bindings")
+        );
     }
 
     #[test]
