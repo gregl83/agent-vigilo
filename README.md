@@ -1,4 +1,4 @@
-[![Build](https://github.com/gregl83/agent-vigilo/actions/workflows/build.yml/badge.svg)](https://github.com/gregl83/agent-vigilo/actions/workflows/build.yml)
+[![Build](https://github.com/gregl83/agent-vigilo/actions/workflows/build.yaml/badge.svg?branch=main)](https://github.com/gregl83/agent-vigilo/actions/workflows/build.yaml)
 [![Coverage Status](https://codecov.io/gh/gregl83/agent-vigilo/graph/badge.svg?token=CL93O7DW9C)](https://codecov.io/gh/gregl83/agent-vigilo)
 [![Crates.io](https://img.shields.io/crates/v/agent-vigilo.svg)](https://crates.io/crates/agent-vigilo)
 [![Documentation](https://img.shields.io/badge/docs-agentvigilo.com-blue.svg)](https://agentvigilo.com/docs/guides/getting-started)
