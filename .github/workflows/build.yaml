@@ -89,7 +89,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo run -p vigilo --locked -- setup --skip-evaluators
+      - run: cargo run --quiet -p vigilo --locked -- setup --skip-evaluators
+        env:
+          RUSTFLAGS: -Awarnings
 
   evaluator-wasm:
     name: Evaluator Wasm

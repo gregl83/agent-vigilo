@@ -58,7 +58,7 @@ BEGIN
     FOR partition_index IN 0..127 LOOP
         EXECUTE format(
             'CREATE TABLE %I PARTITION OF evaluator_results FOR VALUES IN (%s)',
-            'evaluator_results_p' || lpad(partition_index::text, 2, '0'),
+            'evaluator_results_p' || lpad(partition_index::text, 3, '0'),
             partition_index
         );
     END LOOP;

@@ -54,7 +54,7 @@ BEGIN
     FOR partition_index IN 0..127 LOOP
         EXECUTE format(
             'CREATE TABLE %I PARTITION OF executions FOR VALUES IN (%s)',
-            'executions_p' || lpad(partition_index::text, 2, '0'),
+            'executions_p' || lpad(partition_index::text, 3, '0'),
             partition_index
         );
     END LOOP;

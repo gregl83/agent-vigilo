@@ -29,7 +29,7 @@ BEGIN
     FOR partition_index IN 0..127 LOOP
         EXECUTE format(
             'CREATE TABLE %I PARTITION OF run_chunks FOR VALUES IN (%s)',
-            'run_chunks_p' || lpad(partition_index::text, 2, '0'),
+            'run_chunks_p' || lpad(partition_index::text, 3, '0'),
             partition_index
         );
     END LOOP;
