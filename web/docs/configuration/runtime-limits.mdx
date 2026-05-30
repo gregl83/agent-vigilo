@@ -12,6 +12,21 @@ keywords:
 
 These process-level settings bound evaluator execution resource use. They can be supplied as CLI flags or environment variables.
 
+## Worker Chunk Concurrency
+
+`vigilo worker start` processes chunk-ready messages with bounded per-process concurrency. The default keeps one chunk in flight per worker process, which matches the safest local/dev posture and scales horizontally by running more workers. Larger deployments can raise the limit to improve process utilization when chunks are uneven, agent calls are I/O-bound, or retry waits create tail latency.
+
+| Flag | Environment | Default | Purpose |
+| --- | --- | ---: | --- |
+| `--max-inflight-chunks` | `VIGILO_WORKER_MAX_INFLIGHT_CHUNKS` | `1` | Maximum unacked chunk messages processed concurrently by one worker process. RabbitMQ stream prefetch is set to the same value so a worker does not reserve more chunk messages than it can actively process. |
+
+When increasing this value, size the database pool, agent endpoint capacity, and Wasm evaluator semaphore together. A practical upper-bound check is:
+
+```text
+max_inflight_chunks * case_parallelism_per_chunk <= agent/db concurrency budget
+wasm_max_concurrent_evaluations <= CPU and memory budget
+```
+
 ## Wasm Evaluator Isolation
 
 Each evaluator invocation runs in a fresh Wasmtime store with CPU, memory, table, instance, timeout, and logging limits. Workers also use a process-wide semaphore so many valid evaluators cannot exhaust host resources at the same time.

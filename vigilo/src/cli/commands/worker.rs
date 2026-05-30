@@ -52,7 +52,7 @@ const MAX_COMPUTED_CHUNK_LEASE_SECONDS: i32 = 86_400;
 const RUN_CONTEXT_CACHE_MAX_ENTRIES: u64 = 1024;
 const RUN_CONTEXT_CACHE_TTI_SECONDS: u64 = 900;
 const WARMUP_PARALLELISM: usize = 8;
-const WORKER_STREAM_PREFETCH: u16 = 64;
+const DEFAULT_WORKER_MAX_INFLIGHT_CHUNKS: u16 = 1;
 const CASE_EXECUTION_PARALLELISM_FOR_LEASE_BUDGET: i32 = 8;
 const WORKER_MQ_RECONNECT_INITIAL_DELAY_MS: u64 = 250;
 const WORKER_MQ_RECONNECT_MAX_DELAY_MS: u64 = 30_000;
@@ -110,6 +110,10 @@ fn compute_chunk_processing_lease_seconds(
         .saturating_add(CHUNK_LEASE_SAFETY_SECONDS);
 
     computed.clamp(CHUNK_LEASE_SECONDS, MAX_COMPUTED_CHUNK_LEASE_SECONDS)
+}
+
+fn worker_stream_prefetch(max_inflight_chunks: u16) -> u16 {
+    max_inflight_chunks.max(1)
 }
 
 #[derive(Clone)]
@@ -256,7 +260,11 @@ impl EvaluatorLoaderService {
 /// Worker execution modes.
 pub(crate) enum SubCommand {
     /// Start a worker process
-    Start,
+    Start {
+        /// Maximum chunk messages processed concurrently by one worker process
+        #[arg(long, env = "VIGILO_WORKER_MAX_INFLIGHT_CHUNKS", default_value_t = DEFAULT_WORKER_MAX_INFLIGHT_CHUNKS, value_parser = clap::value_parser!(u16).range(1..=1024))]
+        max_inflight_chunks: u16,
+    },
 
     /// Process a single worker cycle and exit
     Once,
@@ -274,9 +282,11 @@ impl Executable for Command {
     /// Executes the selected worker mode.
     async fn exec(self, context: Context) -> anyhow::Result<()> {
         match self.command {
-            Some(SubCommand::Start) => {
+            Some(SubCommand::Start {
+                max_inflight_chunks,
+            }) => {
                 info!("starting worker process");
-                start::exec(context).await
+                start::exec(context, max_inflight_chunks).await
             }
             Some(SubCommand::Once) => {
                 info!("running single worker cycle");
@@ -769,5 +779,29 @@ async fn run_worker_message(
             );
             Ok(WorkerCycleOutcome::Processed)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_WORKER_MAX_INFLIGHT_CHUNKS,
+        worker_stream_prefetch,
+    };
+
+    #[test]
+    fn default_worker_processes_one_chunk_at_a_time() {
+        assert_eq!(DEFAULT_WORKER_MAX_INFLIGHT_CHUNKS, 1);
+        assert_eq!(
+            worker_stream_prefetch(DEFAULT_WORKER_MAX_INFLIGHT_CHUNKS),
+            1
+        );
+    }
+
+    #[test]
+    fn worker_stream_prefetch_matches_inflight_chunk_capacity() {
+        assert_eq!(worker_stream_prefetch(1), 1);
+        assert_eq!(worker_stream_prefetch(4), 4);
+        assert_eq!(worker_stream_prefetch(64), 64);
     }
 }

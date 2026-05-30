@@ -3,14 +3,12 @@ use super::*;
 async fn open_worker_consumer(
     mq: &crate::mq::Client,
     shutdown: &tokio_util::sync::CancellationToken,
+    prefetch: u16,
 ) -> anyhow::Result<Option<lapin::Consumer>> {
     let mut delay = Duration::from_millis(WORKER_MQ_RECONNECT_INITIAL_DELAY_MS);
 
     loop {
-        match mq
-            .consume_worker_stream("vigilo-worker", WORKER_STREAM_PREFETCH)
-            .await
-        {
+        match mq.consume_worker_stream("vigilo-worker", prefetch).await {
             Ok(consumer) => return Ok(Some(consumer)),
             Err(err) => {
                 mq.invalidate_session().await;
@@ -31,9 +29,21 @@ async fn open_worker_consumer(
     }
 }
 
+async fn drain_in_flight_chunks(
+    in_flight: &mut JoinSet<anyhow::Result<WorkerCycleOutcome>>,
+) -> anyhow::Result<()> {
+    while let Some(result) = in_flight.join_next().await {
+        result.map_err(|err| anyhow::anyhow!("worker chunk task join failed: {}", err))??;
+    }
+
+    Ok(())
+}
+
 /// Starts the long-running worker loop.
-pub(super) async fn exec(context: Context) -> anyhow::Result<()> {
+pub(super) async fn exec(context: Context, max_inflight_chunks: u16) -> anyhow::Result<()> {
     let evaluator_loader = EvaluatorLoaderService::new(context.clone());
+    let prefetch = worker_stream_prefetch(max_inflight_chunks);
+    let max_inflight_chunks = usize::from(max_inflight_chunks.max(1));
     ServiceRunner::new("worker")
         .run(move |shutdown| {
             let context = context.clone();
@@ -43,18 +53,28 @@ pub(super) async fn exec(context: Context) -> anyhow::Result<()> {
                 // The stream is reopened below if RabbitMQ closes it or reports
                 // a transient delivery failure.
                 let mq = context.mq().await?;
-                let Some(mut consumer) = open_worker_consumer(mq, &shutdown).await? else {
+                let Some(mut consumer) = open_worker_consumer(mq, &shutdown, prefetch).await? else {
                     return Ok(());
                 };
                 let mut reconnect_delay =
                     Duration::from_millis(WORKER_MQ_RECONNECT_INITIAL_DELAY_MS);
+                let mut in_flight = JoinSet::new();
 
                 loop {
                     tokio::select! {
                         // --- Handle cooperative shutdown ---
-                        // Shutdown wins over waiting for more deliveries.
-                        _ = shutdown.cancelled() => return Ok(()),
-                        delivery = consumer.next() => {
+                        // Stop accepting new deliveries and let claimed chunks
+                        // settle through normal ack/retry paths.
+                        _ = shutdown.cancelled() => {
+                            drain_in_flight_chunks(&mut in_flight).await?;
+                            return Ok(());
+                        },
+                        task_result = in_flight.join_next(), if !in_flight.is_empty() => {
+                            task_result
+                                .ok_or_else(|| anyhow::anyhow!("worker chunk task set ended unexpectedly"))?
+                                .map_err(|err| anyhow::anyhow!("worker chunk task join failed: {}", err))??;
+                        },
+                        delivery = consumer.next(), if in_flight.len() < max_inflight_chunks => {
                             let Some(delivery_result) = delivery else {
                                 // --- Reopen closed stream ---
                                 // Recover from a closed delivery stream without
@@ -65,10 +85,14 @@ pub(super) async fn exec(context: Context) -> anyhow::Result<()> {
                                     "worker consumer stream closed; reopening consumer after backoff"
                                 );
                                 tokio::select! {
-                                    _ = shutdown.cancelled() => return Ok(()),
+                                    _ = shutdown.cancelled() => {
+                                        drain_in_flight_chunks(&mut in_flight).await?;
+                                        return Ok(());
+                                    },
                                     _ = tokio::time::sleep(reconnect_delay) => {}
                                 }
-                                let Some(reopened) = open_worker_consumer(mq, &shutdown).await? else {
+                                let Some(reopened) = open_worker_consumer(mq, &shutdown, prefetch).await? else {
+                                    drain_in_flight_chunks(&mut in_flight).await?;
                                     return Ok(());
                                 };
                                 consumer = reopened;
@@ -90,10 +114,14 @@ pub(super) async fn exec(context: Context) -> anyhow::Result<()> {
                                         "worker consumer delivery failed; reopening consumer after backoff"
                                     );
                                     tokio::select! {
-                                        _ = shutdown.cancelled() => return Ok(()),
+                                        _ = shutdown.cancelled() => {
+                                            drain_in_flight_chunks(&mut in_flight).await?;
+                                            return Ok(());
+                                        },
                                         _ = tokio::time::sleep(reconnect_delay) => {}
                                     }
-                                    let Some(reopened) = open_worker_consumer(mq, &shutdown).await? else {
+                                    let Some(reopened) = open_worker_consumer(mq, &shutdown, prefetch).await? else {
+                                        drain_in_flight_chunks(&mut in_flight).await?;
                                         return Ok(());
                                     };
                                     consumer = reopened;
@@ -139,7 +167,15 @@ pub(super) async fn exec(context: Context) -> anyhow::Result<()> {
                             };
 
                             // --- Run shared chunk workflow ---
-                            run_worker_message(context.clone(), &evaluator_loader, message).await?;
+                            // Multiple chunks can run concurrently only up to
+                            // the configured capacity. RabbitMQ prefetch is set
+                            // to the same capacity so this worker does not
+                            // reserve more messages than it can process.
+                            let context = context.clone();
+                            let evaluator_loader = evaluator_loader.clone();
+                            in_flight.spawn(async move {
+                                run_worker_message(context, &evaluator_loader, message).await
+                            });
                         }
                     }
                 }
