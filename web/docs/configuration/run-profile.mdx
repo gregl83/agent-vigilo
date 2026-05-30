@@ -106,9 +106,13 @@ persistence:
   persist_evaluator_evidence: true
 ```
 
-- `mode` (enum): `full` | `summary`
-- `persist_raw_outputs` (enum): `all` | `failures_only` | `none`
-- `persist_evaluator_evidence` (bool)
+- `mode` (enum): `full` | `summary`. `full` stores execution-level case snapshots and evaluator binding config on each execution. `summary` stores only summary-safe execution identity/routing fields and redacts execution `input_payload`, `expected_output`, `case_metadata`, tags, and evaluator binding `config` in the execution snapshot.
+- `persist_raw_outputs` (enum): `all` | `failures_only` | `none`. Controls `evaluator_results.raw_evaluator_output`. `all` retains every evaluator raw output, `failures_only` retains raw output only for failed or errored findings, and `none` stores a redaction marker for every finding.
+- `persist_evaluator_evidence` (bool): controls `evaluator_results.evidence`. When `false`, finding evidence is replaced with a redaction marker. Raw evaluator output is also redacted because it can contain the same evidence.
+
+These settings affect execution/result artifact retention. Dataset case blobs and dataset-version membership remain durable so workers can execute retries and runs remain reproducible by content hash. The run profile snapshot is also retained because workers load it to invoke the configured agent and evaluators.
+
+Do not put long-lived secrets directly in `agent.http.headers` for shared databases. Header values are part of the run profile snapshot used at runtime. Prefer local development values, short-lived tokens, or a future secret-reference integration.
 
 ## `agent`
 

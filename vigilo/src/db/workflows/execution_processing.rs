@@ -56,6 +56,9 @@ use crate::{
             AggregationSettings,
             CaseGroupProfile,
             EvaluatorBinding,
+            PersistRawOutputsMode,
+            PersistenceMode,
+            PersistenceSettings,
             RunProfile,
         },
     },
@@ -84,6 +87,132 @@ struct CaseEvaluationPlan {
     profile_group_id: String,
     evaluator_bindings: Vec<EvaluatorBinding>,
     aggregation: AggregationSettings,
+}
+
+fn redacted_payload(reason: &str) -> serde_json::Value {
+    json!({
+        "redacted": true,
+        "reason": reason,
+    })
+}
+
+fn should_persist_raw_evaluator_output(
+    persistence: &PersistenceSettings,
+    status: &EvaluationStatus,
+) -> bool {
+    match &persistence.persist_raw_outputs {
+        PersistRawOutputsMode::All => true,
+        PersistRawOutputsMode::FailuresOnly => {
+            matches!(status, EvaluationStatus::Failed | EvaluationStatus::Error)
+        }
+        PersistRawOutputsMode::None => false,
+    }
+}
+
+fn persisted_evaluator_evidence(
+    persistence: &PersistenceSettings,
+    evidence: serde_json::Value,
+) -> serde_json::Value {
+    if persistence.persist_evaluator_evidence {
+        evidence
+    } else {
+        redacted_payload("persistence.persist_evaluator_evidence=false")
+    }
+}
+
+fn persisted_raw_evaluator_output(
+    persistence: &PersistenceSettings,
+    status: &EvaluationStatus,
+    raw_output: serde_json::Value,
+) -> serde_json::Value {
+    if !persistence.persist_evaluator_evidence {
+        return redacted_payload("persistence.persist_evaluator_evidence=false");
+    }
+
+    if should_persist_raw_evaluator_output(persistence, status) {
+        raw_output
+    } else {
+        redacted_payload(match &persistence.persist_raw_outputs {
+            PersistRawOutputsMode::All => "persistence.persist_raw_outputs=all",
+            PersistRawOutputsMode::FailuresOnly => "persistence.persist_raw_outputs=failures_only",
+            PersistRawOutputsMode::None => "persistence.persist_raw_outputs=none",
+        })
+    }
+}
+
+fn persisted_case_input_payload(
+    profile: &RunProfile,
+    case: &chunk_processing::WorkerCaseBatchItem,
+) -> serde_json::Value {
+    match &profile.persistence.mode {
+        PersistenceMode::Full => case.input_payload.clone(),
+        PersistenceMode::Summary => json!({
+            "redacted": true,
+            "reason": "persistence.mode=summary",
+            "case_hash": case.case_hash.clone(),
+            "field": "input_payload",
+        }),
+    }
+}
+
+fn persisted_case_expected_output(
+    profile: &RunProfile,
+    case: &chunk_processing::WorkerCaseBatchItem,
+) -> serde_json::Value {
+    match &profile.persistence.mode {
+        PersistenceMode::Full => case.expected_output.clone(),
+        PersistenceMode::Summary => json!({
+            "redacted": true,
+            "reason": "persistence.mode=summary",
+            "case_hash": case.case_hash.clone(),
+            "field": "expected_output",
+        }),
+    }
+}
+
+fn persisted_case_metadata(
+    profile: &RunProfile,
+    case: &chunk_processing::WorkerCaseBatchItem,
+) -> serde_json::Value {
+    match &profile.persistence.mode {
+        PersistenceMode::Full => case.metadata.clone(),
+        PersistenceMode::Summary => json!({
+            "redacted": true,
+            "reason": "persistence.mode=summary",
+            "case_hash": case.case_hash.clone(),
+            "field": "case_metadata",
+        }),
+    }
+}
+
+fn persisted_case_tags(profile: &RunProfile, tags: &serde_json::Value) -> serde_json::Value {
+    match &profile.persistence.mode {
+        PersistenceMode::Full => tags.clone(),
+        PersistenceMode::Summary => serde_json::Value::Array(Vec::new()),
+    }
+}
+
+fn persisted_evaluator_manifest(
+    profile: &RunProfile,
+    evaluator_bindings: &[EvaluatorBinding],
+) -> anyhow::Result<serde_json::Value> {
+    match &profile.persistence.mode {
+        PersistenceMode::Full => Ok(serde_json::to_value(evaluator_bindings)?),
+        PersistenceMode::Summary => Ok(serde_json::Value::Array(
+            evaluator_bindings
+                .iter()
+                .map(|binding| {
+                    json!({
+                        "ref": binding.evaluator_ref.clone(),
+                        "dimension": binding.dimension.clone(),
+                        "blocking": binding.blocking,
+                        "weight": binding.weight,
+                        "config": redacted_payload("persistence.mode=summary"),
+                    })
+                })
+                .collect(),
+        )),
+    }
 }
 
 /// Runtime metadata needed to execute one evaluator binding for a run.
@@ -562,6 +691,10 @@ async fn allocate_execution_attempts_for_cases(
         profile_group_id: &'a str,
         evaluator_manifest: serde_json::Value,
         expected_evaluator_count: i32,
+        tags: serde_json::Value,
+        input_payload: serde_json::Value,
+        expected_output: serde_json::Value,
+        case_metadata: serde_json::Value,
         input_ordinal: i32,
     }
 
@@ -573,8 +706,15 @@ async fn allocate_execution_attempts_for_cases(
             Ok(AllocationInput {
                 case,
                 profile_group_id: &plan.profile_group_id,
-                evaluator_manifest: serde_json::to_value(&plan.evaluator_bindings)?,
+                evaluator_manifest: persisted_evaluator_manifest(
+                    run_profile,
+                    &plan.evaluator_bindings,
+                )?,
                 expected_evaluator_count: i32::try_from(plan.evaluator_bindings.len())?,
+                tags: persisted_case_tags(run_profile, &case.tags),
+                input_payload: persisted_case_input_payload(run_profile, case),
+                expected_output: persisted_case_expected_output(run_profile, case),
+                case_metadata: persisted_case_metadata(run_profile, case),
                 input_ordinal: i32::try_from(index)?,
             })
         })
@@ -615,10 +755,10 @@ async fn allocate_execution_attempts_for_cases(
         b.push_bind(row.case.case_id)
             .push_bind(&row.case.case_hash)
             .push_bind(&row.case.task_type)
-            .push_bind(&row.case.tags)
-            .push_bind(&row.case.input_payload)
-            .push_bind(&row.case.expected_output)
-            .push_bind(&row.case.metadata)
+            .push_bind(&row.tags)
+            .push_bind(&row.input_payload)
+            .push_bind(&row.expected_output)
+            .push_bind(&row.case_metadata)
             .push_bind(row.profile_group_id)
             .push_bind(&row.evaluator_manifest)
             .push_bind(row.expected_evaluator_count)
@@ -1443,6 +1583,7 @@ async fn evaluate_case_execution(
                 let agent_output = agent_output.clone();
                 let profile_id = profile_id.clone();
                 let profile_version = profile_version.clone();
+                let persistence = run_profile.persistence.clone();
                 tasks.spawn(async move {
                     let wasm = context.wasm().await?.clone();
                     let component = get_or_load_component(&context, &binding.evaluator_ref).await?;
@@ -1505,8 +1646,12 @@ async fn evaluate_case_execution(
                                     severity: "high".to_string(),
                                     failure_category: failure_category.clone(),
                                     reason: reason.clone(),
-                                    evidence: json!({}),
-                                    raw_evaluator_output: serialized_output,
+                                    evidence: persisted_evaluator_evidence(&persistence, json!({})),
+                                    raw_evaluator_output: persisted_raw_evaluator_output(
+                                        &persistence,
+                                        &status,
+                                        serialized_output,
+                                    ),
                                 });
                                 records.push(EvaluatorExecutionRecord {
                                     evaluator_id: evaluator_entry.evaluator_id,
@@ -1564,8 +1709,15 @@ async fn evaluate_case_execution(
                                         severity,
                                         failure_category: failure_category.clone(),
                                         reason: reason.clone(),
-                                        evidence: finding.evidence,
-                                        raw_evaluator_output: serialized_output.clone(),
+                                        evidence: persisted_evaluator_evidence(
+                                            &persistence,
+                                            finding.evidence,
+                                        ),
+                                        raw_evaluator_output: persisted_raw_evaluator_output(
+                                            &persistence,
+                                            &status,
+                                            serialized_output.clone(),
+                                        ),
                                     });
                                     records.push(EvaluatorExecutionRecord {
                                         evaluator_id: evaluator_entry.evaluator_id,
@@ -1611,10 +1763,14 @@ async fn evaluate_case_execution(
                                 severity: "high".to_string(),
                                 failure_category: failure_category.clone(),
                                 reason: reason.clone(),
-                                evidence: json!({}),
-                                raw_evaluator_output: json!({
-                                    "error": err.to_string()
-                                }),
+                                evidence: persisted_evaluator_evidence(&persistence, json!({})),
+                                raw_evaluator_output: persisted_raw_evaluator_output(
+                                    &persistence,
+                                    &status,
+                                    json!({
+                                        "error": err.to_string()
+                                    }),
+                                ),
                             });
                             records.push(EvaluatorExecutionRecord {
                                 evaluator_id: evaluator_entry.evaluator_id,
@@ -2084,22 +2240,29 @@ mod tests {
         evaluation_plan_for_case,
         make_test_case,
         matching_groups_for_case,
+        persisted_case_input_payload,
+        persisted_evaluator_evidence,
+        persisted_evaluator_manifest,
+        persisted_raw_evaluator_output,
     };
     use crate::{
-        contracts::run::{
-            AgentHttpConfig,
-            AgentProfile,
-            AggregationMethod,
-            AggregationSettings,
-            AppliesTo,
-            CaseGroupProfile,
-            DimensionAggregation,
-            EvaluatorBinding,
-            PersistRawOutputsMode,
-            PersistenceMode,
-            PersistenceSettings,
-            RunDefaults,
-            RunProfile,
+        contracts::{
+            evaluator::EvaluationStatus,
+            run::{
+                AgentHttpConfig,
+                AgentProfile,
+                AggregationMethod,
+                AggregationSettings,
+                AppliesTo,
+                CaseGroupProfile,
+                DimensionAggregation,
+                EvaluatorBinding,
+                PersistRawOutputsMode,
+                PersistenceMode,
+                PersistenceSettings,
+                RunDefaults,
+                RunProfile,
+            },
         },
         db::workflows::chunk_processing::WorkerCaseBatchItem,
     };
@@ -2110,7 +2273,7 @@ mod tests {
             dimension: dimension.to_string(),
             blocking: false,
             weight: 1.0,
-            config: json!({}),
+            config: json!({"threshold": 0.8}),
         }
     }
 
@@ -2302,6 +2465,85 @@ mod tests {
         assert_eq!(
             test_case.case_group.as_deref(),
             Some("sentiment_classification")
+        );
+    }
+
+    #[test]
+    fn summary_mode_redacts_execution_payload_snapshots() {
+        let mut profile = routing_profile();
+        profile.persistence.mode = PersistenceMode::Summary;
+        let case = worker_case(Some("sentiment_classification"));
+
+        let persisted = persisted_case_input_payload(&profile, &case);
+
+        assert_eq!(persisted["redacted"], json!(true));
+        assert_eq!(persisted["field"], json!("input_payload"));
+        assert_eq!(persisted["case_hash"], json!("case-hash"));
+    }
+
+    #[test]
+    fn summary_mode_redacts_evaluator_binding_config_from_manifest() {
+        let mut profile = routing_profile();
+        profile.persistence.mode = PersistenceMode::Summary;
+        let plan = evaluation_plan_for_case(&profile, &worker_case(None)).unwrap();
+
+        let manifest = persisted_evaluator_manifest(&profile, &plan.evaluator_bindings).unwrap();
+
+        assert_eq!(manifest[0]["ref"], json!("vigilo/sentiment-basic-en:0.1.0"));
+        assert_eq!(manifest[0]["config"]["redacted"], json!(true));
+    }
+
+    #[test]
+    fn raw_output_policy_keeps_only_failed_or_error_findings_for_failures_only() {
+        let mut profile = routing_profile();
+        profile.persistence.persist_raw_outputs = PersistRawOutputsMode::FailuresOnly;
+
+        let passed = persisted_raw_evaluator_output(
+            &profile.persistence,
+            &EvaluationStatus::Passed,
+            json!({"raw": "kept"}),
+        );
+        let failed = persisted_raw_evaluator_output(
+            &profile.persistence,
+            &EvaluationStatus::Failed,
+            json!({"raw": "kept"}),
+        );
+
+        assert_eq!(passed["redacted"], json!(true));
+        assert_eq!(failed, json!({"raw": "kept"}));
+    }
+
+    #[test]
+    fn evidence_policy_redacts_finding_evidence_when_disabled() {
+        let mut profile = routing_profile();
+        profile.persistence.persist_evaluator_evidence = false;
+
+        let evidence =
+            persisted_evaluator_evidence(&profile.persistence, json!({"span": "sensitive"}));
+
+        assert_eq!(evidence["redacted"], json!(true));
+        assert_eq!(
+            evidence["reason"],
+            json!("persistence.persist_evaluator_evidence=false")
+        );
+    }
+
+    #[test]
+    fn evidence_policy_redacts_raw_output_to_avoid_embedded_evidence_leaks() {
+        let mut profile = routing_profile();
+        profile.persistence.persist_raw_outputs = PersistRawOutputsMode::All;
+        profile.persistence.persist_evaluator_evidence = false;
+
+        let raw = persisted_raw_evaluator_output(
+            &profile.persistence,
+            &EvaluationStatus::Failed,
+            json!({"evidence": {"span": "sensitive"}}),
+        );
+
+        assert_eq!(raw["redacted"], json!(true));
+        assert_eq!(
+            raw["reason"],
+            json!("persistence.persist_evaluator_evidence=false")
         );
     }
 }

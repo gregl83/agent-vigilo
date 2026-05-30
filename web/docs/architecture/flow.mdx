@@ -97,7 +97,7 @@ For each loaded case, workers resolve the evaluation plan from the run profile. 
 The resolved evaluation plan is stored on the execution before the attempt runs:
 
 - `profile_group_id`: the selected profile group id, or a deterministic comma-separated id list for multiple automatic matches
-- `evaluator_manifest`: the resolved evaluator bindings and evaluator configs
+- `evaluator_manifest`: the resolved evaluator bindings and, when `persistence.mode: full`, evaluator configs
 - `expected_evaluator_count`: the number of evaluator invocations expected for the execution
 
 The dataset `case_group` value is part of immutable case content. It is loaded from `case_blobs`, passed into evaluator input, and affects the case hash because changing it changes evaluator routing.
@@ -134,7 +134,11 @@ Each evaluator finding records:
 - severity
 - profile aggregation dimension
 - normalized score
-- evidence
+- evidence, unless `persistence.persist_evaluator_evidence: false`
+- raw evaluator output according to `persistence.persist_raw_outputs`
+
+When `persistence.mode: summary`, execution-level case payload snapshots and evaluator binding config are replaced with redaction markers. Dataset case blobs remain durable for retry execution and reproducibility.
+When `persistence.persist_evaluator_evidence: false`, raw evaluator output is also redacted because raw output may contain embedded evidence.
 
 If evaluation fails:
 
@@ -281,7 +285,7 @@ Evaluator findings are never updated, only inserted. This provides:
 ### 2. Separation of state vs evidence
 
 - state tables (runs, executions, attempts) are mutable
-- evaluator results are immutable facts
+- evaluator results are immutable facts, with evidence/raw-output fields governed by the run profile persistence policy
 
 ### 3. Idempotent finalization
 
@@ -326,6 +330,6 @@ The system is designed to:
 
 - handle distributed execution safely
 - tolerate worker failure and retries
-- preserve evaluation evidence
+- preserve evaluation evidence according to the configured persistence policy
 - produce deterministic, policy-driven outcomes
 - reliably signal completion to downstream systems

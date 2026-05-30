@@ -80,6 +80,8 @@ Fields:
 - When `case_group` is omitted, Vigilo selects matching profile case groups from `task_type`, `tags_any`, and `tags_all`.
 - `case_group` is part of immutable case content. Changing only `case_group` changes the case hash because it changes evaluator selection and aggregation behavior.
 
+Dataset case content is stored as immutable case blobs for reproducibility and retry execution. Run profile `persistence.mode: summary` redacts execution-level case snapshots, but it does not remove the underlying dataset case blobs needed by workers.
+
 ## Example
 
 See the repository sample dataset:
