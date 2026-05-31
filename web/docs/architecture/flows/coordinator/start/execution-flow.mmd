@@ -26,8 +26,8 @@ sequenceDiagram
             Vigilo->>Vigilo: Run coordinator cycle
             Vigilo->>DB: Recover expired chunk leases
             DB-->>Vigilo: Recovered and failed chunk counts
-            Vigilo->>DB: Drain dispatchable run windows
-            DB-->>Vigilo: Dispatch window count
+            Vigilo->>DB: Drain dispatchable run-shard windows
+            DB-->>Vigilo: Dispatch shard window count
             Vigilo->>DB: Drain finalizable runs
             DB-->>Vigilo: Finalization count
             Vigilo->>DB: Claim publishable outbox delivery rows

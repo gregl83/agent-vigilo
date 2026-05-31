@@ -153,8 +153,10 @@ async fn cancel_open_chunks(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_id: Uuid,
 ) -> anyhow::Result<i64> {
-    // Query behavior: move only open chunks to cancelled and clear their worker
-    // lease. Completed/failed chunks remain as historical terminal outcomes.
+    // Query behavior: move only open chunks to cancelled, clear their worker
+    // lease, and drain shard dispatch cursors so no later coordinator cycle
+    // tries to dispatch stale open cursor rows. Completed/failed chunks remain
+    // as historical terminal outcomes.
     let count = sqlx::query_scalar::<_, i64>(
         r#"
         WITH updated AS (
@@ -164,6 +166,13 @@ async fn cancel_open_chunks(
                 updated_at = now()
             WHERE run_id = $1::uuid
               AND status IN ('pending', 'leased')
+            RETURNING 1
+        ),
+        drained_cursors AS (
+            UPDATE run_shard_dispatch_cursors
+            SET status = 'drained',
+                updated_at = now()
+            WHERE run_id = $1::uuid
             RETURNING 1
         )
         SELECT COUNT(*)::bigint

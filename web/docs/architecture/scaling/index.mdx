@@ -22,12 +22,13 @@ Implemented today:
 - Shard-partitioned high-volume execution tables inside one PostgreSQL database.
 - Chunk-ready messages that carry `run_id`, `run_shard`, and `chunk_id`.
 - Worker hot-path queries that use `run_id + run_shard` for chunk-local processing.
+- Coordinator dispatch cursors keyed by `run_id + run_shard`, so dispatch windows scan one shard partition at a time and large runs rotate across open shard cursors.
 
 Not implemented yet:
 
 - Multiple PostgreSQL placement routing.
 - A runtime `db_for_shard(run_id, run_shard)` resolver.
-- Coordinator ownership by shard range or database placement.
+- Coordinator ownership by database placement or global shard range.
 - Cross-database run finalization, cancellation, result export, or status fanout.
 - Automated shard migration tooling.
 
@@ -45,6 +46,7 @@ Run chunks receive a shard during run creation. Every execution, attempt, aggreg
 
 ```text
 run_chunks(run_id, run_shard, id)
+run_shard_dispatch_cursors(run_id, run_shard)
 executions(run_id, run_shard, id)
 execution_attempts(run_id, run_shard, id)
 execution_aggregates(run_id, run_shard, execution_id)
@@ -77,6 +79,12 @@ Chunk-ready messages include the routing key:
 
 Workers use `run_id + run_shard + chunk_id` to claim the chunk. In the single-cluster deployment, the database resolver is trivial because every shard points at the same pool. In a future multi-cluster deployment, the resolver should map `run_id + run_shard` to a database placement before the worker opens a transaction.
 
+## Coordinator Dispatch Routing
+
+Run creation stores one `run_shard_dispatch_cursors` row for every logical shard used by the run. Each coordinator dispatch window claims one open cursor with `FOR UPDATE SKIP LOCKED`, selects pending chunks only for that `run_id + run_shard`, and then either releases the cursor for another window or marks it drained when no undispatched pending chunks remain. Dispatch updates the parent `runs` row only when starting a pending run; already-running runs dispatch by cursor while taking only a compatible shared run-row lock.
+
+This means a single dispatch statement is shard-local. A large run is not forced onto one shard; its chunks remain spread across the 128 logical shard range. Because open cursors are ordered by cursor update time, repeated dispatch windows rotate across a run's active shards instead of draining the lowest shard first. Multiple coordinators can claim different open shard cursors for the same already-running run without taking incompatible run-row locks, while cancellation and finalization still serialize through their exclusive lifecycle updates.
+
 ## Future Placement Layer
 
 When one PostgreSQL cluster is not enough, add placement metadata without changing chunk messages or row identity:
@@ -105,6 +113,7 @@ Use this procedure when moving logical shards to a new PostgreSQL placement.
 
 ```text
 run_chunks
+run_shard_dispatch_cursors
 executions
 execution_attempts
 execution_aggregates
@@ -121,6 +130,7 @@ evaluator_results
 - `run_shard` is stable for the lifetime of a chunk and its child rows.
 - Do not recalculate `run_shard` when adding database capacity.
 - Queue messages must include `run_shard`; workers should not rediscover it with an extra lookup on the hot path.
+- Coordinator dispatch should claim `run_shard_dispatch_cursors` and select chunks by `run_id + run_shard`, not scan all chunks for a run.
 - Chunk-local worker queries should include `run_id` and `run_shard`.
 - Joins between shard-partitioned run tables must use the full logical key, including `run_shard` (for example `run_id + run_shard + execution_id`), so result queries preserve partition locality and cannot cross-match rows from different shards.
 - Run-level reporting may fan out across all 128 shards for the run.

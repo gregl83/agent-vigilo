@@ -12,8 +12,8 @@ flowchart TD
     CoordinatorId[Load throughput knobs and generate coordinator id]
     Contexts{Runtime contexts available?}
     Recover[Recover expired chunk leases]
-    DispatchClaim{Dispatchable run claimed?}
-    DispatchRun[Start run if needed and enqueue chunk window]
+    DispatchClaim{Dispatchable run-shard cursor claimed?}
+    DispatchRun[Start run if needed and enqueue shard chunk window]
     FinalizeClaim{Finalizable run claimed?}
     FinalizeRun[Roll up counts, set gate, and enqueue completion event]
     ClaimOutbox[Claim publishable delivery rows]

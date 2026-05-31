@@ -19,11 +19,11 @@ sequenceDiagram
     Vigilo->>DB: Validate profile executability
     DB-->>Vigilo: Runnable evaluator summary
 
-    Vigilo->>Vigilo: Plan case blobs, dataset version, run, and chunks
+    Vigilo->>Vigilo: Plan case blobs, dataset version, run, chunks, and shard dispatch cursors
     Vigilo->>DB: Store run creation records in transaction
 
     alt Run creation committed
-        DB-->>Vigilo: Run, dataset, case, and chunk records saved
+        DB-->>Vigilo: Run, dataset, case, chunk, and shard cursor records saved
         Vigilo->>Vigilo: Build run creation payload
         Vigilo-->>User: Success response
     else Validation or persistence fails

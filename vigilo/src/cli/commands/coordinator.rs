@@ -88,7 +88,7 @@ pub(crate) struct Command {
     #[arg(long, env = "VIGILO_COORDINATOR_LEASE_SECONDS", default_value_t = COORDINATOR_LEASE_SECONDS, value_parser = clap::value_parser!(i32).range(1..=86400))]
     pub lease_seconds: i32,
 
-    /// Maximum run dispatch windows prepared per coordinator cycle
+    /// Maximum run-shard dispatch windows prepared per coordinator cycle
     #[arg(long, env = "VIGILO_COORDINATOR_MAX_DISPATCH_PER_CYCLE", default_value_t = COORDINATOR_MAX_DISPATCH_PER_CYCLE, value_parser = clap::value_parser!(u64).range(1..=100_000))]
     pub max_dispatch_per_cycle: u64,
 
@@ -96,7 +96,7 @@ pub(crate) struct Command {
     #[arg(long, env = "VIGILO_COORDINATOR_MAX_FINALIZE_PER_CYCLE", default_value_t = COORDINATOR_MAX_FINALIZE_PER_CYCLE, value_parser = clap::value_parser!(u64).range(1..=100_000))]
     pub max_finalize_per_cycle: u64,
 
-    /// Number of run chunks made ready per dispatch window
+    /// Number of run chunks made ready per run-shard dispatch window
     #[arg(long, env = "VIGILO_RUN_CHUNK_DISPATCH_WINDOW_SIZE", default_value_t = RUN_CHUNK_DISPATCH_WINDOW_SIZE, value_parser = clap::value_parser!(i64).range(1..=1_000_000))]
     pub run_chunk_dispatch_window_size: i64,
 
@@ -273,7 +273,7 @@ async fn drain_dispatch_batch(
     // --- Dispatch drain pass ---
     // Repeatedly claim one dispatchable run/window until the cycle limit is
     // reached or no pending dispatch work remains.
-    debug!(coordinator_id = %coordinator_id, "draining dispatchable run windows");
+    debug!(coordinator_id = %coordinator_id, "draining dispatchable run-shard windows");
 
     let mut dispatched = 0usize;
     for _ in 0..config.max_dispatch_per_cycle {
@@ -289,19 +289,25 @@ async fn drain_dispatch_batch(
         };
 
         dispatched += 1;
-        debug!(run_id = %run.id, run_key = %run.run_key, "claimed dispatchable run window");
+        debug!(
+            run_id = %run.id,
+            run_key = %run.run_key,
+            run_shard = run.run_shard,
+            "claimed dispatchable run shard window"
+        );
         info!(
             run_id = %run.id,
             run_key = %run.run_key,
+            run_shard = run.run_shard,
             chunk_events_enqueued = run.chunk_events_enqueued,
             chunks_marked_dispatched = run.chunks_marked_dispatched,
             run_started_events_enqueued = run.run_started_events_enqueued,
-            "prepared bounded dispatch window"
+            "prepared bounded dispatch shard window"
         );
     }
 
     if dispatched == 0 {
-        info!("no dispatchable run windows available for coordinator cycle");
+        info!("no dispatchable run-shard windows available for coordinator cycle");
     } else {
         info!(
             coordinator_id = %coordinator_id,

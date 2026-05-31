@@ -14,7 +14,7 @@ flowchart TD
     Event{Next service event?}
     Contexts{Runtime contexts available?}
     Recover[Recover expired chunk leases]
-    Dispatch[Drain dispatchable run windows]
+    Dispatch[Drain dispatchable run-shard windows]
     Finalize[Drain finalizable runs]
     Outbox[Claim delivery queue batch and publish with bounded concurrency]
     Wait[Wait for next tick]

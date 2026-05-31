@@ -9,11 +9,11 @@ config:
 flowchart TD
     Create([run create])
     Pending[Run pending]
-    DispatchGuard{Pending or running with undispatched chunks?}
-    DispatchLock[Lock one dispatchable run]
+    DispatchGuard{Pending or running with open shard cursor?}
+    DispatchLock[Claim one run-shard dispatch cursor]
     Running[Run running]
-    DispatchEvents[Insert run.started if new and chunk-ready window]
-    DispatchCursor[Mark selected chunks dispatched]
+    DispatchEvents[Insert run.started if new and shard chunk-ready window]
+    DispatchCursor[Mark selected chunks dispatched and release or drain cursor]
 
     FinalizeGuard{Running or finalizing with no open chunks?}
     Finalizing[Run finalizing]

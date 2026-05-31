@@ -20,9 +20,9 @@ sequenceDiagram
     Vigilo->>DB: Recover expired chunk leases
     DB-->>Vigilo: Recovered chunks and poison chunks failed
 
-    loop Dispatch bounded run windows
-        Vigilo->>DB: Claim dispatchable run and enqueue chunk window
-        DB-->>Vigilo: Dispatch window or no work
+    loop Dispatch bounded run-shard windows
+        Vigilo->>DB: Claim open run-shard cursor and enqueue chunk window
+        DB-->>Vigilo: Dispatch shard window or no work
     end
 
     loop Finalize bounded terminal runs

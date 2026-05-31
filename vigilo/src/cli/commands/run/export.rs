@@ -244,8 +244,7 @@ pub(super) fn run_export_payload(
     aggregates: &[ExecutionAggregate],
     evaluator_results: &[EvaluatorResult],
 ) -> Value {
-    let mut attempts_by_execution: BTreeMap<(i16, Uuid), Vec<&ExecutionAttempt>> =
-        BTreeMap::new();
+    let mut attempts_by_execution: BTreeMap<(i16, Uuid), Vec<&ExecutionAttempt>> = BTreeMap::new();
     for attempt in attempts {
         attempts_by_execution
             .entry((attempt.run_shard, attempt.execution_id))

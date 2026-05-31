@@ -17,7 +17,7 @@ import decisionFlowDiagram from './decision-flow.mmd';
 
 # Coordinator Once Command
 
-How `vigilo coordinator once` executes one configurable bounded orchestration cycle and exits.
+How `vigilo coordinator once` executes one configurable bounded orchestration cycle and exits. Dispatch work is claimed by `run_id + run_shard` cursor so each chunk-ready window is partition-local.
 
 ## Execution Flow
 

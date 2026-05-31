@@ -108,6 +108,7 @@ pub(crate) async fn finalize_claimed_run(
     // terminal_chunk_failure - flag terminal chunk failures/cancellations.
     // open_chunk_exists      - guard against late pending/leased chunks.
     // finalized              - persist completed run state and summary.
+    // drained_cursors       - close any leftover dispatch cursors for the run.
     // inserted_event         - idempotent run.completed outbox event.
     let finalized = sqlx::query_as::<_, FinalizedRun>(
         r#"
@@ -221,6 +222,14 @@ pub(crate) async fn finalize_claimed_run(
                 r.passed_execution_count,
                 r.failed_execution_count,
                 r.errored_execution_count
+        ),
+        drained_cursors AS (
+            UPDATE run_shard_dispatch_cursors c
+            SET status = 'drained',
+                updated_at = now()
+            FROM finalized f
+            WHERE c.run_id = f.id
+            RETURNING 1
         ),
         inserted_event AS (
             INSERT INTO outbox_events (event_type, aggregate_type, aggregate_id, dedupe_key, payload)

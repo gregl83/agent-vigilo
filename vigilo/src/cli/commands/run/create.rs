@@ -127,6 +127,7 @@ pub(super) async fn exec(
     run_create::bulk_insert_dataset_membership(&mut tx, dataset_version_id, &dataset_cases).await?;
     run_create::insert_run_create(&mut tx, run_id, &run_draft).await?;
     run_create::bulk_insert_run_chunks(&mut tx, run_id, dataset_version_id, &chunks).await?;
+    run_create::bulk_insert_run_shard_dispatch_cursors(&mut tx, run_id, &chunks).await?;
 
     tx.commit().await?;
 

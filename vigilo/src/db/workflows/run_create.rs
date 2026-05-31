@@ -6,6 +6,8 @@
 //! run before a coordinator marks it running. Bulk paths are chunked to keep
 //! statement size and bind counts bounded for large datasets.
 
+use std::collections::BTreeSet;
+
 use sqlx::{
     Postgres,
     QueryBuilder,
@@ -273,7 +275,7 @@ pub(crate) async fn insert_run_create(
 ///
 /// Query behavior: bulk inserts run-local chunk ranges in bounded batches. Each
 /// chunk points at the immutable dataset version and starts as `pending` with
-/// no dispatch cursor or worker lease.
+/// no worker lease.
 pub(crate) async fn bulk_insert_run_chunks(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     run_id: Uuid,
@@ -302,6 +304,39 @@ pub(crate) async fn bulk_insert_run_chunks(
 
         query_builder.build().execute(tx.as_mut()).await?;
     }
+
+    Ok(())
+}
+
+/// Inserts one dispatch cursor per run shard used by the run's chunk set.
+///
+/// Dispatch cursors let coordinators claim a `(run_id, run_shard)` pair before
+/// selecting chunks, keeping dispatch scans aligned with the `run_chunks`
+/// partition key.
+pub(crate) async fn bulk_insert_run_shard_dispatch_cursors(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    run_id: Uuid,
+    chunks: &[RunChunkDraft],
+) -> anyhow::Result<()> {
+    if chunks.is_empty() {
+        return Ok(());
+    }
+
+    let run_shards = chunks
+        .iter()
+        .map(|chunk| chunk.run_shard)
+        .collect::<BTreeSet<_>>();
+
+    let mut query_builder = QueryBuilder::<Postgres>::new(
+        "INSERT INTO run_shard_dispatch_cursors (run_id, run_shard, status) ",
+    );
+
+    query_builder.push_values(run_shards, |mut b, run_shard| {
+        b.push_bind(run_id).push_bind(run_shard).push_bind("open");
+    });
+
+    query_builder.push(" ON CONFLICT (run_id, run_shard) DO NOTHING");
+    query_builder.build().execute(tx.as_mut()).await?;
 
     Ok(())
 }

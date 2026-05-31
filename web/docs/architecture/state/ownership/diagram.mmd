@@ -27,6 +27,7 @@ flowchart TD
     CompleteChunk[Complete chunks]
 
     GuardRun[Run status and lifecycle lease]
+    GuardDispatch[Run-shard dispatch cursor]
     GuardChunk[Chunk status and worker lease]
     GuardAttempt[Current attempt id and attempt number]
     GuardOutbox[Outbox dedupe key and delivery claim token]
@@ -46,6 +47,7 @@ flowchart TD
 
     RunCreate --> DB
     RunCancel --> DB
+    Dispatch --> GuardDispatch
     Dispatch --> GuardRun
     RecoverLeases --> GuardChunk
     Finalize --> GuardRun
@@ -56,13 +58,14 @@ flowchart TD
     Execute --> GuardAttempt
 
     GuardRun --> DB
+    GuardDispatch --> DB
     GuardChunk --> DB
     GuardAttempt --> DB
     GuardOutbox --> DB
     Publish --> Queue
 
     class CLI command
-    class Coordinator,Worker,GuardRun,GuardChunk,GuardAttempt,GuardOutbox system
+    class Coordinator,Worker,GuardRun,GuardDispatch,GuardChunk,GuardAttempt,GuardOutbox system
     class RunCreate,RunCancel,RunRead,Dispatch,RecoverLeases,Finalize,Publish,ChunkClaim,Execute,CompleteChunk component
     class DB success
     class Queue external
