@@ -11,9 +11,13 @@ struct RunExportBatch {
 async fn select_execution_batch_by_run_id(
     db: &sqlx::PgPool,
     run_id: Uuid,
-    after_execution_id: Option<Uuid>,
+    after_execution: Option<(i16, Uuid)>,
     limit: i64,
 ) -> anyhow::Result<Vec<Execution>> {
+    let (after_run_shard, after_execution_id): (Option<i16>, Option<Uuid>) = after_execution
+        .map(|(run_shard, execution_id)| (Some(run_shard), Some(execution_id)))
+        .unwrap_or((None, None));
+
     let executions = sqlx::query_as::<_, Execution>(
         r#"
         SELECT
@@ -44,12 +48,16 @@ async fn select_execution_batch_by_run_id(
             updated_at
         FROM executions
         WHERE run_id = $1::uuid
-          AND ($2::uuid IS NULL OR id > $2::uuid)
-        ORDER BY id
-        LIMIT $3
+          AND (
+              $2::int2 IS NULL
+              OR (run_shard, id) > ($2::int2, $3::uuid)
+          )
+        ORDER BY run_shard, id
+        LIMIT $4
         "#,
     )
     .bind(run_id)
+    .bind(after_run_shard)
     .bind(after_execution_id)
     .bind(limit)
     .fetch_all(db)
@@ -83,36 +91,41 @@ async fn select_run_export_batch_for_executions(
 
     let attempts = sqlx::query_as::<_, ExecutionAttempt>(
         r#"
+        WITH input (execution_id, run_shard) AS (
+            SELECT *
+            FROM UNNEST($2::uuid[], $3::int2[])
+        )
         SELECT
-            id,
-            execution_id,
-            run_id,
-            run_shard,
-            attempt_no,
-            status::text as status,
-            worker_id,
-            worker_host,
-            queue_message_id,
-            broker_message_id,
-            leased_until::text as leased_until,
-            heartbeat_at::text as heartbeat_at,
-            request_artifact_uri,
-            response_artifact_uri,
-            agent_latency_ms,
-            evaluator_latency_ms,
-            total_latency_ms,
-            token_usage,
-            outcome_summary,
-            error_message,
-            created_at,
-            started_at,
-            completed_at,
-            updated_at
-        FROM execution_attempts
-        WHERE run_id = $1::uuid
-          AND execution_id = ANY($2::uuid[])
-          AND run_shard = ANY($3::int2[])
-        ORDER BY execution_id, attempt_no, id
+            ea.id,
+            ea.execution_id,
+            ea.run_id,
+            ea.run_shard,
+            ea.attempt_no,
+            ea.status::text as status,
+            ea.worker_id,
+            ea.worker_host,
+            ea.queue_message_id,
+            ea.broker_message_id,
+            ea.leased_until::text as leased_until,
+            ea.heartbeat_at::text as heartbeat_at,
+            ea.request_artifact_uri,
+            ea.response_artifact_uri,
+            ea.agent_latency_ms,
+            ea.evaluator_latency_ms,
+            ea.total_latency_ms,
+            ea.token_usage,
+            ea.outcome_summary,
+            ea.error_message,
+            ea.created_at,
+            ea.started_at,
+            ea.completed_at,
+            ea.updated_at
+        FROM execution_attempts ea
+        JOIN input
+          ON input.execution_id = ea.execution_id
+         AND input.run_shard = ea.run_shard
+        WHERE ea.run_id = $1::uuid
+        ORDER BY ea.execution_id, ea.attempt_no, ea.id
         "#,
     )
     .bind(run_id)
@@ -123,24 +136,29 @@ async fn select_run_export_batch_for_executions(
 
     let aggregates = sqlx::query_as::<_, ExecutionAggregate>(
         r#"
+        WITH input (execution_id, run_shard) AS (
+            SELECT *
+            FROM UNNEST($2::uuid[], $3::int2[])
+        )
         SELECT
-            execution_id,
-            run_id,
-            run_shard,
-            attempt_id,
-            overall_status::text as overall_status,
-            aggregate_score,
-            evaluator_result_count,
-            dimension_scores,
-            blocking_failures,
-            summary,
-            created_at,
-            updated_at
-        FROM execution_aggregates
-        WHERE run_id = $1::uuid
-          AND execution_id = ANY($2::uuid[])
-          AND run_shard = ANY($3::int2[])
-        ORDER BY execution_id
+            eag.execution_id,
+            eag.run_id,
+            eag.run_shard,
+            eag.attempt_id,
+            eag.overall_status::text as overall_status,
+            eag.aggregate_score,
+            eag.evaluator_result_count,
+            eag.dimension_scores,
+            eag.blocking_failures,
+            eag.summary,
+            eag.created_at,
+            eag.updated_at
+        FROM execution_aggregates eag
+        JOIN input
+          ON input.execution_id = eag.execution_id
+         AND input.run_shard = eag.run_shard
+        WHERE eag.run_id = $1::uuid
+        ORDER BY eag.execution_id
         "#,
     )
     .bind(run_id)
@@ -153,50 +171,59 @@ async fn select_run_export_batch_for_executions(
         .iter()
         .map(|attempt| attempt.id)
         .collect::<Vec<_>>();
+    let attempt_shards = attempts
+        .iter()
+        .map(|attempt| attempt.run_shard)
+        .collect::<Vec<_>>();
 
     let evaluator_results = if attempt_ids.is_empty() {
         Vec::new()
     } else {
         sqlx::query_as::<_, EvaluatorResult>(
             r#"
+            WITH input (attempt_id, run_shard) AS (
+                SELECT *
+                FROM UNNEST($2::uuid[], $3::int2[])
+            )
             SELECT
-                id,
-                run_id,
-                run_shard,
-                execution_id,
-                attempt_id,
-                evaluator_id,
-                finding_index,
-                evaluator_version,
-                evaluator_profile_id,
-                evaluator_profile_version,
-                evaluator_interface_version,
-                evaluator_runtime_version,
-                dimension,
-                status::text as status,
-                blocking,
-                score_kind,
-                raw_score,
-                raw_score_min,
-                raw_score_max,
-                normalized_score,
-                weight,
-                severity::text as severity,
-                failure_category,
-                reason,
-                evidence,
-                raw_evaluator_output,
-                created_at
-            FROM evaluator_results
-            WHERE run_id = $1::uuid
-              AND attempt_id = ANY($2::uuid[])
-              AND run_shard = ANY($3::int2[])
-            ORDER BY execution_id, attempt_id, evaluator_id, finding_index, created_at, id
+                er.id,
+                er.run_id,
+                er.run_shard,
+                er.execution_id,
+                er.attempt_id,
+                er.evaluator_id,
+                er.finding_index,
+                er.evaluator_version,
+                er.evaluator_profile_id,
+                er.evaluator_profile_version,
+                er.evaluator_interface_version,
+                er.evaluator_runtime_version,
+                er.dimension,
+                er.status::text as status,
+                er.blocking,
+                er.score_kind,
+                er.raw_score,
+                er.raw_score_min,
+                er.raw_score_max,
+                er.normalized_score,
+                er.weight,
+                er.severity::text as severity,
+                er.failure_category,
+                er.reason,
+                er.evidence,
+                er.raw_evaluator_output,
+                er.created_at
+            FROM evaluator_results er
+            JOIN input
+              ON input.attempt_id = er.attempt_id
+             AND input.run_shard = er.run_shard
+            WHERE er.run_id = $1::uuid
+            ORDER BY er.execution_id, er.attempt_id, er.evaluator_id, er.finding_index, er.created_at, er.id
             "#,
         )
         .bind(run_id)
         .bind(&attempt_ids)
-        .bind(&execution_shards)
+        .bind(&attempt_shards)
         .fetch_all(db)
         .await?
     };
@@ -217,23 +244,24 @@ pub(super) fn run_export_payload(
     aggregates: &[ExecutionAggregate],
     evaluator_results: &[EvaluatorResult],
 ) -> Value {
-    let mut attempts_by_execution: BTreeMap<Uuid, Vec<&ExecutionAttempt>> = BTreeMap::new();
+    let mut attempts_by_execution: BTreeMap<(i16, Uuid), Vec<&ExecutionAttempt>> =
+        BTreeMap::new();
     for attempt in attempts {
         attempts_by_execution
-            .entry(attempt.execution_id)
+            .entry((attempt.run_shard, attempt.execution_id))
             .or_default()
             .push(attempt);
     }
 
-    let mut aggregates_by_execution: BTreeMap<Uuid, &ExecutionAggregate> = BTreeMap::new();
+    let mut aggregates_by_execution: BTreeMap<(i16, Uuid), &ExecutionAggregate> = BTreeMap::new();
     for aggregate in aggregates {
-        aggregates_by_execution.insert(aggregate.execution_id, aggregate);
+        aggregates_by_execution.insert((aggregate.run_shard, aggregate.execution_id), aggregate);
     }
 
-    let mut results_by_attempt: BTreeMap<Uuid, Vec<&EvaluatorResult>> = BTreeMap::new();
+    let mut results_by_attempt: BTreeMap<(i16, Uuid), Vec<&EvaluatorResult>> = BTreeMap::new();
     for result in evaluator_results {
         results_by_attempt
-            .entry(result.attempt_id)
+            .entry((result.run_shard, result.attempt_id))
             .or_default()
             .push(result);
     }
@@ -242,12 +270,12 @@ pub(super) fn run_export_payload(
         .iter()
         .map(|execution| {
             let exported_attempts = attempts_by_execution
-                .get(&execution.id)
+                .get(&(execution.run_shard, execution.id))
                 .into_iter()
                 .flatten()
                 .map(|attempt| {
                     let attempt_results = results_by_attempt
-                        .get(&attempt.id)
+                        .get(&(attempt.run_shard, attempt.id))
                         .into_iter()
                         .flatten()
                         .map(|result| json!(result))
@@ -261,7 +289,7 @@ pub(super) fn run_export_payload(
                 .collect::<Vec<_>>();
 
             let aggregate = aggregates_by_execution
-                .get(&execution.id)
+                .get(&(execution.run_shard, execution.id))
                 .map(|row| json!(row))
                 .unwrap_or(Value::Null);
 
@@ -349,7 +377,7 @@ pub(super) async fn exec(
             let mut all_attempts = Vec::new();
             let mut all_aggregates = Vec::new();
             let mut all_evaluator_results = Vec::new();
-            let mut cursor = None;
+            let mut cursor: Option<(i16, Uuid)> = None;
 
             loop {
                 let execution_batch =
@@ -358,7 +386,9 @@ pub(super) async fn exec(
                     break;
                 }
 
-                cursor = execution_batch.last().map(|execution| execution.id);
+                cursor = execution_batch
+                    .last()
+                    .map(|execution| (execution.run_shard, execution.id));
                 let batch =
                     select_run_export_batch_for_executions(db, run_id, execution_batch).await?;
 
@@ -408,7 +438,7 @@ pub(super) async fn exec(
             });
             out.write_line(serde_json::to_string(&summary_line)?)?;
 
-            let mut cursor = None;
+            let mut cursor: Option<(i16, Uuid)> = None;
             loop {
                 // --- Load execution page ---
                 // Page executions by id and load child attempts, aggregates,
@@ -419,29 +449,33 @@ pub(super) async fn exec(
                     break;
                 }
 
-                cursor = execution_batch.last().map(|execution| execution.id);
+                cursor = execution_batch
+                    .last()
+                    .map(|execution| (execution.run_shard, execution.id));
                 let batch =
                     select_run_export_batch_for_executions(db, run_id, execution_batch).await?;
 
-                let mut attempts_by_execution: BTreeMap<Uuid, Vec<&ExecutionAttempt>> =
+                let mut attempts_by_execution: BTreeMap<(i16, Uuid), Vec<&ExecutionAttempt>> =
                     BTreeMap::new();
                 for attempt in &batch.attempts {
                     attempts_by_execution
-                        .entry(attempt.execution_id)
+                        .entry((attempt.run_shard, attempt.execution_id))
                         .or_default()
                         .push(attempt);
                 }
 
-                let mut aggregates_by_execution: BTreeMap<Uuid, &ExecutionAggregate> =
+                let mut aggregates_by_execution: BTreeMap<(i16, Uuid), &ExecutionAggregate> =
                     BTreeMap::new();
                 for aggregate in &batch.aggregates {
-                    aggregates_by_execution.insert(aggregate.execution_id, aggregate);
+                    aggregates_by_execution
+                        .insert((aggregate.run_shard, aggregate.execution_id), aggregate);
                 }
 
-                let mut results_by_attempt: BTreeMap<Uuid, Vec<&EvaluatorResult>> = BTreeMap::new();
+                let mut results_by_attempt: BTreeMap<(i16, Uuid), Vec<&EvaluatorResult>> =
+                    BTreeMap::new();
                 for result in &batch.evaluator_results {
                     results_by_attempt
-                        .entry(result.attempt_id)
+                        .entry((result.run_shard, result.attempt_id))
                         .or_default()
                         .push(result);
                 }
@@ -458,7 +492,9 @@ pub(super) async fn exec(
                     });
                     out.write_line(serde_json::to_string(&execution_line)?)?;
 
-                    if let Some(aggregate) = aggregates_by_execution.get(&execution.id) {
+                    if let Some(aggregate) =
+                        aggregates_by_execution.get(&(execution.run_shard, execution.id))
+                    {
                         let aggregate_line = json!({
                             "type": "execution_aggregate",
                             "run_id": run_id,
@@ -469,7 +505,7 @@ pub(super) async fn exec(
                     }
 
                     for attempt in attempts_by_execution
-                        .get(&execution.id)
+                        .get(&(execution.run_shard, execution.id))
                         .into_iter()
                         .flatten()
                     {
@@ -481,7 +517,11 @@ pub(super) async fn exec(
                         });
                         out.write_line(serde_json::to_string(&attempt_line)?)?;
 
-                        for result in results_by_attempt.get(&attempt.id).into_iter().flatten() {
+                        for result in results_by_attempt
+                            .get(&(attempt.run_shard, attempt.id))
+                            .into_iter()
+                            .flatten()
+                        {
                             let result_line = json!({
                                 "type": "evaluator_result",
                                 "run_id": run_id,

@@ -122,6 +122,7 @@ evaluator_results
 - Do not recalculate `run_shard` when adding database capacity.
 - Queue messages must include `run_shard`; workers should not rediscover it with an extra lookup on the hot path.
 - Chunk-local worker queries should include `run_id` and `run_shard`.
+- Joins between shard-partitioned run tables must use the full logical key, including `run_shard` (for example `run_id + run_shard + execution_id`), so result queries preserve partition locality and cannot cross-match rows from different shards.
 - Run-level reporting may fan out across all 128 shards for the run.
 - Large payload artifacts should be moved outside PostgreSQL before cross-cluster movement becomes routine.
 
