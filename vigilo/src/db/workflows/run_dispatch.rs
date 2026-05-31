@@ -446,11 +446,20 @@ pub(crate) async fn dispatch_next_run_window(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        collections::BTreeSet,
+        time::Duration,
+    };
 
     use sqlx::PgPool;
 
     use super::*;
+    use crate::db::workflows::{
+        run_cancel,
+        run_finalize,
+    };
+
+    // --- Fixtures and assertions ---
 
     async fn seed_pending_run(pool: &PgPool, shard_chunk_counts: &[(i16, i32)]) -> Uuid {
         let dataset_id = Uuid::now_v7();
@@ -597,47 +606,182 @@ mod tests {
         .unwrap();
     }
 
+    async fn mark_all_chunks_completed(pool: &PgPool, run_id: Uuid) {
+        sqlx::query(
+            r#"
+            UPDATE run_chunks
+            SET status = 'completed',
+                dispatched_at = COALESCE(dispatched_at, now()),
+                updated_at = now()
+            WHERE run_id = $1::uuid
+            "#,
+        )
+        .bind(run_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            UPDATE run_shard_dispatch_cursors
+            SET status = 'drained',
+                updated_at = now()
+            WHERE run_id = $1::uuid
+            "#,
+        )
+        .bind(run_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn lock_run_for_share(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, run_id: Uuid) {
+        sqlx::query(
+            r#"
+            SELECT id
+            FROM runs
+            WHERE id = $1::uuid
+            FOR SHARE
+            "#,
+        )
+        .bind(run_id)
+        .execute(&mut **tx)
+        .await
+        .unwrap();
+    }
+
+    async fn lock_run_for_update(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, run_id: Uuid) {
+        sqlx::query(
+            r#"
+            SELECT id
+            FROM runs
+            WHERE id = $1::uuid
+            FOR UPDATE
+            "#,
+        )
+        .bind(run_id)
+        .execute(&mut **tx)
+        .await
+        .unwrap();
+    }
+
+    async fn dispatch_window(pool: &PgPool) -> Option<DispatchedRun> {
+        dispatch_next_run_window(pool, Uuid::now_v7(), 60, 10)
+            .await
+            .unwrap()
+    }
+
+    async fn dispatched_chunk_count(pool: &PgPool, run_id: Uuid, run_shard: i16) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM run_chunks
+            WHERE run_id = $1::uuid
+              AND run_shard = $2
+              AND dispatched_at IS NOT NULL
+            "#,
+        )
+        .bind(run_id)
+        .bind(run_shard)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn cursor_status(pool: &PgPool, run_id: Uuid, run_shard: i16) -> String {
+        sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT status
+            FROM run_shard_dispatch_cursors
+            WHERE run_id = $1::uuid
+              AND run_shard = $2
+            "#,
+        )
+        .bind(run_id)
+        .bind(run_shard)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn cursor_status_count(pool: &PgPool, run_id: Uuid, status: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM run_shard_dispatch_cursors
+            WHERE run_id = $1::uuid
+              AND status = $2
+            "#,
+        )
+        .bind(run_id)
+        .bind(status)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn run_status(pool: &PgPool, run_id: Uuid) -> String {
+        sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT status::text
+            FROM runs
+            WHERE id = $1::uuid
+            "#,
+        )
+        .bind(run_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn chunk_ready_event_count(pool: &PgPool, run_id: Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM outbox_events
+            WHERE aggregate_id = $1::uuid
+              AND event_type = 'run.chunk.ready'
+            "#,
+        )
+        .bind(run_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn run_started_event_count(pool: &PgPool, run_id: Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM outbox_events
+            WHERE aggregate_id = $1::uuid
+              AND event_type = 'run.started'
+            "#,
+        )
+        .bind(run_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    fn dispatched_shards(windows: &[DispatchedRun]) -> BTreeSet<i16> {
+        windows.iter().map(|window| window.run_shard).collect()
+    }
+
+    // --- Shard cursor dispatch behavior ---
+
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
     async fn dispatch_scans_one_run_shard_at_a_time(pool: PgPool) {
         let run_id = seed_pending_run(&pool, &[(0, 2), (1, 2)]).await;
 
-        let first = dispatch_next_run_window(&pool, Uuid::now_v7(), 60, 10)
-            .await
-            .unwrap()
-            .unwrap();
+        let first = dispatch_window(&pool).await.unwrap();
         assert_eq!(first.id, run_id);
         assert_eq!(first.run_shard, 0);
         assert_eq!(first.chunks_marked_dispatched, 2);
 
-        let shard_1_dispatched = sqlx::query_scalar::<_, i64>(
-            r#"
-            SELECT COUNT(*)::bigint
-            FROM run_chunks
-            WHERE run_id = $1::uuid
-              AND run_shard = 1
-              AND dispatched_at IS NOT NULL
-            "#,
-        )
-        .bind(run_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(shard_1_dispatched, 0);
-
-        let cursor_status = sqlx::query_scalar::<_, String>(
-            r#"
-            SELECT status
-            FROM run_shard_dispatch_cursors
-            WHERE run_id = $1::uuid
-              AND run_shard = 0
-            "#,
-        )
-        .bind(run_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(cursor_status, "drained");
+        assert_eq!(dispatched_chunk_count(&pool, run_id, 1).await, 0);
+        assert_eq!(cursor_status(&pool, run_id, 0).await, "drained");
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -651,20 +795,7 @@ mod tests {
             .unwrap();
         assert_eq!(first.run_shard, 0);
         assert_eq!(first.chunks_marked_dispatched, 2);
-
-        let cursor_status = sqlx::query_scalar::<_, String>(
-            r#"
-            SELECT status
-            FROM run_shard_dispatch_cursors
-            WHERE run_id = $1::uuid
-              AND run_shard = 0
-            "#,
-        )
-        .bind(run_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(cursor_status, "open");
+        assert_eq!(cursor_status(&pool, run_id, 0).await, "open");
 
         let second = dispatch_next_run_window(&pool, Uuid::now_v7(), 60, 2)
             .await
@@ -676,32 +807,73 @@ mod tests {
 
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn concurrent_dispatchers_claim_distinct_shards_for_same_running_run(pool: PgPool) {
+        let run_id = seed_pending_run(&pool, &[(0, 1), (1, 1)]).await;
+        mark_run_running(&pool, run_id).await;
+
+        let (left, right) = tokio::join!(dispatch_window(&pool), dispatch_window(&pool));
+        let windows = [left, right]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<DispatchedRun>>();
+
+        assert_eq!(windows.len(), 2);
+        assert_eq!(dispatched_shards(&windows), BTreeSet::from([0, 1]));
+        assert_eq!(chunk_ready_event_count(&pool, run_id).await, 2);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn concurrent_dispatchers_do_not_duplicate_one_shard_cursor(pool: PgPool) {
+        let run_id = seed_pending_run(&pool, &[(0, 1)]).await;
+        mark_run_running(&pool, run_id).await;
+
+        let (left, right) = tokio::join!(dispatch_window(&pool), dispatch_window(&pool));
+        let windows = [left, right]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<DispatchedRun>>();
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].run_shard, 0);
+        assert_eq!(dispatched_chunk_count(&pool, run_id, 0).await, 1);
+        assert_eq!(chunk_ready_event_count(&pool, run_id).await, 1);
+        assert_eq!(cursor_status(&pool, run_id, 0).await, "drained");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn concurrent_pending_run_start_emits_one_started_event(pool: PgPool) {
+        let run_id = seed_pending_run(&pool, &[(0, 1), (1, 1)]).await;
+
+        let (left, right) = tokio::join!(dispatch_window(&pool), dispatch_window(&pool));
+        let windows = [left, right]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<DispatchedRun>>();
+
+        assert_eq!(windows.len(), 2);
+        assert_eq!(dispatched_shards(&windows), BTreeSet::from([0, 1]));
+        assert_eq!(run_status(&pool, run_id).await, "running");
+        assert_eq!(run_started_event_count(&pool, run_id).await, 1);
+        assert_eq!(chunk_ready_event_count(&pool, run_id).await, 2);
+    }
+
+    // --- Parent run lifecycle locking ---
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
     async fn running_dispatch_does_not_wait_on_parent_run_share_lock(pool: PgPool) {
         let run_id = seed_pending_run(&pool, &[(0, 1)]).await;
         mark_run_running(&pool, run_id).await;
 
         let mut tx = pool.begin().await.unwrap();
-        sqlx::query(
-            r#"
-            SELECT id
-            FROM runs
-            WHERE id = $1::uuid
-            FOR SHARE
-            "#,
-        )
-        .bind(run_id)
-        .execute(&mut *tx)
-        .await
-        .unwrap();
+        lock_run_for_share(&mut tx, run_id).await;
 
-        let dispatched = tokio::time::timeout(
-            Duration::from_secs(1),
-            dispatch_next_run_window(&pool, Uuid::now_v7(), 60, 10),
-        )
-        .await
-        .expect("dispatch should not wait on a compatible parent run share lock")
-        .unwrap()
-        .unwrap();
+        let dispatched = tokio::time::timeout(Duration::from_secs(1), dispatch_window(&pool))
+            .await
+            .expect("dispatch should not wait on a compatible parent run share lock")
+            .unwrap();
 
         assert_eq!(dispatched.id, run_id);
         assert_eq!(dispatched.run_shard, 0);
@@ -718,29 +890,68 @@ mod tests {
         mark_run_running(&pool, run_id).await;
 
         let mut tx = pool.begin().await.unwrap();
-        sqlx::query(
-            r#"
-            SELECT id
-            FROM runs
-            WHERE id = $1::uuid
-            FOR UPDATE
-            "#,
-        )
-        .bind(run_id)
-        .execute(&mut *tx)
-        .await
-        .unwrap();
+        lock_run_for_update(&mut tx, run_id).await;
 
-        let dispatch_result = tokio::time::timeout(
-            Duration::from_millis(100),
-            dispatch_next_run_window(&pool, Uuid::now_v7(), 60, 10),
-        )
-        .await;
+        let dispatch_result =
+            tokio::time::timeout(Duration::from_millis(100), dispatch_window(&pool)).await;
         assert!(
             dispatch_result.is_err(),
             "dispatch should wait behind an exclusive lifecycle update lock"
         );
 
         tx.rollback().await.unwrap();
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn cancel_waits_behind_active_dispatch_lifecycle_share_lock(pool: PgPool) {
+        let run_id = seed_pending_run(&pool, &[(0, 1)]).await;
+        mark_run_running(&pool, run_id).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        lock_run_for_share(&mut tx, run_id).await;
+
+        let cancel_result = tokio::time::timeout(
+            Duration::from_millis(100),
+            run_cancel::cancel_run(&pool, run_id),
+        )
+        .await;
+        assert!(
+            cancel_result.is_err(),
+            "cancellation should wait behind active dispatch lifecycle locks"
+        );
+
+        tx.rollback().await.unwrap();
+
+        let outcome = run_cancel::cancel_run(&pool, run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(outcome.cancelled);
+        assert_eq!(run_status(&pool, run_id).await, "cancelled");
+        assert_eq!(cursor_status_count(&pool, run_id, "drained").await, 1);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn finalization_skips_run_with_active_dispatch_lifecycle_share_lock(pool: PgPool) {
+        let run_id = seed_pending_run(&pool, &[(0, 1)]).await;
+        mark_run_running(&pool, run_id).await;
+        mark_all_chunks_completed(&pool, run_id).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        lock_run_for_share(&mut tx, run_id).await;
+
+        let skipped = run_finalize::claim_next_finalizable_run(&pool, Uuid::now_v7(), 60)
+            .await
+            .unwrap();
+        assert!(skipped.is_none());
+
+        tx.rollback().await.unwrap();
+
+        let claimed = run_finalize::claim_next_finalizable_run(&pool, Uuid::now_v7(), 60)
+            .await
+            .unwrap();
+        assert_eq!(claimed.unwrap().id, run_id);
     }
 }

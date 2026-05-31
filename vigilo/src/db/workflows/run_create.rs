@@ -340,3 +340,116 @@ pub(crate) async fn bulk_insert_run_shard_dispatch_cursors(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use sqlx::PgPool;
+
+    use super::*;
+
+    async fn insert_minimal_run(pool: &PgPool, run_id: Uuid) {
+        let dataset_id = Uuid::now_v7();
+        let dataset_version_id = Uuid::now_v7();
+
+        sqlx::query(
+            r#"
+            INSERT INTO dataset_versions (dataset_version_id, dataset_id, dataset_version)
+            VALUES ($1::uuid, $2::uuid, 'test')
+            "#,
+        )
+        .bind(dataset_version_id)
+        .bind(dataset_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO runs (
+                id,
+                run_key,
+                dataset_id,
+                dataset_version_id,
+                dataset_version,
+                evaluation_profile_id,
+                evaluation_profile_version,
+                profile_version_id,
+                profile_hash,
+                aggregation_policy_id,
+                aggregation_policy_version,
+                aggregation_policy_hash,
+                agent_provider,
+                agent_name,
+                prompt_config_id,
+                prompt_config_version,
+                expected_execution_count
+            )
+            VALUES (
+                $1::uuid,
+                $2,
+                $3::uuid,
+                $4::uuid,
+                'test',
+                'profile',
+                '1.0.0',
+                'profile-version',
+                'profile-hash',
+                'aggregation',
+                '1.0.0',
+                'aggregation-hash',
+                'example',
+                'agent',
+                'prompt',
+                '1.0.0',
+                3
+            )
+            "#,
+        )
+        .bind(run_id)
+        .bind(format!("run-{run_id}"))
+        .bind(dataset_id)
+        .bind(dataset_version_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn chunk(run_shard: i16, ordinal: i32) -> RunChunkDraft {
+        RunChunkDraft {
+            chunk_id: Uuid::now_v7(),
+            run_shard,
+            profile_group_id: "default".to_string(),
+            ordinal_start: ordinal,
+            ordinal_end: ordinal + 1,
+        }
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn bulk_insert_run_shard_dispatch_cursors_inserts_distinct_open_shards(pool: PgPool) {
+        let run_id = Uuid::now_v7();
+        insert_minimal_run(&pool, run_id).await;
+
+        let chunks = vec![chunk(0, 0), chunk(1, 1), chunk(1, 2)];
+        let mut tx = pool.begin().await.unwrap();
+        bulk_insert_run_shard_dispatch_cursors(&mut tx, run_id, &chunks)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let rows = sqlx::query_as::<_, (i16, String)>(
+            r#"
+            SELECT run_shard, status
+            FROM run_shard_dispatch_cursors
+            WHERE run_id = $1::uuid
+            ORDER BY run_shard
+            "#,
+        )
+        .bind(run_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(rows, vec![(0, "open".to_string()), (1, "open".to_string())]);
+    }
+}
