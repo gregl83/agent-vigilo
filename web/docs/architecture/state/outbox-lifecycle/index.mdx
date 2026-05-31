@@ -29,7 +29,7 @@ How durable outbox ledger rows and hot delivery rows make state-change events pu
 - Claimed batches are published with bounded concurrency controlled by the coordinator outbox publish parallelism setting.
 - RabbitMQ publication declares durable queues and bindings before publish, uses persistent messages, sets the outbox `dedupe_key` as the AMQP message id, publishes with mandatory routing, and waits for publisher confirmation.
 - Successful publishes mark the ledger event `published` and delete the delivery row only when the delivery row still has the same `claim_token`; failed publishes clear the claim and return the delivery row to retry with a delay and error message.
-- Broker delivery is at-least-once. Exactly-once effects are managed by idempotency guards: outbox `dedupe_key`, fenced publisher claims, chunk-claim checks, current-attempt authority checks, and evaluator-result uniqueness.
+- Broker delivery is at-least-once. Exactly-once effects are managed by idempotency guards: outbox `dedupe_key`, fenced publisher claims, chunk-claim checks, current-attempt and live-attempt-lease authority checks, and evaluator-result uniqueness.
 
 ## Related
 

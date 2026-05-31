@@ -101,8 +101,8 @@ Agent Vigilo is structured as a distributed AI evaluation system. Runs are creat
 ## Current Runtime Shape
 
 - **CLI runtime** parses commands, initializes shared context, applies migrations, publishes evaluators, creates runs, starts services, and renders JSON or TOON output.
-- **Coordinator** recovers expired chunk leases, claims coordinator leases, dispatches runnable chunks, finalizes completed runs, and publishes state-change events from the outbox delivery queue.
-- **Worker** consumes `run.chunk.ready` messages, claims chunk leases, allocates due attempts, delays retry-scheduled chunks until `retry_after`, invokes target agents, runs evaluator bindings, persists results, and settles RabbitMQ deliveries.
+- **Coordinator** recovers expired chunk leases, marks abandoned running attempts stale, claims coordinator leases, dispatches runnable chunks, finalizes completed runs, and publishes state-change events from the outbox delivery queue.
+- **Worker** consumes `run.chunk.ready` messages, claims chunk leases, allocates due attempts with worker and message ownership, renews chunk and attempt leases, delays retry-scheduled chunks until `retry_after`, invokes target agents, runs evaluator bindings, persists results, and settles RabbitMQ deliveries.
 - **PostgreSQL** is the authority for evaluators, datasets, runs, shard-partitioned chunks, attempts, evaluator results, execution aggregates, coordinator leases, outbox ledger rows, and hot delivery rows.
 - **RabbitMQ** distributes worker-ready chunk messages and receives confirmed durable event publications from the outbox publisher.
 - **Wasmtime** executes versioned WASI Preview 2 evaluator components with per-invocation store limits and a process-wide active-evaluation semaphore.
@@ -110,7 +110,7 @@ Agent Vigilo is structured as a distributed AI evaluation system. Runs are creat
 ## Reliability Boundaries
 
 - **Chunk ownership** is guarded by database chunk status and lease timestamps.
-- **Attempt authority** requires the current attempt id and attempt number before terminal writes are accepted.
+- **Attempt authority** requires the current attempt id, attempt number, worker id, and live attempt lease before worker-owned terminal writes are accepted.
 - **Evaluator results** are append-oriented evidence rows with uniqueness guards at the persistence boundary.
 - **Outbox publication** uses a durable `outbox_events` ledger and a partitioned `outbox_delivery_queue` for hot publish work.
 - **RabbitMQ publication** uses durable topology, persistent messages, mandatory routing, publisher confirms, and the outbox dedupe key as the AMQP message id.

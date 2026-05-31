@@ -40,7 +40,11 @@ async fn drain_in_flight_chunks(
 }
 
 /// Starts the long-running worker loop.
-pub(super) async fn exec(context: Context, max_inflight_chunks: u16) -> anyhow::Result<()> {
+pub(super) async fn exec(
+    context: Context,
+    runtime: WorkerRuntime,
+    max_inflight_chunks: u16,
+) -> anyhow::Result<()> {
     let evaluator_loader = EvaluatorLoaderService::new(context.clone());
     let prefetch = worker_stream_prefetch(max_inflight_chunks);
     let max_inflight_chunks = usize::from(max_inflight_chunks.max(1));
@@ -48,6 +52,7 @@ pub(super) async fn exec(context: Context, max_inflight_chunks: u16) -> anyhow::
         .run(move |shutdown| {
             let context = context.clone();
             let evaluator_loader = evaluator_loader.clone();
+            let runtime = runtime.clone();
             async move {
                 // --- Open consumer stream ---
                 // The stream is reopened below if RabbitMQ closes it or reports
@@ -173,8 +178,9 @@ pub(super) async fn exec(context: Context, max_inflight_chunks: u16) -> anyhow::
                             // reserve more messages than it can process.
                             let context = context.clone();
                             let evaluator_loader = evaluator_loader.clone();
+                            let runtime = runtime.clone();
                             in_flight.spawn(async move {
-                                run_worker_message(context, &evaluator_loader, message).await
+                                run_worker_message(context, &evaluator_loader, runtime, message).await
                             });
                         }
                     }

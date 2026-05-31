@@ -23,6 +23,8 @@ Chunk-ready messages carry `run_id`, `run_shard`, and `chunk_id`. The worker use
 
 By default, one worker process keeps one chunk in flight at a time. Set `--max-inflight-chunks` or `VIGILO_WORKER_MAX_INFLIGHT_CHUNKS` to allow multiple chunk messages to be processed concurrently by the same process. RabbitMQ prefetch is set to the same value, so the worker only reserves chunk messages it has capacity to run.
 
+Each worker process uses a stable `worker_id` for attempts it allocates. While processing a chunk, it renews the chunk lease and the running attempt leases; terminal transitions require the current attempt tokens and a live attempt lease for that worker.
+
 ## Execution Flow
 
 <Mermaid value={executionFlowDiagram} />

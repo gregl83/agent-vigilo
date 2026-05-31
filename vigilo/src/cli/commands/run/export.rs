@@ -93,6 +93,7 @@ async fn select_run_export_batch_for_executions(
             worker_id,
             worker_host,
             queue_message_id,
+            broker_message_id,
             leased_until::text as leased_until,
             heartbeat_at::text as heartbeat_at,
             request_artifact_uri,

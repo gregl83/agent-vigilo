@@ -1028,6 +1028,7 @@ mod tests {
             worker_id: None,
             worker_host: None,
             queue_message_id: None,
+            broker_message_id: None,
             leased_until: None,
             heartbeat_at: None,
             request_artifact_uri: Some("s3://bucket/request.json".to_string()),

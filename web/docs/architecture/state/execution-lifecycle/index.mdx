@@ -24,8 +24,9 @@ How executions and attempts become authoritative work records while workers proc
 
 - Executions are inserted or upserted only while the owning run is `running`; workers use a shared run-state guard so chunks for the same run can proceed concurrently.
 - Within a claimed chunk, workers can process multiple cases concurrently; each case still receives an authoritative attempt id and attempt number.
-- A new worker attempt marks any previous running attempt `stale`.
-- Terminal transitions require the execution's current attempt id and attempt number to match the worker's transition.
+- New attempts record the worker id, host label, internal queue message UUID, broker message id, lease expiration, and heartbeat timestamp.
+- A new worker attempt or recovered expired chunk lease marks any previous running attempt `stale`.
+- Terminal transitions require the execution's current attempt id and attempt number to match the worker's transition, and worker-owned transitions also require a live attempt lease for that worker.
 - Completed executions require an aggregate row; failed transitions upsert an error aggregate.
 - Failed attempts that still have retry budget move the execution to `retry_scheduled` with `retry_after`; the next chunk pass only creates a new attempt once that timestamp is due.
 - `defaults.max_attempts` is the hard execution retry limit. Exhausted open executions are closed as failed instead of being requeued indefinitely.

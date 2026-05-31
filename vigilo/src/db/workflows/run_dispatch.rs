@@ -53,6 +53,8 @@ pub(crate) async fn recover_expired_chunk_leases(
     //
     // expired         - recoverable leased chunks whose lease is past due.
     // recovered       - clear lease, increment recovery_count, return rows.
+    // stale_recovered_attempts
+    //                 - mark current running attempts stale before requeue.
     // recovery_events - publish a fresh, recovery-scoped chunk-ready event.
     let recovered = sqlx::query_scalar::<_, i64>(
         r#"
@@ -85,6 +87,28 @@ pub(crate) async fn recover_expired_chunk_leases(
               AND rc.run_shard = expired.run_shard
               AND rc.id = expired.id
             RETURNING rc.run_id, rc.run_shard, rc.id, rc.recovery_count
+        ),
+        stale_recovered_attempts AS (
+            UPDATE execution_attempts ea
+            SET status = 'stale'::attempt_status,
+                error_message = COALESCE(
+                    ea.error_message,
+                    'attempt lease expired with recovered chunk'
+                ),
+                completed_at = COALESCE(ea.completed_at, now()),
+                leased_until = NULL,
+                updated_at = now()
+            FROM recovered
+            JOIN executions e
+              ON e.run_id = recovered.run_id
+             AND e.run_shard = recovered.run_shard
+             AND e.chunk_id = recovered.id
+            WHERE ea.run_id = recovered.run_id
+              AND ea.run_shard = recovered.run_shard
+              AND ea.execution_id = e.id
+              AND ea.id = e.current_attempt_id
+              AND ea.status = 'running'::attempt_status
+            RETURNING ea.id
         ),
         recovery_events AS (
             INSERT INTO outbox_events (event_type, aggregate_type, aggregate_id, dedupe_key, payload)
@@ -121,6 +145,8 @@ pub(crate) async fn recover_expired_chunk_leases(
     //
     // expired - leased chunks past due that have exhausted recovery attempts.
     // failed  - clear the dead lease and make the chunk terminal.
+    // stale_failed_attempts
+    //         - mark current running attempts stale with the failed chunk.
     let failed = sqlx::query_scalar::<_, i64>(
         r#"
         WITH expired AS (
@@ -146,6 +172,28 @@ pub(crate) async fn recover_expired_chunk_leases(
               AND rc.run_shard = expired.run_shard
               AND rc.id = expired.id
             RETURNING 1
+        ),
+        stale_failed_attempts AS (
+            UPDATE execution_attempts ea
+            SET status = 'stale'::attempt_status,
+                error_message = COALESCE(
+                    ea.error_message,
+                    'attempt lease expired with failed chunk'
+                ),
+                completed_at = COALESCE(ea.completed_at, now()),
+                leased_until = NULL,
+                updated_at = now()
+            FROM expired
+            JOIN executions e
+              ON e.run_id = expired.run_id
+             AND e.run_shard = expired.run_shard
+             AND e.chunk_id = expired.id
+            WHERE ea.run_id = expired.run_id
+              AND ea.run_shard = expired.run_shard
+              AND ea.execution_id = e.id
+              AND ea.id = e.current_attempt_id
+              AND ea.status = 'running'::attempt_status
+            RETURNING ea.id
         )
         SELECT COUNT(*)::bigint
         FROM failed

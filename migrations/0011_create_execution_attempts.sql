@@ -10,6 +10,7 @@ CREATE TABLE execution_attempts (
     worker_id UUID,
     worker_host TEXT,
     queue_message_id UUID,
+    broker_message_id TEXT,
 
     -- lease/heartbeat for distributed recovery
     leased_until TIMESTAMPTZ,
@@ -94,7 +95,10 @@ COMMENT ON COLUMN execution_attempts.worker_host IS
     'Optional host or node identifier where the worker is running. Useful for debugging distributed execution.';
 
 COMMENT ON COLUMN execution_attempts.queue_message_id IS
-    'Identifier of the queue message associated with this attempt, if applicable. Used for tracing and debugging message processing.';
+    'Internal UUID correlation id for the worker delivery that allocated this attempt.';
+
+COMMENT ON COLUMN execution_attempts.broker_message_id IS
+    'Broker-provided message id or dedupe key associated with this attempt, if applicable. Used for tracing and debugging message processing.';
 
 COMMENT ON COLUMN execution_attempts.leased_until IS
     'Lease expiration timestamp for this attempt. Used to detect abandoned or stalled work and allow reassignment.';

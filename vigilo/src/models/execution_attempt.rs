@@ -31,6 +31,8 @@ pub(crate) struct ExecutionAttemptDraft {
     pub(crate) worker_host: Option<String>,
     /// Queue message id associated with the work item, when available.
     pub(crate) queue_message_id: Option<Uuid>,
+    /// Broker-provided message id or dedupe key, when available.
+    pub(crate) broker_message_id: Option<String>,
 }
 
 /// Mutable attempt status fields.
@@ -63,6 +65,8 @@ pub(crate) struct ExecutionAttempt {
     pub(crate) worker_host: Option<String>,
     /// Queue message id associated with the work item, when available.
     pub(crate) queue_message_id: Option<Uuid>,
+    /// Broker-provided message id or dedupe key, when available.
+    pub(crate) broker_message_id: Option<String>,
     /// Lease expiration returned as text by direct table helpers.
     pub(crate) leased_until: Option<String>,
     /// Last worker heartbeat returned as text by direct table helpers.

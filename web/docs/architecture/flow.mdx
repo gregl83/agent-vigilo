@@ -89,7 +89,8 @@ execution_attempt.status = running
 Each attempt is associated with:
 
 - a worker
-- a lease (for failure detection)
+- an attempt lease and heartbeat
+- an internal queue message UUID plus the broker message id, when available
 - an attempt number
 
 For each loaded case, workers resolve the evaluation plan from the run profile. An explicit dataset `case_group` selects the profile group with the same id. When `case_group` is omitted, workers use the profile group's `applies_to` task and tag rules.
@@ -189,11 +190,13 @@ This occurs when:
 - a worker loses its lease
 - a newer attempt supersedes it
 
+Workers renew the chunk lease and the running attempt leases while processing. Terminal execution transitions are accepted only from the current attempt owner with a live attempt lease, except for retry-budget exhaustion closures after recovery.
+
 Retries are bounded by `defaults.max_attempts`. When the current attempt number has reached that limit, the worker closes the execution as failed instead of scheduling another attempt. Planned retry waits do not consume the worker-message failure retry budget; actual worker processing failures still use bounded RabbitMQ retry buckets and are quarantined or fail the chunk after exhaustion.
 
 ### 7. Run Finalization
 
-Before finalization, the coordinator recovers expired chunk leases for running runs. Recoverable chunks are reset to `pending` and receive a recovery-scoped `run.chunk.ready` event. Chunks that exceed the recovery limit are marked `failed`.
+Before finalization, the coordinator recovers expired chunk leases for running runs. Recoverable chunks are reset to `pending`, their current running attempts are marked `stale`, and they receive a recovery-scoped `run.chunk.ready` event. Chunks that exceed the recovery limit are marked `failed`.
 
 The coordinator checks:
 

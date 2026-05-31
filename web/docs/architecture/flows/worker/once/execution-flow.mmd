@@ -37,6 +37,7 @@ sequenceDiagram
             else Chunk claimed
                 Vigilo->>DB: Load run context and case batch
                 DB-->>Vigilo: Profile, evaluator catalog, and cases
+                Vigilo->>DB: Start chunk and attempt lease heartbeat
                 Vigilo->>WASM: Warm evaluator components
                 WASM-->>Vigilo: Warmup result
                 Vigilo->>Queue: Hold delivery unacked while chunk is owned
@@ -47,7 +48,7 @@ sequenceDiagram
                     Vigilo->>WASM: Execute evaluators in sandboxed stores
                 end
                 WASM-->>Vigilo: Evaluation outputs
-                Vigilo->>DB: Persist batched execution results and terminal transitions
+                Vigilo->>DB: Persist batched results and lease-guarded terminal transitions
                 Vigilo->>DB: Summarize chunk execution state
                 DB-->>Vigilo: Terminal or retry-waiting chunk state
                 alt Executions still waiting for retry

@@ -32,7 +32,7 @@ flowchart TD
     WasmSemaphore["fa:fa-gauge-high <br/> <b>Wasm Evaluation Semaphore</b> <br/> <small>[Component: Rust / Tokio]</small> <br/> <small>Caps active evaluator invocations across the worker process.</small>"]:::component
     EvaluatorExecutor["fa:fa-microchip <br/> <b>Evaluator Runtime Executor</b> <br/> <small>[Component: Rust / Wasmtime]</small> <br/> <small>Runs WIT-backed evaluator components in fresh stores with memory, fuel, timeout, and log limits.</small>"]:::component
     ResultPersistence["fa:fa-database <br/> <b>Result Persistence Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Appends evaluator results and upserts aggregates with child-row authority checks.</small>"]:::component
-    TerminalTransitions["fa:fa-shield-halved <br/> <b>Terminal Transition Guard</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Marks attempts completed, retry-scheduled, or terminal only when current-attempt authority still matches.</small>"]:::component
+    TerminalTransitions["fa:fa-shield-halved <br/> <b>Terminal Transition Guard</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Marks attempts completed, retry-scheduled, or terminal only when current-attempt and live-lease authority still match.</small>"]:::component
 
     %% worker boundary
     subgraph WorkerRuntime["&nbsp;"]

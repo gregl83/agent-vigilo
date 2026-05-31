@@ -235,7 +235,8 @@ const EXECUTION_RETRY_MAX_SECONDS: i32 = 600;
 /// Terminal state transition to apply after evaluator processing finishes.
 ///
 /// The attempt id and attempt number are authority tokens. A transition only
-/// applies if the execution still points at the same current attempt.
+/// applies if the execution still points at the same current attempt and, for
+/// worker-owned transitions, the worker still owns a live attempt lease.
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutionTerminalTransition {
     pub(crate) execution_id: Uuid,
@@ -243,6 +244,17 @@ pub(crate) struct ExecutionTerminalTransition {
     pub(crate) attempt_no: i32,
     pub(crate) completed: bool,
     pub(crate) error_message: Option<String>,
+    pub(crate) requires_worker_lease: bool,
+}
+
+/// Worker ownership attached to newly allocated execution attempts.
+#[derive(Debug, Clone)]
+pub(crate) struct AttemptLeaseContext {
+    pub(crate) worker_id: Uuid,
+    pub(crate) worker_host: Option<String>,
+    pub(crate) queue_message_id: Uuid,
+    pub(crate) broker_message_id: Option<String>,
+    pub(crate) lease_seconds: i32,
 }
 
 /// Result of processing a single case execution.
@@ -316,6 +328,28 @@ fn processed_terminal_failure(
             attempt_no,
             completed: false,
             error_message: Some(error_message),
+            requires_worker_lease: true,
+        },
+    }
+}
+
+fn processed_terminal_failure_without_worker_lease(
+    execution_id: Uuid,
+    attempt_id: Uuid,
+    attempt_no: i32,
+    error_message: String,
+) -> ProcessedExecution {
+    ProcessedExecution {
+        execution_id,
+        attempt_id,
+        result_count: 0,
+        terminal_transition: ExecutionTerminalTransition {
+            execution_id,
+            attempt_id,
+            attempt_no,
+            completed: false,
+            error_message: Some(error_message),
+            requires_worker_lease: false,
         },
     }
 }
@@ -661,11 +695,13 @@ fn make_test_case(case: &chunk_processing::WorkerCaseBatchItem) -> anyhow::Resul
 /// The returned flags tell the worker whether a case should run now, wait for
 /// `retry_after`, be skipped because it is already terminal, or be failed
 /// because its retry budget is exhausted.
+#[allow(clippy::too_many_arguments)]
 async fn allocate_execution_attempts_for_cases(
     db: &PgPool,
     run_id: Uuid,
     run_shard: i16,
     chunk_id: Uuid,
+    lease: &AttemptLeaseContext,
     run_profile: &RunProfile,
     cases: &[chunk_processing::WorkerCaseBatchItem],
     evaluation_plans_by_case: &[CaseEvaluationPlan],
@@ -675,6 +711,9 @@ async fn allocate_execution_attempts_for_cases(
     }
     if run_profile.defaults.max_attempts == 0 {
         anyhow::bail!("run profile defaults.max_attempts must be greater than zero");
+    }
+    if lease.lease_seconds <= 0 {
+        anyhow::bail!("attempt lease_seconds must be greater than zero");
     }
     let max_attempts = i32::try_from(run_profile.defaults.max_attempts)?;
 
@@ -787,6 +826,34 @@ async fn allocate_execution_attempts_for_cases(
     query_builder.push_bind(max_attempts);
     query_builder.push(
         r#"::int AS max_attempts
+        ),
+        attempt_lease AS (
+            SELECT
+                "#,
+    );
+    query_builder.push_bind(lease.worker_id);
+    query_builder.push(
+        r#"::uuid AS worker_id,
+                "#,
+    );
+    query_builder.push_bind(&lease.worker_host);
+    query_builder.push(
+        r#"::text AS worker_host,
+                "#,
+    );
+    query_builder.push_bind(lease.queue_message_id);
+    query_builder.push(
+        r#"::uuid AS queue_message_id,
+                "#,
+    );
+    query_builder.push_bind(&lease.broker_message_id);
+    query_builder.push(
+        r#"::text AS broker_message_id,
+                "#,
+    );
+    query_builder.push_bind(lease.lease_seconds);
+    query_builder.push(
+        r#"::int AS lease_seconds
         ),
         upserted AS (
             INSERT INTO executions (
@@ -997,7 +1064,13 @@ async fn allocate_execution_attempts_for_cases(
                 run_id,
                 run_shard,
                 attempt_no,
+                worker_id,
+                worker_host,
+                queue_message_id,
+                broker_message_id,
                 status,
+                leased_until,
+                heartbeat_at,
                 started_at,
                 created_at,
                 updated_at
@@ -1007,11 +1080,18 @@ async fn allocate_execution_attempts_for_cases(
                 bumped.run_id,
                 bumped.run_shard,
                 bumped.attempt_no,
+                attempt_lease.worker_id,
+                attempt_lease.worker_host,
+                attempt_lease.queue_message_id,
+                attempt_lease.broker_message_id,
                 'running'::attempt_status,
+                now() + (attempt_lease.lease_seconds * interval '1 second'),
+                now(),
                 now(),
                 now(),
                 now()
             FROM bumped
+            CROSS JOIN attempt_lease
             RETURNING id AS attempt_id, execution_id, run_id, run_shard, attempt_no
         ),
         updated_execution AS (
@@ -1106,6 +1186,52 @@ async fn allocate_execution_attempts_for_cases(
     Ok(allocations)
 }
 
+/// Renews live attempt leases owned by one worker for the current chunk.
+///
+/// The chunk lease remains the scheduling boundary. Attempt leases mirror that
+/// ownership at case granularity so stale workers cannot complete attempts after
+/// coordinator recovery or reassignment.
+pub(crate) async fn heartbeat_running_attempts_for_chunk(
+    db: &PgPool,
+    run_id: Uuid,
+    run_shard: i16,
+    chunk_id: Uuid,
+    worker_id: Uuid,
+    lease_seconds: i32,
+) -> anyhow::Result<u64> {
+    if lease_seconds <= 0 {
+        anyhow::bail!("attempt lease_seconds must be greater than zero");
+    }
+
+    let result = sqlx::query(
+        r#"
+        UPDATE execution_attempts
+        SET leased_until = now() + ($5::int * interval '1 second'),
+            heartbeat_at = now(),
+            updated_at = now()
+        FROM executions
+        WHERE execution_attempts.run_id = $1::uuid
+          AND execution_attempts.run_shard = $2
+          AND execution_attempts.worker_id = $4::uuid
+          AND execution_attempts.status = 'running'::attempt_status
+          AND executions.run_id = execution_attempts.run_id
+          AND executions.run_shard = execution_attempts.run_shard
+          AND executions.id = execution_attempts.execution_id
+          AND executions.chunk_id = $3::uuid
+          AND executions.current_attempt_id = execution_attempts.id
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(chunk_id)
+    .bind(worker_id)
+    .bind(lease_seconds)
+    .execute(db)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
 /// Applies terminal execution transitions as one authoritative batch.
 ///
 /// The batch updates attempts and executions together. If any transition no
@@ -1125,6 +1251,7 @@ pub(crate) async fn finalize_execution_terminal_transitions(
     db: &PgPool,
     run_id: Uuid,
     run_shard: i16,
+    worker_id: Uuid,
     max_attempts: i32,
     transitions: &[ExecutionTerminalTransition],
 ) -> anyhow::Result<()> {
@@ -1152,6 +1279,10 @@ pub(crate) async fn finalize_execution_terminal_transitions(
         .iter()
         .map(|transition| transition.error_message.clone())
         .collect::<Vec<_>>();
+    let requires_worker_lease = transitions
+        .iter()
+        .map(|transition| transition.requires_worker_lease)
+        .collect::<Vec<_>>();
 
     // Query outline:
     //
@@ -1173,8 +1304,9 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                 $2::uuid[],
                 $3::int4[],
                 $4::bool[],
-                $5::text[]
-            ) AS t(execution_id, attempt_id, attempt_no, completed, error_message)
+                $5::text[],
+                $6::bool[]
+            ) AS t(execution_id, attempt_id, attempt_no, completed, error_message, requires_worker_lease)
         ),
         transition_count AS (
             SELECT COUNT(*) AS expected_count
@@ -1183,7 +1315,7 @@ pub(crate) async fn finalize_execution_terminal_transitions(
         run_guard AS (
             SELECT id
             FROM runs
-            WHERE id = $6::uuid
+            WHERE id = $7::uuid
               AND status = 'running'::run_status
             FOR SHARE
         ),
@@ -1194,11 +1326,31 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                 executions.run_shard
             FROM transition_input
             JOIN executions
-              ON executions.run_id = $6::uuid
-             AND executions.run_shard = $7
+              ON executions.run_id = $7::uuid
+             AND executions.run_shard = $8
              AND executions.id = transition_input.execution_id
              AND executions.current_attempt_id = transition_input.attempt_id
              AND executions.current_attempt_no = transition_input.attempt_no
+            JOIN execution_attempts
+              ON execution_attempts.run_id = executions.run_id
+             AND execution_attempts.run_shard = executions.run_shard
+             AND execution_attempts.id = transition_input.attempt_id
+             AND execution_attempts.execution_id = transition_input.execution_id
+             AND (
+                    (
+                        transition_input.requires_worker_lease
+                        AND execution_attempts.status = 'running'::attempt_status
+                        AND execution_attempts.worker_id = $9::uuid
+                        AND execution_attempts.leased_until >= now()
+                    )
+                    OR (
+                        NOT transition_input.requires_worker_lease
+                        AND execution_attempts.status IN (
+                            'running'::attempt_status,
+                            'stale'::attempt_status
+                        )
+                    )
+                 )
             JOIN run_guard
               ON run_guard.id = executions.run_id
         ),
@@ -1219,8 +1371,8 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                 END AS overall_status
             FROM authoritative_input
             LEFT JOIN execution_aggregates
-              ON execution_aggregates.run_id = $6::uuid
-             AND execution_aggregates.run_shard = $7
+              ON execution_aggregates.run_id = $7::uuid
+             AND execution_aggregates.run_shard = $8
              AND execution_aggregates.execution_id = authoritative_input.execution_id
              AND execution_aggregates.attempt_id = authoritative_input.attempt_id
             WHERE NOT authoritative_input.completed
@@ -1242,20 +1394,25 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                     'attempt lost authority before terminal transition'
                 ),
                 completed_at = now(),
+                leased_until = NULL,
                 updated_at = now()
             FROM transition_input
             JOIN executions
-              ON executions.run_id = $6::uuid
-             AND executions.run_shard = $7
+              ON executions.run_id = $7::uuid
+             AND executions.run_shard = $8
              AND executions.id = transition_input.execution_id
-            WHERE execution_attempts.run_id = $6::uuid
-              AND execution_attempts.run_shard = $7
+            WHERE execution_attempts.run_id = $7::uuid
+              AND execution_attempts.run_shard = $8
               AND execution_attempts.id = transition_input.attempt_id
               AND execution_attempts.execution_id = transition_input.execution_id
               AND execution_attempts.status = 'running'::attempt_status
+              AND transition_input.requires_worker_lease
               AND (
                   executions.current_attempt_id IS DISTINCT FROM transition_input.attempt_id
                   OR executions.current_attempt_no IS DISTINCT FROM transition_input.attempt_no
+                  OR execution_attempts.worker_id IS DISTINCT FROM $9::uuid
+                  OR execution_attempts.leased_until IS NULL
+                  OR execution_attempts.leased_until < now()
               )
             RETURNING execution_attempts.id
         ),
@@ -1274,8 +1431,8 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                 completed_at = now(),
                 updated_at = now()
             FROM terminal_input, terminal_input_check
-            WHERE execution_attempts.run_id = $6::uuid
-              AND execution_attempts.run_shard = $7
+            WHERE execution_attempts.run_id = $7::uuid
+              AND execution_attempts.run_shard = $8
               AND execution_attempts.id = terminal_input.attempt_id
               AND execution_attempts.execution_id = terminal_input.execution_id
             RETURNING
@@ -1289,7 +1446,7 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                 terminal_input.overall_status,
                 (
                     NOT terminal_input.completed
-                    AND terminal_input.attempt_no < $8::int
+                    AND terminal_input.attempt_no < $10::int
                 ) AS retry_scheduled
         ),
         failed_aggregate_upsert AS (
@@ -1357,8 +1514,8 @@ pub(crate) async fn finalize_execution_terminal_transitions(
                     WHEN attempt_update.retry_scheduled THEN
                         now() + (
                             LEAST(
-                                $9::int * POWER(3::numeric, GREATEST(attempt_update.attempt_no - 1, 0)),
-                                $10::int::numeric
+                                $11::int * POWER(3::numeric, GREATEST(attempt_update.attempt_no - 1, 0)),
+                                $12::int::numeric
                             )::int * interval '1 second'
                         )
                     ELSE NULL
@@ -1376,8 +1533,8 @@ pub(crate) async fn finalize_execution_terminal_transitions(
             FROM attempt_update
             LEFT JOIN failed_aggregate_upsert
               ON failed_aggregate_upsert.execution_id = attempt_update.execution_id
-            WHERE executions.run_id = $6::uuid
-              AND executions.run_shard = $7
+            WHERE executions.run_id = $7::uuid
+              AND executions.run_shard = $8
               AND executions.id = attempt_update.execution_id
               AND executions.current_attempt_id = attempt_update.attempt_id
               AND executions.current_attempt_no = attempt_update.attempt_no
@@ -1396,8 +1553,10 @@ pub(crate) async fn finalize_execution_terminal_transitions(
     .bind(attempt_nos)
     .bind(completed_flags)
     .bind(error_messages)
+    .bind(requires_worker_lease)
     .bind(run_id)
     .bind(run_shard)
+    .bind(worker_id)
     .bind(max_attempts)
     .bind(EXECUTION_RETRY_BASE_SECONDS)
     .bind(EXECUTION_RETRY_MAX_SECONDS)
@@ -1867,6 +2026,7 @@ async fn evaluate_case_execution(
                     attempt_no,
                     completed: true,
                     error_message: None,
+                    requires_worker_lease: true,
                 },
             };
 
@@ -2084,6 +2244,7 @@ pub(crate) async fn process_case_batch_execution(
     run_id: Uuid,
     run_shard: i16,
     chunk_id: Uuid,
+    lease: &AttemptLeaseContext,
     run_profile: &RunProfile,
     evaluator_catalog: &RunEvaluatorCatalog,
     cases: &[chunk_processing::WorkerCaseBatchItem],
@@ -2103,6 +2264,7 @@ pub(crate) async fn process_case_batch_execution(
         run_id,
         run_shard,
         chunk_id,
+        lease,
         run_profile,
         cases,
         &evaluation_plans_by_case,
@@ -2151,7 +2313,7 @@ pub(crate) async fn process_case_batch_execution(
                         )
                     })?;
                     CaseExecutionOutcome {
-                        processed: Some(processed_terminal_failure(
+                        processed: Some(processed_terminal_failure_without_worker_lease(
                             allocation.execution_id,
                             attempt_id,
                             allocation.attempt_no,
@@ -2234,10 +2396,13 @@ pub(crate) fn is_runnable_evaluator_state(state: &EvaluatorState) -> bool {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use sqlx::PgPool;
     use uuid::Uuid;
 
     use super::{
+        ExecutionTerminalTransition,
         evaluation_plan_for_case,
+        finalize_execution_terminal_transitions,
         make_test_case,
         matching_groups_for_case,
         persisted_case_input_payload,
@@ -2264,8 +2429,20 @@ mod tests {
                 RunProfile,
             },
         },
-        db::workflows::chunk_processing::WorkerCaseBatchItem,
+        db::workflows::{
+            chunk_processing::WorkerCaseBatchItem,
+            run_dispatch,
+        },
     };
+
+    struct SeededAttempt {
+        run_id: Uuid,
+        run_shard: i16,
+        chunk_id: Uuid,
+        execution_id: Uuid,
+        attempt_id: Uuid,
+        worker_id: Uuid,
+    }
 
     fn evaluator_binding(evaluator_ref: &str, dimension: &str) -> EvaluatorBinding {
         EvaluatorBinding {
@@ -2360,6 +2537,274 @@ mod tests {
             tags: json!(["sentiment"]),
             metadata: json!({}),
         }
+    }
+
+    async fn seed_running_attempt(
+        pool: &PgPool,
+        attempt_lease_seconds: i32,
+        chunk_lease_seconds: i32,
+    ) -> SeededAttempt {
+        let dataset_id = Uuid::now_v7();
+        let dataset_version_id = Uuid::now_v7();
+        let run_id = Uuid::now_v7();
+        let chunk_id = Uuid::now_v7();
+        let execution_id = Uuid::now_v7();
+        let attempt_id = Uuid::now_v7();
+        let case_id = Uuid::now_v7();
+        let worker_id = Uuid::now_v7();
+        let queue_message_id = Uuid::now_v7();
+        let run_shard = 0i16;
+
+        sqlx::query(
+            r#"
+            INSERT INTO dataset_versions (dataset_version_id, dataset_id, dataset_version)
+            VALUES ($1::uuid, $2::uuid, 'test')
+            "#,
+        )
+        .bind(dataset_version_id)
+        .bind(dataset_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO runs (
+                id,
+                run_key,
+                dataset_id,
+                dataset_version_id,
+                dataset_version,
+                evaluation_profile_id,
+                evaluation_profile_version,
+                profile_version_id,
+                profile_hash,
+                aggregation_policy_id,
+                aggregation_policy_version,
+                aggregation_policy_hash,
+                agent_provider,
+                agent_name,
+                prompt_config_id,
+                prompt_config_version,
+                status,
+                expected_execution_count,
+                started_at,
+                dispatched_at
+            )
+            VALUES (
+                $1::uuid,
+                $2,
+                $3::uuid,
+                $4::uuid,
+                'test',
+                'profile',
+                '1.0.0',
+                'profile-version',
+                'profile-hash',
+                'aggregation',
+                '1.0.0',
+                'aggregation-hash',
+                'example',
+                'agent',
+                'prompt',
+                '1.0.0',
+                'running'::run_status,
+                1,
+                now(),
+                now()
+            )
+            "#,
+        )
+        .bind(run_id)
+        .bind(format!("run-{run_id}"))
+        .bind(dataset_id)
+        .bind(dataset_version_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO run_chunks (
+                id,
+                run_id,
+                run_shard,
+                dataset_version_id,
+                profile_group_id,
+                ordinal_start,
+                ordinal_end,
+                status,
+                leased_until,
+                dispatched_at
+            )
+            VALUES (
+                $1::uuid,
+                $2::uuid,
+                $3,
+                $4::uuid,
+                'default',
+                0,
+                1,
+                'leased',
+                now() + ($5::int * interval '1 second'),
+                now()
+            )
+            "#,
+        )
+        .bind(chunk_id)
+        .bind(run_id)
+        .bind(run_shard)
+        .bind(dataset_version_id)
+        .bind(chunk_lease_seconds)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO executions (
+                id,
+                run_id,
+                run_shard,
+                chunk_id,
+                case_id,
+                case_hash,
+                profile_group_id,
+                task_type,
+                evaluation_profile_id,
+                evaluation_profile_version,
+                expected_evaluator_count,
+                status,
+                current_attempt_no,
+                started_at
+            )
+            VALUES (
+                $1::uuid,
+                $2::uuid,
+                $3,
+                $4::uuid,
+                $5::uuid,
+                'case-hash',
+                'default',
+                'classification',
+                'profile',
+                '1.0.0',
+                0,
+                'running'::execution_status,
+                1,
+                now()
+            )
+            "#,
+        )
+        .bind(execution_id)
+        .bind(run_id)
+        .bind(run_shard)
+        .bind(chunk_id)
+        .bind(case_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO execution_attempts (
+                id,
+                execution_id,
+                run_id,
+                run_shard,
+                attempt_no,
+                status,
+                worker_id,
+                worker_host,
+                queue_message_id,
+                broker_message_id,
+                leased_until,
+                heartbeat_at,
+                started_at
+            )
+            VALUES (
+                $1::uuid,
+                $2::uuid,
+                $3::uuid,
+                $4,
+                1,
+                'running'::attempt_status,
+                $5::uuid,
+                'worker-a',
+                $6::uuid,
+                'broker-message',
+                now() + ($7::int * interval '1 second'),
+                now(),
+                now()
+            )
+            "#,
+        )
+        .bind(attempt_id)
+        .bind(execution_id)
+        .bind(run_id)
+        .bind(run_shard)
+        .bind(worker_id)
+        .bind(queue_message_id)
+        .bind(attempt_lease_seconds)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            UPDATE executions
+            SET current_attempt_id = $4::uuid
+            WHERE run_id = $1::uuid
+              AND run_shard = $2
+              AND id = $3::uuid
+            "#,
+        )
+        .bind(run_id)
+        .bind(run_shard)
+        .bind(execution_id)
+        .bind(attempt_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        SeededAttempt {
+            run_id,
+            run_shard,
+            chunk_id,
+            execution_id,
+            attempt_id,
+            worker_id,
+        }
+    }
+
+    async fn insert_passing_aggregate(pool: &PgPool, seed: &SeededAttempt) {
+        sqlx::query(
+            r#"
+            INSERT INTO execution_aggregates (
+                execution_id,
+                run_id,
+                run_shard,
+                attempt_id,
+                overall_status,
+                evaluator_result_count
+            )
+            VALUES (
+                $1::uuid,
+                $2::uuid,
+                $3,
+                $4::uuid,
+                'passed'::evaluation_status,
+                0
+            )
+            "#,
+        )
+        .bind(seed.execution_id)
+        .bind(seed.run_id)
+        .bind(seed.run_shard)
+        .bind(seed.attempt_id)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     fn routing_profile() -> RunProfile {
@@ -2545,5 +2990,117 @@ mod tests {
             raw["reason"],
             json!("persistence.persist_evaluator_evidence=false")
         );
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn terminal_transition_rejects_expired_attempt_lease(pool: PgPool) {
+        let seed = seed_running_attempt(&pool, -5, 120).await;
+        insert_passing_aggregate(&pool, &seed).await;
+
+        let result = finalize_execution_terminal_transitions(
+            &pool,
+            seed.run_id,
+            seed.run_shard,
+            seed.worker_id,
+            1,
+            &[ExecutionTerminalTransition {
+                execution_id: seed.execution_id,
+                attempt_id: seed.attempt_id,
+                attempt_no: 1,
+                completed: true,
+                error_message: None,
+                requires_worker_lease: true,
+            }],
+        )
+        .await;
+
+        assert!(result.is_err());
+        let status = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT status::text
+            FROM execution_attempts
+            WHERE run_id = $1::uuid
+              AND run_shard = $2
+              AND id = $3::uuid
+            "#,
+        )
+        .bind(seed.run_id)
+        .bind(seed.run_shard)
+        .bind(seed.attempt_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(status, "stale");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn expired_chunk_recovery_stales_attempt_and_requeues_chunk(pool: PgPool) {
+        let seed = seed_running_attempt(&pool, -5, -5).await;
+
+        let stats = run_dispatch::recover_expired_chunk_leases(&pool, 3, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.recovered, 1);
+        assert_eq!(stats.failed, 0);
+
+        let (chunk_status, recovery_count) = sqlx::query_as::<_, (String, i32)>(
+            r#"
+            SELECT status, recovery_count
+            FROM run_chunks
+            WHERE run_id = $1::uuid
+              AND run_shard = $2
+              AND id = $3::uuid
+            "#,
+        )
+        .bind(seed.run_id)
+        .bind(seed.run_shard)
+        .bind(seed.chunk_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(chunk_status, "pending");
+        assert_eq!(recovery_count, 1);
+
+        let attempt_status = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT status::text
+            FROM execution_attempts
+            WHERE run_id = $1::uuid
+              AND run_shard = $2
+              AND id = $3::uuid
+            "#,
+        )
+        .bind(seed.run_id)
+        .bind(seed.run_shard)
+        .bind(seed.attempt_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempt_status, "stale");
+
+        let requeued = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM outbox_events
+            WHERE event_type = 'run.chunk.ready'
+              AND aggregate_id = $1::uuid
+              AND dedupe_key = format(
+                    'run:%s:chunk:%s:ready:recovery:%s',
+                    $1::uuid,
+                    $2::uuid,
+                    1
+                  )
+            "#,
+        )
+        .bind(seed.run_id)
+        .bind(seed.chunk_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(requeued, 1);
     }
 }

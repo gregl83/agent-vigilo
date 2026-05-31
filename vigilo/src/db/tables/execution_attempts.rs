@@ -22,9 +22,9 @@ pub(crate) async fn insert_execution_attempt(
         r#"
         INSERT INTO execution_attempts (
             execution_id, run_id, run_shard, attempt_no,
-            worker_id, worker_host, queue_message_id
+            worker_id, worker_host, queue_message_id, broker_message_id
         )
-        VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7)
+        VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8)
         RETURNING
             id,
             execution_id,
@@ -35,6 +35,7 @@ pub(crate) async fn insert_execution_attempt(
             worker_id,
             worker_host,
             queue_message_id,
+            broker_message_id,
             leased_until::text as leased_until,
             heartbeat_at::text as heartbeat_at,
             request_artifact_uri,
@@ -58,6 +59,7 @@ pub(crate) async fn insert_execution_attempt(
     .bind(draft.worker_id)
     .bind(&draft.worker_host)
     .bind(draft.queue_message_id)
+    .bind(&draft.broker_message_id)
     .fetch_one(db)
     .await?;
 
@@ -83,6 +85,7 @@ pub(crate) async fn select_execution_attempt_by_id(
             worker_id,
             worker_host,
             queue_message_id,
+            broker_message_id,
             leased_until::text as leased_until,
             heartbeat_at::text as heartbeat_at,
             request_artifact_uri,
@@ -131,6 +134,7 @@ pub(crate) async fn list_execution_attempts_by_execution_id(
             worker_id,
             worker_host,
             queue_message_id,
+            broker_message_id,
             leased_until::text as leased_until,
             heartbeat_at::text as heartbeat_at,
             request_artifact_uri,
@@ -178,6 +182,7 @@ pub(crate) async fn list_execution_attempts_by_run_id(
             worker_id,
             worker_host,
             queue_message_id,
+            broker_message_id,
             leased_until::text as leased_until,
             heartbeat_at::text as heartbeat_at,
             request_artifact_uri,
@@ -231,6 +236,7 @@ pub(crate) async fn update_execution_attempt_status(
             worker_id,
             worker_host,
             queue_message_id,
+            broker_message_id,
             leased_until::text as leased_until,
             heartbeat_at::text as heartbeat_at,
             request_artifact_uri,

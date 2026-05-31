@@ -20,7 +20,14 @@ use clap::{
 use futures_util::StreamExt;
 use moka::future::Cache;
 use serde::Deserialize;
-use tokio::task::JoinSet;
+use tokio::{
+    sync::Mutex,
+    task::{
+        JoinHandle,
+        JoinSet,
+    },
+};
+use tokio_util::sync::CancellationToken;
 use tracing::{
     debug,
     info,
@@ -46,14 +53,13 @@ mod once;
 mod start;
 
 const CHUNK_LEASE_SECONDS: i32 = 60;
-const CHUNK_LEASE_SAFETY_SECONDS: i32 = 120;
-const CHUNK_LEASE_EVALUATOR_BUDGET_SECONDS_PER_CASE_BATCH: i32 = 30;
-const MAX_COMPUTED_CHUNK_LEASE_SECONDS: i32 = 86_400;
+const CHUNK_PROCESSING_LEASE_SECONDS: i32 = 120;
+const ATTEMPT_LEASE_SECONDS: i32 = 120;
+const WORKER_HEARTBEAT_INTERVAL_SECONDS: u64 = 15;
 const RUN_CONTEXT_CACHE_MAX_ENTRIES: u64 = 1024;
 const RUN_CONTEXT_CACHE_TTI_SECONDS: u64 = 900;
 const WARMUP_PARALLELISM: usize = 8;
 const DEFAULT_WORKER_MAX_INFLIGHT_CHUNKS: u16 = 1;
-const CASE_EXECUTION_PARALLELISM_FOR_LEASE_BUDGET: i32 = 8;
 const WORKER_MQ_RECONNECT_INITIAL_DELAY_MS: u64 = 250;
 const WORKER_MQ_RECONNECT_MAX_DELAY_MS: u64 = 30_000;
 
@@ -78,12 +84,30 @@ struct WorkerRunContext {
     evaluator_catalog: execution_processing::RunEvaluatorCatalog,
 }
 
+#[derive(Debug, Clone)]
+struct WorkerRuntime {
+    worker_id: Uuid,
+    worker_host: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 /// Queue payload that signals a run chunk is ready for processing.
 struct ChunkReadyMessage {
     run_id: Uuid,
     run_shard: i16,
     chunk_id: Uuid,
+}
+
+struct ChunkLeaseGuard {
+    db: sqlx::PgPool,
+    chunk: Mutex<crate::models::run_chunk::RunChunk>,
+    lease_seconds: i32,
+}
+
+struct ChunkHeartbeat {
+    guard: Arc<ChunkLeaseGuard>,
+    cancel: CancellationToken,
+    handle: JoinHandle<()>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -94,22 +118,158 @@ struct WarmupStats {
     loaded: usize,
 }
 
-fn compute_chunk_processing_lease_seconds(
-    profile: &RunProfile,
-    chunk: &crate::models::run_chunk::RunChunk,
-) -> i32 {
-    let case_count = (chunk.ordinal_end - chunk.ordinal_start).max(1);
-    let case_batches = (case_count + CASE_EXECUTION_PARALLELISM_FOR_LEASE_BUDGET - 1)
-        / CASE_EXECUTION_PARALLELISM_FOR_LEASE_BUDGET;
-    let request_timeout = i32::try_from(profile.defaults.request_timeout_secs)
-        .unwrap_or(MAX_COMPUTED_CHUNK_LEASE_SECONDS);
-    let per_batch_budget =
-        request_timeout.saturating_add(CHUNK_LEASE_EVALUATOR_BUDGET_SECONDS_PER_CASE_BATCH);
-    let computed = case_batches
-        .saturating_mul(per_batch_budget)
-        .saturating_add(CHUNK_LEASE_SAFETY_SECONDS);
+impl WorkerRuntime {
+    fn new() -> Self {
+        Self {
+            worker_id: Uuid::now_v7(),
+            worker_host: worker_host_label(),
+        }
+    }
+}
 
-    computed.clamp(CHUNK_LEASE_SECONDS, MAX_COMPUTED_CHUNK_LEASE_SECONDS)
+impl ChunkLeaseGuard {
+    fn new(
+        db: &sqlx::PgPool,
+        chunk: crate::models::run_chunk::RunChunk,
+        lease_seconds: i32,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            db: db.clone(),
+            chunk: Mutex::new(chunk),
+            lease_seconds,
+        })
+    }
+
+    async fn current_chunk(&self) -> crate::models::run_chunk::RunChunk {
+        self.chunk.lock().await.clone()
+    }
+
+    async fn renew(&self) -> anyhow::Result<bool> {
+        let current = self.current_chunk().await;
+        let Some(renewed) =
+            chunk_processing::extend_chunk_lease(&self.db, &current, self.lease_seconds).await?
+        else {
+            return Ok(false);
+        };
+        *self.chunk.lock().await = renewed;
+        Ok(true)
+    }
+}
+
+impl ChunkHeartbeat {
+    fn start(
+        db: &sqlx::PgPool,
+        chunk: crate::models::run_chunk::RunChunk,
+        runtime: WorkerRuntime,
+    ) -> Self {
+        let guard = ChunkLeaseGuard::new(db, chunk, CHUNK_PROCESSING_LEASE_SECONDS);
+        let cancel = CancellationToken::new();
+        let heartbeat_guard = guard.clone();
+        let heartbeat_cancel = cancel.clone();
+        let handle = tokio::spawn(async move {
+            run_chunk_heartbeat(heartbeat_guard, runtime, heartbeat_cancel).await;
+        });
+
+        Self {
+            guard,
+            cancel,
+            handle,
+        }
+    }
+
+    async fn stop(self) -> crate::models::run_chunk::RunChunk {
+        self.cancel.cancel();
+        if let Err(err) = self.handle.await {
+            warn!(error = %err, "worker heartbeat task failed to join");
+        }
+        self.guard.current_chunk().await
+    }
+}
+
+fn worker_host_label() -> Option<String> {
+    ["VIGILO_WORKER_HOST", "HOSTNAME", "COMPUTERNAME"]
+        .iter()
+        .find_map(|key| std::env::var(key).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+async fn run_chunk_heartbeat(
+    guard: Arc<ChunkLeaseGuard>,
+    runtime: WorkerRuntime,
+    cancel: CancellationToken,
+) {
+    let mut interval =
+        tokio::time::interval(Duration::from_secs(WORKER_HEARTBEAT_INTERVAL_SECONDS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = interval.tick() => {
+                let chunk = guard.current_chunk().await;
+                match guard.renew().await {
+                    Ok(true) => {
+                        match execution_processing::heartbeat_running_attempts_for_chunk(
+                            &guard.db,
+                            chunk.run_id,
+                            chunk.run_shard,
+                            chunk.id,
+                            runtime.worker_id,
+                            ATTEMPT_LEASE_SECONDS,
+                        )
+                        .await
+                        {
+                            Ok(renewed_attempts) => {
+                                debug!(
+                                    run_id = %chunk.run_id,
+                                    chunk_id = %chunk.id,
+                                    worker_id = %runtime.worker_id,
+                                    renewed_attempts,
+                                    "renewed worker chunk and attempt leases"
+                                );
+                            }
+                            Err(err) => {
+                                warn!(
+                                    run_id = %chunk.run_id,
+                                    chunk_id = %chunk.id,
+                                    worker_id = %runtime.worker_id,
+                                    error = %err,
+                                    "failed to renew attempt leases during worker heartbeat"
+                                );
+                            }
+                        }
+                    }
+                    Ok(false) => {
+                        warn!(
+                            run_id = %chunk.run_id,
+                            chunk_id = %chunk.id,
+                            worker_id = %runtime.worker_id,
+                            "worker lost chunk lease during heartbeat"
+                        );
+                        return;
+                    }
+                    Err(err) => {
+                        warn!(
+                            run_id = %chunk.run_id,
+                            chunk_id = %chunk.id,
+                            worker_id = %runtime.worker_id,
+                            error = %err,
+                            "failed to renew chunk lease during worker heartbeat"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn broker_message_id(message: &crate::mq::RawConsumedMessage) -> Option<String> {
+    message
+        .properties
+        .message_id()
+        .as_ref()
+        .map(ToString::to_string)
 }
 
 fn worker_stream_prefetch(max_inflight_chunks: u16) -> u16 {
@@ -286,11 +446,11 @@ impl Executable for Command {
                 max_inflight_chunks,
             }) => {
                 info!("starting worker process");
-                start::exec(context, max_inflight_chunks).await
+                start::exec(context, WorkerRuntime::new(), max_inflight_chunks).await
             }
             Some(SubCommand::Once) => {
                 info!("running single worker cycle");
-                once::exec(context).await
+                once::exec(context, WorkerRuntime::new()).await
             }
             None => anyhow::bail!("missing worker subcommand; use `vigilo worker start`"),
         }
@@ -308,12 +468,13 @@ impl Executable for Command {
 async fn run_worker_drain_pass(
     context: Context,
     evaluator_loader: &EvaluatorLoaderService,
+    runtime: WorkerRuntime,
     max_messages: usize,
 ) -> anyhow::Result<usize> {
     let mut processed = 0usize;
 
     for _ in 0..max_messages {
-        match run_worker_cycle(context.clone(), evaluator_loader).await? {
+        match run_worker_cycle(context.clone(), evaluator_loader, runtime.clone()).await? {
             WorkerCycleOutcome::Processed => {
                 processed += 1;
             }
@@ -327,6 +488,7 @@ async fn run_worker_drain_pass(
 async fn run_worker_cycle(
     context: Context,
     evaluator_loader: &EvaluatorLoaderService,
+    runtime: WorkerRuntime,
 ) -> anyhow::Result<WorkerCycleOutcome> {
     // --- Fetch worker message ---
     // `Empty` is a normal one-shot outcome, not an error.
@@ -363,7 +525,7 @@ async fn run_worker_cycle(
         }
     };
 
-    run_worker_message(context, evaluator_loader, message).await
+    run_worker_message(context, evaluator_loader, runtime, message).await
 }
 
 async fn settle_retryable_chunk_failure(
@@ -439,6 +601,7 @@ async fn settle_chunk_waiting_for_execution_retry(
 async fn run_worker_message(
     context: Context,
     evaluator_loader: &EvaluatorLoaderService,
+    runtime: WorkerRuntime,
     message: crate::mq::ConsumedMessage,
 ) -> anyhow::Result<WorkerCycleOutcome> {
     // --- Acquire shared services ---
@@ -521,16 +684,14 @@ async fn run_worker_message(
         .get_or_build_run_context(chunk.run_id)
         .await?;
 
-    let processing_lease_seconds =
-        compute_chunk_processing_lease_seconds(&run_context.profile, &chunk);
     let Some(extended_chunk) =
-        chunk_processing::extend_chunk_lease(db, &chunk, processing_lease_seconds).await?
+        chunk_processing::extend_chunk_lease(db, &chunk, CHUNK_PROCESSING_LEASE_SECONDS).await?
     else {
         mq.ack(&message.raw).await?;
         warn!(
             run_id = %chunk.run_id,
             chunk_id = %chunk.id,
-            lease_seconds = processing_lease_seconds,
+            lease_seconds = CHUNK_PROCESSING_LEASE_SECONDS,
             "chunk lease was lost before processing budget extension; acknowledged stale message"
         );
         return Ok(WorkerCycleOutcome::Processed);
@@ -539,10 +700,18 @@ async fn run_worker_message(
     debug!(
         run_id = %chunk.run_id,
         chunk_id = %chunk.id,
-        lease_seconds = processing_lease_seconds,
+        lease_seconds = CHUNK_PROCESSING_LEASE_SECONDS,
         leased_until = ?chunk.leased_until,
         "extended chunk lease for processing budget"
     );
+    let heartbeat = ChunkHeartbeat::start(db, chunk.clone(), runtime.clone());
+    let attempt_lease = execution_processing::AttemptLeaseContext {
+        worker_id: runtime.worker_id,
+        worker_host: runtime.worker_host.clone(),
+        queue_message_id: Uuid::now_v7(),
+        broker_message_id: broker_message_id(&message.raw),
+        lease_seconds: ATTEMPT_LEASE_SECONDS,
+    };
 
     // --- Warm evaluator components ---
     // Warmup failures are treated as recoverable worker failures because no
@@ -561,6 +730,7 @@ async fn run_worker_message(
             );
         }
         Err(err) => {
+            let chunk = heartbeat.stop().await;
             let settlement = settle_retryable_chunk_failure(
                 db,
                 mq,
@@ -599,6 +769,7 @@ async fn run_worker_message(
                 chunk.run_id,
                 chunk.run_shard,
                 chunk.id,
+                &attempt_lease,
                 &run_context.profile,
                 &run_context.evaluator_catalog,
                 &cases,
@@ -607,6 +778,7 @@ async fn run_worker_message(
             {
                 Ok(processed) => processed,
                 Err(err) => {
+                    let chunk = heartbeat.stop().await;
                     let settlement = settle_retryable_chunk_failure(
                         db,
                         mq,
@@ -662,11 +834,13 @@ async fn run_worker_message(
                 db,
                 chunk.run_id,
                 chunk.run_shard,
+                runtime.worker_id,
                 i32::try_from(run_context.profile.defaults.max_attempts)?,
                 &terminal_transitions,
             )
             .await
             {
+                let chunk = heartbeat.stop().await;
                 let settlement = settle_retryable_chunk_failure(
                     db,
                     mq,
@@ -697,6 +871,7 @@ async fn run_worker_message(
             )
             .await?;
             if chunk_state.open_execution_count > 0 {
+                let chunk = heartbeat.stop().await;
                 let reason = format!(
                     "chunk has {} open executions, including {} retry-scheduled executions; next_retry_after={:?}",
                     chunk_state.open_execution_count,
@@ -727,6 +902,7 @@ async fn run_worker_message(
             // --- Complete chunk and acknowledge message ---
             // All executions in the chunk are terminal, so complete the chunk
             // under the same lease token.
+            let chunk = heartbeat.stop().await;
             let completed = chunk_processing::mark_chunk_completed(db, &chunk).await?;
             if completed == 0 {
                 mq.ack(&message.raw).await?;
@@ -755,6 +931,7 @@ async fn run_worker_message(
             Ok(WorkerCycleOutcome::Processed)
         }
         Err(err) => {
+            let chunk = heartbeat.stop().await;
             let settlement = settle_retryable_chunk_failure(
                 db,
                 mq,

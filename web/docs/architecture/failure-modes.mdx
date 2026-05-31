@@ -13,11 +13,11 @@ keywords:
 
 ## Worker crash
 
-Chunk messages are delivered at least once. A worker holds the RabbitMQ delivery unacked while it owns the chunk lease. If the worker exits before acknowledgement, RabbitMQ may redeliver the message and the next worker must win the database chunk claim by `run_id + run_shard + chunk_id` before doing work. The coordinator also scans expired chunk leases, requeues recoverable chunks with recovery-scoped `run.chunk.ready` events, and marks chunks failed after the recovery limit.
+Chunk messages are delivered at least once. A worker holds the RabbitMQ delivery unacked while it owns the chunk lease, and it renews both the chunk lease and the running attempt leases while processing. If the worker exits before acknowledgement, RabbitMQ may redeliver the message and the next worker must win the database chunk claim by `run_id + run_shard + chunk_id` before doing work. The coordinator also scans expired chunk leases, marks current running attempts stale, requeues recoverable chunks with recovery-scoped `run.chunk.ready` events, and marks chunks failed after the recovery limit.
 
 ## Duplicate delivery
 
-Duplicate broker deliveries are allowed. Exactly-once effects are managed in the database: chunks can only be claimed from an open or expired lease, recovered chunk-ready events carry unique recovery dedupe keys, executions only accept terminal transitions from the current attempt id and attempt number, and evaluator findings are unique per run, attempt, evaluator, and finding index.
+Duplicate broker deliveries are allowed. Exactly-once effects are managed in the database: chunks can only be claimed from an open or expired lease, recovered chunk-ready events carry unique recovery dedupe keys, executions only accept terminal transitions from the current attempt id, attempt number, worker id, and live attempt lease, and evaluator findings are unique per run, attempt, evaluator, and finding index.
 
 ## Outbox publisher crash
 
@@ -29,7 +29,7 @@ RabbitMQ publishes use durable topology, persistent messages, mandatory routing,
 
 ## Partial persistence
 
-Worker persistence batches are guarded by current-attempt authority checks. If a stale worker loses authority, its final state changes are rejected rather than overwriting a newer attempt.
+Worker persistence batches are guarded by current-attempt and live-attempt-lease authority checks. If a stale worker loses authority, its final state changes are rejected rather than overwriting a newer attempt.
 
 ## Execution retry waits
 
