@@ -4,6 +4,10 @@
 [![Documentation](https://img.shields.io/badge/docs-agentvigilo.com-blue.svg)](https://agentvigilo.com/docs/guides/getting-started)
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+<p align="center">
+  <img src="web/static/img/logo.svg" alt="Agent Vigilo logo" width="120" />
+</p>
+
 # Agent Vigilo
 
 **Distributed AI evaluation infrastructure and deployment gating experiments for generative AI systems.**
