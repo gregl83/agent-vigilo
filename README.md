@@ -51,6 +51,8 @@ git config core.hooksPath scripts/hooks
 
 The pre-commit hook runs nightly rustfmt only. The pre-push hook runs clippy, Rust tests, and the web typecheck. Migration smoke checks, evaluator Wasm builds, and the web production build run in CI.
 
+Coverage is generated in CI with `cargo llvm-cov` and uploaded to Codecov from the `Coverage` job. Configure the repository secret `CODECOV_TOKEN` in GitHub Actions for authenticated uploads.
+
 ## Project Status
 
 Agent Vigilo is an active systems project focused on reliable AI evaluation, LLM evaluation workflows, agent testing, and deployment gates. The implementation favors explicit contracts, durable state transitions, and operational diagrams over black-box orchestration.

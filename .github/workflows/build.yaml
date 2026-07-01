@@ -25,6 +25,7 @@ jobs:
       - rustfmt
       - clippy
       - test
+      - coverage
       - migrations
       - evaluator-wasm
       - web
@@ -65,6 +66,27 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace --locked --verbose
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate Rust coverage report
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          flags: rust
+          name: rust-workspace
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   migrations:
     name: Migrations
