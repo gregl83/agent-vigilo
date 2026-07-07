@@ -1,3 +1,10 @@
+//! Helpers for long-running async services.
+//!
+//! Coordinator and worker start commands use [`ServiceRunner`] to run a loop or
+//! task until process shutdown, apply cooperative cancellation, and enforce a
+//! bounded shutdown timeout. Service-specific work should be passed in as async
+//! closures; this module should stay generic and avoid runtime-domain state.
+
 use std::{
     future::Future,
     pin::Pin,

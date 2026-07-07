@@ -1,3 +1,9 @@
+//! Run results summary command implementation.
+//!
+//! Loads a run and aggregate result counts without materializing every
+//! execution. This module is for summary-only inspection; detailed execution,
+//! attempt, aggregate, and evaluator-result data belongs in `run::export`.
+
 use super::*;
 
 pub(super) fn run_results_payload(run: &Run, summary: &RunResultsSummary) -> Value {

@@ -1,3 +1,17 @@
+//! Binary entry point for the `agent-vigilo` CLI.
+//!
+//! This module wires clap argument parsing, process logging, shared runtime
+//! context construction, and top-level command dispatch. Keep application
+//! behavior in command/runtime modules; the entry point should stay limited to
+//! process setup, error reporting, and exit-code selection.
+
+//! Binary entry point for the `agent-vigilo` CLI.
+//!
+//! This module wires clap argument parsing, process logging, shared runtime
+//! context construction, and top-level command dispatch. Keep application
+//! behavior in command/runtime modules; the entry point should stay limited to
+//! process setup, error reporting, and exit-code selection.
+
 use std::{
     io::stderr,
     process::ExitCode,

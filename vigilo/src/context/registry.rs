@@ -1,3 +1,9 @@
+//! Compiled evaluator registry cache context.
+//!
+//! Workers use this cache to reuse Wasmtime components keyed by fully qualified
+//! evaluator references. Values are weighted by approximate compiled image size
+//! so the cache stays within the configured memory budget.
+
 use moka::future::Cache;
 use tokio::sync::OnceCell;
 use tracing::debug;

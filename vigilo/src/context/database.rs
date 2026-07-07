@@ -1,3 +1,10 @@
+//! Lazy PostgreSQL pool context.
+//!
+//! Commands call this module through [`crate::context::Context::db`] when they
+//! first need database access. Connection options are process-wide and should
+//! be supplied by CLI/env configuration; query behavior belongs in `db::tables`
+//! or `db::workflows`.
+
 use sqlx::{
     PgPool,
     postgres::PgPoolOptions,

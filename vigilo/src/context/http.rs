@@ -1,3 +1,9 @@
+//! Lazy shared HTTP client context.
+//!
+//! Runtime paths use this client for outbound agent calls. Keep transport-wide
+//! configuration here; request shape, timeout semantics, and response
+//! normalization belong in `agent_client`.
+
 use tokio::sync::OnceCell;
 use tracing::debug;
 

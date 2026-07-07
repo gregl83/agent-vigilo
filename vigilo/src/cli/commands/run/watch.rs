@@ -1,3 +1,10 @@
+//! Run watch command implementation.
+//!
+//! Polls an existing run until it reaches a terminal status, emitting snapshots
+//! only when visible state changes or completion occurs. Watch mode never waits
+//! for a missing run to appear; callers must create the run first and pass a
+//! valid UUID.
+
 use super::*;
 
 async fn select_existing_run_for_watch(db: &sqlx::PgPool, run_id: Uuid) -> anyhow::Result<Run> {

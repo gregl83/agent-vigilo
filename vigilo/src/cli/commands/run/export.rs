@@ -1,3 +1,10 @@
+//! Run export command implementation.
+//!
+//! Exports run summary data and execution artifacts as either one JSON document
+//! or streamed JSONL records. Use JSON for small runs and JSONL for large runs;
+//! pagination must stay ordered by `(run_shard, execution_id)` so exports are
+//! deterministic and resumable internally.
+
 use super::*;
 
 #[derive(Debug)]

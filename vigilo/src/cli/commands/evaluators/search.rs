@@ -1,3 +1,9 @@
+//! Evaluator search command implementation.
+//!
+//! Queries registry summaries within one namespace and writes a structured
+//! response through the configured output buffer. Keep result shaping here
+//! small and stable so agents can parse `data` and `meta` consistently.
+
 use super::*;
 
 pub(super) async fn exec(

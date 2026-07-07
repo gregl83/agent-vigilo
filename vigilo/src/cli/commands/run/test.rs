@@ -1,3 +1,10 @@
+//! Run profile and dataset validation command implementation.
+//!
+//! Parses profile/dataset YAML or JSON, validates schema plus evaluator
+//! executability, and writes the parsed contracts without creating run rows.
+//! Use this path when changing profile authoring rules so failures are caught
+//! before durable orchestration state is created.
+
 use super::*;
 
 /// Implements `vigilo run test`.

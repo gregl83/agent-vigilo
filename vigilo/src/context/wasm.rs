@@ -1,3 +1,10 @@
+//! Wasm evaluator runtime context.
+//!
+//! This module prepares evaluator artifacts for publishing, compiles registry
+//! components, and executes evaluator tests inside a Wasmtime component-model
+//! sandbox. Keep WIT mapping here aligned with `wit/evaluator.wit`; resource
+//! limits, fuel, timeout, and log caps must be enforced for every invocation.
+
 use std::{
     env::consts::ARCH,
     fs,

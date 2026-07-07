@@ -1,3 +1,10 @@
+//! Evaluator publish command implementation.
+//!
+//! This module resolves the requested manifest profile, prepares the evaluator
+//! Wasm artifact, and inserts it into the built-in Vigilo registry namespace.
+//! Callers must provide an evaluator crate directory with `Vigilo.toml`; release
+//! publishing expects the release Wasm artifact to have been built.
+
 use super::*;
 
 pub(super) async fn exec(

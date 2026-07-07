@@ -1,3 +1,10 @@
+//! Long-running worker mode.
+//!
+//! Used by `vigilo worker start` to consume worker queue messages until
+//! shutdown. The module owns stream reconnection and in-flight chunk limits,
+//! while the shared worker message path owns validation, leasing, processing,
+//! retry, and quarantine behavior.
+
 use super::*;
 
 async fn open_worker_consumer(

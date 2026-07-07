@@ -1,3 +1,10 @@
+//! Long-running coordinator mode.
+//!
+//! Used by `vigilo coordinator start` to run coordinator cycles on a fixed tick
+//! until process shutdown. The same coordinator id is reused across cycles, and
+//! all durable leasing/finalization behavior is delegated to the shared cycle
+//! implementation.
+
 use super::*;
 
 /// Starts the long-running coordinator loop.

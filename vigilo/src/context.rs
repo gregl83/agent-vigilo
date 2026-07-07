@@ -1,3 +1,19 @@
+//! Lazily initialized process context.
+//!
+//! Commands receive a cloned [`Context`] and request services on demand:
+//! database pool, HTTP client, message queue client, output buffer, evaluator
+//! registry cache, and Wasm runtime. Service modules in `context::*` should
+//! remain thin initialization boundaries; domain behavior belongs in runtime,
+//! db, mq, or command modules.
+
+//! Lazily initialized process context.
+//!
+//! Commands receive a cloned [`Context`] and request services on demand:
+//! database pool, HTTP client, message queue client, output buffer, evaluator
+//! registry cache, and Wasm runtime. Service modules in `context::*` should
+//! remain thin initialization boundaries; domain behavior belongs in runtime,
+//! db, mq, or command modules.
+
 use std::sync::Arc;
 
 pub(crate) mod database;

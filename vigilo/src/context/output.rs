@@ -1,3 +1,10 @@
+//! Process stdout output context.
+//!
+//! Commands write structured payloads through this module so JSON and TOON
+//! formatting stay consistent across the CLI. Diagnostic logs should continue
+//! to use tracing/stderr; stdout is reserved for machine-readable command
+//! results.
+
 use std::{
     collections::BTreeMap,
     io::{

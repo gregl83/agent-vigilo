@@ -1,3 +1,9 @@
+//! Evaluator state update command implementation.
+//!
+//! Updates registry state for one fully qualified evaluator id. Inputs must use
+//! `<namespace>/<name>:<version>` and state changes should preserve operator
+//! reason text when provided for auditability.
+
 use super::*;
 
 pub(super) async fn exec(

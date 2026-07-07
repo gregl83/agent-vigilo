@@ -1,3 +1,9 @@
+//! Run status command implementation.
+//!
+//! Returns a single run progress snapshot using the same payload shape as
+//! watch updates. This command should avoid side effects and should validate
+//! the run id before initializing database-backed command work.
+
 use super::*;
 
 pub(super) async fn exec(context: Context, run_id: String) -> anyhow::Result<()> {

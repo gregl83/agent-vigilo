@@ -1,3 +1,10 @@
+//! Run cancellation command implementation.
+//!
+//! Cancels an active run through the workflow layer and reports the terminal
+//! run snapshot plus counts of closed chunks, executions, attempts, and outbox
+//! events. Run identifiers must be UUIDs; cancellation behavior must remain
+//! idempotent and workflow-owned.
+
 use super::*;
 
 pub(super) fn run_cancel_payload(outcome: &run_cancel::CancelRunOutcome) -> Value {

@@ -1,3 +1,17 @@
+//! CLI application definition.
+//!
+//! This module defines global options, shared output selection, and the
+//! `Executable` dispatch contract used by subcommands. Command implementations
+//! should live under `cli::commands`; this root should only own arguments that
+//! apply process-wide and values needed to construct [`crate::context::Context`].
+
+//! CLI application definition.
+//!
+//! This module defines global options, shared output selection, and the
+//! `Executable` dispatch contract used by subcommands. Command implementations
+//! should live under `cli::commands`; this root should only own arguments that
+//! apply process-wide and values needed to construct [`crate::context::Context`].
+
 use async_trait::async_trait;
 use clap::{
     ArgAction,

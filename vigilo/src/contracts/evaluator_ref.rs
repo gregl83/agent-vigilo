@@ -1,3 +1,10 @@
+//! Evaluator identifier parsing.
+//!
+//! All runtime and CLI entry points that accept evaluator references should use
+//! this module to enforce the canonical `<namespace>/<name>:<version>` format.
+//! Avoid accepting legacy or shorthand forms in new code so persisted refs,
+//! profile bindings, and operator commands stay unambiguous.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EvaluatorIdentity {
     pub(crate) namespace: String,

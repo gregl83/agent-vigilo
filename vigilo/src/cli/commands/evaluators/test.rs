@@ -1,3 +1,10 @@
+//! Evaluator test command implementation.
+//!
+//! Runs one registry evaluator against canonical evaluator `input` JSON and
+//! returns the evaluator `output` plus normalized findings. Disabled or removed
+//! evaluators cannot be tested, and test input must match the host-side
+//! evaluator execution contract.
+
 use super::*;
 
 pub(super) async fn exec(

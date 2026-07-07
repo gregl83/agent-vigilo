@@ -1,3 +1,10 @@
+//! Single-pass coordinator mode.
+//!
+//! Used by `vigilo coordinator once` to execute exactly one orchestration cycle
+//! with a fresh coordinator id. This module should only bridge CLI mode
+//! selection to the shared coordinator cycle; ordering and lease rules belong
+//! in the parent coordinator module and database workflows.
+
 use super::*;
 
 /// Runs a single coordinator cycle with a fresh coordinator id.

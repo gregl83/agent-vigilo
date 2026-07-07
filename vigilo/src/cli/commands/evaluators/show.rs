@@ -1,3 +1,9 @@
+//! Evaluator inspection command implementation.
+//!
+//! Loads one registry record by fully qualified evaluator id and writes its
+//! metadata, interface fields, runtime fingerprint, and state. Missing
+//! evaluators are reported as command errors instead of empty payloads.
+
 use super::*;
 
 pub(super) async fn exec(context: Context, evaluator: String) -> anyhow::Result<()> {

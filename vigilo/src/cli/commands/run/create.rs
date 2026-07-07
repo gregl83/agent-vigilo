@@ -1,3 +1,10 @@
+//! Run creation command implementation.
+//!
+//! Validates profile/dataset inputs, derives stable hashes and dataset version
+//! identity, and writes pending run work in one transaction. This module must
+//! not publish queue-visible work directly; coordinator dispatch owns worker
+//! visibility after the run is durably created.
+
 use super::*;
 
 /// Implements `vigilo run create`.

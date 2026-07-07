@@ -1,3 +1,11 @@
+//! Shared clap argument parsing helpers.
+//!
+//! Command modules use these functions as value parsers when an argument must
+//! resolve to an existing file or directory before command execution begins.
+//! Keep this module limited to reusable parsing/validation helpers; command
+//! semantics belong in the command modules that consume the parsed values.
+
+/// Parser functions intended for direct use from clap `value_parser` fields.
 pub mod parsers {
     use std::path::PathBuf;
 
