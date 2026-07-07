@@ -1,0 +1,31 @@
+CREATE TABLE shard_placements (
+    run_id UUID NOT NULL,
+    run_shard SMALLINT NOT NULL CHECK (run_shard >= 0 AND run_shard < 128),
+    database_alias TEXT NOT NULL REFERENCES database_placements(alias),
+    status TEXT NOT NULL CHECK (status IN ('active', 'moving', 'draining')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT pk_shard_placements PRIMARY KEY (run_id, run_shard)
+);
+
+CREATE INDEX idx_shard_placements_database_alias_status
+    ON shard_placements(database_alias, status);
+
+COMMENT ON TABLE shard_placements IS
+    'Routing catalog for a run logical shard. Each row maps one run_id and run_shard pair to a database placement alias.';
+
+COMMENT ON COLUMN shard_placements.run_id IS
+    'Run whose logical shard is routed by this placement row.';
+
+COMMENT ON COLUMN shard_placements.run_shard IS
+    'Logical shard number for this run. Values are constrained to the 128 shard range used by run_chunks and execution tables.';
+
+COMMENT ON COLUMN shard_placements.database_alias IS
+    'Database placement alias that owns this run shard.';
+
+COMMENT ON COLUMN shard_placements.status IS
+    'Shard placement lifecycle. Active is dispatchable; moving and draining are reserved for shard movement workflows.';
+
+COMMENT ON INDEX idx_shard_placements_database_alias_status IS
+    'Lookup index for routing and administrative scans grouped by database placement and dispatchability status.';
