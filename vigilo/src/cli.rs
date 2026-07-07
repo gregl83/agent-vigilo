@@ -51,6 +51,18 @@ pub(crate) struct App {
     #[arg(long, env = "DATABASE_MAX_CONNECTIONS", default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=256))]
     pub database_max_connections: u32,
 
+    /// Active control-capable database placement alias
+    #[arg(long, env = "VIGILO_CONTROL_DATABASE_ALIAS", default_value = "primary")]
+    pub control_database_alias: String,
+
+    /// Default shard-capable placement alias for newly created run shards
+    #[arg(
+        long,
+        env = "VIGILO_DEFAULT_SHARD_DATABASE_ALIAS",
+        default_value = "primary"
+    )]
+    pub default_shard_database_alias: String,
+
     /// Messaging URL (connection string)
     #[arg(long, env = "MESSAGING_URL")]
     pub messaging_url: String,

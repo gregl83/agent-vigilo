@@ -31,6 +31,7 @@ impl Context {
     pub fn new(
         db_uri: String,
         db_max_connections: u32,
+        placement_config: database::PlacementConfig,
         mq_uri: String,
         wasm_config: wasm::Config,
         output_format: output::OutputFormat,
@@ -39,6 +40,7 @@ impl Context {
             db: database::Context {
                 uri: db_uri,
                 max_connections: db_max_connections,
+                placement_config,
                 cell: Default::default(),
             },
             http: http::Context {
@@ -64,6 +66,10 @@ impl Context {
 
     pub async fn db(&self) -> anyhow::Result<&sqlx::PgPool> {
         self.0.db.get().await
+    }
+
+    pub async fn validate_database_placements(&self) -> anyhow::Result<()> {
+        self.0.db.validate_placement_config().await
     }
 
     pub async fn http(&self) -> anyhow::Result<&reqwest::Client> {

@@ -16,6 +16,10 @@ use serde::{
 pub(crate) const DEFAULT_DATABASE_ALIAS: &str = "primary";
 pub(crate) const DEFAULT_DATABASE_URL_ENV: &str = "DATABASE_URL";
 
+pub(crate) const DATABASE_PLACEMENT_ROLE_CONTROL: &str = "control";
+pub(crate) const DATABASE_PLACEMENT_ROLE_SHARD: &str = "shard";
+pub(crate) const DATABASE_PLACEMENT_ROLE_CONTROL_AND_SHARD: &str = "control_and_shard";
+
 /// Persisted database placement row.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub(crate) struct DatabasePlacement {
@@ -31,4 +35,20 @@ pub(crate) struct DatabasePlacement {
     pub(crate) created_at: DateTime<Utc>,
     /// Time this placement row was last updated.
     pub(crate) updated_at: DateTime<Utc>,
+}
+
+impl DatabasePlacement {
+    pub(crate) fn is_control_capable(&self) -> bool {
+        matches!(
+            self.role.as_str(),
+            DATABASE_PLACEMENT_ROLE_CONTROL | DATABASE_PLACEMENT_ROLE_CONTROL_AND_SHARD
+        )
+    }
+
+    pub(crate) fn is_shard_capable(&self) -> bool {
+        matches!(
+            self.role.as_str(),
+            DATABASE_PLACEMENT_ROLE_SHARD | DATABASE_PLACEMENT_ROLE_CONTROL_AND_SHARD
+        )
+    }
 }

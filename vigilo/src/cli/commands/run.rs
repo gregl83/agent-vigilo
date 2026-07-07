@@ -708,6 +708,7 @@ mod tests {
     use crate::{
         context::{
             Context,
+            database::PlacementConfig,
             output::OutputFormat,
             wasm,
         },
@@ -944,6 +945,7 @@ mod tests {
         let context = Context::new(
             "not-a-postgres-url".to_string(),
             1,
+            PlacementConfig::default_single_database(),
             "not-used".to_string(),
             wasm::Config::default(),
             OutputFormat::Json,
@@ -1127,6 +1129,7 @@ mod tests {
         let context = Context::new(
             "not-a-postgres-url".to_string(),
             1,
+            PlacementConfig::default_single_database(),
             "not-used".to_string(),
             wasm::Config::default(),
             OutputFormat::Json,
@@ -1149,6 +1152,7 @@ mod tests {
         let context = Context::new(
             "not-a-postgres-url".to_string(),
             1,
+            PlacementConfig::default_single_database(),
             "not-used".to_string(),
             wasm::Config::default(),
             OutputFormat::Json,

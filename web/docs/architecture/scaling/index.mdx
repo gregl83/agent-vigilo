@@ -24,6 +24,8 @@ Implemented today:
   `database_placements` and `shard_placements`.
 - A seeded default placement:
   `primary -> DATABASE_URL` with role `control_and_shard`.
+- Runtime placement configuration for the control alias and default shard alias.
+- Placement catalog validation during `vigilo setup` after migrations run.
 - Chunk-ready messages that carry `run_id`, `run_shard`, and `chunk_id`.
 - Worker hot-path queries that use `run_id + run_shard` for chunk-local processing.
 - Coordinator dispatch cursors keyed by `run_id + run_shard`, so dispatch windows scan one shard partition at a time and large runs rotate across open shard cursors.
@@ -33,6 +35,7 @@ Not implemented yet:
 - Multiple PostgreSQL placement routing at runtime.
 - A runtime `db_for_shard(run_id, run_shard)` resolver.
 - Automatic creation of `shard_placements` rows during run creation.
+- Multi-placement assignment policy at run creation.
 - Coordinator ownership by database placement or global shard range.
 - Cross-database run finalization, cancellation, result export, or status fanout.
 - Automated shard migration tooling.
@@ -141,6 +144,33 @@ status = active
 ```
 
 Until runtime routing is implemented, every workflow still uses the single configured database connection. The placement tables are the catalog that later phases will use to map each `run_id + run_shard` pair to a database alias. Expansion changes placement rows, not the logical shard value stored in execution data.
+
+## Runtime Placement Configuration
+
+The `database_placements` table is the authoritative placement catalog. Environment variables provide secret connection values and process-local defaults; they must not duplicate the placement catalog.
+
+Default single-database configuration:
+
+```text
+DATABASE_URL=postgres://...
+VIGILO_CONTROL_DATABASE_ALIAS=primary
+VIGILO_DEFAULT_SHARD_DATABASE_ALIAS=primary
+```
+
+`DATABASE_URL` connects to the active control-capable placement. The seeded `primary` row uses `database_url_env = DATABASE_URL`, so command-line `--database-url` or the `DATABASE_URL` env var supplies that connection value.
+
+When adding a shard placement, insert a `database_placements` row and deploy the matching secret env var:
+
+```text
+alias = shard_001
+database_url_env = VIGILO_SHARD_001_DATABASE_URL
+role = shard
+status = active
+
+VIGILO_SHARD_001_DATABASE_URL=postgres://...
+```
+
+The initial run-shard assignment rule is deliberately simple: every new run shard maps to `VIGILO_DEFAULT_SHARD_DATABASE_ALIAS` when placement rows are created. Richer assignment policies should be introduced only with an explicit admin/config contract, because routing must read stored `shard_placements` rows instead of recalculating from current placement count.
 
 ## Migration Runbook
 

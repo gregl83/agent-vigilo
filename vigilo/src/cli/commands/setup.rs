@@ -48,6 +48,9 @@ impl Executable for Command {
         info!("running database migrations");
         migrations::migrate(db, self.migrations_dir).await?;
 
+        info!("validating database placement configuration");
+        context.validate_database_placements().await?;
+
         if self.skip_evaluators {
             info!("skipping built-in evaluator publishing");
         } else {

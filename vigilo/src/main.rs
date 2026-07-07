@@ -38,6 +38,7 @@ use cli::{
 mod context;
 use context::{
     Context,
+    database::PlacementConfig,
     wasm,
 };
 mod contracts;
@@ -92,9 +93,21 @@ async fn main() -> ExitCode {
                 max_log_message_bytes: app.wasm_max_log_message_bytes,
                 max_log_messages: app.wasm_max_log_messages,
             };
+            let placement_config = match PlacementConfig::new(
+                app.control_database_alias.clone(),
+                app.default_shard_database_alias.clone(),
+            ) {
+                Ok(config) => config,
+                Err(e) => {
+                    error!(error = %e, "invalid database placement configuration");
+                    return ExitCode::FAILURE;
+                }
+            };
+
             let context = Context::new(
                 app.database_url.clone(),
                 app.database_max_connections,
+                placement_config,
                 app.messaging_url.clone(),
                 wasm_config,
                 app.output_format,

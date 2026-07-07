@@ -7,6 +7,7 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod database_placements;
 pub(crate) mod evaluator_results;
 pub(crate) mod evaluators;
 pub(crate) mod execution_aggregates;
