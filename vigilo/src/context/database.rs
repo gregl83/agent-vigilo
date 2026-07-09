@@ -15,17 +15,13 @@ use std::{
     time::Duration,
 };
 
-use chrono::Utc;
 use moka::future::Cache;
 use sqlx::{
     PgPool,
     postgres::PgPoolOptions,
 };
 use tokio::sync::OnceCell;
-use tracing::{
-    debug,
-    warn,
-};
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
@@ -38,10 +34,7 @@ use crate::{
             DEFAULT_DATABASE_URL_ENV,
             DatabasePlacement,
         },
-        shard_placement::{
-            SHARD_PLACEMENT_STATUS_ACTIVE,
-            ShardPlacement,
-        },
+        shard_placement::ShardPlacement,
     },
 };
 
@@ -141,6 +134,10 @@ impl Db {
             .await
     }
 
+    pub(crate) fn default_execution_database_alias(&self) -> &str {
+        &self.placement_config.default_shard_database_alias
+    }
+
     /// Returns a pool for an explicit placement alias.
     ///
     /// This is an infrastructure hook for router/admin workflows. Most callers
@@ -179,14 +176,15 @@ impl Db {
         }
 
         let db = self.control().await?;
-        let placement =
-            match shard_placements::select_shard_placement(db, run_id, run_shard).await? {
-                Some(placement) => placement,
-                None => {
-                    self.legacy_default_shard_placement(run_id, run_shard)
-                        .await?
-                }
-            };
+        let Some(placement) =
+            shard_placements::select_shard_placement(db, run_id, run_shard).await?
+        else {
+            anyhow::bail!(
+                "missing shard placement for run {} shard {}; run creation must insert shard_placements rows before execution routing",
+                run_id,
+                run_shard
+            );
+        };
 
         self.validate_shard_placement_alias(&placement).await?;
         self.shard_placement_cache
@@ -355,33 +353,6 @@ impl Db {
     ) -> anyhow::Result<()> {
         let catalog = self.placement_catalog().await?;
         catalog.require_shard_capable_alias(&placement.database_alias)
-    }
-
-    #[allow(dead_code)]
-    async fn legacy_default_shard_placement(
-        &self,
-        run_id: Uuid,
-        run_shard: i16,
-    ) -> anyhow::Result<ShardPlacement> {
-        let catalog = self.placement_catalog().await?;
-        catalog.require_shard_capable_alias(&self.placement_config.default_shard_database_alias)?;
-
-        warn!(
-            run_id = %run_id,
-            run_shard,
-            database_alias = %self.placement_config.default_shard_database_alias,
-            "missing shard_placements row; falling back to default shard database alias"
-        );
-
-        let now = Utc::now();
-        Ok(ShardPlacement {
-            run_id,
-            run_shard,
-            database_alias: self.placement_config.default_shard_database_alias.clone(),
-            status: SHARD_PLACEMENT_STATUS_ACTIVE.to_string(),
-            created_at: now,
-            updated_at: now,
-        })
     }
 }
 
@@ -637,16 +608,18 @@ mod tests {
 
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
-    async fn execution_placement_falls_back_to_default_alias_for_legacy_rows(pool: PgPool) {
+    async fn execution_placement_requires_stored_shard_placement(pool: PgPool) {
         let context = context_with_control_pool(pool);
         let run_id = Uuid::now_v7();
 
-        let placement = context.execution_placement(run_id, 3).await.unwrap();
+        let error = context.execution_placement(run_id, 3).await.unwrap_err();
 
-        assert_eq!(placement.run_id, run_id);
-        assert_eq!(placement.run_shard, 3);
-        assert_eq!(placement.database_alias, DEFAULT_DATABASE_ALIAS);
-        assert_eq!(placement.status, SHARD_PLACEMENT_STATUS_ACTIVE);
+        assert!(error.to_string().contains("missing shard placement"));
+        assert!(
+            error
+                .to_string()
+                .contains("run creation must insert shard_placements rows")
+        );
     }
 
     #[sqlx::test(migrations = "../migrations")]

@@ -65,13 +65,14 @@ Implemented today:
 - A seeded `primary -> DATABASE_URL` placement with role `control_and_shard`.
 - Runtime configuration for the control alias and default shard-capable alias.
 - Placement catalog validation during `vigilo setup`.
+- Run creation inserts one active `shard_placements` row for each `run_shard`
+  used by the run.
 - A database service/router that exposes `control()` and execution routing primitives to DB/workflow code.
 - Chunk-ready messages and worker queries that carry `run_id`, `run_shard`, and `chunk_id`.
 - Coordinator dispatch cursors keyed by `run_id + run_shard`.
 
 Not implemented yet:
 
-- Automatic creation of `shard_placements` rows during run creation.
 - Multi-placement assignment policy at run creation.
 - Worker, coordinator, recovery, finalization, cancellation, result export, and status fanout paths migrated to execution placement routing.
 - Automated shard migration tooling.
@@ -150,7 +151,7 @@ run_id + run_shard -> database_alias
 
 The runtime router reads placement rows from control storage. DB workflow code can resolve execution-owned storage by `run_id + run_shard`, validate that the target alias is active and shard-capable, and return the pool for that placement.
 
-Legacy runs without `shard_placements` rows temporarily fall back to the configured default shard-capable alias so existing single-database deployments continue to work until rows are backfilled. Expansion changes placement rows, not the `run_shard` value stored on execution rows.
+Every new run must create placement rows for the `run_shard` values it uses. Missing `shard_placements` rows are setup or run-creation errors. Expansion changes placement rows, not the `run_shard` value stored on execution rows.
 
 ## Routing Boundary
 

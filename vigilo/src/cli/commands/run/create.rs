@@ -23,7 +23,9 @@ pub(super) async fn exec(
     // --- Load command inputs ---
     // Acquire output/database handles and parse profile/dataset payloads before
     // any durable writes are attempted.
-    let db = context.db().await?.control().await?;
+    let database = context.db().await?;
+    let default_execution_database_alias = database.default_execution_database_alias().to_string();
+    let db = database.control().await?;
     let out = context.out().await?;
 
     let parsed = load_run_inputs(profile, profile_file, dataset, dataset_file)?;
@@ -118,9 +120,10 @@ pub(super) async fn exec(
     };
 
     // --- Persist pending run work ---
-    // Write immutable case blobs, dataset membership, the pending run, and
-    // pending chunks in one transaction. Coordinator dispatch owns worker
-    // visibility; no queue-visible events are emitted here.
+    // Write immutable case blobs, dataset membership, the pending run, pending
+    // chunks, and shard placement rows in one transaction. Coordinator
+    // dispatch owns worker visibility; no queue-visible events are emitted
+    // here.
     let mut tx = db.begin().await?;
 
     run_create::bulk_insert_case_blobs(&mut tx, &case_blobs).await?;
@@ -134,6 +137,13 @@ pub(super) async fn exec(
     run_create::bulk_insert_dataset_membership(&mut tx, dataset_version_id, &dataset_cases).await?;
     run_create::insert_run_create(&mut tx, run_id, &run_draft).await?;
     run_create::bulk_insert_run_chunks(&mut tx, run_id, dataset_version_id, &chunks).await?;
+    run_create::bulk_insert_shard_placements(
+        &mut tx,
+        run_id,
+        &chunks,
+        &default_execution_database_alias,
+    )
+    .await?;
     run_create::bulk_insert_run_shard_dispatch_cursors(&mut tx, run_id, &chunks).await?;
 
     tx.commit().await?;

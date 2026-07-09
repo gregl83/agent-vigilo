@@ -1,10 +1,11 @@
 //! Run creation persistence workflow helpers.
 //!
 //! These helpers write immutable dataset content, dataset membership, the run
-//! row, and pending run chunks inside the caller's transaction. Dispatch owns
-//! chunk-ready event creation in bounded windows so workers cannot process a
-//! run before a coordinator marks it running. Bulk paths are chunked to keep
-//! statement size and bind counts bounded for large datasets.
+//! row, pending run chunks, and shard placement rows inside the caller's
+//! transaction. Dispatch owns chunk-ready event creation in bounded windows so
+//! workers cannot process a run before a coordinator marks it running. Bulk
+//! paths are chunked to keep statement size and bind counts bounded for large
+//! datasets.
 
 use std::collections::BTreeSet;
 
@@ -16,9 +17,14 @@ use uuid::Uuid;
 
 use crate::models::{
     case_blob::CaseBlobDraft,
+    database_placement::{
+        DATABASE_PLACEMENT_ROLE_CONTROL_AND_SHARD,
+        DATABASE_PLACEMENT_ROLE_SHARD,
+    },
     dataset_version_case::DatasetVersionCaseDraft,
     run::RunDraft,
     run_chunk::RunChunkDraft,
+    shard_placement::SHARD_PLACEMENT_STATUS_ACTIVE,
 };
 
 const CASE_BLOB_INSERT_CHUNK_SIZE: usize = 500;
@@ -341,6 +347,88 @@ pub(crate) async fn bulk_insert_run_shard_dispatch_cursors(
     Ok(())
 }
 
+/// Inserts one active execution placement row per run shard used by the run.
+///
+/// The chunk planner already assigned `run_shard` values. This workflow stores
+/// the durable routing decision for each distinct `run_id + run_shard` before
+/// the run can be dispatched.
+pub(crate) async fn bulk_insert_shard_placements(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    run_id: Uuid,
+    chunks: &[RunChunkDraft],
+    database_alias: &str,
+) -> anyhow::Result<()> {
+    if chunks.is_empty() {
+        return Ok(());
+    }
+
+    validate_active_shard_capable_placement(tx, database_alias).await?;
+
+    let run_shards = chunks
+        .iter()
+        .map(|chunk| chunk.run_shard)
+        .collect::<BTreeSet<_>>();
+
+    let mut query_builder = QueryBuilder::<Postgres>::new(
+        "INSERT INTO shard_placements (run_id, run_shard, database_alias, status) ",
+    );
+
+    query_builder.push_values(run_shards, |mut b, run_shard| {
+        b.push_bind(run_id)
+            .push_bind(run_shard)
+            .push_bind(database_alias)
+            .push_bind(SHARD_PLACEMENT_STATUS_ACTIVE);
+    });
+
+    query_builder.build().execute(tx.as_mut()).await?;
+
+    Ok(())
+}
+
+async fn validate_active_shard_capable_placement(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    database_alias: &str,
+) -> anyhow::Result<()> {
+    let placement = sqlx::query_as::<_, (String, String)>(
+        r#"
+        SELECT role, status
+        FROM database_placements
+        WHERE alias = $1
+        "#,
+    )
+    .bind(database_alias)
+    .fetch_optional(tx.as_mut())
+    .await?;
+
+    let Some((role, status)) = placement else {
+        anyhow::bail!(
+            "database placement alias {} is not configured",
+            database_alias
+        );
+    };
+
+    if status != "active" {
+        anyhow::bail!(
+            "database placement alias {} has status {}, which cannot receive new shard placements",
+            database_alias,
+            status
+        );
+    }
+
+    if !matches!(
+        role.as_str(),
+        DATABASE_PLACEMENT_ROLE_SHARD | DATABASE_PLACEMENT_ROLE_CONTROL_AND_SHARD
+    ) {
+        anyhow::bail!(
+            "database placement alias {} has role {}, which is not shard-capable",
+            database_alias,
+            role
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::PgPool;
@@ -451,5 +539,66 @@ mod tests {
         .unwrap();
 
         assert_eq!(rows, vec![(0, "open".to_string()), (1, "open".to_string())]);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn bulk_insert_shard_placements_inserts_distinct_active_shards(pool: PgPool) {
+        let run_id = Uuid::now_v7();
+        insert_minimal_run(&pool, run_id).await;
+
+        let chunks = vec![chunk(0, 0), chunk(1, 1), chunk(1, 2)];
+        let mut tx = pool.begin().await.unwrap();
+        bulk_insert_shard_placements(&mut tx, run_id, &chunks, "primary")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let rows = sqlx::query_as::<_, (i16, String, String)>(
+            r#"
+            SELECT run_shard, database_alias, status
+            FROM shard_placements
+            WHERE run_id = $1::uuid
+            ORDER BY run_shard
+            "#,
+        )
+        .bind(run_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                (0, "primary".to_string(), "active".to_string()),
+                (1, "primary".to_string(), "active".to_string())
+            ]
+        );
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn bulk_insert_shard_placements_rejects_control_only_alias(pool: PgPool) {
+        let run_id = Uuid::now_v7();
+        insert_minimal_run(&pool, run_id).await;
+
+        sqlx::query(
+            r#"
+            UPDATE database_placements
+            SET role = 'control'
+            WHERE alias = 'primary'
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let chunks = vec![chunk(0, 0)];
+        let mut tx = pool.begin().await.unwrap();
+        let error = bulk_insert_shard_placements(&mut tx, run_id, &chunks, "primary")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("not shard-capable"));
     }
 }
