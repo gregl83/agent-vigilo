@@ -12,7 +12,48 @@ keywords:
 
 # Scaling
 
-Agent Vigilo starts as a single PostgreSQL deployment, but high-volume execution data is keyed by a logical `run_shard` so large runs can spread across 128 shard partitions and later move to additional database placements.
+Agent Vigilo is designed to start with one PostgreSQL database and grow without changing application code. The default setup stores control data and execution data in the same database. The schema still records a stable `run_shard` for high-volume execution rows so those rows can later move to additional PostgreSQL placements.
+
+## Default Setup
+
+Most teams only need one database to start:
+
+```text
+DATABASE_URL=postgres://...
+```
+
+`vigilo setup` applies migrations, seeds the default placement catalog, and validates that the process can connect to the control database. These optional settings default to `primary`:
+
+```text
+VIGILO_CONTROL_DATABASE_ALIAS=primary
+VIGILO_DEFAULT_SHARD_DATABASE_ALIAS=primary
+```
+
+The seeded catalog row is:
+
+```text
+alias = primary
+database_url_env = DATABASE_URL
+role = control_and_shard
+status = active
+```
+
+That means all data routes to the same PostgreSQL database until you add another placement.
+
+## Database Architecture
+
+Agent Vigilo separates database purpose from database location:
+
+- **Control storage** is the source of truth for evaluator registry rows, global run metadata, placement catalog rows, coordinator state, and other control-plane records.
+- **Execution storage** holds high-volume run work: chunks, executions, attempts, aggregates, evaluator results, and shard-local workflow state.
+- A **database placement** is a named PostgreSQL target such as `primary` or `shard_001`.
+- A **shard placement** maps one `run_id + run_shard` pair to a database placement.
+
+In the default deployment, `primary` has role `control_and_shard`, so it is both the control database and the execution database.
+
+In a larger deployment, there is still only one active control-capable placement. Additional placements can have role `shard` and hold execution-owned rows. Routing changes by updating placement rows, not by changing worker or coordinator code.
+
+Environment variables only hold connection secrets. The database placement catalog is the authority for which placements exist and what role each placement has.
 
 ## Current Implementation Status
 
@@ -20,49 +61,22 @@ Implemented today:
 
 - 128 logical `run_shard` values.
 - Shard-partitioned high-volume execution tables inside one PostgreSQL database.
-- Placement catalog tables:
-  `database_placements` and `shard_placements`.
-- A seeded default placement:
-  `primary -> DATABASE_URL` with role `control_and_shard`.
-- Runtime placement configuration for the control alias and default shard alias.
-- Placement catalog validation during `vigilo setup` after migrations run.
-- A runtime database router inside `context::database`. The process context's
-  `db()` accessor follows the same service pattern as the other contexts:
-  `context.db().await?` returns the initialized database service. That service
-  lazily initializes its control pool, placement catalog, and per-placement
-  pools. The router resolves active placement aliases through `database_url_env`,
-  caches `run_id + run_shard` placement lookups briefly, and rejects `moving`
-  or `draining` shard placements for normal dispatch routing.
-- Chunk-ready messages that carry `run_id`, `run_shard`, and `chunk_id`.
-- Worker hot-path queries that use `run_id + run_shard` for chunk-local processing.
-- Coordinator dispatch cursors keyed by `run_id + run_shard`, so dispatch windows scan one shard partition at a time and large runs rotate across open shard cursors.
+- Placement catalog tables: `database_placements` and `shard_placements`.
+- A seeded `primary -> DATABASE_URL` placement with role `control_and_shard`.
+- Runtime configuration for the control alias and default shard-capable alias.
+- Placement catalog validation during `vigilo setup`.
+- A database service/router that exposes `control()` and execution routing primitives to DB/workflow code.
+- Chunk-ready messages and worker queries that carry `run_id`, `run_shard`, and `chunk_id`.
+- Coordinator dispatch cursors keyed by `run_id + run_shard`.
 
 Not implemented yet:
 
 - Automatic creation of `shard_placements` rows during run creation.
 - Multi-placement assignment policy at run creation.
-- Coordinator ownership by database placement or global shard range.
-- Worker, coordinator, recovery, finalization, cancellation, result export, or
-  status fanout paths migrated to the placement router.
+- Worker, coordinator, recovery, finalization, cancellation, result export, and status fanout paths migrated to execution placement routing.
 - Automated shard migration tooling.
 
-The current system should be read as **logical sharding on a single PostgreSQL deployment**, with placement metadata, schema, and message contracts prepared for future physical shard routing.
-
-## Terminology
-
-A database placement is a named PostgreSQL target. The placement `alias` is stable routing metadata, and `database_url_env` names the environment variable that contains the actual connection URL.
-
-A logical shard is a `run_shard` value in the range `0..127`. It partitions run execution data and stays stable for the lifetime of the run shard.
-
-A shard placement maps one `(run_id, run_shard)` pair to a database placement alias. Moving data to another database changes the placement row, not the `run_shard` stored on execution rows.
-
-Placement roles describe what kind of data a database may hold:
-
-- `control`: authoritative control-plane data such as global run metadata and routing catalog rows.
-- `shard`: shard-local execution data such as chunks, executions, attempts, aggregates, evaluator results, and shard-local outbox events.
-- `control_and_shard`: both roles in one database. This is the default single-database deployment.
-
-Only one active control-capable placement may exist at a time. In schema terms, there can be at most one active placement whose role is `control` or `control_and_shard`. Multiple active `shard` placements are allowed.
+The current system should be read as **single-database operation with logical sharding and placement metadata in place**.
 
 ## Current Shard Model
 
@@ -85,7 +99,7 @@ evaluator_results(run_id, run_shard, id)
 
 The high-volume tables are list partitioned by `run_shard`. A worker that owns one chunk can query by `run_id + run_shard + chunk_id`, keeping the chunk-local workflow on one partition per table.
 
-## Small Deployment
+## Default Single-Database Deployment
 
 The default deployment can keep every logical shard on one PostgreSQL cluster:
 
@@ -107,7 +121,7 @@ Chunk-ready messages include the routing key:
 }
 ```
 
-Workers use `run_id + run_shard + chunk_id` to claim the chunk. In the single-cluster deployment, the database resolver is trivial because every shard points at the same pool. In a future multi-cluster deployment, the resolver should map `run_id + run_shard` to a database placement before the worker opens a transaction.
+Workers use `run_id + run_shard + chunk_id` to claim the chunk. In the default deployment every shard points at the same pool. Later routing phases will resolve `run_id + run_shard` to the correct execution placement before worker transactions start.
 
 ## Coordinator Dispatch Routing
 
@@ -115,43 +129,28 @@ Run creation stores one `run_shard_dispatch_cursors` row for every logical shard
 
 This means a single dispatch statement is shard-local. A large run is not forced onto one shard; its chunks remain spread across the 128 logical shard range. Because open cursors are ordered by cursor update time, repeated dispatch windows rotate across a run's active shards instead of draining the lowest shard first. Multiple coordinators can claim different open shard cursors for the same already-running run without taking incompatible run-row locks, while cancellation and finalization still serialize through their exclusive lifecycle updates.
 
-## Placement Layer
+## Placement Reference
 
-Placement metadata exists in the database even for the default single-database deployment:
+Placement metadata exists even in the default single-database deployment.
 
-```sql
-CREATE TABLE database_placements (
-    alias TEXT PRIMARY KEY,
-    database_url_env TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('control', 'shard', 'control_and_shard')),
-    status TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE shard_placements (
-    run_id UUID NOT NULL,
-    run_shard SMALLINT NOT NULL CHECK (run_shard >= 0 AND run_shard < 128),
-    database_alias TEXT NOT NULL REFERENCES database_placements(alias),
-    status TEXT NOT NULL CHECK (status IN ('active', 'moving', 'draining')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (run_id, run_shard)
-);
-```
-
-Fresh databases seed one placement row:
+`database_placements` is the placement catalog:
 
 ```text
-alias = primary
-database_url_env = DATABASE_URL
-role = control_and_shard
-status = active
+alias              stable placement name, such as primary or shard_001
+database_url_env   environment variable that holds the connection URL
+role               control, shard, or control_and_shard
+status             active or disabled
 ```
 
-The runtime router reads the placement tables from the control database. DB workflow code can resolve execution-owned storage by `run_id + run_shard`, validate that the target alias is active and shard-capable, and return the pool for that placement. Legacy runs without `shard_placements` rows temporarily fall back to the configured default shard alias so existing single-database deployments continue to work until rows are backfilled.
+`shard_placements` is the execution routing map:
 
-Most workflows still use the single configured database connection until later routing phases migrate worker, coordinator, finalization, and export paths to the router. Expansion changes placement rows, not the logical shard value stored in execution data.
+```text
+run_id + run_shard -> database_alias
+```
+
+The runtime router reads placement rows from control storage. DB workflow code can resolve execution-owned storage by `run_id + run_shard`, validate that the target alias is active and shard-capable, and return the pool for that placement.
+
+Legacy runs without `shard_placements` rows temporarily fall back to the configured default shard-capable alias so existing single-database deployments continue to work until rows are backfilled. Expansion changes placement rows, not the `run_shard` value stored on execution rows.
 
 ## Routing Boundary
 
@@ -177,19 +176,9 @@ This keeps topology decisions contained:
 - Thin command dispatch and generic runtime code should not choose between
   control and execution databases directly.
 
-## Runtime Placement Configuration
+## Adding An Execution Database
 
 The `database_placements` table is the authoritative placement catalog. Environment variables provide secret connection values and process-local defaults; they must not duplicate the placement catalog.
-
-Default single-database configuration:
-
-```text
-DATABASE_URL=postgres://...
-VIGILO_CONTROL_DATABASE_ALIAS=primary
-VIGILO_DEFAULT_SHARD_DATABASE_ALIAS=primary
-```
-
-`DATABASE_URL` connects to the active control-capable placement. The seeded `primary` row uses `database_url_env = DATABASE_URL`, so command-line `--database-url` or the `DATABASE_URL` env var supplies that connection value.
 
 When adding a shard placement, insert a `database_placements` row and deploy the matching secret env var:
 
@@ -202,7 +191,7 @@ status = active
 VIGILO_SHARD_001_DATABASE_URL=postgres://...
 ```
 
-The initial run-shard assignment rule is deliberately simple: every new run shard maps to `VIGILO_DEFAULT_SHARD_DATABASE_ALIAS` when placement rows are created. Richer assignment policies should be introduced only with an explicit admin/config contract, because routing must read stored `shard_placements` rows instead of recalculating from current placement count.
+After that, new `shard_placements` rows can point selected execution shards at `shard_001`. The initial assignment rule is deliberately simple: every new run shard maps to `VIGILO_DEFAULT_SHARD_DATABASE_ALIAS` when placement rows are created. Richer policies should be introduced only with an explicit admin/config contract, because routing must read stored `shard_placements` rows instead of recalculating from current placement count.
 
 ## Migration Runbook
 
