@@ -26,18 +26,24 @@ Implemented today:
   `primary -> DATABASE_URL` with role `control_and_shard`.
 - Runtime placement configuration for the control alias and default shard alias.
 - Placement catalog validation during `vigilo setup` after migrations run.
+- A runtime database router inside `context::database`. The process context's
+  `db()` accessor follows the same service pattern as the other contexts:
+  `context.db().await?` returns the initialized database service. That service
+  lazily initializes its control pool, placement catalog, and per-placement
+  pools. The router resolves active placement aliases through `database_url_env`,
+  caches `run_id + run_shard` placement lookups briefly, and rejects `moving`
+  or `draining` shard placements for normal dispatch routing.
 - Chunk-ready messages that carry `run_id`, `run_shard`, and `chunk_id`.
 - Worker hot-path queries that use `run_id + run_shard` for chunk-local processing.
 - Coordinator dispatch cursors keyed by `run_id + run_shard`, so dispatch windows scan one shard partition at a time and large runs rotate across open shard cursors.
 
 Not implemented yet:
 
-- Multiple PostgreSQL placement routing at runtime.
-- A runtime `db_for_shard(run_id, run_shard)` resolver.
 - Automatic creation of `shard_placements` rows during run creation.
 - Multi-placement assignment policy at run creation.
 - Coordinator ownership by database placement or global shard range.
-- Cross-database run finalization, cancellation, result export, or status fanout.
+- Worker, coordinator, recovery, finalization, cancellation, result export, or
+  status fanout paths migrated to the placement router.
 - Automated shard migration tooling.
 
 The current system should be read as **logical sharding on a single PostgreSQL deployment**, with placement metadata, schema, and message contracts prepared for future physical shard routing.
@@ -143,7 +149,33 @@ role = control_and_shard
 status = active
 ```
 
-Until runtime routing is implemented, every workflow still uses the single configured database connection. The placement tables are the catalog that later phases will use to map each `run_id + run_shard` pair to a database alias. Expansion changes placement rows, not the logical shard value stored in execution data.
+The runtime router reads the placement tables from the control database. DB workflow code can resolve execution-owned storage by `run_id + run_shard`, validate that the target alias is active and shard-capable, and return the pool for that placement. Legacy runs without `shard_placements` rows temporarily fall back to the configured default shard alias so existing single-database deployments continue to work until rows are backfilled.
+
+Most workflows still use the single configured database connection until later routing phases migrate worker, coordinator, finalization, and export paths to the router. Expansion changes placement rows, not the logical shard value stored in execution data.
+
+## Routing Boundary
+
+The router is an infrastructure primitive, not an application-level decision
+that should appear throughout thin command dispatch or generic runtime code.
+Callers should express domain intent through workflow functions such as
+evaluator publishing, run creation, chunk processing, dispatch, finalization,
+and export. Those workflows decide whether their data lives in control storage,
+execution storage, or both.
+
+Inside those DB/workflow boundaries, control storage is accessed through the
+database service's control pool and execution-owned storage is resolved by
+`run_id + run_shard`. Outside those boundaries, code should not care whether a
+run uses one database placement or many.
+
+This keeps topology decisions contained:
+
+- Evaluator registry workflows use control storage internally.
+- Run metadata workflows use control storage internally.
+- Chunk and execution workflows route execution-owned data by `run_id +
+  run_shard` internally.
+- Run-level reporting workflows fan out across execution placements internally.
+- Thin command dispatch and generic runtime code should not choose between
+  control and execution databases directly.
 
 ## Runtime Placement Configuration
 

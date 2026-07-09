@@ -379,7 +379,7 @@ impl EvaluatorLoaderService {
         let context_result = self
             .run_context_cache
             .try_get_with::<_, anyhow::Error>(run_id, async move {
-                let db = context.db().await?;
+                let db = context.db().await?.control().await?;
                 let Some(profile_snapshot) =
                     runs::select_run_profile_snapshot_by_id(db, run_id).await?
                 else {
@@ -607,7 +607,7 @@ async fn run_worker_message(
     // --- Acquire shared services ---
     // All subsequent settlement paths use these handles to keep ack/retry
     // behavior centralized.
-    let db = context.db().await?;
+    let db = context.db().await?.control().await?;
     let mq = context.mq().await?;
 
     debug!(

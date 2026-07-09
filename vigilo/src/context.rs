@@ -1,10 +1,10 @@
 //! Lazily initialized process context.
 //!
 //! Commands receive a cloned [`Context`] and request services on demand:
-//! database pool, HTTP client, message queue client, output buffer, evaluator
-//! registry cache, and Wasm runtime. Service modules in `context::*` should
-//! remain thin initialization boundaries; domain behavior belongs in runtime,
-//! db, mq, or command modules.
+//! database service, HTTP client, message queue client, output buffer,
+//! evaluator registry cache, and Wasm runtime. Service modules in `context::*`
+//! should remain thin initialization boundaries; domain behavior belongs in
+//! runtime, db, mq, or command modules.
 
 use std::sync::Arc;
 
@@ -38,9 +38,11 @@ impl Context {
     ) -> Self {
         Self(Arc::new(ContextInner {
             db: database::Context {
-                uri: db_uri,
-                max_connections: db_max_connections,
-                placement_config,
+                config: database::Config {
+                    uri: db_uri,
+                    max_connections: db_max_connections,
+                    placement_config,
+                },
                 cell: Default::default(),
             },
             http: http::Context {
@@ -64,12 +66,8 @@ impl Context {
         }))
     }
 
-    pub async fn db(&self) -> anyhow::Result<&sqlx::PgPool> {
+    pub(crate) async fn db(&self) -> anyhow::Result<&database::Db> {
         self.0.db.get().await
-    }
-
-    pub async fn validate_database_placements(&self) -> anyhow::Result<()> {
-        self.0.db.validate_placement_config().await
     }
 
     pub async fn http(&self) -> anyhow::Result<&reqwest::Client> {

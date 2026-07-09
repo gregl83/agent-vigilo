@@ -183,7 +183,7 @@ async fn run_coordinator_cycle(
     debug!(coordinator_id = %coordinator_id, "starting coordinator cycle pre-flight");
 
     debug!(coordinator_id = %coordinator_id, "acquiring database context");
-    let db = context.db().await?;
+    let db = context.db().await?.control().await?;
     debug!(coordinator_id = %coordinator_id, "database context ready");
 
     debug!(coordinator_id = %coordinator_id, "acquiring messaging context");

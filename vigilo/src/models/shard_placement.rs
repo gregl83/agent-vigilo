@@ -14,6 +14,10 @@ use serde::{
 };
 use uuid::Uuid;
 
+pub(crate) const SHARD_PLACEMENT_STATUS_ACTIVE: &str = "active";
+pub(crate) const SHARD_PLACEMENT_STATUS_MOVING: &str = "moving";
+pub(crate) const SHARD_PLACEMENT_STATUS_DRAINING: &str = "draining";
+
 /// Insert payload for a shard placement row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ShardPlacementDraft {
@@ -42,4 +46,10 @@ pub(crate) struct ShardPlacement {
     pub(crate) created_at: DateTime<Utc>,
     /// Time this placement row was last updated.
     pub(crate) updated_at: DateTime<Utc>,
+}
+
+impl ShardPlacement {
+    pub(crate) fn is_dispatchable(&self) -> bool {
+        self.status == SHARD_PLACEMENT_STATUS_ACTIVE
+    }
 }

@@ -23,7 +23,7 @@ pub(super) async fn exec(
     // --- Load command inputs ---
     // Acquire output/database handles and parse profile/dataset payloads before
     // any durable writes are attempted.
-    let db = context.db().await?;
+    let db = context.db().await?.control().await?;
     let out = context.out().await?;
 
     let parsed = load_run_inputs(profile, profile_file, dataset, dataset_file)?;

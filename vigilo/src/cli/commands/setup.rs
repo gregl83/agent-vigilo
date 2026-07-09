@@ -43,13 +43,13 @@ impl Executable for Command {
     /// - executes SQL migrations from `migrations_dir`
     /// - reserves a hook for evaluator bootstrapping (not implemented yet)
     async fn exec(self, context: Context) -> anyhow::Result<()> {
-        let db = context.db().await?;
+        let db = context.db().await?.control().await?;
 
         info!("running database migrations");
         migrations::migrate(db, self.migrations_dir).await?;
 
         info!("validating database placement configuration");
-        context.validate_database_placements().await?;
+        context.db().await?.validate_placement_config().await?;
 
         if self.skip_evaluators {
             info!("skipping built-in evaluator publishing");

@@ -368,7 +368,7 @@ pub(super) async fn exec(
     }
 
     let run_id = parse_run_id(&run_id)?;
-    let db = context.db().await?;
+    let db = context.db().await?.control().await?;
     let out = context.out().await?;
 
     let run = select_existing_run(db, run_id).await?;

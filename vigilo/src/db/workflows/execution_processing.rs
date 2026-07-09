@@ -466,7 +466,7 @@ pub(crate) async fn get_or_load_component(
     let component = cache
         .try_get_with(evaluator_ref_owned.clone(), async move {
             let identity = parse_fully_qualified_evaluator(&evaluator_ref_for_closure)?;
-            let db = context.db().await?;
+            let db = context.db().await?.control().await?;
             let evaluator_record = evaluators::select_evaluator(
                 db,
                 &identity.namespace,
