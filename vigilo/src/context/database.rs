@@ -41,6 +41,22 @@ use crate::{
 const SHARD_PLACEMENT_CACHE_TTL: Duration = Duration::from_secs(5);
 const SHARD_PLACEMENT_CACHE_CAPACITY: u64 = 10_000;
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ExecutionRouteError {
+    #[error(
+        "missing shard placement for run {run_id} shard {run_shard}; run creation must insert shard_placements rows before execution routing"
+    )]
+    MissingShardPlacement { run_id: Uuid, run_shard: i16 },
+    #[error(
+        "shard placement for run {run_id} shard {run_shard} has status {status}, which is not dispatchable"
+    )]
+    NonDispatchableShardPlacement {
+        run_id: Uuid,
+        run_shard: i16,
+        status: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlacementConfig {
     pub(crate) control_database_alias: String,
@@ -179,11 +195,7 @@ impl Db {
         let Some(placement) =
             shard_placements::select_shard_placement(db, run_id, run_shard).await?
         else {
-            anyhow::bail!(
-                "missing shard placement for run {} shard {}; run creation must insert shard_placements rows before execution routing",
-                run_id,
-                run_shard
-            );
+            return Err(ExecutionRouteError::MissingShardPlacement { run_id, run_shard }.into());
         };
 
         self.validate_shard_placement_alias(&placement).await?;
@@ -203,12 +215,12 @@ impl Db {
         let placement = self.execution_placement(run_id, run_shard).await?;
 
         if !placement.is_dispatchable() {
-            anyhow::bail!(
-                "shard placement for run {} shard {} has status {}, which is not dispatchable",
+            return Err(ExecutionRouteError::NonDispatchableShardPlacement {
                 run_id,
                 run_shard,
-                placement.status
-            );
+                status: placement.status,
+            }
+            .into());
         }
 
         self.placement(&placement.database_alias).await

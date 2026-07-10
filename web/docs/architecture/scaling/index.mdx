@@ -71,7 +71,8 @@ Implemented today:
 - Chunk-ready messages that carry `run_id`, `run_shard`, and `chunk_id`.
 - Worker chunk-local processing resolves the execution database by
   `run_id + run_shard`; run profile and evaluator registry metadata remain
-  control-plane reads.
+  control-plane reads. `moving` or `draining` shard placements delay worker
+  messages instead of allowing new chunk claims.
 - Coordinator dispatch cursors keyed by `run_id + run_shard`.
 
 Not implemented yet:

@@ -39,7 +39,10 @@ use uuid::Uuid;
 
 use super::Executable;
 use crate::{
-    context::Context,
+    context::{
+        Context,
+        database::ExecutionRouteError,
+    },
     contracts::run::RunProfile,
     db::{
         tables::runs,
@@ -64,6 +67,7 @@ const WARMUP_PARALLELISM: usize = 8;
 const DEFAULT_WORKER_MAX_INFLIGHT_CHUNKS: u16 = 1;
 const WORKER_MQ_RECONNECT_INITIAL_DELAY_MS: u64 = 250;
 const WORKER_MQ_RECONNECT_MAX_DELAY_MS: u64 = 30_000;
+const WORKER_ROUTE_RETRY_DELAY_SECONDS: i64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerCycleOutcome {
@@ -276,6 +280,13 @@ fn broker_message_id(message: &crate::mq::RawConsumedMessage) -> Option<String> 
 
 fn worker_stream_prefetch(max_inflight_chunks: u16) -> u16 {
     max_inflight_chunks.max(1)
+}
+
+fn execution_route_is_temporarily_blocked(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<ExecutionRouteError>(),
+        Some(ExecutionRouteError::NonDispatchableShardPlacement { .. })
+    )
 }
 
 #[derive(Clone)]
@@ -649,11 +660,32 @@ async fn run_worker_message(
     // Chunk leases, case batches, attempts, evaluator results, aggregates, and
     // chunk terminal state are execution-owned. Resolve this once at the worker
     // workflow boundary so lower helpers do not need to know topology.
-    let db = context
-        .db()
-        .await?
+    let db_service = context.db().await?;
+    let db = match db_service
         .execution(payload.run_id, payload.run_shard)
-        .await?;
+        .await
+    {
+        Ok(db) => db,
+        Err(err) if execution_route_is_temporarily_blocked(&err) => {
+            mq.delay_worker_message(
+                &message.raw,
+                WORKER_ROUTE_RETRY_DELAY_SECONDS,
+                &err.to_string(),
+                "execution_route_blocked",
+            )
+            .await?;
+            info!(
+                run_id = %payload.run_id,
+                run_shard = payload.run_shard,
+                chunk_id = %payload.chunk_id,
+                delay_seconds = WORKER_ROUTE_RETRY_DELAY_SECONDS,
+                error = %err,
+                "execution route is temporarily blocked; delayed worker message"
+            );
+            return Ok(WorkerCycleOutcome::Processed);
+        }
+        Err(err) => return Err(err),
+    };
 
     // --- Claim chunk ownership ---
     // Duplicate, stale, cancelled, completed, or not-yet-running chunks are
@@ -979,8 +1011,10 @@ mod tests {
     use super::{
         ChunkReadyMessage,
         DEFAULT_WORKER_MAX_INFLIGHT_CHUNKS,
+        execution_route_is_temporarily_blocked,
         worker_stream_prefetch,
     };
+    use crate::context::database::ExecutionRouteError;
 
     #[test]
     fn default_worker_processes_one_chunk_at_a_time() {
@@ -1013,5 +1047,26 @@ mod tests {
         assert_eq!(message.run_id, run_id);
         assert_eq!(message.run_shard, 42);
         assert_eq!(message.chunk_id, chunk_id);
+    }
+
+    #[test]
+    fn non_dispatchable_execution_route_is_temporary_worker_backpressure() {
+        let error = anyhow::Error::new(ExecutionRouteError::NonDispatchableShardPlacement {
+            run_id: Uuid::now_v7(),
+            run_shard: 7,
+            status: "moving".to_string(),
+        });
+
+        assert!(execution_route_is_temporarily_blocked(&error));
+    }
+
+    #[test]
+    fn missing_execution_route_is_not_temporary_worker_backpressure() {
+        let error = anyhow::Error::new(ExecutionRouteError::MissingShardPlacement {
+            run_id: Uuid::now_v7(),
+            run_shard: 7,
+        });
+
+        assert!(!execution_route_is_temporarily_blocked(&error));
     }
 }
