@@ -20,7 +20,10 @@ use uuid::Uuid;
 
 use super::Executable;
 use crate::{
-    context::Context,
+    context::{
+        Context,
+        database,
+    },
     db::workflows::{
         run_dispatch,
         run_finalize,
@@ -178,12 +181,13 @@ async fn run_coordinator_cycle(
     config: &CoordinatorRuntimeConfig,
 ) -> anyhow::Result<()> {
     // --- Acquire cycle services ---
-    // The database handle is used for recovery/dispatch/finalization/outbox
-    // claim work; the queue handle is only needed for the final publish pass.
+    // The database service owns control and execution placement routing. The
+    // queue handle is only needed for the final publish pass.
     debug!(coordinator_id = %coordinator_id, "starting coordinator cycle pre-flight");
 
     debug!(coordinator_id = %coordinator_id, "acquiring database context");
-    let db = context.db().await?.control().await?;
+    let database = context.db().await?;
+    let control_db = database.control().await?;
     debug!(coordinator_id = %coordinator_id, "database context ready");
 
     debug!(coordinator_id = %coordinator_id, "acquiring messaging context");
@@ -193,15 +197,15 @@ async fn run_coordinator_cycle(
     // --- Recover expired chunk leases ---
     // Recovery runs before new dispatch so dead workers do not block
     // finalization or leave ready work stranded.
-    let recovery_stats = recover_expired_chunk_leases(db, coordinator_id, config).await?;
+    let recovery_stats = recover_expired_chunk_leases(control_db, coordinator_id, config).await?;
 
     // --- Dispatch runnable chunk windows ---
     // Dispatch is drained before finalization so newly-created work gets
     // surfaced promptly.
-    let dispatch_count = drain_dispatch_batch(db, coordinator_id, config).await?;
+    let dispatch_count = drain_dispatch_batch(database, control_db, coordinator_id, config).await?;
 
     // --- Finalize terminal runs ---
-    let finalized_count = drain_finalize_batch(db, coordinator_id, config).await?;
+    let finalized_count = drain_finalize_batch(control_db, coordinator_id, config).await?;
 
     // --- Publish durable outbox events ---
     // Failed broker publishes stay in the outbox delivery queue for retry.
@@ -213,7 +217,7 @@ async fn run_coordinator_cycle(
         lease_seconds: config.outbox_lease_seconds,
         retry_delay_seconds: config.outbox_retry_delay_seconds,
     };
-    let publish_stats = publish_pending_events(db, &publisher, &outbox_config).await?;
+    let publish_stats = publish_pending_events(control_db, &publisher, &outbox_config).await?;
     info!(
         expired_chunk_leases_recovered = recovery_stats.recovered,
         expired_chunk_leases_failed = recovery_stats.failed,
@@ -266,7 +270,8 @@ async fn recover_expired_chunk_leases(
 }
 
 async fn drain_dispatch_batch(
-    db: &sqlx::PgPool,
+    database: &database::Db,
+    control_db: &sqlx::PgPool,
     coordinator_id: Uuid,
     config: &CoordinatorRuntimeConfig,
 ) -> anyhow::Result<usize> {
@@ -277,15 +282,21 @@ async fn drain_dispatch_batch(
 
     let mut dispatched = 0usize;
     for _ in 0..config.max_dispatch_per_cycle {
-        let Some(run) = run_dispatch::dispatch_next_run_window(
-            db,
+        let Some(route) = run_dispatch::select_next_dispatch_route(control_db).await? else {
+            break;
+        };
+
+        let execution_db = database.execution(route.run_id, route.run_shard).await?;
+        let Some(run) = run_dispatch::dispatch_routed_run_window(
+            execution_db,
             coordinator_id,
             config.lease_seconds,
             config.run_chunk_dispatch_window_size,
+            &route,
         )
         .await?
         else {
-            break;
+            continue;
         };
 
         dispatched += 1;

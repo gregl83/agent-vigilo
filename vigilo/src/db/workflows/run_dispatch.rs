@@ -19,6 +19,13 @@ pub(crate) struct DispatchedRun {
     pub(crate) run_started_events_enqueued: i64,
 }
 
+/// Control-plane route selected for one dispatch attempt.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub(crate) struct DispatchRoute {
+    pub(crate) run_id: Uuid,
+    pub(crate) run_shard: i16,
+}
+
 /// Counts returned after one expired chunk lease recovery pass.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ChunkLeaseRecoveryStats {
@@ -210,6 +217,52 @@ pub(crate) async fn recover_expired_chunk_leases(
     Ok(ChunkLeaseRecoveryStats { recovered, failed })
 }
 
+/// Selects the next control-plane dispatch route.
+///
+/// This query does not claim execution rows. It chooses one open
+/// `(run_id, run_shard)` cursor whose shard placement is active and whose
+/// database placement can hold execution data. The execution dispatch query
+/// then locks and advances that exact cursor on the resolved placement.
+pub(crate) async fn select_next_dispatch_route(
+    db: &PgPool,
+) -> anyhow::Result<Option<DispatchRoute>> {
+    let route = sqlx::query_as::<_, DispatchRoute>(
+        r#"
+        SELECT
+            c.run_id,
+            c.run_shard
+        FROM run_shard_dispatch_cursors c
+        JOIN runs r
+          ON r.id = c.run_id
+        JOIN shard_placements sp
+          ON sp.run_id = c.run_id
+         AND sp.run_shard = c.run_shard
+        JOIN database_placements dp
+          ON dp.alias = sp.database_alias
+        WHERE c.status = 'open'
+          AND sp.status = 'active'
+          AND dp.status = 'active'
+          AND dp.role IN ('shard', 'control_and_shard')
+          AND (
+              r.status = 'running'::run_status
+              OR (
+                  r.status = 'pending'::run_status
+                  AND (
+                      r.coordinator_leased_until IS NULL
+                      OR r.coordinator_leased_until < now()
+                  )
+              )
+          )
+        ORDER BY c.updated_at ASC, c.run_id ASC, c.run_shard ASC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(db)
+    .await?;
+
+    Ok(route)
+}
+
 /// Claims one dispatchable run shard and enqueues a bounded chunk-ready window.
 ///
 /// Pending runs are first marked running and receive a `run.started` event. A
@@ -231,11 +284,45 @@ pub(crate) async fn recover_expired_chunk_leases(
 /// - Releases the shard cursor if more undispatched chunks remain, or marks it
 ///   drained when that shard has no undispatched pending chunks left.
 /// - Emits `run.started` only when the run transitioned from `pending`.
-pub(crate) async fn dispatch_next_run_window(
+#[cfg(test)]
+async fn dispatch_next_run_window(
     db: &PgPool,
     coordinator_id: Uuid,
     lease_seconds: i32,
     chunk_window_size: i64,
+) -> anyhow::Result<Option<DispatchedRun>> {
+    dispatch_next_run_window_for_route(db, coordinator_id, lease_seconds, chunk_window_size, None)
+        .await
+}
+
+/// Claims and dispatches one exact run-shard route.
+///
+/// The route is selected from control storage before the caller resolves the
+/// execution placement. This function keeps the shard-local dispatch statement
+/// constrained to that routed `run_id + run_shard`.
+pub(crate) async fn dispatch_routed_run_window(
+    db: &PgPool,
+    coordinator_id: Uuid,
+    lease_seconds: i32,
+    chunk_window_size: i64,
+    route: &DispatchRoute,
+) -> anyhow::Result<Option<DispatchedRun>> {
+    dispatch_next_run_window_for_route(
+        db,
+        coordinator_id,
+        lease_seconds,
+        chunk_window_size,
+        Some((route.run_id, route.run_shard)),
+    )
+    .await
+}
+
+async fn dispatch_next_run_window_for_route(
+    db: &PgPool,
+    coordinator_id: Uuid,
+    lease_seconds: i32,
+    chunk_window_size: i64,
+    route: Option<(Uuid, i16)>,
 ) -> anyhow::Result<Option<DispatchedRun>> {
     // Query outline:
     //
@@ -260,6 +347,8 @@ pub(crate) async fn dispatch_next_run_window(
             JOIN runs r
               ON r.id = c.run_id
             WHERE c.status = 'open'
+              AND ($4::uuid IS NULL OR c.run_id = $4::uuid)
+              AND ($5::smallint IS NULL OR c.run_shard = $5::smallint)
               AND (
                   r.status = 'running'::run_status
                   OR (
@@ -438,6 +527,8 @@ pub(crate) async fn dispatch_next_run_window(
     .bind(coordinator_id)
     .bind(lease_seconds)
     .bind(chunk_window_size)
+    .bind(route.map(|(run_id, _)| run_id))
+    .bind(route.map(|(_, run_shard)| run_shard))
     .fetch_optional(db)
     .await?;
 
@@ -635,6 +726,23 @@ mod tests {
         .unwrap();
     }
 
+    async fn insert_shard_placements(pool: &PgPool, run_id: Uuid, placements: &[(i16, &str)]) {
+        for (run_shard, status) in placements {
+            sqlx::query(
+                r#"
+                INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
+                VALUES ($1::uuid, $2, 'primary', $3)
+                "#,
+            )
+            .bind(run_id)
+            .bind(run_shard)
+            .bind(status)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
     async fn lock_run_for_share(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, run_id: Uuid) {
         sqlx::query(
             r#"
@@ -782,6 +890,38 @@ mod tests {
 
         assert_eq!(dispatched_chunk_count(&pool, run_id, 1).await, 0);
         assert_eq!(cursor_status(&pool, run_id, 0).await, "drained");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn select_next_dispatch_route_skips_moving_shard_placement(pool: PgPool) {
+        let run_id = seed_pending_run(&pool, &[(0, 1), (1, 1)]).await;
+        insert_shard_placements(&pool, run_id, &[(0, "moving"), (1, "active")]).await;
+
+        let route = select_next_dispatch_route(&pool).await.unwrap().unwrap();
+
+        assert_eq!(route.run_id, run_id);
+        assert_eq!(route.run_shard, 1);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn dispatch_routed_run_window_dispatches_exact_route(pool: PgPool) {
+        let run_id = seed_pending_run(&pool, &[(0, 1), (1, 1)]).await;
+        let route = DispatchRoute {
+            run_id,
+            run_shard: 1,
+        };
+
+        let dispatched = dispatch_routed_run_window(&pool, Uuid::now_v7(), 60, 10, &route)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(dispatched.id, run_id);
+        assert_eq!(dispatched.run_shard, 1);
+        assert_eq!(dispatched_chunk_count(&pool, run_id, 0).await, 0);
+        assert_eq!(dispatched_chunk_count(&pool, run_id, 1).await, 1);
     }
 
     #[sqlx::test(migrations = "../migrations")]
