@@ -17,7 +17,7 @@
 //! - `execution_processing` allocates case attempts, persists evaluator
 //!   evidence, schedules retries, and applies current-attempt guarded terminal
 //!   transitions.
-//! - `run_finalize` rolls terminal chunks/executions into one completed run.
+//! - `run_finalize` combines routed shard summaries into one completed run.
 //! - `run_cancel` closes open work and emits an idempotent cancellation event.
 //! - `run_profile_validation` verifies profile/dataset/evaluator compatibility
 //!   before durable run work is created.

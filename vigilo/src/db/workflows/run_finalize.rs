@@ -1,11 +1,14 @@
 //! Run finalization workflow helpers.
 //!
 //! Finalization is coordinator-owned and guarded by leases. Workers write
-//! execution and aggregate state without updating the shared run row; this
-//! workflow rolls execution counts up once when all chunks are terminal.
+//! execution and aggregate state into shard-local storage. This workflow uses
+//! `run_shard_summaries` read by the coordinator from execution placements to
+//! complete the authoritative control `runs` row.
 
 use sqlx::PgPool;
 use uuid::Uuid;
+
+use super::run_shard_summary::RunShardSummary;
 
 /// Minimal run projection returned when a coordinator claims finalization.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -26,55 +29,76 @@ pub(crate) struct FinalizedRun {
     pub(crate) errored_execution_count: i32,
 }
 
-/// Claims a run whose chunks are all terminal and whose finalization lease is open.
+/// Selects the next run whose dispatch cursors are drained.
 ///
 /// Query behavior:
-/// - Selects one `running` or expired-lease `finalizing` run whose chunks are
-///   no longer `pending` or `leased`.
-/// - Uses `FOR UPDATE SKIP LOCKED` so coordinators can race without blocking.
-/// - Moves the run to `finalizing` and writes a coordinator lease token that
-///   protects the later finalization pass.
-pub(crate) async fn claim_next_finalizable_run(
+/// - Does not inspect execution-owned rows.
+/// - Requires all control dispatch cursors for the run to be drained.
+/// - Returns `finalizing` runs only when their coordinator lease has expired.
+pub(crate) async fn select_next_finalization_candidate(
     db: &PgPool,
+) -> anyhow::Result<Option<ClaimedRunForFinalization>> {
+    let candidate = sqlx::query_as::<_, ClaimedRunForFinalization>(
+        r#"
+        SELECT r.id, r.run_key
+        FROM runs r
+        WHERE r.status IN ('running'::run_status, 'finalizing'::run_status)
+          AND (
+              r.status <> 'finalizing'::run_status
+              OR r.coordinator_leased_until IS NULL
+              OR r.coordinator_leased_until < now()
+          )
+          AND EXISTS (
+              SELECT 1
+              FROM run_shard_dispatch_cursors c
+              WHERE c.run_id = r.id
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM run_shard_dispatch_cursors c
+              WHERE c.run_id = r.id
+                AND c.status = 'open'
+          )
+        ORDER BY r.updated_at ASC, r.id ASC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(db)
+    .await?;
+
+    Ok(candidate)
+}
+
+/// Claims a finalization candidate in control storage.
+///
+/// The coordinator reads shard summaries before calling this. Claiming only
+/// serializes the final control write and protects retries if the process dies
+/// after the claim but before completion.
+pub(crate) async fn claim_finalization_candidate(
+    db: &PgPool,
+    run_id: Uuid,
     coordinator_id: Uuid,
     lease_seconds: i32,
 ) -> anyhow::Result<Option<ClaimedRunForFinalization>> {
-    // Query outline:
-    //
-    // candidate - one run with only terminal chunks and an open finalization lease.
-    // update    - claim finalization ownership and extend coordinator lease.
     let claimed = sqlx::query_as::<_, ClaimedRunForFinalization>(
         r#"
-        WITH candidate AS (
-            SELECT r.id
-            FROM runs r
-            WHERE r.status IN ('running'::run_status, 'finalizing'::run_status)
-              AND (
-                  r.status <> 'finalizing'::run_status
-                  OR r.coordinator_leased_until IS NULL
-                  OR r.coordinator_leased_until < now()
-              )
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM run_chunks rc
-                  WHERE rc.run_id = r.id
-                    AND rc.status IN ('pending', 'leased')
-              )
-            ORDER BY r.updated_at ASC
-            FOR UPDATE SKIP LOCKED
-            LIMIT 1
-        )
         UPDATE runs r
         SET status = 'finalizing'::run_status,
-            coordinator_id = $1,
-            coordinator_leased_until = now() + ($2::int * interval '1 second'),
+            coordinator_id = $2,
+            coordinator_leased_until = now() + ($3::int * interval '1 second'),
             coordinator_heartbeat_at = now(),
             updated_at = now()
-        FROM candidate
-        WHERE r.id = candidate.id
+        WHERE r.id = $1::uuid
+          AND r.status IN ('running'::run_status, 'finalizing'::run_status)
+          AND (
+              r.status <> 'finalizing'::run_status
+              OR r.coordinator_leased_until IS NULL
+              OR r.coordinator_leased_until < now()
+          )
         RETURNING r.id, r.run_key
         "#,
     )
+    .bind(run_id)
     .bind(coordinator_id)
     .bind(lease_seconds)
     .fetch_optional(db)
@@ -83,33 +107,86 @@ pub(crate) async fn claim_next_finalizable_run(
     Ok(claimed)
 }
 
-/// Finalizes a claimed run and enqueues the idempotent `run.completed` event.
+/// Claims the next control candidate without reading execution storage.
 ///
-/// Returns `None` if the run is no longer in `finalizing` state or if open
-/// chunks appeared after claim time.
+/// Retained for existing workflow tests; production finalization uses
+/// [`select_next_finalization_candidate`] plus routed shard summary reads.
+#[cfg(test)]
+pub(crate) async fn claim_next_finalizable_run(
+    db: &PgPool,
+    coordinator_id: Uuid,
+    lease_seconds: i32,
+) -> anyhow::Result<Option<ClaimedRunForFinalization>> {
+    let Some(candidate) = select_next_finalization_candidate(db).await? else {
+        return Ok(None);
+    };
+
+    claim_finalization_candidate(db, candidate.id, coordinator_id, lease_seconds).await
+}
+
+/// Finalizes a claimed run from routed shard summaries.
 ///
 /// Query behavior:
 /// - Locks the claimed run row.
-/// - Counts terminal executions and joins current-attempt aggregates.
-/// - Checks for failed/cancelled chunks and re-checks that no open chunks
-///   appeared since the finalization claim.
-/// - Marks the run `completed`, sets gate status to fail on failed chunks,
-///   missing execution coverage, missing aggregates, or failed/error
-///   executions.
-/// - Inserts one idempotent `run.completed` outbox event.
-pub(crate) async fn finalize_claimed_run(
+/// - Uses precomputed shard summary counters supplied by the coordinator.
+/// - Marks the run `completed`, sets the final gate status, persists the
+///   global summary, drains leftover cursors, and emits `run.completed` in the
+///   control outbox.
+pub(crate) async fn finalize_claimed_run_from_summaries(
     db: &PgPool,
     run_id: Uuid,
+    summaries: &[RunShardSummary],
 ) -> anyhow::Result<Option<FinalizedRun>> {
-    // Query outline:
-    //
-    // run_row                - lock the claimed finalizing run.
-    // execution_counts       - count terminal executions and aggregate outcomes.
-    // terminal_chunk_failure - flag terminal chunk failures/cancellations.
-    // open_chunk_exists      - guard against late pending/leased chunks.
-    // finalized              - persist completed run state and summary.
-    // drained_cursors       - close any leftover dispatch cursors for the run.
-    // inserted_event         - idempotent run.completed outbox event.
+    if summaries.is_empty() || summaries.iter().any(|summary| !summary.is_terminal()) {
+        return Ok(None);
+    }
+
+    let expected_execution_count = summaries
+        .iter()
+        .map(|summary| summary.expected_execution_count)
+        .sum::<i32>();
+    let terminal_execution_count = summaries
+        .iter()
+        .map(|summary| summary.terminal_execution_count)
+        .sum::<i32>();
+    let passed_execution_count = summaries
+        .iter()
+        .map(|summary| summary.passed_execution_count)
+        .sum::<i32>();
+    let failed_execution_count = summaries
+        .iter()
+        .map(|summary| summary.failed_execution_count)
+        .sum::<i32>();
+    let errored_execution_count = summaries
+        .iter()
+        .map(|summary| summary.errored_execution_count)
+        .sum::<i32>();
+    let missing_aggregate_count = summaries
+        .iter()
+        .map(|summary| summary.missing_aggregate_count)
+        .sum::<i32>();
+    let failed_chunk_count = summaries
+        .iter()
+        .map(|summary| summary.failed_chunk_count)
+        .sum::<i32>();
+    let cancelled_chunk_count = summaries
+        .iter()
+        .map(|summary| summary.cancelled_chunk_count)
+        .sum::<i32>();
+    let shard_summary_count = i32::try_from(summaries.len())?;
+    let coverage_complete = terminal_execution_count >= expected_execution_count;
+    let has_terminal_chunk_failure = failed_chunk_count > 0 || cancelled_chunk_count > 0;
+    let gate_status = if has_terminal_chunk_failure
+        || failed_execution_count > 0
+        || errored_execution_count > 0
+        || missing_aggregate_count > 0
+        || !coverage_complete
+    {
+        "fail"
+    } else {
+        "pass"
+    };
+
     let finalized = sqlx::query_as::<_, FinalizedRun>(
         r#"
         WITH run_row AS (
@@ -122,98 +199,34 @@ pub(crate) async fn finalize_claimed_run(
               AND status = 'finalizing'::run_status
             FOR UPDATE
         ),
-        execution_counts AS (
-            SELECT
-                rr.id AS run_id,
-                COUNT(executions.id)::int AS terminal_execution_count,
-                COALESCE(SUM(
-                    CASE WHEN execution_aggregates.overall_status = 'passed'::evaluation_status THEN 1 ELSE 0 END
-                )::int, 0) AS passed_execution_count,
-                COALESCE(SUM(
-                    CASE WHEN execution_aggregates.overall_status = 'failed'::evaluation_status THEN 1 ELSE 0 END
-                )::int, 0) AS failed_execution_count,
-                COALESCE(SUM(
-                    CASE WHEN execution_aggregates.overall_status = 'error'::evaluation_status THEN 1 ELSE 0 END
-                )::int, 0) AS errored_execution_count,
-                COALESCE(SUM(
-                    CASE
-                        WHEN executions.id IS NOT NULL
-                         AND execution_aggregates.execution_id IS NULL
-                        THEN 1
-                        ELSE 0
-                    END
-                )::int, 0) AS missing_aggregate_count
-            FROM run_row rr
-            LEFT JOIN executions
-              ON executions.run_id = rr.id
-             AND executions.status IN (
-                 'completed'::execution_status,
-                 'failed'::execution_status,
-                 'timed_out'::execution_status,
-                 'cancelled'::execution_status
-             )
-            LEFT JOIN execution_aggregates
-              ON execution_aggregates.run_id = rr.id
-             AND execution_aggregates.run_shard = executions.run_shard
-             AND execution_aggregates.execution_id = executions.id
-             AND execution_aggregates.attempt_id = executions.current_attempt_id
-            GROUP BY rr.id
-        ),
-        terminal_chunk_failure AS (
-            SELECT
-                EXISTS (
-                    SELECT 1
-                    FROM run_chunks
-                    WHERE run_id = $1::uuid
-                      AND status IN ('failed', 'cancelled')
-                    LIMIT 1
-                ) AS exists
-        ),
-        open_chunk_exists AS (
-            SELECT
-                EXISTS (
-                    SELECT 1
-                    FROM run_chunks
-                    WHERE run_id = $1::uuid
-                      AND status IN ('pending', 'leased')
-                    LIMIT 1
-                ) AS exists
-        ),
         finalized AS (
             UPDATE runs r
             SET status = 'completed'::run_status,
-                gate_status = CASE
-                    WHEN tcf.exists
-                      OR ec.failed_execution_count > 0
-                      OR ec.errored_execution_count > 0
-                      OR ec.terminal_execution_count < rr.expected_execution_count
-                      OR ec.missing_aggregate_count > 0
-                    THEN 'fail'::gate_status
-                    ELSE 'pass'::gate_status
-                END,
-                terminal_execution_count = ec.terminal_execution_count,
-                passed_execution_count = ec.passed_execution_count,
-                failed_execution_count = ec.failed_execution_count,
-                errored_execution_count = ec.errored_execution_count,
+                gate_status = $2::gate_status,
+                terminal_execution_count = $4,
+                passed_execution_count = $5,
+                failed_execution_count = $6,
+                errored_execution_count = $7,
                 summary = jsonb_build_object(
-                    'expected_execution_count', rr.expected_execution_count,
-                    'terminal_execution_count', ec.terminal_execution_count,
-                    'passed_execution_count', ec.passed_execution_count,
-                    'failed_execution_count', ec.failed_execution_count,
-                    'errored_execution_count', ec.errored_execution_count,
-                    'missing_aggregate_count', ec.missing_aggregate_count,
-                    'coverage_complete', ec.terminal_execution_count >= rr.expected_execution_count,
-                    'has_terminal_chunk_failure', tcf.exists
+                    'expected_execution_count', $3::int,
+                    'terminal_execution_count', $4::int,
+                    'passed_execution_count', $5::int,
+                    'failed_execution_count', $6::int,
+                    'errored_execution_count', $7::int,
+                    'missing_aggregate_count', $8::int,
+                    'failed_chunk_count', $9::int,
+                    'cancelled_chunk_count', $10::int,
+                    'coverage_complete', $11::bool,
+                    'has_terminal_chunk_failure', $12::bool,
+                    'shard_summary_count', $13::int
                 ),
                 finalized_at = COALESCE(r.finalized_at, now()),
                 completed_at = COALESCE(r.completed_at, now()),
                 coordinator_leased_until = NULL,
                 coordinator_heartbeat_at = now(),
                 updated_at = now()
-            FROM run_row rr, execution_counts ec, terminal_chunk_failure tcf, open_chunk_exists oce
+            FROM run_row rr
             WHERE r.id = rr.id
-              AND ec.run_id = rr.id
-              AND NOT oce.exists
             RETURNING
                 r.id,
                 r.run_key,
@@ -263,8 +276,269 @@ pub(crate) async fn finalize_claimed_run(
         "#,
     )
     .bind(run_id)
+    .bind(gate_status)
+    .bind(expected_execution_count)
+    .bind(terminal_execution_count)
+    .bind(passed_execution_count)
+    .bind(failed_execution_count)
+    .bind(errored_execution_count)
+    .bind(missing_aggregate_count)
+    .bind(failed_chunk_count)
+    .bind(cancelled_chunk_count)
+    .bind(coverage_complete)
+    .bind(has_terminal_chunk_failure)
+    .bind(shard_summary_count)
     .fetch_optional(db)
     .await?;
 
     Ok(finalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    use super::*;
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx finalization tests"]
+    async fn finalize_claimed_run_from_summaries_combines_terminal_shards(pool: PgPool) {
+        let run_id = Uuid::now_v7();
+        let dataset_id = Uuid::now_v7();
+        let dataset_version_id = Uuid::now_v7();
+
+        seed_run(&pool, run_id, dataset_id, dataset_version_id, "finalizing").await;
+        seed_dispatch_cursor(&pool, run_id, 3, "open").await;
+
+        let mut first_summary = terminal_summary(run_id, 3, "completed");
+        first_summary.expected_execution_count = 2;
+        first_summary.terminal_execution_count = 2;
+        first_summary.passed_execution_count = 2;
+
+        let mut second_summary = terminal_summary(run_id, 7, "failed");
+        second_summary.failed_execution_count = 1;
+
+        let summaries = vec![first_summary, second_summary];
+
+        let finalized = finalize_claimed_run_from_summaries(&pool, run_id, &summaries)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(finalized.id, run_id);
+        assert_eq!(finalized.gate_status, "fail");
+        assert_eq!(finalized.terminal_execution_count, 3);
+        assert_eq!(finalized.passed_execution_count, 2);
+        assert_eq!(finalized.failed_execution_count, 1);
+        assert_eq!(finalized.errored_execution_count, 0);
+
+        let row = sqlx::query_as::<_, PersistedRun>(
+            r#"
+            SELECT
+                status::text AS status,
+                gate_status::text AS gate_status,
+                expected_execution_count,
+                terminal_execution_count,
+                passed_execution_count,
+                failed_execution_count,
+                errored_execution_count,
+                summary
+            FROM runs
+            WHERE id = $1::uuid
+            "#,
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(row.status, "completed");
+        assert_eq!(row.gate_status, "fail");
+        assert_eq!(row.expected_execution_count, 3);
+        assert_eq!(row.terminal_execution_count, 3);
+        assert_eq!(row.passed_execution_count, 2);
+        assert_eq!(row.failed_execution_count, 1);
+        assert_eq!(row.errored_execution_count, 0);
+        assert_eq!(row.summary["shard_summary_count"], Value::from(2));
+        assert_eq!(row.summary["coverage_complete"], Value::from(true));
+
+        let cursor_status = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT status
+            FROM run_shard_dispatch_cursors
+            WHERE run_id = $1::uuid
+              AND run_shard = 3
+            "#,
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cursor_status, "drained");
+
+        let event_count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM outbox_events
+            WHERE aggregate_id = $1::uuid
+              AND event_type = 'run.completed'
+            "#,
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(event_count, 1);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx finalization tests"]
+    async fn finalize_claimed_run_from_summaries_waits_for_running_summary(pool: PgPool) {
+        let run_id = Uuid::now_v7();
+        let dataset_id = Uuid::now_v7();
+        let dataset_version_id = Uuid::now_v7();
+
+        seed_run(&pool, run_id, dataset_id, dataset_version_id, "finalizing").await;
+        let mut summary = terminal_summary(run_id, 3, "running");
+        summary.expected_execution_count = 2;
+        summary.terminal_execution_count = 1;
+        let summaries = vec![summary];
+
+        let finalized = finalize_claimed_run_from_summaries(&pool, run_id, &summaries)
+            .await
+            .unwrap();
+
+        assert!(finalized.is_none());
+
+        let status = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT status::text
+            FROM runs
+            WHERE id = $1::uuid
+            "#,
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "finalizing");
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct PersistedRun {
+        status: String,
+        gate_status: String,
+        expected_execution_count: i32,
+        terminal_execution_count: i32,
+        passed_execution_count: i32,
+        failed_execution_count: i32,
+        errored_execution_count: i32,
+        summary: Value,
+    }
+
+    fn terminal_summary(run_id: Uuid, run_shard: i16, status: &str) -> RunShardSummary {
+        RunShardSummary {
+            run_id,
+            run_shard,
+            expected_execution_count: 1,
+            terminal_execution_count: 1,
+            passed_execution_count: 0,
+            failed_execution_count: 0,
+            errored_execution_count: 0,
+            missing_aggregate_count: 0,
+            failed_chunk_count: 0,
+            cancelled_chunk_count: 0,
+            status: status.to_owned(),
+        }
+    }
+
+    async fn seed_run(
+        pool: &PgPool,
+        run_id: Uuid,
+        dataset_id: Uuid,
+        dataset_version_id: Uuid,
+        status: &str,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO dataset_versions (dataset_version_id, dataset_id, dataset_version)
+            VALUES ($1::uuid, $2::uuid, 'dataset')
+            "#,
+        )
+        .bind(dataset_version_id)
+        .bind(dataset_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO runs (
+                id,
+                run_key,
+                dataset_id,
+                dataset_version_id,
+                dataset_version,
+                evaluation_profile_id,
+                evaluation_profile_version,
+                profile_version_id,
+                profile_hash,
+                aggregation_policy_id,
+                aggregation_policy_version,
+                aggregation_policy_hash,
+                agent_provider,
+                agent_name,
+                prompt_config_id,
+                prompt_config_version,
+                status,
+                expected_execution_count
+            )
+            VALUES (
+                $1::uuid,
+                $2,
+                $3::uuid,
+                $4::uuid,
+                'dataset',
+                'profile',
+                '1.0.0',
+                'profile-version',
+                'profile-hash',
+                'aggregation',
+                '1.0.0',
+                'aggregation-hash',
+                'example',
+                'agent',
+                'prompt',
+                '1.0.0',
+                $5::run_status,
+                3
+            )
+            "#,
+        )
+        .bind(run_id)
+        .bind(format!("run-{run_id}"))
+        .bind(dataset_id)
+        .bind(dataset_version_id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_dispatch_cursor(pool: &PgPool, run_id: Uuid, run_shard: i16, status: &str) {
+        sqlx::query(
+            r#"
+            INSERT INTO run_shard_dispatch_cursors (run_id, run_shard, status)
+            VALUES ($1::uuid, $2, $3)
+            "#,
+        )
+        .bind(run_id)
+        .bind(run_shard)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
 }

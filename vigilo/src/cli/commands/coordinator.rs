@@ -27,6 +27,7 @@ use crate::{
     db::workflows::{
         run_dispatch,
         run_finalize,
+        run_shard_summary,
     },
     outbox::{
         EventPublisher,
@@ -189,7 +190,6 @@ async fn run_coordinator_cycle(
 
     debug!(coordinator_id = %coordinator_id, "acquiring database context");
     let database = context.db().await?;
-    let control_db = database.control().await?;
     debug!(coordinator_id = %coordinator_id, "database context ready");
 
     debug!(coordinator_id = %coordinator_id, "acquiring messaging context");
@@ -207,7 +207,7 @@ async fn run_coordinator_cycle(
     let dispatch_count = drain_dispatch_batch(database, coordinator_id, config).await?;
 
     // --- Finalize terminal runs ---
-    let finalized_count = drain_finalize_batch(control_db, coordinator_id, config).await?;
+    let finalized_count = drain_finalize_batch(database, coordinator_id, config).await?;
 
     // --- Publish durable outbox events ---
     // Failed broker publishes stay in the outbox delivery queue for retry.
@@ -409,7 +409,7 @@ async fn publish_outbox_events(
 }
 
 async fn drain_finalize_batch(
-    db: &sqlx::PgPool,
+    database: &database::Db,
     coordinator_id: Uuid,
     config: &CoordinatorRuntimeConfig,
 ) -> anyhow::Result<usize> {
@@ -420,15 +420,38 @@ async fn drain_finalize_batch(
 
     let mut finalized = 0usize;
     for _ in 0..config.max_finalize_per_cycle {
-        let Some(run) =
-            run_finalize::claim_next_finalizable_run(db, coordinator_id, config.lease_seconds)
-                .await?
-        else {
+        let control_db = database.control().await?;
+        let Some(run) = run_finalize::select_next_finalization_candidate(control_db).await? else {
             break;
         };
 
-        debug!(run_id = %run.id, run_key = %run.run_key, "claimed run for finalization");
-        if let Some(done) = run_finalize::finalize_claimed_run(db, run.id).await? {
+        let summaries = collect_run_shard_summaries(database, run.id).await?;
+        if summaries.is_empty() || summaries.iter().any(|summary| !summary.is_terminal()) {
+            debug!(
+                run_id = %run.id,
+                run_key = %run.run_key,
+                shard_summary_count = summaries.len(),
+                "finalization candidate is waiting for terminal shard summaries"
+            );
+            break;
+        }
+
+        let Some(claimed) = run_finalize::claim_finalization_candidate(
+            control_db,
+            run.id,
+            coordinator_id,
+            config.lease_seconds,
+        )
+        .await?
+        else {
+            continue;
+        };
+
+        debug!(run_id = %claimed.id, run_key = %claimed.run_key, "claimed run for finalization");
+        if let Some(done) =
+            run_finalize::finalize_claimed_run_from_summaries(control_db, claimed.id, &summaries)
+                .await?
+        {
             finalized += 1;
             info!(
                 run_id = %done.id,
@@ -441,7 +464,7 @@ async fn drain_finalize_batch(
                 "finalized run and enqueued completion event"
             );
         } else {
-            debug!(run_id = %run.id, "claimed finalizable run but no finalization update was applied");
+            debug!(run_id = %claimed.id, "claimed finalizable run but no finalization update was applied");
         }
     }
 
@@ -459,4 +482,39 @@ async fn drain_finalize_batch(
     }
 
     Ok(finalized)
+}
+
+async fn collect_run_shard_summaries(
+    database: &database::Db,
+    run_id: Uuid,
+) -> anyhow::Result<Vec<run_shard_summary::RunShardSummary>> {
+    let routes = database.execution_routes_for_run(run_id).await?;
+    let mut summaries = Vec::with_capacity(routes.len());
+
+    for (run_shard, alias, db) in routes {
+        let Some(summary) =
+            run_shard_summary::select_run_shard_summary(&db, run_id, run_shard).await?
+        else {
+            debug!(
+                run_id = %run_id,
+                run_shard,
+                database_alias = %alias,
+                "run shard summary is not available yet"
+            );
+            return Ok(Vec::new());
+        };
+
+        debug!(
+            run_id = %summary.run_id,
+            run_shard = summary.run_shard,
+            database_alias = %alias,
+            status = %summary.status,
+            terminal_execution_count = summary.terminal_execution_count,
+            expected_execution_count = summary.expected_execution_count,
+            "loaded run shard summary for finalization"
+        );
+        summaries.push(summary);
+    }
+
+    Ok(summaries)
 }

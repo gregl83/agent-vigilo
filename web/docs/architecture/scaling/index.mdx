@@ -84,17 +84,23 @@ Implemented today:
   the execution placement that owns the changed rows.
 - Worker chunk-local SQL uses the execution-local run snapshot instead of
   joining the authoritative control `runs` row.
-- Shard-local `run_shard_summaries` roll execution/chunk progress up to one
-  row per `run_id + run_shard` for later global finalization.
+- Shard-local `run_shard_summaries` roll execution/chunk progress up to one row
+  per `run_id + run_shard`.
+- Coordinator finalization reads those routed shard summaries, aggregates them
+  in memory, writes the global `runs` outcome in control storage, and emits
+  `run.completed` from the control outbox.
 
 Not implemented yet:
 
 - Multi-placement assignment policy at run creation.
-- Finalization, cancellation, result export, status fanout, and evaluator
-  metadata replication paths migrated to execution placement routing.
+- Cancellation, result export, status fanout, evaluator metadata replication,
+  and case-data routing/replication paths migrated to execution placement
+  routing.
 - Automated shard migration tooling.
 
-The current system should be read as **single-database operation with logical sharding and placement metadata in place**.
+The current system should be read as **single-database operation by default,
+with routed execution workflows being introduced behind the database service
+boundary**.
 
 ## Current Shard Model
 
@@ -190,7 +196,10 @@ This keeps topology decisions contained:
 - Run metadata workflows use control storage internally.
 - Chunk and execution workflows route execution-owned data by `run_id +
   run_shard` internally.
-- Run-level reporting workflows fan out across execution placements internally.
+- Run finalization fans out across execution placements for shard summaries and
+  writes the global run outcome to control storage.
+- Run-level reporting workflows should fan out across execution placements
+  internally.
 - Thin command dispatch and generic runtime code should not choose between
   control and execution databases directly.
 

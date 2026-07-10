@@ -9,7 +9,6 @@ use uuid::Uuid;
 
 /// Current shard-local summary for one run shard.
 #[derive(Debug, Clone, sqlx::FromRow)]
-#[allow(dead_code)]
 pub(crate) struct RunShardSummary {
     pub(crate) run_id: Uuid,
     pub(crate) run_shard: i16,
@@ -22,6 +21,45 @@ pub(crate) struct RunShardSummary {
     pub(crate) failed_chunk_count: i32,
     pub(crate) cancelled_chunk_count: i32,
     pub(crate) status: String,
+}
+
+impl RunShardSummary {
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(self.status.as_str(), "completed" | "failed")
+    }
+}
+
+/// Reads the shard-local summary for one routed run shard.
+pub(crate) async fn select_run_shard_summary(
+    db: &PgPool,
+    run_id: Uuid,
+    run_shard: i16,
+) -> anyhow::Result<Option<RunShardSummary>> {
+    let summary = sqlx::query_as::<_, RunShardSummary>(
+        r#"
+        SELECT
+            run_id,
+            run_shard,
+            expected_execution_count,
+            terminal_execution_count,
+            passed_execution_count,
+            failed_execution_count,
+            errored_execution_count,
+            missing_aggregate_count,
+            failed_chunk_count,
+            cancelled_chunk_count,
+            status
+        FROM run_shard_summaries
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(summary)
 }
 
 /// Recomputes and upserts the shard-local summary for a prepared run shard.
