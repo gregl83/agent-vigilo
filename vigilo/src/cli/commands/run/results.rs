@@ -52,10 +52,11 @@ pub(super) fn run_results_payload(run: &Run, summary: &RunResultsSummary) -> Val
 
 pub(super) async fn exec(context: Context, run_id: String) -> anyhow::Result<()> {
     let run_id = parse_run_id(&run_id)?;
-    let db = context.db().await?.control().await?;
+    let database = context.db().await?;
+    let db = database.control().await?;
     let out = context.out().await?;
     let run = select_existing_run(db, run_id).await?;
-    let summary = select_run_results_summary(db, run_id).await?;
+    let summary = run_results_workflow::select_run_results_summary(database, run_id).await?;
     let payload = run_results_payload(&run, &summary);
 
     out.write_value(&payload)?;

@@ -44,7 +44,12 @@ use crate::{
         workflows::{
             run_cancel,
             run_create,
+            run_export as run_export_workflow,
             run_profile_validation,
+            run_results::{
+                self as run_results_workflow,
+                RunResultsSummary,
+            },
         },
     },
     models::{
@@ -403,65 +408,10 @@ fn run_watch_payload(run: &Run, terminal: bool) -> Value {
     })
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
-struct RunResultsSummary {
-    execution_count: i64,
-    aggregate_count: i64,
-    passed_execution_count: i64,
-    failed_execution_count: i64,
-    error_execution_count: i64,
-    skipped_execution_count: i64,
-    missing_aggregate_count: i64,
-    evaluator_result_count: i64,
-    blocking_failure_count: i64,
-    average_score: Option<f64>,
-    min_score: Option<f64>,
-    max_score: Option<f64>,
-}
-
 async fn select_existing_run(db: &sqlx::PgPool, run_id: Uuid) -> anyhow::Result<Run> {
     runs::select_run_by_id(db, run_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("run '{}' was not found", run_id))
-}
-
-async fn select_run_results_summary(
-    db: &sqlx::PgPool,
-    run_id: Uuid,
-) -> anyhow::Result<RunResultsSummary> {
-    let summary = sqlx::query_as::<_, RunResultsSummary>(
-        r#"
-        SELECT
-            COUNT(e.id)::bigint AS execution_count,
-            COUNT(ea.execution_id)::bigint AS aggregate_count,
-            COUNT(*) FILTER (WHERE ea.overall_status = 'passed'::evaluation_status)::bigint AS passed_execution_count,
-            COUNT(*) FILTER (WHERE ea.overall_status = 'failed'::evaluation_status)::bigint AS failed_execution_count,
-            COUNT(*) FILTER (WHERE ea.overall_status = 'error'::evaluation_status)::bigint AS error_execution_count,
-            COUNT(*) FILTER (WHERE ea.overall_status = 'skipped'::evaluation_status)::bigint AS skipped_execution_count,
-            COUNT(e.id) FILTER (WHERE ea.execution_id IS NULL)::bigint AS missing_aggregate_count,
-            COALESCE(SUM(ea.evaluator_result_count), 0)::bigint AS evaluator_result_count,
-            COALESCE(SUM(
-                CASE
-                    WHEN ea.blocking_failures IS NULL THEN 0
-                    ELSE jsonb_array_length(ea.blocking_failures)
-                END
-            ), 0)::bigint AS blocking_failure_count,
-            AVG(ea.aggregate_score) AS average_score,
-            MIN(ea.aggregate_score) AS min_score,
-            MAX(ea.aggregate_score) AS max_score
-        FROM executions e
-        LEFT JOIN execution_aggregates ea
-          ON ea.run_id = e.run_id
-         AND ea.run_shard = e.run_shard
-         AND ea.execution_id = e.id
-        WHERE e.run_id = $1::uuid
-        "#,
-    )
-    .bind(run_id)
-    .fetch_one(db)
-    .await?;
-
-    Ok(summary)
 }
 
 #[derive(Debug, Subcommand)]

@@ -264,6 +264,28 @@ impl Db {
         Ok(routed)
     }
 
+    /// Returns all readable execution routes for a run.
+    ///
+    /// Read paths such as results/export can read from `moving` or `draining`
+    /// shard placements. Those states block new claims and dispatch, not
+    /// inspection of the placement currently recorded for the shard.
+    pub(crate) async fn execution_read_routes_for_run(
+        &self,
+        run_id: Uuid,
+    ) -> anyhow::Result<Vec<(i16, String, PgPool)>> {
+        let db = self.control().await?;
+        let placements = shard_placements::list_shard_placements_for_run(db, run_id).await?;
+        let mut routed = Vec::with_capacity(placements.len());
+
+        for placement in placements {
+            self.validate_shard_placement_alias(&placement).await?;
+            let pool = self.placement(&placement.database_alias).await?.clone();
+            routed.push((placement.run_shard, placement.database_alias, pool));
+        }
+
+        Ok(routed)
+    }
+
     pub(crate) async fn validate_placement_config(&self) -> anyhow::Result<()> {
         let db = self.control().await?;
         let placements = database_placements::list_active_database_placements(db).await?;
@@ -674,6 +696,30 @@ mod tests {
         assert_eq!(routed[0].1, DEFAULT_DATABASE_ALIAS);
         assert_eq!(routed[1].0, 9);
         assert_eq!(routed[1].1, DEFAULT_DATABASE_ALIAS);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
+    async fn execution_read_routes_for_run_include_moving_placements(pool: PgPool) {
+        let context = context_with_control_pool(pool);
+        let run_id = Uuid::now_v7();
+
+        insert_shard_placement(
+            context.control().await.unwrap(),
+            run_id,
+            7,
+            DEFAULT_DATABASE_ALIAS,
+            SHARD_PLACEMENT_STATUS_MOVING,
+        )
+        .await;
+
+        let dispatch_error = context.execution_routes_for_run(run_id).await.unwrap_err();
+        assert!(dispatch_error.to_string().contains("not dispatchable"));
+
+        let readable = context.execution_read_routes_for_run(run_id).await.unwrap();
+        assert_eq!(readable.len(), 1);
+        assert_eq!(readable[0].0, 7);
+        assert_eq!(readable[0].1, DEFAULT_DATABASE_ALIAS);
     }
 
     #[sqlx::test(migrations = "../migrations")]

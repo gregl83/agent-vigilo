@@ -13,11 +13,20 @@ pub(crate) struct RunShardSummary {
     pub(crate) run_id: Uuid,
     pub(crate) run_shard: i16,
     pub(crate) expected_execution_count: i32,
+    pub(crate) execution_count: i32,
     pub(crate) terminal_execution_count: i32,
+    pub(crate) aggregate_count: i32,
     pub(crate) passed_execution_count: i32,
     pub(crate) failed_execution_count: i32,
     pub(crate) errored_execution_count: i32,
+    pub(crate) skipped_execution_count: i32,
     pub(crate) missing_aggregate_count: i32,
+    pub(crate) evaluator_result_count: i64,
+    pub(crate) blocking_failure_count: i64,
+    pub(crate) score_count: i64,
+    pub(crate) score_sum: f64,
+    pub(crate) min_score: Option<f64>,
+    pub(crate) max_score: Option<f64>,
     pub(crate) failed_chunk_count: i32,
     pub(crate) cancelled_chunk_count: i32,
     pub(crate) status: String,
@@ -41,11 +50,20 @@ pub(crate) async fn select_run_shard_summary(
             run_id,
             run_shard,
             expected_execution_count,
+            execution_count,
             terminal_execution_count,
+            aggregate_count,
             passed_execution_count,
             failed_execution_count,
             errored_execution_count,
+            skipped_execution_count,
             missing_aggregate_count,
+            evaluator_result_count,
+            blocking_failure_count,
+            score_count,
+            score_sum,
+            min_score,
+            max_score,
             failed_chunk_count,
             cancelled_chunk_count,
             status
@@ -88,6 +106,7 @@ pub(crate) async fn refresh_run_shard_summary(
             SELECT
                 snapshot.run_id,
                 snapshot.run_shard,
+                COUNT(e.id)::int AS execution_count,
                 COUNT(e.id) FILTER (
                     WHERE e.status IN (
                         'completed'::execution_status,
@@ -96,6 +115,7 @@ pub(crate) async fn refresh_run_shard_summary(
                         'cancelled'::execution_status
                     )
                 )::int AS terminal_execution_count,
+                COUNT(ea.execution_id)::int AS aggregate_count,
                 COUNT(e.id) FILTER (
                     WHERE e.status IN (
                         'completed'::execution_status,
@@ -130,8 +150,28 @@ pub(crate) async fn refresh_run_shard_summary(
                         'timed_out'::execution_status,
                         'cancelled'::execution_status
                     )
+                      AND ea.overall_status = 'skipped'::evaluation_status
+                )::int AS skipped_execution_count,
+                COUNT(e.id) FILTER (
+                    WHERE e.status IN (
+                        'completed'::execution_status,
+                        'failed'::execution_status,
+                        'timed_out'::execution_status,
+                        'cancelled'::execution_status
+                    )
                       AND ea.execution_id IS NULL
-                )::int AS missing_aggregate_count
+                )::int AS missing_aggregate_count,
+                COALESCE(SUM(ea.evaluator_result_count), 0)::bigint AS evaluator_result_count,
+                COALESCE(SUM(
+                    CASE
+                        WHEN ea.blocking_failures IS NULL THEN 0
+                        ELSE jsonb_array_length(ea.blocking_failures)
+                    END
+                ), 0)::bigint AS blocking_failure_count,
+                COUNT(ea.aggregate_score)::bigint AS score_count,
+                COALESCE(SUM(ea.aggregate_score), 0.0)::double precision AS score_sum,
+                MIN(ea.aggregate_score) AS min_score,
+                MAX(ea.aggregate_score) AS max_score
             FROM snapshot
             LEFT JOIN executions e
               ON e.run_id = snapshot.run_id
@@ -161,11 +201,20 @@ pub(crate) async fn refresh_run_shard_summary(
                 snapshot.run_id,
                 snapshot.run_shard,
                 snapshot.expected_execution_count,
+                execution_counts.execution_count,
                 execution_counts.terminal_execution_count,
+                execution_counts.aggregate_count,
                 execution_counts.passed_execution_count,
                 execution_counts.failed_execution_count,
                 execution_counts.errored_execution_count,
+                execution_counts.skipped_execution_count,
                 execution_counts.missing_aggregate_count,
+                execution_counts.evaluator_result_count,
+                execution_counts.blocking_failure_count,
+                execution_counts.score_count,
+                execution_counts.score_sum,
+                execution_counts.min_score,
+                execution_counts.max_score,
                 chunk_counts.failed_chunk_count,
                 chunk_counts.cancelled_chunk_count,
                 CASE
@@ -193,11 +242,20 @@ pub(crate) async fn refresh_run_shard_summary(
                 run_id,
                 run_shard,
                 expected_execution_count,
+                execution_count,
                 terminal_execution_count,
+                aggregate_count,
                 passed_execution_count,
                 failed_execution_count,
                 errored_execution_count,
+                skipped_execution_count,
                 missing_aggregate_count,
+                evaluator_result_count,
+                blocking_failure_count,
+                score_count,
+                score_sum,
+                min_score,
+                max_score,
                 failed_chunk_count,
                 cancelled_chunk_count,
                 status
@@ -206,22 +264,40 @@ pub(crate) async fn refresh_run_shard_summary(
                 run_id,
                 run_shard,
                 expected_execution_count,
+                execution_count,
                 terminal_execution_count,
+                aggregate_count,
                 passed_execution_count,
                 failed_execution_count,
                 errored_execution_count,
+                skipped_execution_count,
                 missing_aggregate_count,
+                evaluator_result_count,
+                blocking_failure_count,
+                score_count,
+                score_sum,
+                min_score,
+                max_score,
                 failed_chunk_count,
                 cancelled_chunk_count,
                 status
             FROM computed
             ON CONFLICT (run_id, run_shard) DO UPDATE
             SET expected_execution_count = EXCLUDED.expected_execution_count,
+                execution_count = EXCLUDED.execution_count,
                 terminal_execution_count = EXCLUDED.terminal_execution_count,
+                aggregate_count = EXCLUDED.aggregate_count,
                 passed_execution_count = EXCLUDED.passed_execution_count,
                 failed_execution_count = EXCLUDED.failed_execution_count,
                 errored_execution_count = EXCLUDED.errored_execution_count,
+                skipped_execution_count = EXCLUDED.skipped_execution_count,
                 missing_aggregate_count = EXCLUDED.missing_aggregate_count,
+                evaluator_result_count = EXCLUDED.evaluator_result_count,
+                blocking_failure_count = EXCLUDED.blocking_failure_count,
+                score_count = EXCLUDED.score_count,
+                score_sum = EXCLUDED.score_sum,
+                min_score = EXCLUDED.min_score,
+                max_score = EXCLUDED.max_score,
                 failed_chunk_count = EXCLUDED.failed_chunk_count,
                 cancelled_chunk_count = EXCLUDED.cancelled_chunk_count,
                 status = EXCLUDED.status,
@@ -230,11 +306,20 @@ pub(crate) async fn refresh_run_shard_summary(
                 run_id,
                 run_shard,
                 expected_execution_count,
+                execution_count,
                 terminal_execution_count,
+                aggregate_count,
                 passed_execution_count,
                 failed_execution_count,
                 errored_execution_count,
+                skipped_execution_count,
                 missing_aggregate_count,
+                evaluator_result_count,
+                blocking_failure_count,
+                score_count,
+                score_sum,
+                min_score,
+                max_score,
                 failed_chunk_count,
                 cancelled_chunk_count,
                 status
@@ -318,10 +403,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(summary.expected_execution_count, 2);
+        assert_eq!(summary.execution_count, 2);
         assert_eq!(summary.terminal_execution_count, 2);
+        assert_eq!(summary.aggregate_count, 2);
         assert_eq!(summary.passed_execution_count, 1);
         assert_eq!(summary.failed_execution_count, 1);
+        assert_eq!(summary.errored_execution_count, 0);
+        assert_eq!(summary.skipped_execution_count, 0);
         assert_eq!(summary.missing_aggregate_count, 0);
+        assert_eq!(summary.evaluator_result_count, 2);
+        assert_eq!(summary.blocking_failure_count, 0);
+        assert_eq!(summary.score_count, 0);
+        assert_eq!(summary.score_sum, 0.0);
         assert_eq!(summary.status, "failed");
     }
 

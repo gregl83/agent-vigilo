@@ -13,6 +13,8 @@
 //!   snapshots, and owns chunk visibility plus expired chunk lease recovery.
 //! - `run_shard_summary` refreshes shard-local progress rollups used by later
 //!   global finalization.
+//! - `run_results` combines routed shard summaries for run-level reporting.
+//! - `run_export` pages routed execution artifacts for run export.
 //! - `chunk_processing` is worker-owned chunk lease claim/release/completion.
 //! - `execution_processing` allocates case attempts, persists evaluator
 //!   evidence, schedules retries, and applies current-attempt guarded terminal
@@ -27,6 +29,8 @@ pub(crate) mod execution_processing;
 pub(crate) mod run_cancel;
 pub(crate) mod run_create;
 pub(crate) mod run_dispatch;
+pub(crate) mod run_export;
 pub(crate) mod run_finalize;
 pub(crate) mod run_profile_validation;
+pub(crate) mod run_results;
 pub(crate) mod run_shard_summary;
