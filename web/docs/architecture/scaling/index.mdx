@@ -78,6 +78,9 @@ Implemented today:
   route-constrained shard dispatch statement.
 - Chunk lease recovery runs bounded recovery passes per active execution
   placement.
+- Durable outbox publishing runs once per active database placement. Control
+  workflows publish from the control outbox; execution workflows publish from
+  the execution placement that owns the changed rows.
 
 Not implemented yet:
 

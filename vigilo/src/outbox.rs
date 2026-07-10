@@ -1,10 +1,14 @@
 //! Durable outbox publication.
 //!
-//! Database workflows insert events into `outbox_events` in the same
-//! transaction as state changes. The coordinator calls this module after each
-//! orchestration pass to claim a bounded batch of delivery rows, publish each
-//! joined event payload to the message broker, and either mark it published or
-//! reschedule the delivery row for retry.
+//! Database workflows insert events into the local `outbox_events` table in
+//! the same transaction as state changes. Control-plane workflows write to the
+//! control placement; execution workflows write to the execution placement that
+//! owns the changed rows.
+//!
+//! The coordinator calls this module once per active database placement after
+//! each orchestration pass to claim a bounded batch of delivery rows, publish
+//! each joined event payload to the message broker, and either mark it
+//! published or reschedule the delivery row for retry.
 //! This keeps database state and external message delivery loosely coupled
 //! without losing events when a process exits between commit and publish.
 

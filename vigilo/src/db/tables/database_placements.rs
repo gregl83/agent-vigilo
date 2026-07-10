@@ -27,6 +27,25 @@ pub(crate) async fn list_active_database_placements(
     Ok(placements)
 }
 
+/// Lists every active database alias.
+///
+/// Outbox publication runs once per active placement because workflows write
+/// durable events in the same database transaction as the state they changed.
+pub(crate) async fn list_active_database_aliases(db: &PgPool) -> anyhow::Result<Vec<String>> {
+    let aliases = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT alias
+        FROM database_placements
+        WHERE status = 'active'
+        ORDER BY alias
+        "#,
+    )
+    .fetch_all(db)
+    .await?;
+
+    Ok(aliases)
+}
+
 /// Lists active shard-capable aliases that currently own active shard rows.
 ///
 /// Recovery scans run per execution placement, so aliases without active shard
@@ -79,6 +98,29 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx placement tests"]
+    async fn list_active_database_aliases_filters_disabled(pool: PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES
+                ('shard_001', 'VIGILO_SHARD_001_DATABASE_URL', 'shard', 'active'),
+                ('shard_002', 'VIGILO_SHARD_002_DATABASE_URL', 'shard', 'disabled')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let aliases = list_active_database_aliases(&pool).await.unwrap();
+
+        assert_eq!(
+            aliases,
+            vec!["primary".to_string(), "shard_001".to_string()]
+        );
+    }
 
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx placement tests"]

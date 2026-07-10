@@ -3,7 +3,7 @@
 //! The coordinator drives run-level orchestration:
 //! - atomically starts pending runs and dispatches chunk-ready event windows
 //! - finalizes runs whose chunks/executions are terminal
-//! - publishes outbox events to messaging
+//! - publishes outbox events from active database placements to messaging
 
 use std::time::Duration;
 
@@ -29,7 +29,9 @@ use crate::{
         run_finalize,
     },
     outbox::{
+        EventPublisher,
         MqEventPublisher,
+        OutboxPublishStats,
         OutboxPublisherConfig,
         publish_pending_events,
     },
@@ -111,7 +113,7 @@ pub(crate) struct Command {
     #[arg(long, env = "VIGILO_CHUNK_LEASE_MAX_RECOVERIES", default_value_t = CHUNK_LEASE_MAX_RECOVERIES, value_parser = clap::value_parser!(i32).range(0..=10_000))]
     pub chunk_lease_max_recoveries: i32,
 
-    /// Maximum outbox events claimed per publish pass
+    /// Maximum outbox events claimed per database placement per publish pass
     #[arg(long, env = "VIGILO_OUTBOX_BATCH_SIZE", default_value_t = OUTBOX_BATCH_SIZE, value_parser = clap::value_parser!(i64).range(1..=1_000_000))]
     pub outbox_batch_size: i64,
 
@@ -174,7 +176,7 @@ impl Executable for Command {
 /// 1. recover expired worker chunk leases
 /// 2. atomically start pending runs and dispatch chunk-ready windows
 /// 3. claim/finalize finalizable runs (bounded batch)
-/// 4. publish a bounded batch of pending outbox events
+/// 4. publish bounded batches of pending outbox events from active placements
 async fn run_coordinator_cycle(
     context: Context,
     coordinator_id: Uuid,
@@ -217,7 +219,8 @@ async fn run_coordinator_cycle(
         lease_seconds: config.outbox_lease_seconds,
         retry_delay_seconds: config.outbox_retry_delay_seconds,
     };
-    let publish_stats = publish_pending_events(control_db, &publisher, &outbox_config).await?;
+    let publish_stats =
+        publish_outbox_events(database, &publisher, &outbox_config, coordinator_id).await?;
     info!(
         expired_chunk_leases_recovered = recovery_stats.recovered,
         expired_chunk_leases_failed = recovery_stats.failed,
@@ -353,6 +356,46 @@ async fn drain_dispatch_batch(
     }
 
     Ok(dispatched)
+}
+
+async fn publish_outbox_events(
+    database: &database::Db,
+    publisher: &dyn EventPublisher,
+    config: &OutboxPublisherConfig,
+    coordinator_id: Uuid,
+) -> anyhow::Result<OutboxPublishStats> {
+    let aliases = database.active_outbox_database_aliases().await?;
+    let mut stats = OutboxPublishStats::default();
+
+    for alias in aliases {
+        let db = database.placement(&alias).await?;
+        let alias_stats = publish_pending_events(db, publisher, config).await?;
+
+        stats.claimed += alias_stats.claimed;
+        stats.published += alias_stats.published;
+        stats.failed += alias_stats.failed;
+        stats.stale_claims += alias_stats.stale_claims;
+
+        if alias_stats.claimed > 0 {
+            info!(
+                coordinator_id = %coordinator_id,
+                database_alias = %alias,
+                outbox_events_claimed = alias_stats.claimed,
+                outbox_events_published = alias_stats.published,
+                outbox_events_failed = alias_stats.failed,
+                outbox_stale_claims = alias_stats.stale_claims,
+                "completed outbox publish pass for database placement"
+            );
+        } else {
+            debug!(
+                coordinator_id = %coordinator_id,
+                database_alias = %alias,
+                "no publishable outbox events for database placement"
+            );
+        }
+    }
+
+    Ok(stats)
 }
 
 async fn drain_finalize_batch(
