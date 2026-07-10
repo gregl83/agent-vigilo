@@ -68,13 +68,16 @@ Implemented today:
 - Run creation inserts one active `shard_placements` row for each `run_shard`
   used by the run.
 - A database service/router that exposes `control()` and execution routing primitives to DB/workflow code.
-- Chunk-ready messages and worker queries that carry `run_id`, `run_shard`, and `chunk_id`.
+- Chunk-ready messages that carry `run_id`, `run_shard`, and `chunk_id`.
+- Worker chunk-local processing resolves the execution database by
+  `run_id + run_shard`; run profile and evaluator registry metadata remain
+  control-plane reads.
 - Coordinator dispatch cursors keyed by `run_id + run_shard`.
 
 Not implemented yet:
 
 - Multi-placement assignment policy at run creation.
-- Worker, coordinator, recovery, finalization, cancellation, result export, and status fanout paths migrated to execution placement routing.
+- Coordinator, recovery, finalization, cancellation, result export, and status fanout paths migrated to execution placement routing.
 - Automated shard migration tooling.
 
 The current system should be read as **single-database operation with logical sharding and placement metadata in place**.

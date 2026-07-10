@@ -2,7 +2,9 @@
 //!
 //! Workers consume chunk-ready queue messages, claim work, warm evaluator
 //! components, execute case-level evaluation workflows, and acknowledge or
-//! requeue queue messages based on outcome.
+//! requeue queue messages based on outcome. Chunk-local worker persistence uses
+//! the execution database selected by `run_id + run_shard`; run profile and
+//! evaluator registry metadata remain control-plane reads.
 
 use std::{
     sync::Arc,
@@ -605,9 +607,9 @@ async fn run_worker_message(
     message: crate::mq::ConsumedMessage,
 ) -> anyhow::Result<WorkerCycleOutcome> {
     // --- Acquire shared services ---
-    // All subsequent settlement paths use these handles to keep ack/retry
-    // behavior centralized.
-    let db = context.db().await?.control().await?;
+    // Settlement paths use the message queue handle to keep ack/retry behavior
+    // centralized. The execution database is resolved after payload validation
+    // because routing requires run_id + run_shard from the chunk-ready message.
     let mq = context.mq().await?;
 
     debug!(
@@ -642,6 +644,16 @@ async fn run_worker_message(
         chunk_id = %payload.chunk_id,
         "parsed chunk-ready message payload"
     );
+
+    // --- Resolve execution storage ---
+    // Chunk leases, case batches, attempts, evaluator results, aggregates, and
+    // chunk terminal state are execution-owned. Resolve this once at the worker
+    // workflow boundary so lower helpers do not need to know topology.
+    let db = context
+        .db()
+        .await?
+        .execution(payload.run_id, payload.run_shard)
+        .await?;
 
     // --- Claim chunk ownership ---
     // Duplicate, stale, cancelled, completed, or not-yet-running chunks are
@@ -961,7 +973,11 @@ async fn run_worker_message(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+    use uuid::Uuid;
+
     use super::{
+        ChunkReadyMessage,
         DEFAULT_WORKER_MAX_INFLIGHT_CHUNKS,
         worker_stream_prefetch,
     };
@@ -980,5 +996,22 @@ mod tests {
         assert_eq!(worker_stream_prefetch(1), 1);
         assert_eq!(worker_stream_prefetch(4), 4);
         assert_eq!(worker_stream_prefetch(64), 64);
+    }
+
+    #[test]
+    fn chunk_ready_message_carries_execution_route_key() {
+        let run_id = Uuid::now_v7();
+        let chunk_id = Uuid::now_v7();
+
+        let message: ChunkReadyMessage = serde_json::from_value(json!({
+            "run_id": run_id,
+            "run_shard": 42,
+            "chunk_id": chunk_id,
+        }))
+        .unwrap();
+
+        assert_eq!(message.run_id, run_id);
+        assert_eq!(message.run_shard, 42);
+        assert_eq!(message.chunk_id, chunk_id);
     }
 }
