@@ -25,15 +25,15 @@ pub(crate) struct WorkerCaseBatchItem {
     pub(crate) metadata: serde_json::Value,
 }
 
-/// Claims a pending or expired chunk for a running run.
+/// Claims a pending or expired chunk for a prepared run shard.
 ///
 /// Returns `None` when another worker already owns the current lease or the
 /// chunk's run is not currently processable.
 ///
 /// Query behavior: one guarded `UPDATE ... RETURNING` claims ownership only if
-/// the chunk is pending or its previous lease has expired and the parent run is
-/// still `running`. The returned `leased_until` value is the worker's lease
-/// token for later completion, release, or failure.
+/// the chunk is pending or its previous lease has expired and the execution
+/// placement has a local run snapshot. The returned `leased_until` value is the
+/// worker's lease token for later completion, release, or failure.
 pub(crate) async fn claim_chunk_for_processing(
     db: &PgPool,
     run_id: Uuid,
@@ -56,9 +56,9 @@ pub(crate) async fn claim_chunk_for_processing(
 		  )
 		  AND EXISTS (
 			SELECT 1
-			FROM runs
-			WHERE runs.id = run_chunks.run_id
-			  AND runs.status = 'running'::run_status
+			FROM run_snapshots rs
+			WHERE rs.run_id = run_chunks.run_id
+			  AND rs.run_shard = run_chunks.run_shard
 		  )
 		RETURNING
 			id,
@@ -91,8 +91,9 @@ pub(crate) async fn claim_chunk_for_processing(
 /// row, otherwise stale workers cannot overwrite the current owner.
 ///
 /// Query behavior: updates the lease only when the chunk is still leased by the
-/// same timestamp token and the parent run is still `running`. `None` means the
-/// worker lost authority and should acknowledge the stale message.
+/// same timestamp token and the execution placement still has a local run
+/// snapshot. `None` means the worker lost authority and should acknowledge the
+/// stale message.
 pub(crate) async fn extend_chunk_lease(
     db: &PgPool,
     chunk: &RunChunk,
@@ -110,9 +111,9 @@ pub(crate) async fn extend_chunk_lease(
 		  AND leased_until IS NOT DISTINCT FROM $5::timestamptz
 		  AND EXISTS (
 			SELECT 1
-			FROM runs
-			WHERE runs.id = run_chunks.run_id
-			  AND runs.status = 'running'::run_status
+			FROM run_snapshots rs
+			WHERE rs.run_id = run_chunks.run_id
+			  AND rs.run_shard = run_chunks.run_shard
 		  )
 		RETURNING
 			id,

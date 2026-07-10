@@ -75,17 +75,21 @@ Implemented today:
   messages instead of allowing new chunk claims.
 - Coordinator dispatch selects dispatchable `run_id + run_shard` routes from
   control storage, resolves the execution placement, and runs a
-  route-constrained shard dispatch statement.
+  route-constrained shard dispatch statement. The dispatch statement prepares
+  an execution-local run snapshot before inserting worker-visible chunk events.
 - Chunk lease recovery runs bounded recovery passes per active execution
   placement.
 - Durable outbox publishing runs once per active database placement. Control
   workflows publish from the control outbox; execution workflows publish from
   the execution placement that owns the changed rows.
+- Worker chunk-local SQL uses the execution-local run snapshot instead of
+  joining the authoritative control `runs` row.
 
 Not implemented yet:
 
 - Multi-placement assignment policy at run creation.
-- Finalization, cancellation, result export, and status fanout paths migrated to execution placement routing.
+- Finalization, cancellation, result export, status fanout, and evaluator
+  metadata replication paths migrated to execution placement routing.
 - Automated shard migration tooling.
 
 The current system should be read as **single-database operation with logical sharding and placement metadata in place**.

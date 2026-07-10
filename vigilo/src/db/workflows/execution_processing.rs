@@ -808,15 +808,20 @@ async fn allocate_execution_attempts_for_cases(
         r#"
         ),
         run_guard AS (
-            SELECT id
-            FROM runs
-            WHERE id =
+            SELECT run_id AS id
+            FROM run_snapshots
+            WHERE run_id =
         "#,
     );
     query_builder.push_bind(run_id);
     query_builder.push(
         r#"::uuid
-              AND status = 'running'::run_status
+              AND run_shard =
+        "#,
+    );
+    query_builder.push_bind(run_shard);
+    query_builder.push(
+        r#"
             FOR SHARE
         ),
         attempt_policy AS (
@@ -1313,10 +1318,10 @@ pub(crate) async fn finalize_execution_terminal_transitions(
             FROM transition_input
         ),
         run_guard AS (
-            SELECT id
-            FROM runs
-            WHERE id = $7::uuid
-              AND status = 'running'::run_status
+            SELECT run_id AS id
+            FROM run_snapshots
+            WHERE run_id = $7::uuid
+              AND run_shard = $8
             FOR SHARE
         ),
         authoritative_input AS (
@@ -2113,15 +2118,20 @@ async fn persist_completed_execution_results_batch(
         r#"
         ),
         run_guard AS (
-            SELECT id
-            FROM runs
-            WHERE id =
+            SELECT run_id AS id
+            FROM run_snapshots
+            WHERE run_id =
         "#,
     );
     authority_query.push_bind(run_id);
     authority_query.push(
         r#"::uuid
-              AND status = 'running'::run_status
+              AND run_shard =
+        "#,
+    );
+    authority_query.push_bind(run_shard);
+    authority_query.push(
+        r#"
             FOR SHARE
         ),
         locked AS (
@@ -2616,6 +2626,59 @@ mod tests {
             "#,
         )
         .bind(run_id)
+        .bind(format!("run-{run_id}"))
+        .bind(dataset_id)
+        .bind(dataset_version_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO run_snapshots (
+                run_id,
+                run_shard,
+                run_key,
+                dataset_id,
+                dataset_version_id,
+                dataset_version,
+                evaluation_profile_id,
+                evaluation_profile_version,
+                profile_version_id,
+                profile_hash,
+                aggregation_policy_id,
+                aggregation_policy_version,
+                aggregation_policy_hash,
+                agent_provider,
+                agent_name,
+                prompt_config_id,
+                prompt_config_version,
+                expected_execution_count
+            )
+            VALUES (
+                $1::uuid,
+                $2,
+                $3,
+                $4::uuid,
+                $5::uuid,
+                'test',
+                'profile',
+                '1.0.0',
+                'profile-version',
+                'profile-hash',
+                'aggregation',
+                '1.0.0',
+                'aggregation-hash',
+                'example',
+                'agent',
+                'prompt',
+                '1.0.0',
+                1
+            )
+            "#,
+        )
+        .bind(run_id)
+        .bind(run_shard)
         .bind(format!("run-{run_id}"))
         .bind(dataset_id)
         .bind(dataset_version_id)

@@ -3,8 +3,9 @@
 //! Workers consume chunk-ready queue messages, claim work, warm evaluator
 //! components, execute case-level evaluation workflows, and acknowledge or
 //! requeue queue messages based on outcome. Chunk-local worker persistence uses
-//! the execution database selected by `run_id + run_shard`; run profile and
-//! evaluator registry metadata remain control-plane reads.
+//! the execution database selected by `run_id + run_shard`; run profile
+//! snapshots are read from that execution placement, while evaluator registry
+//! metadata remains a control-plane read.
 
 use std::{
     sync::Arc,
@@ -45,7 +46,7 @@ use crate::{
     },
     contracts::run::RunProfile,
     db::{
-        tables::runs,
+        tables::run_snapshots,
         workflows::{
             chunk_processing,
             execution_processing,
@@ -94,6 +95,12 @@ struct WorkerRunContext {
 struct WorkerRuntime {
     worker_id: Uuid,
     worker_host: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct WorkerRunContextKey {
+    run_id: Uuid,
+    run_shard: i16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,7 +304,7 @@ fn execution_route_is_temporarily_blocked(error: &anyhow::Error) -> bool {
 /// Wasmtime components.
 struct EvaluatorLoaderService {
     context: Context,
-    run_context_cache: Arc<Cache<Uuid, Arc<WorkerRunContext>>>,
+    run_context_cache: Arc<Cache<WorkerRunContextKey, Arc<WorkerRunContext>>>,
 }
 
 impl EvaluatorLoaderService {
@@ -386,23 +393,32 @@ impl EvaluatorLoaderService {
     async fn get_or_build_run_context(
         &self,
         run_id: Uuid,
+        run_shard: i16,
+        execution_db: &sqlx::PgPool,
     ) -> anyhow::Result<Arc<WorkerRunContext>> {
         let context = self.context.clone();
+        let execution_db = execution_db.clone();
+        let key = WorkerRunContextKey { run_id, run_shard };
 
         let context_result = self
             .run_context_cache
-            .try_get_with::<_, anyhow::Error>(run_id, async move {
-                let db = context.db().await?.control().await?;
+            .try_get_with::<_, anyhow::Error>(key, async move {
                 let Some(profile_snapshot) =
-                    runs::select_run_profile_snapshot_by_id(db, run_id).await?
+                    run_snapshots::select_run_profile_snapshot(&execution_db, run_id, run_shard)
+                        .await?
                 else {
-                    anyhow::bail!("run '{}' missing profile snapshot", run_id);
+                    anyhow::bail!(
+                        "run '{}' shard {} missing run profile snapshot",
+                        run_id,
+                        run_shard
+                    );
                 };
                 let profile: RunProfile =
                     serde_json::from_value(profile_snapshot).map_err(|err| {
                         anyhow::anyhow!("run '{}' profile is invalid: {}", run_id, err)
                     })?;
                 let evaluator_refs = execution_processing::evaluator_refs_from_profile(&profile)?;
+                let db = context.db().await?.control().await?;
                 let evaluator_catalog =
                     execution_processing::build_run_evaluator_catalog(db, &profile).await?;
 
@@ -725,7 +741,7 @@ async fn run_worker_message(
     // The extended lease timestamp becomes the authority token for every later
     // chunk settlement.
     let run_context = evaluator_loader
-        .get_or_build_run_context(chunk.run_id)
+        .get_or_build_run_context(chunk.run_id, chunk.run_shard, db)
         .await?;
 
     let Some(extended_chunk) =

@@ -9,8 +9,8 @@
 //! Reading guide:
 //! - `run_create` writes immutable dataset/run/chunk seed state, but does not
 //!   make work visible to workers.
-//! - `run_dispatch` is coordinator-owned visibility and expired chunk lease
-//!   recovery.
+//! - `run_dispatch` starts dispatchable runs, prepares execution-local run
+//!   snapshots, and owns chunk visibility plus expired chunk lease recovery.
 //! - `chunk_processing` is worker-owned chunk lease claim/release/completion.
 //! - `execution_processing` allocates case attempts, persists evaluator
 //!   evidence, schedules retries, and applies current-attempt guarded terminal

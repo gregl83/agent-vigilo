@@ -314,13 +314,23 @@ async fn drain_dispatch_batch(
             break;
         };
 
+        let Some(snapshot) = run_dispatch::prepare_dispatch_run_snapshot(
+            control_db,
+            &route,
+            coordinator_id,
+            config.lease_seconds,
+        )
+        .await?
+        else {
+            continue;
+        };
+
         let execution_db = database.execution(route.run_id, route.run_shard).await?;
         let Some(run) = run_dispatch::dispatch_routed_run_window(
             execution_db,
-            coordinator_id,
-            config.lease_seconds,
             config.run_chunk_dispatch_window_size,
             &route,
+            &snapshot,
         )
         .await?
         else {
