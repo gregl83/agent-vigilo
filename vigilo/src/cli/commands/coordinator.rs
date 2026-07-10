@@ -197,12 +197,12 @@ async fn run_coordinator_cycle(
     // --- Recover expired chunk leases ---
     // Recovery runs before new dispatch so dead workers do not block
     // finalization or leave ready work stranded.
-    let recovery_stats = recover_expired_chunk_leases(control_db, coordinator_id, config).await?;
+    let recovery_stats = recover_expired_chunk_leases(database, coordinator_id, config).await?;
 
     // --- Dispatch runnable chunk windows ---
     // Dispatch is drained before finalization so newly-created work gets
     // surfaced promptly.
-    let dispatch_count = drain_dispatch_batch(database, control_db, coordinator_id, config).await?;
+    let dispatch_count = drain_dispatch_batch(database, coordinator_id, config).await?;
 
     // --- Finalize terminal runs ---
     let finalized_count = drain_finalize_batch(control_db, coordinator_id, config).await?;
@@ -236,7 +236,7 @@ async fn run_coordinator_cycle(
 }
 
 async fn recover_expired_chunk_leases(
-    db: &sqlx::PgPool,
+    database: &database::Db,
     coordinator_id: Uuid,
     config: &CoordinatorRuntimeConfig,
 ) -> anyhow::Result<run_dispatch::ChunkLeaseRecoveryStats> {
@@ -245,12 +245,37 @@ async fn recover_expired_chunk_leases(
     // exhausting recovery attempts.
     debug!(coordinator_id = %coordinator_id, "recovering expired chunk leases");
 
-    let stats = run_dispatch::recover_expired_chunk_leases(
-        db,
-        config.chunk_lease_max_recoveries,
-        config.chunk_lease_recovery_batch_size,
-    )
-    .await?;
+    let aliases = database.active_execution_database_aliases().await?;
+    let mut stats = run_dispatch::ChunkLeaseRecoveryStats::default();
+
+    for alias in aliases {
+        let db = database.placement(&alias).await?;
+        let alias_stats = run_dispatch::recover_expired_chunk_leases(
+            db,
+            config.chunk_lease_max_recoveries,
+            config.chunk_lease_recovery_batch_size,
+        )
+        .await?;
+
+        stats.recovered += alias_stats.recovered;
+        stats.failed += alias_stats.failed;
+
+        if alias_stats.recovered > 0 || alias_stats.failed > 0 {
+            info!(
+                coordinator_id = %coordinator_id,
+                database_alias = %alias,
+                expired_chunk_leases_recovered = alias_stats.recovered,
+                expired_chunk_leases_failed = alias_stats.failed,
+                "completed expired chunk lease recovery pass for execution placement"
+            );
+        } else {
+            debug!(
+                coordinator_id = %coordinator_id,
+                database_alias = %alias,
+                "no expired chunk leases recovered for execution placement"
+            );
+        }
+    }
 
     if stats.recovered == 0 && stats.failed == 0 {
         debug!(
@@ -271,7 +296,6 @@ async fn recover_expired_chunk_leases(
 
 async fn drain_dispatch_batch(
     database: &database::Db,
-    control_db: &sqlx::PgPool,
     coordinator_id: Uuid,
     config: &CoordinatorRuntimeConfig,
 ) -> anyhow::Result<usize> {
@@ -282,6 +306,7 @@ async fn drain_dispatch_batch(
 
     let mut dispatched = 0usize;
     for _ in 0..config.max_dispatch_per_cycle {
+        let control_db = database.control().await?;
         let Some(route) = run_dispatch::select_next_dispatch_route(control_db).await? else {
             break;
         };

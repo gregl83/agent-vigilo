@@ -76,11 +76,13 @@ Implemented today:
 - Coordinator dispatch selects dispatchable `run_id + run_shard` routes from
   control storage, resolves the execution placement, and runs a
   route-constrained shard dispatch statement.
+- Chunk lease recovery runs bounded recovery passes per active execution
+  placement.
 
 Not implemented yet:
 
 - Multi-placement assignment policy at run creation.
-- Recovery, finalization, cancellation, result export, and status fanout paths migrated to execution placement routing.
+- Finalization, cancellation, result export, and status fanout paths migrated to execution placement routing.
 - Automated shard migration tooling.
 
 The current system should be read as **single-database operation with logical sharding and placement metadata in place**.

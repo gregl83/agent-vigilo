@@ -154,6 +154,11 @@ impl Db {
         &self.placement_config.default_shard_database_alias
     }
 
+    pub(crate) async fn active_execution_database_aliases(&self) -> anyhow::Result<Vec<String>> {
+        let db = self.control().await?;
+        database_placements::list_active_shard_database_aliases(db).await
+    }
+
     /// Returns a pool for an explicit placement alias.
     ///
     /// This is an infrastructure hook for router/admin workflows. Most callers
