@@ -50,6 +50,7 @@ use crate::{
         workflows::{
             chunk_processing,
             execution_processing,
+            run_shard_summary,
         },
     },
     runtime::ServiceRunner,
@@ -582,6 +583,7 @@ async fn settle_retryable_chunk_failure(
     } else {
         let failed = chunk_processing::mark_chunk_failed(db, chunk).await?;
         if failed > 0 {
+            run_shard_summary::refresh_run_shard_summary(db, chunk.run_id, chunk.run_shard).await?;
             mq.quarantine_worker_message(
                 &message.raw,
                 &format!("worker message retry budget exhausted: {}", reason),
@@ -973,6 +975,7 @@ async fn run_worker_message(
                 );
                 return Ok(WorkerCycleOutcome::Processed);
             }
+            run_shard_summary::refresh_run_shard_summary(db, chunk.run_id, chunk.run_shard).await?;
 
             mq.ack(&message.raw).await?;
             info!(

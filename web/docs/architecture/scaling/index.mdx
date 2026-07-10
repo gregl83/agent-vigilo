@@ -84,6 +84,8 @@ Implemented today:
   the execution placement that owns the changed rows.
 - Worker chunk-local SQL uses the execution-local run snapshot instead of
   joining the authoritative control `runs` row.
+- Shard-local `run_shard_summaries` roll execution/chunk progress up to one
+  row per `run_id + run_shard` for later global finalization.
 
 Not implemented yet:
 

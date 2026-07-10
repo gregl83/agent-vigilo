@@ -11,6 +11,8 @@
 //!   make work visible to workers.
 //! - `run_dispatch` starts dispatchable runs, prepares execution-local run
 //!   snapshots, and owns chunk visibility plus expired chunk lease recovery.
+//! - `run_shard_summary` refreshes shard-local progress rollups used by later
+//!   global finalization.
 //! - `chunk_processing` is worker-owned chunk lease claim/release/completion.
 //! - `execution_processing` allocates case attempts, persists evaluator
 //!   evidence, schedules retries, and applies current-attempt guarded terminal
@@ -27,3 +29,4 @@ pub(crate) mod run_create;
 pub(crate) mod run_dispatch;
 pub(crate) mod run_finalize;
 pub(crate) mod run_profile_validation;
+pub(crate) mod run_shard_summary;

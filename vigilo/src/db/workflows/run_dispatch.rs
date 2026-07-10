@@ -6,8 +6,12 @@
 //! scans scoped to one run shard at a time while row locks prevent multiple
 //! coordinators from dispatching the same window.
 
+use std::collections::BTreeSet;
+
 use sqlx::PgPool;
 use uuid::Uuid;
+
+use super::run_shard_summary;
 
 /// Run projection returned after a coordinator dispatches one shard window.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -181,7 +185,7 @@ pub(crate) async fn recover_expired_chunk_leases(
     // failed  - clear the dead lease and make the chunk terminal.
     // stale_failed_attempts
     //         - mark current running attempts stale with the failed chunk.
-    let failed = sqlx::query_scalar::<_, i64>(
+    let failed_rows = sqlx::query_as::<_, (Uuid, i16)>(
         r#"
         WITH expired AS (
             SELECT rc.run_id, rc.run_shard, rc.id
@@ -205,7 +209,7 @@ pub(crate) async fn recover_expired_chunk_leases(
             WHERE rc.run_id = expired.run_id
               AND rc.run_shard = expired.run_shard
               AND rc.id = expired.id
-            RETURNING 1
+            RETURNING rc.run_id, rc.run_shard
         ),
         stale_failed_attempts AS (
             UPDATE execution_attempts ea
@@ -229,18 +233,26 @@ pub(crate) async fn recover_expired_chunk_leases(
               AND ea.status = 'running'::attempt_status
             RETURNING ea.id
         )
-        SELECT COUNT(*)::bigint
+        SELECT run_id, run_shard
         FROM failed
         "#,
     )
     .bind(max_recoveries)
     .bind(batch_size)
-    .fetch_one(&mut *tx)
+    .fetch_all(&mut *tx)
     .await?;
 
     tx.commit().await?;
 
-    Ok(ChunkLeaseRecoveryStats { recovered, failed })
+    let failed_shards = failed_rows.iter().copied().collect::<BTreeSet<_>>();
+    for (run_id, run_shard) in failed_shards {
+        run_shard_summary::refresh_run_shard_summary(db, run_id, run_shard).await?;
+    }
+
+    Ok(ChunkLeaseRecoveryStats {
+        recovered,
+        failed: i64::try_from(failed_rows.len())?,
+    })
 }
 
 /// Selects the next control-plane dispatch route.
@@ -693,6 +705,11 @@ pub(crate) async fn dispatch_routed_run_window(
     .bind(snapshot.run_started_events_enqueued)
     .fetch_optional(db)
     .await?;
+
+    if let Some(dispatched) = &dispatched {
+        run_shard_summary::refresh_run_shard_summary(db, dispatched.id, dispatched.run_shard)
+            .await?;
+    }
 
     Ok(dispatched)
 }
