@@ -89,13 +89,21 @@ Implemented today:
 - Coordinator finalization reads those routed shard summaries, aggregates them
   in memory, writes the global `runs` outcome in control storage, and emits
   `run.completed` from the control outbox.
+- `run results` reads global run metadata from control storage and combines
+  routed shard summaries from execution placements.
+- `run export --format jsonl` streams one routed run shard at a time and marks
+  execution-scoped records with `run_shard` and `database_alias`.
+- `run export --format json` pages routed shards and materializes a single JSON
+  document for smaller exports.
+- Result/export read routing can inspect `moving` or `draining` shard
+  placements; those states block new work, not reads from the current source
+  placement.
 
 Not implemented yet:
 
 - Multi-placement assignment policy at run creation.
-- Cancellation, result export, status fanout, evaluator metadata replication,
-  and case-data routing/replication paths migrated to execution placement
-  routing.
+- Cancellation, status fanout, evaluator metadata replication, and canonical
+  case-data routing/replication paths migrated to execution placement routing.
 - Automated shard migration tooling.
 
 The current system should be read as **single-database operation by default,
@@ -198,7 +206,7 @@ This keeps topology decisions contained:
   run_shard` internally.
 - Run finalization fans out across execution placements for shard summaries and
   writes the global run outcome to control storage.
-- Run-level reporting workflows should fan out across execution placements
+- Run-level reporting and export workflows fan out across execution placements
   internally.
 - Thin command dispatch and generic runtime code should not choose between
   control and execution databases directly.
@@ -256,4 +264,4 @@ evaluator_results
 
 ## Recreating a Database
 
-For a fresh deployment, apply the original migration files normally. The 128-shard schema is part of the create-table migrations, so no separate `ALTER TABLE` migration is required when recreating the database.
+For a fresh deployment, apply the original migration files normally. The 128-shard schema is part of the create-table migrations.
