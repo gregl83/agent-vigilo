@@ -119,6 +119,20 @@ Finalization fans in:
 - The coordinator reads routed summaries for the run.
 - Control storage writes the global run outcome and emits `run.completed`.
 
+Cancellation fans out:
+
+- Control storage marks the run cancelled and drains dispatch cursors first.
+- The workflow resolves the run's execution placements and cancels local
+  chunks, executions, and attempts in each placement with bounded fanout.
+- `run.cancelled` remains a control-plane event.
+
+Status and watch reads fan in lightweight progress:
+
+- The control run row remains the authoritative lifecycle record.
+- Live progress is read from routed `run_shard_summaries` when available.
+- Payloads include `data.live_progress` and progress-source metadata so callers
+  can distinguish control-only state from execution-shard progress.
+
 Outbox publication is local to the database where the state changed. Control
 events publish from the control outbox. Execution events publish from the
 execution placement that owns the changed rows.
@@ -192,18 +206,22 @@ Implemented today:
 - 128 logical shards and partitioned execution tables.
 - Stored database and shard placement catalogs.
 - Routed run creation, dispatch, worker processing, lease recovery, outbox
-  publication, shard summaries, finalization, results, export, route
-  inspection, and explicit shard move.
+  publication, shard summaries, finalization, cancellation, live status/watch
+  progress, results, export, route inspection, and explicit shard move.
 - CI coverage for the black-box multi-database route path: run creation to
-  `primary` and `shard_001`, route inspection, control-owned cursors, and shard
-  move.
+  `primary` and `shard_001`, route inspection, control-owned cursors, routed
+  cancellation, and shard move.
 
 Intentionally deferred:
 
+- Route fencing for stale cached placements during movement.
 - Multi-placement assignment policy at run creation.
+- Full worker-required prerequisite closure for movement between execution-only
+  placements.
+- Bulk rebalancing commands for adding or removing large numbers of placements.
 - Evaluator metadata replication to execution placements.
 - Broader canonical case-data routing and replication.
-- Bulk rebalancing commands for adding or removing large numbers of placements.
+- End-to-end multi-database coordinator and worker integration coverage.
 
 These are product and operations contracts, not hidden formulas. Until they are
 designed explicitly, routing remains stored, inspectable, and conservative.

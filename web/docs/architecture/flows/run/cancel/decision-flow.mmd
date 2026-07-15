@@ -10,13 +10,14 @@ flowchart TD
     Start([vigilo run cancel])
 
     RunId{Run id valid?}
-    LockRun[Lock run for cancellation]
+    RequestCancel[Mark control cancellation requested]
     Found{Run exists?}
     Status{Run status?}
-    LoadCancelled[Load cancelled run snapshot]
-    CancelWork[Cancel open attempts, executions, and chunks]
-    UpdateRun[Mark run cancelled]
-    Event[Enqueue cancellation event]
+    Drain[Drain control dispatch cursors]
+    Routes[Resolve execution routes]
+    CancelWork[Cancel execution-local work by placement]
+    Summary[Refresh routed cancellation summary]
+    Event[Enqueue control cancellation event]
     Payload[Build cancellation payload]
 
     Success([Success response])
@@ -31,27 +32,30 @@ flowchart TD
     Start --> RunId
 
     RunId -- No --> RunIdFail
-    RunId -- Yes --> LockRun
+    RunId -- Yes --> RequestCancel
 
-    LockRun --> Found
-    LockRun -. Lookup fails .-> PersistenceFail
+    RequestCancel --> Found
+    RequestCancel -. Lookup fails .-> PersistenceFail
 
     Found -- No --> NotFoundFail
     Found -- Yes --> Status
 
     Status -- Completed or failed --> TerminalFail
-    Status -- Already cancelled --> LoadCancelled
-    Status -- Pending, running, or finalizing --> CancelWork
+    Status -- Already cancelled --> Drain
+    Status -- Pending, running, or finalizing --> Drain
     Status -- Other --> UnsupportedFail
 
-    LoadCancelled --> Payload
-    LoadCancelled -. Lookup fails .-> PersistenceFail
+    Drain --> Routes
+    Drain -. Update fails .-> PersistenceFail
 
-    CancelWork --> UpdateRun
+    Routes --> CancelWork
+    Routes -. Lookup fails .-> PersistenceFail
+
+    CancelWork --> Summary
     CancelWork -. Update fails .-> PersistenceFail
 
-    UpdateRun --> Event
-    UpdateRun -. Update fails .-> PersistenceFail
+    Summary --> Event
+    Summary -. Update fails .-> PersistenceFail
 
     Event --> Payload
     Event -. Enqueue fails .-> PersistenceFail
@@ -61,5 +65,5 @@ flowchart TD
 
     class Start command
     class Success success
-    class RunId,LockRun,Found,Status,LoadCancelled,CancelWork,UpdateRun,Event,Payload system
+    class RunId,RequestCancel,Found,Status,Drain,Routes,CancelWork,Summary,Event,Payload system
     class RunIdFail,NotFoundFail,TerminalFail,UnsupportedFail,PersistenceFail,OutputFail error

@@ -50,6 +50,7 @@ use crate::{
                 self as run_results_workflow,
                 RunResultsSummary,
             },
+            run_status as run_status_workflow,
         },
     },
     models::{
@@ -324,6 +325,14 @@ struct RunWatchSnapshotKey {
     passed_execution_count: i32,
     failed_execution_count: i32,
     errored_execution_count: i32,
+    live_expected_execution_count: i64,
+    live_execution_count: i64,
+    live_terminal_execution_count: i64,
+    live_passed_execution_count: i64,
+    live_failed_execution_count: i64,
+    live_errored_execution_count: i64,
+    live_cancelled_chunk_count: i64,
+    shard_summary_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -334,14 +343,30 @@ pub(crate) enum RunExportFormat {
 
 impl From<&Run> for RunWatchSnapshotKey {
     fn from(run: &Run) -> Self {
+        Self::from(&run_status_workflow::RunStatusProjection::from_control_run(
+            run.clone(),
+        ))
+    }
+}
+
+impl From<&run_status_workflow::RunStatusProjection> for RunWatchSnapshotKey {
+    fn from(status: &run_status_workflow::RunStatusProjection) -> Self {
         Self {
-            status: run.status.clone(),
-            gate_status: run.gate_status.clone(),
-            expected_execution_count: run.expected_execution_count,
-            terminal_execution_count: run.terminal_execution_count,
-            passed_execution_count: run.passed_execution_count,
-            failed_execution_count: run.failed_execution_count,
-            errored_execution_count: run.errored_execution_count,
+            status: status.run.status.clone(),
+            gate_status: status.run.gate_status.clone(),
+            expected_execution_count: status.run.expected_execution_count,
+            terminal_execution_count: status.run.terminal_execution_count,
+            passed_execution_count: status.run.passed_execution_count,
+            failed_execution_count: status.run.failed_execution_count,
+            errored_execution_count: status.run.errored_execution_count,
+            live_expected_execution_count: status.live_progress.expected_execution_count,
+            live_execution_count: status.live_progress.execution_count,
+            live_terminal_execution_count: status.live_progress.terminal_execution_count,
+            live_passed_execution_count: status.live_progress.passed_execution_count,
+            live_failed_execution_count: status.live_progress.failed_execution_count,
+            live_errored_execution_count: status.live_progress.errored_execution_count,
+            live_cancelled_chunk_count: status.live_progress.cancelled_chunk_count,
+            shard_summary_count: status.shard_summary_count,
         }
     }
 }
@@ -380,7 +405,17 @@ fn run_gate_failure_reason(run: &Run) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn run_watch_payload(run: &Run, terminal: bool) -> Value {
+    let status = run_status_workflow::RunStatusProjection::from_control_run(run.clone());
+    run_watch_payload_from_status(&status, terminal)
+}
+
+fn run_watch_payload_from_status(
+    status: &run_status_workflow::RunStatusProjection,
+    terminal: bool,
+) -> Value {
+    let run = &status.run;
     json!({
         "data": {
             "run_id": run.id,
@@ -400,10 +435,26 @@ fn run_watch_payload(run: &Run, terminal: bool) -> Value {
             "finalized_at": run.finalized_at,
             "completed_at": run.completed_at,
             "updated_at": run.updated_at,
+            "live_progress": {
+                "expected_execution_count": status.live_progress.expected_execution_count,
+                "execution_count": status.live_progress.execution_count,
+                "terminal_execution_count": status.live_progress.terminal_execution_count,
+                "passed_execution_count": status.live_progress.passed_execution_count,
+                "failed_execution_count": status.live_progress.failed_execution_count,
+                "errored_execution_count": status.live_progress.errored_execution_count,
+                "skipped_execution_count": status.live_progress.skipped_execution_count,
+                "missing_aggregate_count": status.live_progress.missing_aggregate_count,
+                "failed_chunk_count": status.live_progress.failed_chunk_count,
+                "cancelled_chunk_count": status.live_progress.cancelled_chunk_count,
+            },
         },
         "meta": {
             "terminal": terminal,
             "gate_passed": run.status == "completed" && run.gate_status == "pass",
+            "progress_source": status.progress_source(),
+            "live_progress_complete": status.live_progress_complete(),
+            "execution_route_count": status.execution_route_count,
+            "shard_summary_count": status.shard_summary_count,
         }
     })
 }
@@ -650,8 +701,10 @@ mod tests {
         read_inline_or_file,
         results,
         run_gate_failure_reason,
+        run_status_workflow,
         run_terminal_failure_reason,
         run_watch_payload,
+        run_watch_payload_from_status,
         status,
         watch,
     };
@@ -916,6 +969,46 @@ mod tests {
         assert_eq!(payload["data"]["run_id"], json!(run.id));
         assert_eq!(payload["meta"]["terminal"], json!(true));
         assert_eq!(payload["meta"]["gate_passed"], json!(true));
+    }
+
+    #[test]
+    fn run_watch_payload_includes_live_routed_progress() {
+        let run = run_with_status("running", "unknown");
+        let status = run_status_workflow::RunStatusProjection {
+            run,
+            live_progress: run_status_workflow::RunProgressSummary {
+                expected_execution_count: 10,
+                execution_count: 7,
+                terminal_execution_count: 5,
+                passed_execution_count: 4,
+                failed_execution_count: 1,
+                errored_execution_count: 0,
+                skipped_execution_count: 0,
+                missing_aggregate_count: 0,
+                failed_chunk_count: 0,
+                cancelled_chunk_count: 1,
+            },
+            execution_route_count: 2,
+            shard_summary_count: 1,
+        };
+
+        let payload = run_watch_payload_from_status(&status, false);
+
+        assert_eq!(
+            payload["data"]["live_progress"]["terminal_execution_count"],
+            json!(5)
+        );
+        assert_eq!(
+            payload["data"]["live_progress"]["cancelled_chunk_count"],
+            json!(1)
+        );
+        assert_eq!(
+            payload["meta"]["progress_source"],
+            json!("execution_shards")
+        );
+        assert_eq!(payload["meta"]["live_progress_complete"], json!(false));
+        assert_eq!(payload["meta"]["execution_route_count"], json!(2));
+        assert_eq!(payload["meta"]["shard_summary_count"], json!(1));
     }
 
     #[test]

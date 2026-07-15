@@ -92,6 +92,35 @@ async fn multi_database_routing_flow() -> anyhow::Result<()> {
     assert_eq!(dispatch_cursor_count(&primary, routed_run_id).await?, 2);
     assert_eq!(dispatch_cursor_count(&shard, routed_run_id).await?, 0);
 
+    let cancelled_run_id = create_run(&config, SHARD_ALIAS, 101).await?;
+    let cancel_payload = run_vigilo(
+        &config,
+        SHARD_ALIAS,
+        ["run", "cancel", &cancelled_run_id.to_string()],
+    )?;
+    assert_eq!(cancel_payload["data"]["status"].as_str(), Some("cancelled"));
+    assert_eq!(cancel_payload["meta"]["cancelled"], true);
+    assert_eq!(cancel_payload["meta"]["chunks_cancelled"], 2);
+    assert_eq!(
+        run_chunk_status_count(&shard, cancelled_run_id, "cancelled").await?,
+        2,
+        "routed cancellation closes execution-owned chunks in the shard database"
+    );
+    assert_eq!(
+        dispatch_cursor_status_count(&primary, cancelled_run_id, "drained").await?,
+        2,
+        "routed cancellation drains control-owned dispatch cursors"
+    );
+    assert_eq!(
+        outbox_event_count(&primary, cancelled_run_id, "run.cancelled").await?,
+        1,
+        "run.cancelled remains a control-plane event"
+    );
+    assert_eq!(
+        outbox_event_count(&shard, cancelled_run_id, "run.cancelled").await?,
+        0
+    );
+
     let move_payload = run_vigilo(
         &config,
         PRIMARY_ALIAS,
@@ -392,6 +421,55 @@ async fn dispatch_cursor_count(db: &PgPool, run_id: Uuid) -> anyhow::Result<i64>
         "#,
     )
     .bind(run_id)
+    .fetch_one(db)
+    .await?)
+}
+
+async fn dispatch_cursor_status_count(
+    db: &PgPool,
+    run_id: Uuid,
+    status: &str,
+) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM run_shard_dispatch_cursors
+        WHERE run_id = $1::uuid
+          AND status = $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(status)
+    .fetch_one(db)
+    .await?)
+}
+
+async fn run_chunk_status_count(db: &PgPool, run_id: Uuid, status: &str) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM run_chunks
+        WHERE run_id = $1::uuid
+          AND status = $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(status)
+    .fetch_one(db)
+    .await?)
+}
+
+async fn outbox_event_count(db: &PgPool, run_id: Uuid, event_type: &str) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM outbox_events
+        WHERE aggregate_id = $1::uuid
+          AND event_type = $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(event_type)
     .fetch_one(db)
     .await?)
 }

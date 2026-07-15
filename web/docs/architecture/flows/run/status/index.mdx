@@ -17,7 +17,7 @@ import decisionFlowDiagram from './decision-flow.mmd';
 
 # Run Status Command
 
-How `vigilo run status` loads one run snapshot and returns the same status payload shape used by run watches.
+How `vigilo run status` loads the control run row, reads routed shard summaries, and returns the same status payload shape used by run watches.
 
 A terminal run is not necessarily a passing run. Check `status` for lifecycle and `gate_status` for the evaluation policy outcome; CI should treat `completed` with `gate_status: pass` as success.
 

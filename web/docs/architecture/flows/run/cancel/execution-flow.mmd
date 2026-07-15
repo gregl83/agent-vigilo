@@ -10,11 +10,12 @@ sequenceDiagram
     actor User
     participant Vigilo
     participant ControlDB as Control DB
+    participant ExecDB as Execution DBs
 
     User->>Vigilo: vigilo run cancel
     activate Vigilo
     Vigilo->>Vigilo: Parse run id
-    Vigilo->>ControlDB: Begin cancellation transaction and lock run
+    Vigilo->>ControlDB: Lock run and mark cancellation requested
     ControlDB-->>Vigilo: Run status
 
     alt Run does not exist
@@ -22,13 +23,21 @@ sequenceDiagram
     else Run is completed or failed
         Vigilo-->>User: Cancellation error
     else Run is already cancelled
-        Vigilo->>ControlDB: Load cancelled run snapshot
-        ControlDB-->>Vigilo: Cancellation outcome
+        Vigilo->>ControlDB: Drain dispatch cursors
+        Vigilo->>ControlDB: Resolve readable execution routes
+        ControlDB-->>Vigilo: Route list
+        Vigilo->>ExecDB: Idempotently cancel local work by placement
+        ExecDB-->>Vigilo: Cancellation counts
+        Vigilo->>ControlDB: Refresh cancellation summary and event
         Vigilo-->>User: Success response
     else Run is pending, running, or finalizing
-        Vigilo->>ControlDB: Cancel control-visible open work
-        Vigilo->>ControlDB: Mark run cancelled and enqueue event
-        ControlDB-->>Vigilo: Cancellation outcome
+        Vigilo->>ControlDB: Drain dispatch cursors
+        Vigilo->>ControlDB: Resolve readable execution routes
+        ControlDB-->>Vigilo: Route list
+        Vigilo->>ExecDB: Cancel attempts, executions, and chunks
+        ExecDB-->>Vigilo: Cancellation counts and summaries
+        Vigilo->>ControlDB: Persist final cancellation summary
+        Vigilo->>ControlDB: Enqueue run.cancelled
         Vigilo-->>User: Success response
     end
     deactivate Vigilo

@@ -13,6 +13,8 @@
 //!   snapshots, and owns chunk visibility plus expired chunk lease recovery.
 //! - `run_shard_summary` refreshes shard-local progress rollups used by later
 //!   global finalization.
+//! - `run_status` combines the control run row with routed shard-summary
+//!   progress for status/watch reads.
 //! - `run_results` combines routed shard summaries for run-level reporting.
 //! - `run_export` pages routed execution artifacts for run export.
 //! - `shard_admin` owns placement catalog guardrails for admin commands.
@@ -35,4 +37,5 @@ pub(crate) mod run_finalize;
 pub(crate) mod run_profile_validation;
 pub(crate) mod run_results;
 pub(crate) mod run_shard_summary;
+pub(crate) mod run_status;
 pub(crate) mod shard_admin;

@@ -7,13 +7,18 @@
 
 use super::*;
 
-async fn select_existing_run_for_watch(db: &sqlx::PgPool, run_id: Uuid) -> anyhow::Result<Run> {
-    runs::select_run_by_id(db, run_id).await?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "run '{}' was not found; watch only waits for runs that already exist",
-            run_id
-        )
-    })
+async fn select_existing_run_for_watch(
+    database: &crate::context::database::Db,
+    run_id: Uuid,
+) -> anyhow::Result<run_status_workflow::RunStatusProjection> {
+    run_status_workflow::select_run_status(database, run_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "run '{}' was not found; watch only waits for runs that already exist",
+                run_id
+            )
+        })
 }
 
 pub(super) async fn exec(
@@ -24,29 +29,29 @@ pub(super) async fn exec(
     fail_on_gate: bool,
 ) -> anyhow::Result<()> {
     let run_id = parse_run_id(&run_id)?;
-    let db = context.db().await?.control().await?;
+    let database = context.db().await?;
     let out = context.out().await?;
     let interval = Duration::from_secs(interval_seconds);
     let deadline = timeout_seconds.map(|seconds| Instant::now() + Duration::from_secs(seconds));
     let mut last_snapshot = None;
-    let mut run = select_existing_run_for_watch(db, run_id).await?;
+    let mut status = select_existing_run_for_watch(database, run_id).await?;
 
     loop {
-        let terminal = is_terminal_run_status(&run.status);
-        let snapshot = RunWatchSnapshotKey::from(&run);
+        let terminal = is_terminal_run_status(&status.run.status);
+        let snapshot = RunWatchSnapshotKey::from(&status);
 
         if last_snapshot.as_ref() != Some(&snapshot) || terminal {
-            out.write_value(&run_watch_payload(&run, terminal))?;
+            out.write_value(&run_watch_payload_from_status(&status, terminal))?;
             out.flush()?;
             last_snapshot = Some(snapshot);
         }
 
         if terminal {
-            if let Some(reason) = run_terminal_failure_reason(&run) {
+            if let Some(reason) = run_terminal_failure_reason(&status.run) {
                 anyhow::bail!(reason);
             }
 
-            if fail_on_gate && let Some(reason) = run_gate_failure_reason(&run) {
+            if fail_on_gate && let Some(reason) = run_gate_failure_reason(&status.run) {
                 anyhow::bail!(reason);
             }
             return Ok(());
@@ -58,7 +63,7 @@ pub(super) async fn exec(
                 anyhow::bail!(
                     "timed out watching run '{}' before terminal status; last status={}",
                     run_id,
-                    run.status
+                    status.run.status
                 );
             }
 
@@ -68,6 +73,6 @@ pub(super) async fn exec(
         };
 
         sleep(sleep_for).await;
-        run = select_existing_run_for_watch(db, run_id).await?;
+        status = select_existing_run_for_watch(database, run_id).await?;
     }
 }

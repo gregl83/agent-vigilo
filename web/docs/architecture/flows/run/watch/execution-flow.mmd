@@ -10,15 +10,18 @@ sequenceDiagram
     actor User
     participant Vigilo
     participant ControlDB as Control DB
+    participant ExecDB as Execution DBs
 
     User->>Vigilo: vigilo run watch
     activate Vigilo
     Vigilo->>Vigilo: Parse run id and prepare watch loop
-    Vigilo->>ControlDB: Load run
-    ControlDB-->>Vigilo: Run snapshot
+    Vigilo->>ControlDB: Load run and execution routes
+    ControlDB-->>Vigilo: Run snapshot and route list
+    Vigilo->>ExecDB: Read shard summaries where available
+    ExecDB-->>Vigilo: Live progress summaries
 
     loop Until terminal status or timeout
-        Vigilo->>Vigilo: Compare snapshot with last emitted state
+        Vigilo->>Vigilo: Compare control and live-progress snapshot
         alt Snapshot changed or terminal
             Vigilo-->>User: Watch update
         end
@@ -34,8 +37,10 @@ sequenceDiagram
             Vigilo-->>User: Timeout error
         else Run is still active
             Vigilo->>Vigilo: Wait for next poll interval
-            Vigilo->>ControlDB: Reload run
-            ControlDB-->>Vigilo: Run snapshot
+            Vigilo->>ControlDB: Reload run and execution routes
+            ControlDB-->>Vigilo: Run snapshot and route list
+            Vigilo->>ExecDB: Refresh shard summaries
+            ExecDB-->>Vigilo: Live progress summaries
         end
     end
     deactivate Vigilo

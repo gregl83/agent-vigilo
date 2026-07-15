@@ -10,16 +10,19 @@ sequenceDiagram
     actor User
     participant Vigilo
     participant ControlDB as Control DB
+    participant ExecDB as Execution DBs
 
     User->>Vigilo: vigilo run status
     activate Vigilo
     Vigilo->>Vigilo: Parse run id
-    Vigilo->>ControlDB: Load run
-    ControlDB-->>Vigilo: Run snapshot
+    Vigilo->>ControlDB: Load run and execution routes
+    ControlDB-->>Vigilo: Run snapshot and route list
 
     alt Run loaded
+        Vigilo->>ExecDB: Read shard summaries where available
+        ExecDB-->>Vigilo: Live progress summaries
         Vigilo->>Vigilo: Mark whether status is terminal
-        Vigilo->>Vigilo: Build status payload
+        Vigilo->>Vigilo: Build status payload with live_progress
         Vigilo-->>User: Success response
     else Run lookup fails
         Vigilo-->>User: Status error
