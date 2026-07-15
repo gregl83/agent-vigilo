@@ -15,7 +15,6 @@ use std::collections::{
 use sqlx::{
     Postgres,
     QueryBuilder,
-    types::Json,
 };
 use uuid::Uuid;
 
@@ -40,6 +39,10 @@ use crate::{
 const CASE_BLOB_INSERT_CHUNK_SIZE: usize = 500;
 const DATASET_MEMBERSHIP_INSERT_CHUNK_SIZE: usize = 2_000;
 const RUN_CHUNK_INSERT_CHUNK_SIZE: usize = 2_000;
+
+fn jsonb_text(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).expect("serializing serde_json::Value should not fail")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunShardPlacementAssignment {
@@ -252,11 +255,16 @@ pub(crate) async fn bulk_insert_case_blobs(
             b.push_bind(&row.case_hash)
                 .push_bind(&row.task_type)
                 .push_bind(&row.case_group)
-                .push_bind(Json(row.input_payload.clone()))
-                .push_bind(Json(row.expected_output.clone()))
-                .push_bind(Json(row.context_payload.clone()))
-                .push_bind(Json(row.tags.clone()))
-                .push_bind(Json(row.metadata.clone()));
+                .push_bind(jsonb_text(&row.input_payload))
+                .push_unseparated("::jsonb")
+                .push_bind(jsonb_text(&row.expected_output))
+                .push_unseparated("::jsonb")
+                .push_bind(jsonb_text(&row.context_payload))
+                .push_unseparated("::jsonb")
+                .push_bind(jsonb_text(&row.tags))
+                .push_unseparated("::jsonb")
+                .push_bind(jsonb_text(&row.metadata))
+                .push_unseparated("::jsonb");
         });
 
         query_builder.push(" ON CONFLICT (case_hash) DO NOTHING");
