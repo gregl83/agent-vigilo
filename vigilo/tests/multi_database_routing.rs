@@ -436,6 +436,7 @@ fn run_vigilo_with_policy<'a>(
     shard_assignment_policy: &str,
     args: impl IntoIterator<Item = &'a str>,
 ) -> anyhow::Result<Value> {
+    let args = args.into_iter().collect::<Vec<_>>();
     let output = Command::new(env!("CARGO_BIN_EXE_vigilo"))
         .env(PRIMARY_DATABASE_URL_ENV, &config.primary_url)
         .env(SHARD_DATABASE_URL_ENV, &config.shard_url)
@@ -446,12 +447,13 @@ fn run_vigilo_with_policy<'a>(
         )
         .env("VIGILO_SHARD_ASSIGNMENT_POLICY", shard_assignment_policy)
         .args(["-q", "-f", "json"])
-        .args(args)
+        .args(&args)
         .output()?;
 
     if !output.status.success() {
         anyhow::bail!(
-            "vigilo command failed with status {}\nstdout:\n{}\nstderr:\n{}",
+            "vigilo command {:?} failed with status {}\nstdout:\n{}\nstderr:\n{}",
+            args,
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)

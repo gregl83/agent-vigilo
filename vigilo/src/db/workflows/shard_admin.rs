@@ -1482,6 +1482,10 @@ async fn copy_json_rows(db: &PgPool, table: &str, rows: Vec<Value>) -> anyhow::R
         return Ok(0);
     }
 
+    if table == "case_blobs" {
+        return copy_case_blob_rows(db, rows).await;
+    }
+
     let sql = format!(
         r#"
         INSERT INTO {table}
@@ -1495,6 +1499,41 @@ async fn copy_json_rows(db: &PgPool, table: &str, rows: Vec<Value>) -> anyhow::R
         .bind(Json(Value::Array(rows)))
         .execute(db)
         .await?;
+
+    Ok(result.rows_affected())
+}
+
+async fn copy_case_blob_rows(db: &PgPool, rows: Vec<Value>) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        r#"
+        INSERT INTO case_blobs (
+            case_hash,
+            task_type,
+            case_group,
+            input_payload,
+            expected_output,
+            context_payload,
+            tags,
+            metadata,
+            created_at
+        )
+        SELECT
+            row->>'case_hash',
+            row->>'task_type',
+            row->>'case_group',
+            COALESCE(row->'input_payload', 'null'::jsonb),
+            COALESCE(row->'expected_output', 'null'::jsonb),
+            COALESCE(row->'context_payload', 'null'::jsonb),
+            COALESCE(row->'tags', '[]'::jsonb),
+            COALESCE(row->'metadata', '{}'::jsonb),
+            COALESCE((row->>'created_at')::timestamptz, now())
+        FROM jsonb_array_elements($1::jsonb) AS source(row)
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(Json(Value::Array(rows)))
+    .execute(db)
+    .await?;
 
     Ok(result.rows_affected())
 }
@@ -1881,6 +1920,41 @@ mod tests {
         assert!(outcome.tables.iter().all(|table| table.verified));
         assert_eq!(outcome.placement.database_alias, "shard_001");
         assert_eq!(outcome.placement.status, SHARD_PLACEMENT_STATUS_ACTIVE);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn copy_case_blob_rows_preserves_json_null_context(pool: PgPool) {
+        let case_hash = format!("case-{}", Uuid::now_v7());
+        let source_rows = vec![serde_json::json!({
+            "case_hash": case_hash,
+            "task_type": "classification",
+            "case_group": null,
+            "input_payload": {"text": "hello"},
+            "expected_output": null,
+            "context_payload": null,
+            "tags": [],
+            "metadata": {},
+            "created_at": Utc::now(),
+        })];
+
+        copy_json_rows(&pool, "case_blobs", source_rows)
+            .await
+            .unwrap();
+
+        let context_payload = sqlx::query_scalar::<_, Value>(
+            r#"
+            SELECT context_payload
+            FROM case_blobs
+            WHERE case_hash = $1
+            "#,
+        )
+        .bind(case_hash)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(context_payload, Value::Null);
     }
 
     #[test]
