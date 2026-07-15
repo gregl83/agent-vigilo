@@ -229,6 +229,24 @@ runs
 between execution placements. Source cleanup is intentionally outside the move
 command so teams can apply their own backup and retention policy.
 
+## Bulk Rebalance
+
+Use rebalance operations when adding capacity or draining a placement:
+
+```text
+vigilo shard rebalance plan --to shard_001 --max-items 100
+vigilo shard rebalance plan --from primary --to shard_001 --max-items 100
+vigilo shard rebalance apply <operation_id> --max-items 25
+vigilo shard rebalance verify <operation_id> --max-items 25
+vigilo shard rebalance cancel <operation_id>
+```
+
+A rebalance plan records one item per `run_id + run_shard` in control storage.
+Apply is resumable and bounded; each item still uses the single-shard move
+workflow, including route fencing, copy verification, and active-work guards.
+Plans verify the stored `route_version` before moving an item so stale plans
+fail narrowly instead of rewriting an unexpected route.
+
 ## Current Scope
 
 Implemented today:
@@ -239,15 +257,16 @@ Implemented today:
 - Routed run creation, dispatch, worker processing, lease recovery, outbox
   publication, shard summaries, finalization, cancellation, live status/watch
   progress, results, export, route inspection, route fencing, placement
-  assignment policy, and explicit shard move.
+  assignment policy, explicit shard move, and persisted bulk rebalance
+  operations.
 - CI coverage for the black-box multi-database route path: run creation to
   `primary` and `shard_001`, route inspection, control-owned cursors, routed
-  cancellation, spread-active assignment for one run, shard move,
-  route-version inspection, and prerequisite-copy verification.
+  cancellation, spread-active assignment for one run, shard move, rebalance
+  plan/apply resume/verify, route-version inspection, and prerequisite-copy
+  verification.
 
 Intentionally deferred:
 
-- Bulk rebalancing commands for adding or removing large numbers of placements.
 - Evaluator metadata replication to execution placements.
 - Broader canonical case-data routing and replication.
 - End-to-end multi-database coordinator and worker integration coverage.

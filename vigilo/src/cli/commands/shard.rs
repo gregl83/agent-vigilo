@@ -75,6 +75,12 @@ pub(crate) enum SubCommand {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
+
+    /// Plan, apply, verify, or cancel bulk shard movement
+    Rebalance {
+        #[command(subcommand)]
+        command: RebalanceSubCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -138,6 +144,59 @@ pub(crate) enum PlacementSubCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+/// Bulk shard rebalance operations.
+pub(crate) enum RebalanceSubCommand {
+    /// Create a persisted rebalance plan
+    Plan {
+        /// Optional source placement to drain
+        #[arg(long)]
+        from: Option<String>,
+
+        /// Target database placement alias
+        #[arg(long, alias = "to")]
+        target: String,
+
+        /// Maximum items to include in this plan
+        #[arg(long, default_value_t = 100)]
+        max_items: usize,
+
+        /// Build and print the plan without persisting it
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+
+    /// Apply pending items from a persisted rebalance plan
+    Apply {
+        /// Rebalance operation UUID
+        operation_id: String,
+
+        /// Maximum pending items to apply in this pass
+        #[arg(long, default_value_t = 25)]
+        max_items: usize,
+
+        /// Allow moving shards that still have leased chunks or running attempts
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+
+    /// Verify completed items from a persisted rebalance plan
+    Verify {
+        /// Rebalance operation UUID
+        operation_id: String,
+
+        /// Maximum completed items to verify in this pass
+        #[arg(long, default_value_t = 25)]
+        max_items: usize,
+    },
+
+    /// Cancel unapplied items in a persisted rebalance plan
+    Cancel {
+        /// Rebalance operation UUID
+        operation_id: String,
+    },
+}
+
 #[derive(Debug, Args)]
 /// Arguments for `vigilo shard`.
 pub(crate) struct Command {
@@ -170,6 +229,7 @@ impl Executable for Command {
                 .await
             }
             SubCommand::Placements { command } => exec_placement_command(context, command).await,
+            SubCommand::Rebalance { command } => exec_rebalance_command(context, command).await,
             SubCommand::Route { run_id, run_shard } => {
                 exec_route_command(context, run_id, run_shard).await
             }
@@ -322,8 +382,93 @@ async fn exec_placement_command(
     Ok(())
 }
 
+async fn exec_rebalance_command(
+    context: Context,
+    command: RebalanceSubCommand,
+) -> anyhow::Result<()> {
+    let database = context.db().await?;
+    let out = context.out().await?;
+
+    match command {
+        RebalanceSubCommand::Plan {
+            from,
+            target,
+            max_items,
+            dry_run,
+        } => {
+            let outcome = shard_admin::plan_shard_rebalance(
+                database,
+                shard_admin::ShardRebalancePlanOptions {
+                    source_database_alias: from,
+                    target_database_alias: target,
+                    max_items,
+                    dry_run,
+                },
+            )
+            .await?;
+            info!(
+                operation_id = ?outcome.operation.as_ref().map(|operation| operation.id),
+                planned_item_count = outcome.items.len(),
+                dry_run = outcome.dry_run,
+                "planned shard rebalance operation"
+            );
+            out.write_value(&rebalance_plan_payload(&outcome))?;
+        }
+        RebalanceSubCommand::Apply {
+            operation_id,
+            max_items,
+            force,
+        } => {
+            let operation_id = parse_operation_id(&operation_id)?;
+            let outcome = shard_admin::apply_shard_rebalance(
+                database,
+                operation_id,
+                shard_admin::ShardRebalanceApplyOptions { max_items, force },
+            )
+            .await?;
+            info!(
+                operation_id = %outcome.operation.id,
+                processed_item_count = outcome.processed_items.len(),
+                operation_status = %outcome.operation.status,
+                "applied shard rebalance operation"
+            );
+            out.write_value(&rebalance_apply_payload(&outcome))?;
+        }
+        RebalanceSubCommand::Verify {
+            operation_id,
+            max_items,
+        } => {
+            let operation_id = parse_operation_id(&operation_id)?;
+            let outcome =
+                shard_admin::verify_shard_rebalance(database, operation_id, max_items).await?;
+            info!(
+                operation_id = %outcome.operation.id,
+                verified_item_count = outcome.items.len(),
+                "verified shard rebalance operation"
+            );
+            out.write_value(&rebalance_verify_payload(&outcome))?;
+        }
+        RebalanceSubCommand::Cancel { operation_id } => {
+            let operation_id = parse_operation_id(&operation_id)?;
+            let operation = shard_admin::cancel_shard_rebalance(database, operation_id).await?;
+            info!(
+                operation_id = %operation.id,
+                operation_status = %operation.status,
+                "cancelled shard rebalance operation"
+            );
+            out.write_value(&rebalance_cancel_payload(&operation))?;
+        }
+    }
+
+    Ok(())
+}
+
 fn parse_run_id(raw: &str) -> anyhow::Result<Uuid> {
     Uuid::parse_str(raw).map_err(|err| anyhow::anyhow!("invalid run_id '{}': {}", raw, err))
+}
+
+fn parse_operation_id(raw: &str) -> anyhow::Result<Uuid> {
+    Uuid::parse_str(raw).map_err(|err| anyhow::anyhow!("invalid operation_id '{}': {}", raw, err))
 }
 
 fn database_list_payload(placements: &[DatabasePlacement]) -> Value {
@@ -409,6 +554,60 @@ fn move_payload(outcome: &shard_admin::ShardMoveOutcome) -> Value {
             "forced": outcome.forced,
             "moved": outcome.moved,
             "verified": outcome.tables.iter().all(|table| table.verified),
+        }
+    })
+}
+
+fn rebalance_plan_payload(outcome: &shard_admin::ShardRebalancePlanOutcome) -> Value {
+    json!({
+        "data": {
+            "operation": outcome.operation,
+            "items": outcome.items,
+        },
+        "meta": {
+            "dry_run": outcome.dry_run,
+            "planned_item_count": outcome.items.len(),
+            "persisted": outcome.operation.is_some(),
+        }
+    })
+}
+
+fn rebalance_apply_payload(outcome: &shard_admin::ShardRebalanceApplyOutcome) -> Value {
+    json!({
+        "data": {
+            "operation": outcome.operation,
+            "items": outcome.processed_items,
+        },
+        "meta": {
+            "processed_item_count": outcome.processed_items.len(),
+            "completed_item_count": outcome.operation.completed_item_count,
+            "failed_item_count": outcome.operation.failed_item_count,
+            "cancelled_item_count": outcome.operation.cancelled_item_count,
+        }
+    })
+}
+
+fn rebalance_verify_payload(outcome: &shard_admin::ShardRebalanceVerifyOutcome) -> Value {
+    let verified = outcome.items.iter().all(|item| item.verified);
+    json!({
+        "data": {
+            "operation": outcome.operation,
+            "items": outcome.items,
+        },
+        "meta": {
+            "verified": verified,
+            "verified_item_count": outcome.items.len(),
+        }
+    })
+}
+
+fn rebalance_cancel_payload(operation: &shard_admin::ShardRebalanceOperation) -> Value {
+    json!({
+        "data": {
+            "operation": operation,
+        },
+        "meta": {
+            "cancelled": operation.status == "cancelled",
         }
     })
 }
@@ -514,6 +713,72 @@ mod tests {
     }
 
     #[test]
+    fn rebalance_plan_command_matches_argument_shape() {
+        let cli = TestCli::try_parse_from([
+            "vigilo",
+            "rebalance",
+            "plan",
+            "--from",
+            "primary",
+            "--to",
+            "shard_001",
+            "--max-items",
+            "12",
+            "--dry-run",
+        ])
+        .unwrap();
+
+        let SubCommand::Rebalance {
+            command:
+                RebalanceSubCommand::Plan {
+                    from,
+                    target,
+                    max_items,
+                    dry_run,
+                },
+        } = cli.command
+        else {
+            panic!("expected shard rebalance plan command");
+        };
+
+        assert_eq!(from.as_deref(), Some("primary"));
+        assert_eq!(target, "shard_001");
+        assert_eq!(max_items, 12);
+        assert!(dry_run);
+    }
+
+    #[test]
+    fn rebalance_apply_command_matches_argument_shape() {
+        let operation_id = Uuid::now_v7().to_string();
+        let cli = TestCli::try_parse_from([
+            "vigilo",
+            "rebalance",
+            "apply",
+            &operation_id,
+            "--max-items",
+            "3",
+            "--force",
+        ])
+        .unwrap();
+
+        let SubCommand::Rebalance {
+            command:
+                RebalanceSubCommand::Apply {
+                    operation_id: parsed_operation_id,
+                    max_items,
+                    force,
+                },
+        } = cli.command
+        else {
+            panic!("expected shard rebalance apply command");
+        };
+
+        assert_eq!(parsed_operation_id, operation_id);
+        assert_eq!(max_items, 3);
+        assert!(force);
+    }
+
+    #[test]
     fn database_list_payload_reports_count() {
         let placement = DatabasePlacement {
             alias: "shard_001".to_string(),
@@ -603,6 +868,27 @@ mod tests {
         assert_eq!(payload["meta"]["moved"], json!(true));
         assert_eq!(payload["meta"]["verified"], json!(true));
         assert_eq!(payload["data"]["tables"][0]["table"], json!("run_chunks"));
+    }
+
+    #[test]
+    fn rebalance_plan_payload_reports_persisted_state() {
+        let outcome = shard_admin::ShardRebalancePlanOutcome {
+            operation: None,
+            dry_run: true,
+            items: vec![shard_admin::PlannedShardRebalanceItem {
+                run_id: Uuid::now_v7(),
+                run_shard: 4,
+                source_database_alias: "primary".to_string(),
+                target_database_alias: "shard_001".to_string(),
+                planned_route_version: 1,
+            }],
+        };
+
+        let payload = rebalance_plan_payload(&outcome);
+
+        assert_eq!(payload["meta"]["dry_run"], json!(true));
+        assert_eq!(payload["meta"]["persisted"], json!(false));
+        assert_eq!(payload["meta"]["planned_item_count"], json!(1));
     }
 
     #[test]

@@ -182,6 +182,81 @@ async fn multi_database_routing_flow() -> anyhow::Result<()> {
     assert_eq!(run_chunk_count(&primary, spread_run_id).await?, 2);
     assert_eq!(run_chunk_count(&shard, spread_run_id).await?, 1);
 
+    let rebalance_plan = run_vigilo(
+        &config,
+        PRIMARY_ALIAS,
+        [
+            "shard",
+            "rebalance",
+            "plan",
+            "--from",
+            PRIMARY_ALIAS,
+            "--to",
+            SHARD_ALIAS,
+            "--max-items",
+            "2",
+        ],
+    )?;
+    assert_eq!(rebalance_plan["meta"]["persisted"], true);
+    assert_eq!(rebalance_plan["meta"]["planned_item_count"], 2);
+    let rebalance_operation_id = rebalance_plan["data"]["operation"]["id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("rebalance plan did not return an operation id"))?;
+
+    let rebalance_apply_once = run_vigilo(
+        &config,
+        PRIMARY_ALIAS,
+        [
+            "shard",
+            "rebalance",
+            "apply",
+            rebalance_operation_id,
+            "--max-items",
+            "1",
+        ],
+    )?;
+    assert_eq!(rebalance_apply_once["meta"]["processed_item_count"], 1);
+    assert_eq!(
+        rebalance_apply_once["data"]["operation"]["status"].as_str(),
+        Some("running")
+    );
+
+    let rebalance_apply_resume = run_vigilo(
+        &config,
+        PRIMARY_ALIAS,
+        [
+            "shard",
+            "rebalance",
+            "apply",
+            rebalance_operation_id,
+            "--max-items",
+            "5",
+        ],
+    )?;
+    assert_eq!(
+        rebalance_apply_resume["data"]["operation"]["status"].as_str(),
+        Some("completed")
+    );
+    assert_eq!(
+        rebalance_apply_resume["data"]["operation"]["completed_item_count"],
+        2
+    );
+
+    let rebalance_verify = run_vigilo(
+        &config,
+        PRIMARY_ALIAS,
+        [
+            "shard",
+            "rebalance",
+            "verify",
+            rebalance_operation_id,
+            "--max-items",
+            "2",
+        ],
+    )?;
+    assert_eq!(rebalance_verify["meta"]["verified"], true);
+    assert_eq!(rebalance_verify["meta"]["verified_item_count"], 2);
+
     let move_payload = run_vigilo(
         &config,
         PRIMARY_ALIAS,

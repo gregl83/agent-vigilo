@@ -5,6 +5,12 @@
 //! databases, disable shard databases, assign empty run shards, and move
 //! shard-owned rows between placements.
 
+use std::collections::BTreeMap;
+
+use chrono::{
+    DateTime,
+    Utc,
+};
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::{
@@ -84,11 +90,103 @@ pub(crate) struct ShardRouteInspection {
     pub(crate) routing_decision: &'static str,
 }
 
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub(crate) struct ShardRebalanceOperation {
+    pub(crate) id: Uuid,
+    pub(crate) strategy: String,
+    pub(crate) source_database_alias: Option<String>,
+    pub(crate) target_database_alias: String,
+    pub(crate) status: String,
+    pub(crate) planned_item_count: i32,
+    pub(crate) completed_item_count: i32,
+    pub(crate) failed_item_count: i32,
+    pub(crate) cancelled_item_count: i32,
+    pub(crate) error_message: Option<String>,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) started_at: Option<DateTime<Utc>>,
+    pub(crate) completed_at: Option<DateTime<Utc>>,
+    pub(crate) cancelled_at: Option<DateTime<Utc>>,
+    pub(crate) updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub(crate) struct ShardRebalanceItem {
+    pub(crate) operation_id: Uuid,
+    pub(crate) sequence_no: i32,
+    pub(crate) run_id: Uuid,
+    pub(crate) run_shard: i16,
+    pub(crate) source_database_alias: String,
+    pub(crate) target_database_alias: String,
+    pub(crate) planned_route_version: i64,
+    pub(crate) status: String,
+    pub(crate) error_message: Option<String>,
+    pub(crate) started_at: Option<DateTime<Utc>>,
+    pub(crate) completed_at: Option<DateTime<Utc>>,
+    pub(crate) updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct PlannedShardRebalanceItem {
+    pub(crate) run_id: Uuid,
+    pub(crate) run_shard: i16,
+    pub(crate) source_database_alias: String,
+    pub(crate) target_database_alias: String,
+    pub(crate) planned_route_version: i64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ShardRebalancePlanOptions {
+    pub(crate) source_database_alias: Option<String>,
+    pub(crate) target_database_alias: String,
+    pub(crate) max_items: usize,
+    pub(crate) dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ShardRebalancePlanOutcome {
+    pub(crate) operation: Option<ShardRebalanceOperation>,
+    pub(crate) items: Vec<PlannedShardRebalanceItem>,
+    pub(crate) dry_run: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ShardRebalanceApplyOptions {
+    pub(crate) max_items: usize,
+    pub(crate) force: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ShardRebalanceApplyOutcome {
+    pub(crate) operation: ShardRebalanceOperation,
+    pub(crate) processed_items: Vec<ShardRebalanceItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ShardRebalanceVerifyItem {
+    pub(crate) item: ShardRebalanceItem,
+    pub(crate) verified: bool,
+    pub(crate) tables: Vec<ShardMoveTableReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ShardRebalanceVerifyOutcome {
+    pub(crate) operation: ShardRebalanceOperation,
+    pub(crate) items: Vec<ShardRebalanceVerifyItem>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ShardMoveOptions {
     pub(crate) dry_run: bool,
     pub(crate) verify_only: bool,
     pub(crate) force: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShardRebalanceCandidate {
+    run_id: Uuid,
+    run_shard: i16,
+    source_database_alias: String,
+    route_version: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -127,6 +225,15 @@ const SHARD_TABLES: &[ShardTable] = &[
         name: "run_shard_summaries",
     },
 ];
+
+const REBALANCE_STRATEGY_DRAIN_SOURCE: &str = "drain-source";
+const REBALANCE_STRATEGY_FILL_TARGET: &str = "fill-target";
+const REBALANCE_OPERATION_STATUS_RUNNING: &str = "running";
+const REBALANCE_OPERATION_STATUS_COMPLETED: &str = "completed";
+const REBALANCE_OPERATION_STATUS_CANCELLED: &str = "cancelled";
+const REBALANCE_OPERATION_STATUS_FAILED: &str = "failed";
+const REBALANCE_ITEM_STATUS_COMPLETED: &str = "completed";
+const REBALANCE_ITEM_STATUS_FAILED: &str = "failed";
 
 pub(crate) async fn list_database_placements(
     db: &PgPool,
@@ -346,6 +453,259 @@ pub(crate) async fn set_shard_placement(
     })
 }
 
+/// Creates a persisted rebalance plan or returns the same plan without writing.
+///
+/// The plan records only intended moves. Applying the plan still uses
+/// `move_shard_placement` for each item, so copy, verification, and route
+/// fencing remain centralized in the single-shard move workflow.
+pub(crate) async fn plan_shard_rebalance(
+    database: &database::Db,
+    options: ShardRebalancePlanOptions,
+) -> anyhow::Result<ShardRebalancePlanOutcome> {
+    validate_non_empty(&options.target_database_alias, "target database alias")?;
+    if options.max_items == 0 {
+        anyhow::bail!("max_items must be greater than zero");
+    }
+
+    let control_db = database.control().await?;
+    validate_target_placement(control_db, &options.target_database_alias).await?;
+    if let Some(source_alias) = &options.source_database_alias {
+        validate_source_placement(control_db, source_alias).await?;
+        if source_alias == &options.target_database_alias {
+            anyhow::bail!("source and target database aliases must differ");
+        }
+    }
+
+    let active_aliases = database
+        .active_shard_capable_database_aliases()
+        .await?
+        .into_iter()
+        .filter(|alias| options.source_database_alias.as_ref() != Some(alias))
+        .collect::<Vec<_>>();
+    let candidates = select_rebalance_candidates(
+        list_active_rebalance_candidates(control_db).await?,
+        &active_aliases,
+        options.source_database_alias.as_deref(),
+        &options.target_database_alias,
+        options.max_items,
+    );
+    let items = candidates
+        .into_iter()
+        .map(|candidate| PlannedShardRebalanceItem {
+            run_id: candidate.run_id,
+            run_shard: candidate.run_shard,
+            source_database_alias: candidate.source_database_alias,
+            target_database_alias: options.target_database_alias.clone(),
+            planned_route_version: candidate.route_version,
+        })
+        .collect::<Vec<_>>();
+
+    if options.dry_run {
+        return Ok(ShardRebalancePlanOutcome {
+            operation: None,
+            items,
+            dry_run: true,
+        });
+    }
+
+    let strategy = if options.source_database_alias.is_some() {
+        REBALANCE_STRATEGY_DRAIN_SOURCE
+    } else {
+        REBALANCE_STRATEGY_FILL_TARGET
+    };
+    let operation = insert_rebalance_operation(
+        control_db,
+        strategy,
+        options.source_database_alias.as_deref(),
+        &options.target_database_alias,
+        &items,
+    )
+    .await?;
+
+    Ok(ShardRebalancePlanOutcome {
+        operation: Some(operation),
+        items,
+        dry_run: false,
+    })
+}
+
+/// Applies up to `max_items` pending moves from a persisted rebalance plan.
+///
+/// Re-running apply resumes from remaining pending items. Failed items retain
+/// their error in the item ledger; pending items are left untouched.
+pub(crate) async fn apply_shard_rebalance(
+    database: &database::Db,
+    operation_id: Uuid,
+    options: ShardRebalanceApplyOptions,
+) -> anyhow::Result<ShardRebalanceApplyOutcome> {
+    if options.max_items == 0 {
+        anyhow::bail!("max_items must be greater than zero");
+    }
+
+    let control_db = database.control().await?;
+    let operation = select_rebalance_operation(control_db, operation_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("shard rebalance operation {} was not found", operation_id)
+        })?;
+
+    if matches!(
+        operation.status.as_str(),
+        REBALANCE_OPERATION_STATUS_COMPLETED
+            | REBALANCE_OPERATION_STATUS_CANCELLED
+            | REBALANCE_OPERATION_STATUS_FAILED
+    ) {
+        anyhow::bail!(
+            "shard rebalance operation {} has terminal status {}",
+            operation_id,
+            operation.status
+        );
+    }
+
+    mark_rebalance_operation_running(control_db, operation_id).await?;
+    let pending_items =
+        list_rebalance_apply_items(control_db, operation_id, options.max_items).await?;
+    let mut processed_items = Vec::with_capacity(pending_items.len());
+
+    for item in pending_items {
+        mark_rebalance_item_running(control_db, &item).await?;
+        let result = apply_rebalance_item(database, &item, options.force).await;
+        match result {
+            Ok(()) => {
+                processed_items.push(
+                    mark_rebalance_item_completed(
+                        control_db,
+                        operation_id,
+                        item.run_id,
+                        item.run_shard,
+                    )
+                    .await?,
+                );
+            }
+            Err(error) => {
+                processed_items.push(
+                    mark_rebalance_item_failed(
+                        control_db,
+                        operation_id,
+                        item.run_id,
+                        item.run_shard,
+                        &error.to_string(),
+                    )
+                    .await?,
+                );
+            }
+        }
+    }
+
+    let operation = refresh_rebalance_operation_status(control_db, operation_id).await?;
+
+    Ok(ShardRebalanceApplyOutcome {
+        operation,
+        processed_items,
+    })
+}
+
+pub(crate) async fn verify_shard_rebalance(
+    database: &database::Db,
+    operation_id: Uuid,
+    max_items: usize,
+) -> anyhow::Result<ShardRebalanceVerifyOutcome> {
+    if max_items == 0 {
+        anyhow::bail!("max_items must be greater than zero");
+    }
+
+    let control_db = database.control().await?;
+    let operation = select_rebalance_operation(control_db, operation_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("shard rebalance operation {} was not found", operation_id)
+        })?;
+    let items = list_rebalance_items_by_status(
+        control_db,
+        operation_id,
+        REBALANCE_ITEM_STATUS_COMPLETED,
+        max_items,
+    )
+    .await?;
+    let mut verified_items = Vec::with_capacity(items.len());
+
+    for item in items {
+        let source_db = database.placement(&item.source_database_alias).await?;
+        let target_db = database.placement(&item.target_database_alias).await?;
+        let reports = verify_move_tables(
+            source_db,
+            target_db,
+            item.run_id,
+            item.run_shard,
+            &BTreeMap::new(),
+        )
+        .await?;
+        let verified = reports.iter().all(|report| report.verified);
+        verified_items.push(ShardRebalanceVerifyItem {
+            item,
+            verified,
+            tables: reports,
+        });
+    }
+
+    Ok(ShardRebalanceVerifyOutcome {
+        operation,
+        items: verified_items,
+    })
+}
+
+pub(crate) async fn cancel_shard_rebalance(
+    database: &database::Db,
+    operation_id: Uuid,
+) -> anyhow::Result<ShardRebalanceOperation> {
+    let control_db = database.control().await?;
+    let operation = select_rebalance_operation(control_db, operation_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("shard rebalance operation {} was not found", operation_id)
+        })?;
+
+    if matches!(
+        operation.status.as_str(),
+        REBALANCE_OPERATION_STATUS_COMPLETED
+            | REBALANCE_OPERATION_STATUS_CANCELLED
+            | REBALANCE_OPERATION_STATUS_FAILED
+    ) {
+        return Ok(operation);
+    }
+
+    sqlx::query(
+        r#"
+        WITH cancelled AS (
+            UPDATE shard_rebalance_items
+            SET status = 'cancelled',
+                completed_at = now(),
+                updated_at = now()
+            WHERE operation_id = $1::uuid
+              AND status IN ('pending', 'running')
+            RETURNING 1
+        )
+        UPDATE shard_rebalance_operations
+        SET status = 'cancelled',
+            cancelled_item_count = (
+                SELECT COUNT(*)::int
+                FROM shard_rebalance_items
+                WHERE operation_id = $1::uuid
+                  AND status = 'cancelled'
+            ),
+            cancelled_at = now(),
+            updated_at = now()
+        WHERE id = $1::uuid
+        RETURNING *
+        "#,
+    )
+    .bind(operation_id)
+    .fetch_one(control_db)
+    .await?;
+
+    Ok(operation)
+}
+
 pub(crate) async fn move_shard_placement(
     database: &database::Db,
     run_id: Uuid,
@@ -384,16 +744,6 @@ pub(crate) async fn move_shard_placement(
 
     let source_db = database.placement(&current.database_alias).await?;
     let target_db = database.placement(target_database_alias).await?;
-    let marked_moving =
-        !options.dry_run && !options.verify_only && current.status == SHARD_PLACEMENT_STATUS_ACTIVE;
-
-    if marked_moving {
-        mark_shard_moving(control_db, run_id, run_shard).await?;
-        database
-            .invalidate_execution_placement(run_id, run_shard)
-            .await;
-    }
-
     let active_work_count = count_active_shard_work(source_db, run_id, run_shard).await?;
 
     if active_work_count > 0 && !options.force && !options.verify_only {
@@ -403,6 +753,16 @@ pub(crate) async fn move_shard_placement(
             run_shard,
             active_work_count
         );
+    }
+
+    let marked_moving =
+        !options.dry_run && !options.verify_only && current.status == SHARD_PLACEMENT_STATUS_ACTIVE;
+
+    if marked_moving {
+        mark_shard_moving(control_db, run_id, run_shard).await?;
+        database
+            .invalidate_execution_placement(run_id, run_shard)
+            .await;
     }
 
     let mut copied_rows_by_table = std::collections::BTreeMap::<&'static str, u64>::new();
@@ -478,6 +838,447 @@ pub(crate) async fn move_shard_placement(
     })
 }
 
+fn select_rebalance_candidates(
+    candidates: Vec<ShardRebalanceCandidate>,
+    active_shard_aliases: &[String],
+    source_database_alias: Option<&str>,
+    target_database_alias: &str,
+    max_items: usize,
+) -> Vec<ShardRebalanceCandidate> {
+    if max_items == 0 {
+        return Vec::new();
+    }
+
+    let mut counts = active_shard_aliases
+        .iter()
+        .map(|alias| (alias.as_str(), 0usize))
+        .collect::<BTreeMap<_, _>>();
+    for candidate in &candidates {
+        if let Some(count) = counts.get_mut(candidate.source_database_alias.as_str()) {
+            *count += 1;
+        }
+    }
+
+    let mut candidates = candidates
+        .into_iter()
+        .filter(|candidate| candidate.source_database_alias != target_database_alias)
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.source_database_alias
+            .cmp(&right.source_database_alias)
+            .then_with(|| left.run_id.cmp(&right.run_id))
+            .then_with(|| left.run_shard.cmp(&right.run_shard))
+    });
+
+    if let Some(source_alias) = source_database_alias {
+        return candidates
+            .into_iter()
+            .filter(|candidate| candidate.source_database_alias == source_alias)
+            .take(max_items)
+            .collect();
+    }
+
+    let alias_count = active_shard_aliases.len();
+    if alias_count < 2 {
+        return Vec::new();
+    }
+
+    let target_count = counts
+        .get(target_database_alias)
+        .copied()
+        .unwrap_or_default();
+    let total = counts.values().sum::<usize>();
+    let desired_per_alias = total.div_ceil(alias_count);
+    let needed = desired_per_alias.saturating_sub(target_count);
+    if needed == 0 {
+        return Vec::new();
+    }
+
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            counts
+                .get(candidate.source_database_alias.as_str())
+                .is_some_and(|count| *count > desired_per_alias)
+        })
+        .take(max_items.min(needed))
+        .collect()
+}
+
+async fn list_active_rebalance_candidates(
+    db: &PgPool,
+) -> anyhow::Result<Vec<ShardRebalanceCandidate>> {
+    let candidates = sqlx::query_as::<_, (Uuid, i16, String, i64)>(
+        r#"
+        SELECT sp.run_id, sp.run_shard, sp.database_alias, sp.route_version
+        FROM shard_placements sp
+        JOIN database_placements dp
+          ON dp.alias = sp.database_alias
+        WHERE sp.status = 'active'
+          AND dp.status = 'active'
+          AND dp.role IN ('shard', 'control_and_shard')
+        ORDER BY sp.database_alias, sp.run_id, sp.run_shard
+        "#,
+    )
+    .fetch_all(db)
+    .await?
+    .into_iter()
+    .map(
+        |(run_id, run_shard, source_database_alias, route_version)| ShardRebalanceCandidate {
+            run_id,
+            run_shard,
+            source_database_alias,
+            route_version,
+        },
+    )
+    .collect();
+
+    Ok(candidates)
+}
+
+async fn insert_rebalance_operation(
+    db: &PgPool,
+    strategy: &str,
+    source_database_alias: Option<&str>,
+    target_database_alias: &str,
+    items: &[PlannedShardRebalanceItem],
+) -> anyhow::Result<ShardRebalanceOperation> {
+    let mut tx = db.begin().await?;
+    let operation = sqlx::query_as::<_, ShardRebalanceOperation>(
+        r#"
+        INSERT INTO shard_rebalance_operations (
+            strategy,
+            source_database_alias,
+            target_database_alias,
+            planned_item_count
+        )
+        VALUES ($1, $2, $3, $4)
+        RETURNING *
+        "#,
+    )
+    .bind(strategy)
+    .bind(source_database_alias)
+    .bind(target_database_alias)
+    .bind(items.len() as i32)
+    .fetch_one(tx.as_mut())
+    .await?;
+
+    for (idx, item) in items.iter().enumerate() {
+        sqlx::query(
+            r#"
+            INSERT INTO shard_rebalance_items (
+                operation_id,
+                sequence_no,
+                run_id,
+                run_shard,
+                source_database_alias,
+                target_database_alias,
+                planned_route_version
+            )
+            VALUES ($1::uuid, $2, $3::uuid, $4, $5, $6, $7)
+            "#,
+        )
+        .bind(operation.id)
+        .bind(idx as i32)
+        .bind(item.run_id)
+        .bind(item.run_shard)
+        .bind(&item.source_database_alias)
+        .bind(&item.target_database_alias)
+        .bind(item.planned_route_version)
+        .execute(tx.as_mut())
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(operation)
+}
+
+async fn select_rebalance_operation(
+    db: &PgPool,
+    operation_id: Uuid,
+) -> anyhow::Result<Option<ShardRebalanceOperation>> {
+    let operation = sqlx::query_as::<_, ShardRebalanceOperation>(
+        r#"
+        SELECT *
+        FROM shard_rebalance_operations
+        WHERE id = $1::uuid
+        "#,
+    )
+    .bind(operation_id)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(operation)
+}
+
+async fn mark_rebalance_operation_running(db: &PgPool, operation_id: Uuid) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE shard_rebalance_operations
+        SET status = 'running',
+            started_at = COALESCE(started_at, now()),
+            updated_at = now()
+        WHERE id = $1::uuid
+          AND status IN ('planned', 'running')
+        "#,
+    )
+    .bind(operation_id)
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+async fn list_rebalance_items_by_status(
+    db: &PgPool,
+    operation_id: Uuid,
+    status: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<ShardRebalanceItem>> {
+    let items = sqlx::query_as::<_, ShardRebalanceItem>(
+        r#"
+        SELECT *
+        FROM shard_rebalance_items
+        WHERE operation_id = $1::uuid
+          AND status = $2
+        ORDER BY sequence_no
+        LIMIT $3
+        "#,
+    )
+    .bind(operation_id)
+    .bind(status)
+    .bind(limit as i64)
+    .fetch_all(db)
+    .await?;
+
+    Ok(items)
+}
+
+async fn list_rebalance_apply_items(
+    db: &PgPool,
+    operation_id: Uuid,
+    limit: usize,
+) -> anyhow::Result<Vec<ShardRebalanceItem>> {
+    let items = sqlx::query_as::<_, ShardRebalanceItem>(
+        r#"
+        SELECT *
+        FROM shard_rebalance_items
+        WHERE operation_id = $1::uuid
+          AND status IN ('pending', 'running')
+        ORDER BY sequence_no
+        LIMIT $2
+        "#,
+    )
+    .bind(operation_id)
+    .bind(limit as i64)
+    .fetch_all(db)
+    .await?;
+
+    Ok(items)
+}
+
+async fn mark_rebalance_item_running(db: &PgPool, item: &ShardRebalanceItem) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE shard_rebalance_items
+        SET status = 'running',
+            started_at = COALESCE(started_at, now()),
+            updated_at = now()
+        WHERE operation_id = $1::uuid
+          AND run_id = $2::uuid
+          AND run_shard = $3
+          AND status = 'pending'
+        "#,
+    )
+    .bind(item.operation_id)
+    .bind(item.run_id)
+    .bind(item.run_shard)
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+async fn mark_rebalance_item_completed(
+    db: &PgPool,
+    operation_id: Uuid,
+    run_id: Uuid,
+    run_shard: i16,
+) -> anyhow::Result<ShardRebalanceItem> {
+    mark_rebalance_item_status(
+        db,
+        operation_id,
+        run_id,
+        run_shard,
+        REBALANCE_ITEM_STATUS_COMPLETED,
+        None,
+    )
+    .await
+}
+
+async fn mark_rebalance_item_failed(
+    db: &PgPool,
+    operation_id: Uuid,
+    run_id: Uuid,
+    run_shard: i16,
+    error_message: &str,
+) -> anyhow::Result<ShardRebalanceItem> {
+    mark_rebalance_item_status(
+        db,
+        operation_id,
+        run_id,
+        run_shard,
+        REBALANCE_ITEM_STATUS_FAILED,
+        Some(error_message),
+    )
+    .await
+}
+
+async fn mark_rebalance_item_status(
+    db: &PgPool,
+    operation_id: Uuid,
+    run_id: Uuid,
+    run_shard: i16,
+    status: &str,
+    error_message: Option<&str>,
+) -> anyhow::Result<ShardRebalanceItem> {
+    let item = sqlx::query_as::<_, ShardRebalanceItem>(
+        r#"
+        UPDATE shard_rebalance_items
+        SET status = $4,
+            error_message = $5,
+            completed_at = CASE WHEN $4 IN ('completed', 'failed', 'cancelled') THEN now() ELSE completed_at END,
+            updated_at = now()
+        WHERE operation_id = $1::uuid
+          AND run_id = $2::uuid
+          AND run_shard = $3
+        RETURNING *
+        "#,
+    )
+    .bind(operation_id)
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(status)
+    .bind(error_message)
+    .fetch_one(db)
+    .await?;
+
+    Ok(item)
+}
+
+async fn apply_rebalance_item(
+    database: &database::Db,
+    item: &ShardRebalanceItem,
+    force: bool,
+) -> anyhow::Result<()> {
+    let control_db = database.control().await?;
+    let current = shard_placements::select_shard_placement(control_db, item.run_id, item.run_shard)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "shard placement for run {} shard {} was not found",
+                item.run_id,
+                item.run_shard
+            )
+        })?;
+
+    if current.database_alias == item.target_database_alias
+        && current.status == SHARD_PLACEMENT_STATUS_ACTIVE
+    {
+        return Ok(());
+    }
+
+    if current.database_alias != item.source_database_alias
+        || current.route_version != item.planned_route_version
+        || current.status != SHARD_PLACEMENT_STATUS_ACTIVE
+    {
+        anyhow::bail!(
+            "planned route is stale for run {} shard {}; expected {} version {}, found {} status {} version {}",
+            item.run_id,
+            item.run_shard,
+            item.source_database_alias,
+            item.planned_route_version,
+            current.database_alias,
+            current.status,
+            current.route_version
+        );
+    }
+
+    move_shard_placement(
+        database,
+        item.run_id,
+        item.run_shard,
+        &item.target_database_alias,
+        ShardMoveOptions {
+            dry_run: false,
+            verify_only: false,
+            force,
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn refresh_rebalance_operation_status(
+    db: &PgPool,
+    operation_id: Uuid,
+) -> anyhow::Result<ShardRebalanceOperation> {
+    let (pending, running, completed, failed, cancelled) =
+        sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+            r#"
+            SELECT
+                COUNT(*) FILTER (WHERE status = 'pending')::bigint,
+                COUNT(*) FILTER (WHERE status = 'running')::bigint,
+                COUNT(*) FILTER (WHERE status = 'completed')::bigint,
+                COUNT(*) FILTER (WHERE status = 'failed')::bigint,
+                COUNT(*) FILTER (WHERE status = 'cancelled')::bigint
+            FROM shard_rebalance_items
+            WHERE operation_id = $1::uuid
+            "#,
+        )
+        .bind(operation_id)
+        .fetch_one(db)
+        .await?;
+    let status = if pending == 0 && running == 0 && failed == 0 {
+        REBALANCE_OPERATION_STATUS_COMPLETED
+    } else if pending == 0 && running == 0 && failed > 0 {
+        REBALANCE_OPERATION_STATUS_FAILED
+    } else {
+        REBALANCE_OPERATION_STATUS_RUNNING
+    };
+    let error_message = if status == REBALANCE_OPERATION_STATUS_FAILED {
+        Some("one or more rebalance items failed")
+    } else {
+        None
+    };
+
+    let operation = sqlx::query_as::<_, ShardRebalanceOperation>(
+        r#"
+        UPDATE shard_rebalance_operations
+        SET status = $2,
+            completed_item_count = $3,
+            failed_item_count = $4,
+            cancelled_item_count = $5,
+            error_message = $6,
+            completed_at = CASE WHEN $2 IN ('completed', 'failed') THEN now() ELSE completed_at END,
+            updated_at = now()
+        WHERE id = $1::uuid
+        RETURNING *
+        "#,
+    )
+    .bind(operation_id)
+    .bind(status)
+    .bind(completed as i32)
+    .bind(failed as i32)
+    .bind(cancelled as i32)
+    .bind(error_message)
+    .fetch_one(db)
+    .await?;
+
+    Ok(operation)
+}
+
 async fn count_shard_owned_rows(db: &PgPool, run_id: Uuid, run_shard: i16) -> anyhow::Result<i64> {
     let count = sqlx::query_scalar::<_, i64>(
         r#"
@@ -525,6 +1326,22 @@ async fn validate_target_placement(db: &PgPool, alias: &str) -> anyhow::Result<(
             "database placement alias {} has role {}, which is not shard-capable",
             target.alias,
             target.role
+        );
+    }
+
+    Ok(())
+}
+
+async fn validate_source_placement(db: &PgPool, alias: &str) -> anyhow::Result<()> {
+    let source = database_placements::select_database_placement(db, alias)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("database placement alias {} was not found", alias))?;
+
+    if !source.is_shard_capable() {
+        anyhow::bail!(
+            "database placement alias {} has role {}, which is not shard-capable",
+            source.alias,
+            source.role
         );
     }
 
@@ -1072,6 +1889,75 @@ mod tests {
         assert!(validate_run_shard(127).is_ok());
         assert!(validate_run_shard(-1).is_err());
         assert!(validate_run_shard(128).is_err());
+    }
+
+    #[test]
+    fn rebalance_candidates_drain_source_in_route_order() {
+        let run_a = Uuid::now_v7();
+        let run_b = Uuid::now_v7();
+        let candidates = vec![
+            rebalance_candidate(run_b, 2, "primary", 1),
+            rebalance_candidate(run_a, 1, "primary", 1),
+            rebalance_candidate(run_a, 0, "shard_001", 1),
+        ];
+
+        let selected = select_rebalance_candidates(
+            candidates,
+            &["primary".to_string(), "shard_001".to_string()],
+            Some("primary"),
+            "shard_001",
+            10,
+        );
+
+        assert_eq!(
+            selected,
+            vec![
+                rebalance_candidate(run_a, 1, "primary", 1),
+                rebalance_candidate(run_b, 2, "primary", 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn rebalance_candidates_fill_target_to_even_distribution() {
+        let run_id = Uuid::now_v7();
+        let candidates = vec![
+            rebalance_candidate(run_id, 0, "primary", 1),
+            rebalance_candidate(run_id, 1, "primary", 1),
+            rebalance_candidate(run_id, 2, "primary", 1),
+            rebalance_candidate(run_id, 3, "primary", 1),
+            rebalance_candidate(run_id, 4, "shard_001", 1),
+        ];
+
+        let selected = select_rebalance_candidates(
+            candidates,
+            &["primary".to_string(), "shard_001".to_string()],
+            None,
+            "shard_001",
+            10,
+        );
+
+        assert_eq!(
+            selected,
+            vec![
+                rebalance_candidate(run_id, 0, "primary", 1),
+                rebalance_candidate(run_id, 1, "primary", 1),
+            ]
+        );
+    }
+
+    fn rebalance_candidate(
+        run_id: Uuid,
+        run_shard: i16,
+        source_database_alias: &str,
+        route_version: i64,
+    ) -> ShardRebalanceCandidate {
+        ShardRebalanceCandidate {
+            run_id,
+            run_shard,
+            source_database_alias: source_database_alias.to_string(),
+            route_version,
+        }
     }
 
     fn context_with_control_pool(pool: PgPool, uri: String) -> Db {
