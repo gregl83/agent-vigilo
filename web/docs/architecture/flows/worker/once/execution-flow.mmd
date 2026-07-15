@@ -10,7 +10,8 @@ sequenceDiagram
     actor User
     participant Vigilo
     participant Queue as RabbitMQ
-    participant DB as Vigilo DB
+    participant ControlDB as Control DB
+    participant ExecutionDB as Execution DB
     participant Agent as Target Agent
     participant WASM as WASM Runtime
 
@@ -28,16 +29,20 @@ sequenceDiagram
             Vigilo->>Queue: Acknowledge message
             Vigilo-->>User: Success response
         else Valid payload
-            Vigilo->>DB: Claim chunk lease
-            DB-->>Vigilo: Claimed chunk or no claim
+            Vigilo->>ControlDB: Resolve execution route
+            ControlDB-->>Vigilo: Database alias and placement status
+            Vigilo->>ExecutionDB: Claim chunk lease
+            ExecutionDB-->>Vigilo: Claimed chunk or no claim
 
             alt Chunk not claimable
                 Vigilo->>Queue: Acknowledge duplicate or stale message
                 Vigilo-->>User: Success response
             else Chunk claimed
-                Vigilo->>DB: Load run context and case batch
-                DB-->>Vigilo: Profile, evaluator catalog, and cases
-                Vigilo->>DB: Start chunk and attempt lease heartbeat
+                Vigilo->>ExecutionDB: Load run snapshot and case batch
+                ExecutionDB-->>Vigilo: Profile snapshot and cases
+                Vigilo->>ControlDB: Load evaluator catalog metadata
+                ControlDB-->>Vigilo: Runnable evaluator records
+                Vigilo->>ExecutionDB: Start chunk and attempt lease heartbeat
                 Vigilo->>WASM: Warm evaluator components
                 WASM-->>Vigilo: Warmup result
                 Vigilo->>Queue: Hold delivery unacked while chunk is owned
@@ -48,19 +53,19 @@ sequenceDiagram
                     Vigilo->>WASM: Execute evaluators in sandboxed stores
                 end
                 WASM-->>Vigilo: Evaluation outputs
-                Vigilo->>DB: Persist batched results and lease-guarded terminal transitions
-                Vigilo->>DB: Summarize chunk execution state
-                DB-->>Vigilo: Terminal or retry-waiting chunk state
+                Vigilo->>ExecutionDB: Persist batched results and lease-guarded terminal transitions
+                Vigilo->>ExecutionDB: Refresh shard summary
+                ExecutionDB-->>Vigilo: Terminal or retry-waiting chunk state
                 alt Executions still waiting for retry
-                    Vigilo->>DB: Release chunk lease
+                    Vigilo->>ExecutionDB: Release chunk lease
                     Vigilo->>Queue: Delay message until retry window
                 else All executions terminal
-                    Vigilo->>DB: Complete chunk
+                    Vigilo->>ExecutionDB: Complete chunk
                     Vigilo->>Queue: Acknowledge message
                 end
                 Vigilo-->>User: Success response
             else Recoverable processing failure
-                Vigilo->>DB: Release chunk lease
+                Vigilo->>ExecutionDB: Release chunk lease
                 Vigilo->>Queue: Requeue or acknowledge message
                 Vigilo-->>User: Success response
             end

@@ -9,26 +9,26 @@ config:
 sequenceDiagram
     actor User
     participant Vigilo
-    participant DB as Vigilo DB
+    participant ControlDB as Control DB
 
     User->>Vigilo: vigilo run cancel
     activate Vigilo
     Vigilo->>Vigilo: Parse run id
-    Vigilo->>DB: Begin cancellation transaction and lock run
-    DB-->>Vigilo: Run status
+    Vigilo->>ControlDB: Begin cancellation transaction and lock run
+    ControlDB-->>Vigilo: Run status
 
     alt Run does not exist
         Vigilo-->>User: Run not found error
     else Run is completed or failed
         Vigilo-->>User: Cancellation error
     else Run is already cancelled
-        Vigilo->>DB: Load cancelled run snapshot
-        DB-->>Vigilo: Cancellation outcome
+        Vigilo->>ControlDB: Load cancelled run snapshot
+        ControlDB-->>Vigilo: Cancellation outcome
         Vigilo-->>User: Success response
     else Run is pending, running, or finalizing
-        Vigilo->>DB: Cancel open attempts, executions, and chunks
-        Vigilo->>DB: Mark run cancelled and enqueue event
-        DB-->>Vigilo: Cancellation outcome
+        Vigilo->>ControlDB: Cancel control-visible open work
+        Vigilo->>ControlDB: Mark run cancelled and enqueue event
+        ControlDB-->>Vigilo: Cancellation outcome
         Vigilo-->>User: Success response
     end
     deactivate Vigilo

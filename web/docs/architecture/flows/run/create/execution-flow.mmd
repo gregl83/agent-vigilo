@@ -9,25 +9,28 @@ config:
 sequenceDiagram
     actor User
     participant Vigilo
-    participant DB as Vigilo DB
+    participant ControlDB as Control DB
+    participant ExecutionDB as Execution DB
 
     User->>Vigilo: vigilo run create
     activate Vigilo
 
     Vigilo->>Vigilo: Load and parse profile and dataset inputs
     Vigilo->>Vigilo: Canonicalize payloads and validate dataset
-    Vigilo->>DB: Validate profile executability
-    DB-->>Vigilo: Runnable evaluator summary
+    Vigilo->>ControlDB: Validate profile executability
+    ControlDB-->>Vigilo: Runnable evaluator summary
 
-    Vigilo->>Vigilo: Plan case blobs, dataset version, run, chunks, and shard dispatch cursors
-    Vigilo->>DB: Store run creation records in transaction
+    Vigilo->>Vigilo: Plan case blobs, dataset version, run, chunks, placements, and dispatch cursors
+    Vigilo->>ControlDB: Store run metadata, placement rows, cursors, and canonical dataset rows
+    Vigilo->>ExecutionDB: Store execution-local prerequisites and pending chunks
 
     alt Run creation committed
-        DB-->>Vigilo: Run, dataset, case, chunk, and shard cursor records saved
+        ControlDB-->>Vigilo: Control records saved
+        ExecutionDB-->>Vigilo: Execution seed rows saved
         Vigilo->>Vigilo: Build run creation payload
         Vigilo-->>User: Success response
     else Validation or persistence fails
-        DB-->>Vigilo: Error
+        ControlDB-->>Vigilo: Error
         Vigilo-->>User: Run creation error
     end
 

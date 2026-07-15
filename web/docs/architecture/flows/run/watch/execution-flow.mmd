@@ -9,13 +9,13 @@ config:
 sequenceDiagram
     actor User
     participant Vigilo
-    participant DB as Vigilo DB
+    participant ControlDB as Control DB
 
     User->>Vigilo: vigilo run watch
     activate Vigilo
     Vigilo->>Vigilo: Parse run id and prepare watch loop
-    Vigilo->>DB: Load run
-    DB-->>Vigilo: Run snapshot
+    Vigilo->>ControlDB: Load run
+    ControlDB-->>Vigilo: Run snapshot
 
     loop Until terminal status or timeout
         Vigilo->>Vigilo: Compare snapshot with last emitted state
@@ -34,8 +34,8 @@ sequenceDiagram
             Vigilo-->>User: Timeout error
         else Run is still active
             Vigilo->>Vigilo: Wait for next poll interval
-            Vigilo->>DB: Reload run
-            DB-->>Vigilo: Run snapshot
+            Vigilo->>ControlDB: Reload run
+            ControlDB-->>Vigilo: Run snapshot
         end
     end
     deactivate Vigilo

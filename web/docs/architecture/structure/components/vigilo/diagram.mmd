@@ -16,7 +16,7 @@ flowchart TD
 
     %% components
     CliRouter["fa:fa-terminal <br/> <b>CLI App and Command Router</b> <br/> <small>[Component: Rust / Clap]</small> <br/> <small>Parses global options and dispatches setup, evaluator, run, coordinator, and worker commands.</small>"]:::component
-    RuntimeContext["fa:fa-layer-group <br/> <b>Runtime Context Provider</b> <br/> <small>[Component: Rust]</small> <br/> <small>Lazily initializes database, messaging, output, registry cache, and Wasm runtime clients.</small>"]:::component
+    RuntimeContext["fa:fa-layer-group <br/> <b>Runtime Context Provider</b> <br/> <small>[Component: Rust]</small> <br/> <small>Lazily initializes routed database access, messaging, output, registry cache, and Wasm runtime clients.</small>"]:::component
     OutputRenderer["fa:fa-file-lines <br/> <b>Output Renderer</b> <br/> <small>[Component: Rust]</small> <br/> <small>Writes structured command responses as JSON or TOON.</small>"]:::component
 
     SetupManager["fa:fa-screwdriver-wrench <br/> <b>Setup Manager</b> <br/> <small>[Component: Rust]</small> <br/> <small>Applies schema migrations and bootstraps built-in evaluator packages.</small>"]:::component
@@ -25,8 +25,8 @@ flowchart TD
 
     RunPlanner["fa:fa-list-check <br/> <b>Run Input Planner</b> <br/> <small>[Component: Rust]</small> <br/> <small>Reads profile and dataset payloads, canonicalizes case data, and plans run chunks.</small>"]:::component
     RunValidator["fa:fa-shield-halved <br/> <b>Run Validation Service</b> <br/> <small>[Component: Rust]</small> <br/> <small>Checks agent settings, evaluator references, runnable evaluator state, and case group coverage.</small>"]:::component
-    RunPersistence["fa:fa-database <br/> <b>Run Persistence Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Persists case blobs, dataset versions, run rows, and pending chunks transactionally.</small>"]:::component
-    RunQueries["fa:fa-magnifying-glass <br/> <b>Run Query and Export Component</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Serves run status, watch, cancel, results, and export command flows.</small>"]:::component
+    RunPersistence["fa:fa-database <br/> <b>Run Persistence Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Persists control metadata, placement rows, and execution-local run seed data.</small>"]:::component
+    RunQueries["fa:fa-magnifying-glass <br/> <b>Run Query and Export Component</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Serves status/watch from control storage and routes results/export through shard placements.</small>"]:::component
 
     CoordinatorFacade["fa:fa-compass <br/> <b>Coordinator Command Facade</b> <br/> <small>[Component: Rust]</small> <br/> <small>Starts or executes coordinator orchestration cycles.</small>"]:::component
     WorkerFacade["fa:fa-gear <br/> <b>Worker Command Facade</b> <br/> <small>[Component: Rust]</small> <br/> <small>Starts or executes worker processing cycles.</small>"]:::component
@@ -51,7 +51,7 @@ flowchart TD
     style VigiloRuntime stroke-dasharray: 5 5,fill:none,stroke:#1168bd,stroke-width:2px
 
     %% external containers
-    Database[("<b>Database</b> <br/> <small>[Container: PostgreSQL]</small> <br/> <small>Stores evaluators, datasets, runs, chunks, results, outbox ledger events, hot delivery rows, and migrations.</small>")]:::component
+    Database[("<b>Database Placements</b> <br/> <small>[Container: PostgreSQL]</small> <br/> <small>Store control metadata, routed execution rows, outbox ledgers, delivery rows, and migrations.</small>")]:::component
     Queue[("<b>Queue</b> <br/> <small>[Container: RabbitMQ]</small> <br/> <small>Distributes run chunk-ready events to workers.</small>")]:::component
     Coordinator["fa:fa-compass <br/> <b>Coordinator</b> <br/> <small>[Container: Rust]</small> <br/> <small>Owns run dispatch, finalization, and outbox publication.</small>"]:::component
     Worker["fa:fa-gear <br/> <b>Worker</b> <br/> <small>[Container: Rust]</small> <br/> <small>Consumes chunks, invokes the target agent, runs evaluators, and persists results.</small>"]:::component
@@ -83,7 +83,7 @@ flowchart TD
     RunPlanner -->|"Validates executability with"| RunValidator
     RunPlanner -->|"Persists planned runs through"| RunPersistence
     RunValidator -->|"Checks evaluator registry and profile data in <br> <small>[SQL/TCP]</small>"| Database
-    RunPersistence -->|"Writes run, dataset, case, and chunk records to <br> <small>[SQL/TCP]</small>"| Database
+    RunPersistence -->|"Writes control and execution seed records to <br> <small>[SQL/TCP]</small>"| Database
     RunQueries -->|"Reads and updates run state in <br> <small>[SQL/TCP]</small>"| Database
     RunQueries -->|"Writes formatted results using"| OutputRenderer
 

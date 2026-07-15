@@ -9,14 +9,14 @@ config:
 sequenceDiagram
     actor User
     participant Vigilo
-    participant DB as Vigilo DB
+    participant ControlDB as Control DB
 
     User->>Vigilo: vigilo run test
     activate Vigilo
 
     Vigilo->>Vigilo: Load and parse profile and dataset inputs
-    Vigilo->>DB: Validate profile executability
-    DB-->>Vigilo: Runnable evaluator summary
+    Vigilo->>ControlDB: Validate profile executability
+    ControlDB-->>Vigilo: Runnable evaluator summary
 
     alt Inputs are executable
         Vigilo->>Vigilo: Build validation payload

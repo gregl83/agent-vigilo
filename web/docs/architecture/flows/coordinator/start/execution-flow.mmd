@@ -9,7 +9,8 @@ config:
 sequenceDiagram
     actor User
     participant Vigilo
-    participant DB as Vigilo DB
+    participant ControlDB as Control DB
+    participant ExecutionDB as Execution DBs
     participant Queue as RabbitMQ
 
     User->>Vigilo: vigilo coordinator start
@@ -24,19 +25,24 @@ sequenceDiagram
             Vigilo-->>User: Success response
         else Tick elapsed
             Vigilo->>Vigilo: Run coordinator cycle
-            Vigilo->>DB: Recover expired chunk leases
-            DB-->>Vigilo: Recovered and failed chunk counts
-            Vigilo->>DB: Drain dispatchable run-shard windows
-            DB-->>Vigilo: Dispatch shard window count
-            Vigilo->>DB: Drain finalizable runs
-            DB-->>Vigilo: Finalization count
-            Vigilo->>DB: Claim publishable outbox delivery rows
-            DB-->>Vigilo: Joined event payload batch
+            Vigilo->>ControlDB: List active execution placements
+            Vigilo->>ExecutionDB: Recover expired chunk leases per placement
+            ExecutionDB-->>Vigilo: Recovered and failed chunk counts
+            Vigilo->>ControlDB: Drain dispatchable run-shard cursors
+            Vigilo->>ExecutionDB: Dispatch routed chunk windows
+            ExecutionDB-->>Vigilo: Dispatch shard window count
+            Vigilo->>ControlDB: Claim finalizable runs
+            Vigilo->>ExecutionDB: Read routed shard summaries
+            Vigilo->>ControlDB: Write global finalization result
+            ControlDB-->>Vigilo: Finalization count
+            Vigilo->>ControlDB: List active outbox placements
+            Vigilo->>ExecutionDB: Claim publishable outbox rows per placement
+            ExecutionDB-->>Vigilo: Joined event payload batches
             loop Bounded outbox publish concurrency
                 Vigilo->>Queue: Declare durable topology and publish persistent mandatory events
             end
             Queue-->>Vigilo: Confirmed routed publishes or returned/nacked publishes
-            Vigilo->>DB: Mark ledger published and delete or retry delivery rows
+            Vigilo->>ExecutionDB: Mark ledger published and delete or retry delivery rows
         else Cycle or shutdown fails
             Vigilo-->>User: Service error
         end

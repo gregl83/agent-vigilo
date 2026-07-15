@@ -9,21 +9,24 @@ config:
 sequenceDiagram
     actor User
     participant Vigilo
-    participant DB as Vigilo DB
+    participant ControlDB as Control DB
+    participant ExecutionDB as Execution DBs
 
     User->>Vigilo: vigilo run export
     activate Vigilo
 
     Vigilo->>Vigilo: Validate export request
-    Vigilo->>DB: Load run
-    DB-->>Vigilo: Run record
-    Vigilo->>DB: Load results summary
-    DB-->>Vigilo: Summary counts and scores
+    Vigilo->>ControlDB: Load run
+    ControlDB-->>Vigilo: Run record
+    Vigilo->>ControlDB: Resolve readable execution routes
+    ControlDB-->>Vigilo: Run-shard database aliases
+    Vigilo->>ExecutionDB: Load routed shard summaries
+    ExecutionDB-->>Vigilo: Summary counts and scores
 
     alt JSON export
-        loop Execution batches
-            Vigilo->>DB: Load executions and related records
-            DB-->>Vigilo: Batch data
+        loop Routed shard batches
+            Vigilo->>ExecutionDB: Load executions and related records
+            ExecutionDB-->>Vigilo: Batch data
             Vigilo->>Vigilo: Accumulate export data
         end
         Vigilo->>Vigilo: Build export payload
@@ -31,9 +34,9 @@ sequenceDiagram
     else JSONL export
         Vigilo-->>User: Run line
         Vigilo-->>User: Summary line
-        loop Execution batches
-            Vigilo->>DB: Load executions and related records
-            DB-->>Vigilo: Batch data
+        loop Routed shard batches
+            Vigilo->>ExecutionDB: Load executions and related records
+            ExecutionDB-->>Vigilo: Batch data
             Vigilo-->>User: Execution, aggregate, attempt, and result lines
         end
         Vigilo-->>User: Success response

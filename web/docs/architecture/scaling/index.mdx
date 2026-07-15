@@ -2,7 +2,7 @@
 title: Scaling
 sidebar_label: Scaling
 sidebar_position: 0
-description: Logical shard model, single-cluster startup posture, and migration runbook for expanding Agent Vigilo execution data across larger PostgreSQL capacity.
+description: How Agent Vigilo uses logical run shards, placement metadata, and routed execution storage to scale PostgreSQL-backed evaluation runs.
 keywords:
   - Agent Vigilo scale out
   - evaluation shard migration
@@ -12,24 +12,25 @@ keywords:
 
 # Scaling
 
-Agent Vigilo is designed to start with one PostgreSQL database and grow without changing application code. The default setup stores control data and execution data in the same database. The schema still records a stable `run_shard` for high-volume execution rows so those rows can later move to additional PostgreSQL placements.
+Agent Vigilo starts with one PostgreSQL database and a routing model that can
+grow beyond it. The default deployment stores control data and execution data
+in the same placement. As evaluation volume grows, execution-owned rows can move
+to additional PostgreSQL placements without changing coordinator or worker code.
 
-## Default Setup
+The design principle is simple: **control metadata decides where work lives;
+workers and coordinators follow the stored route.**
 
-Most teams only need one database to start:
+## Default Posture
+
+Most teams can start with one database:
 
 ```text
 DATABASE_URL=postgres://...
-```
-
-`vigilo setup` applies migrations, seeds the default placement catalog, and validates that the process can connect to the control database. These optional settings default to `primary`:
-
-```text
 VIGILO_CONTROL_DATABASE_ALIAS=primary
 VIGILO_DEFAULT_SHARD_DATABASE_ALIAS=primary
 ```
 
-The seeded catalog row is:
+`vigilo setup` applies migrations and seeds:
 
 ```text
 alias = primary
@@ -38,219 +39,107 @@ role = control_and_shard
 status = active
 ```
 
-That means all data routes to the same PostgreSQL database until you add another placement.
+All logical shards route to `primary` until another shard-capable placement is
+added and selected for new or moved run shards.
 
-## Database Architecture
+## Control And Execution Storage
 
-Agent Vigilo separates database purpose from database location:
+Agent Vigilo separates database responsibility from database location.
 
-- **Control storage** is the source of truth for evaluator registry rows, global run metadata, placement catalog rows, coordinator state, and other control-plane records.
-- **Execution storage** holds high-volume run work: chunks, executions, attempts, aggregates, evaluator results, and shard-local workflow state.
-- A **database placement** is a named PostgreSQL target such as `primary` or `shard_001`.
-- A **shard placement** maps one `run_id + run_shard` pair to a database placement.
-
-In the default deployment, `primary` has role `control_and_shard`, so it is both the control database and the execution database.
-
-In a larger deployment, there is still only one active control-capable placement. Additional placements can have role `shard` and hold execution-owned rows. Routing changes by updating placement rows, not by changing worker or coordinator code.
-
-Environment variables only hold connection secrets. The database placement catalog is the authority for which placements exist and what role each placement has.
-
-## Current Implementation Status
-
-Implemented today:
-
-- 128 logical `run_shard` values.
-- Shard-partitioned high-volume execution tables inside one PostgreSQL database.
-- Placement catalog tables: `database_placements` and `shard_placements`.
-- A seeded `primary -> DATABASE_URL` placement with role `control_and_shard`.
-- Runtime configuration for the control alias and default shard-capable alias.
-- Placement catalog validation during `vigilo setup`.
-- Run creation inserts one active `shard_placements` row for each `run_shard`
-  used by the run.
-- Run creation writes pending chunks and local case/run prerequisites to the
-  selected execution placement, while control storage keeps placement rows and
-  dispatch cursors.
-- A database service/router that exposes `control()` and execution routing primitives to DB/workflow code.
-- Chunk-ready messages that carry `run_id`, `run_shard`, and `chunk_id`.
-- Worker chunk-local processing resolves the execution database by
-  `run_id + run_shard`; run profile and evaluator registry metadata remain
-  control-plane reads. `moving` or `draining` shard placements delay worker
-  messages instead of allowing new chunk claims.
-- Coordinator dispatch selects dispatchable `run_id + run_shard` routes from
-  control storage, resolves the execution placement, and runs a
-  route-constrained shard dispatch statement. The dispatch statement prepares
-  an execution-local run snapshot before inserting worker-visible chunk events.
-- Chunk lease recovery runs bounded recovery passes per active execution
+- **Control storage** owns evaluator registry rows, global run metadata,
+  placement catalog rows, dispatch cursors, coordinator leases, and global run
+  lifecycle updates.
+- **Execution storage** owns high-volume run work: chunks, run snapshots,
+  executions, attempts, aggregates, evaluator results, shard summaries, and
+  chunk-ready outbox events.
+- **Database placements** name PostgreSQL targets such as `primary` or
+  `shard_001`.
+- **Shard placements** map one `run_id + run_shard` pair to a database
   placement.
-- Durable outbox publishing runs once per active database placement. Control
-  workflows publish from the control outbox; execution workflows publish from
-  the execution placement that owns the changed rows.
-- Worker chunk-local SQL uses the execution-local run snapshot instead of
-  joining the authoritative control `runs` row.
-- Shard-local `run_shard_summaries` roll execution/chunk progress up to one row
-  per `run_id + run_shard`.
-- Coordinator finalization reads those routed shard summaries, aggregates them
-  in memory, writes the global `runs` outcome in control storage, and emits
-  `run.completed` from the control outbox.
-- `run results` reads global run metadata from control storage and combines
-  routed shard summaries from execution placements.
-- `run export --format jsonl` streams one routed run shard at a time and marks
-  execution-scoped records with `run_shard` and `database_alias`.
-- `run export --format json` pages routed shards and materializes a single JSON
-  document for smaller exports.
-- Result/export read routing can inspect `moving` or `draining` shard
-  placements; those states block new work, not reads from the current source
-  placement.
-- `vigilo shard move` copies one `run_id + run_shard` to another execution
-  placement, verifies row counts and checksums, and switches the routing row
-  after verification.
-- CI runs a two-Postgres integration test for routed dispatch, worker-owned
-  execution writes, results, export, finalization, and shard move.
 
-Not implemented yet:
+There is one active control-capable placement. Additional placements can have
+role `shard` and store execution data. Environment variables hold connection
+secrets; the placement catalog in PostgreSQL is the routing authority.
 
-- Multi-placement assignment policy at run creation.
-- Cancellation, status fanout, evaluator metadata replication, and canonical
-  case-data routing/replication paths migrated to execution placement routing.
+## Logical Shards
 
-The current system should be read as **single-database operation by default,
-with routed execution workflows being introduced behind the database service
-boundary**.
-
-## Current Shard Model
-
-The system uses 128 logical shards:
+The system uses 128 stable logical shards:
 
 ```text
 run_shard = 0..127
 ```
 
-Run chunks receive a shard during run creation. Every execution, attempt, aggregate, and evaluator result produced from that chunk carries the same shard key:
+Run chunks receive a `run_shard` during run creation. Execution-owned rows keep
+that same key:
 
 ```text
 run_chunks(run_id, run_shard, id)
-run_shard_dispatch_cursors(run_id, run_shard)
 executions(run_id, run_shard, id)
 execution_attempts(run_id, run_shard, id)
 execution_aggregates(run_id, run_shard, execution_id)
 evaluator_results(run_id, run_shard, id)
+run_snapshots(run_id, run_shard)
+run_shard_summaries(run_id, run_shard)
 ```
 
-The high-volume tables are list partitioned by `run_shard`. A worker that owns one chunk can query by `run_id + run_shard + chunk_id`, keeping the chunk-local workflow on one partition per table.
+High-volume execution tables are list partitioned by `run_shard`. The key is
+stable for the lifetime of a chunk and its child rows. Adding database capacity
+does not recalculate `run_shard`; it changes stored placement rows.
 
-## Default Single-Database Deployment
+## Routing Lifecycle
 
-The default deployment can keep every logical shard on one PostgreSQL cluster:
+Run creation writes both control metadata and execution seed data:
 
-```text
-run_shard 0..127 -> primary PostgreSQL
-```
+- Control storage receives the run row, placement rows, dispatch cursors, and
+  canonical dataset metadata.
+- The selected execution placement receives local prerequisites and pending
+  chunks.
+- The initial assignment rule is explicit and conservative: new run shards use
+  `VIGILO_DEFAULT_SHARD_DATABASE_ALIAS`.
 
-No multi-cluster routing is required to start. The shard key still matters because it prevents one massive run from concentrating all execution writes into one physical partition.
+Coordinator dispatch is route-constrained:
 
-## Queue and Worker Routing
+- Control storage selects one open `run_id + run_shard` dispatch cursor.
+- The database service resolves that shard placement to an execution pool.
+- The execution placement upserts `run_snapshots`, marks pending chunks
+  dispatched, and writes `run.chunk.ready` outbox events.
+- The control cursor is released or marked drained.
 
-Chunk-ready messages include the routing key:
+Workers stay chunk-local:
 
-```json
-{
-  "run_id": "00000000-0000-0000-0000-000000000000",
-  "run_shard": 42,
-  "chunk_id": "00000000-0000-0000-0000-000000000000"
-}
-```
+- Worker messages carry `run_id`, `run_shard`, and `chunk_id`.
+- The worker resolves the execution route once, then claims chunks, loads the
+  local run snapshot and case data, persists attempts/results/aggregates, and
+  refreshes the shard summary in that execution placement.
+- Evaluator registry metadata remains a control-plane read.
 
-Workers use `run_id + run_shard + chunk_id` to claim the chunk. In the default deployment every shard points at the same pool. Later routing phases will resolve `run_id + run_shard` to the correct execution placement before worker transactions start.
+Finalization fans in:
 
-## Coordinator Dispatch Routing
+- Each execution placement maintains `run_shard_summaries`.
+- The coordinator reads routed summaries for the run.
+- Control storage writes the global run outcome and emits `run.completed`.
 
-Run creation stores one `run_shard_dispatch_cursors` row for every logical shard used by the run. Each coordinator dispatch window claims one open cursor with `FOR UPDATE SKIP LOCKED`, selects pending chunks only for that `run_id + run_shard`, and then either releases the cursor for another window or marks it drained when no undispatched pending chunks remain. Dispatch updates the parent `runs` row only when starting a pending run; already-running runs dispatch by cursor while taking only a compatible shared run-row lock.
+Outbox publication is local to the database where the state changed. Control
+events publish from the control outbox. Execution events publish from the
+execution placement that owns the changed rows.
 
-This means a single dispatch statement is shard-local. A large run is not forced onto one shard; its chunks remain spread across the 128 logical shard range. Because open cursors are ordered by cursor update time, repeated dispatch windows rotate across a run's active shards instead of draining the lowest shard first. Multiple coordinators can claim different open shard cursors for the same already-running run without taking incompatible run-row locks, while cancellation and finalization still serialize through their exclusive lifecycle updates.
+## Operating Placements
 
-## Placement Reference
-
-Placement metadata exists even in the default single-database deployment.
-
-`database_placements` is the placement catalog:
-
-```text
-alias              stable placement name, such as primary or shard_001
-database_url_env   environment variable that holds the connection URL
-role               control, shard, or control_and_shard
-status             active or disabled
-```
-
-`shard_placements` is the execution routing map:
-
-```text
-run_id + run_shard -> database_alias
-```
-
-The runtime router reads placement rows from control storage. DB workflow code can resolve execution-owned storage by `run_id + run_shard`, validate that the target alias is active and shard-capable, and return the pool for that placement.
-
-Every new run must create placement rows for the `run_shard` values it uses. Missing `shard_placements` rows are setup or run-creation errors. Expansion changes placement rows, not the `run_shard` value stored on execution rows.
-
-## Routing Boundary
-
-The router is an infrastructure primitive, not an application-level decision
-that should appear throughout thin command dispatch or generic runtime code.
-Callers should express domain intent through workflow functions such as
-evaluator publishing, run creation, chunk processing, dispatch, finalization,
-and export. Those workflows decide whether their data lives in control storage,
-execution storage, or both.
-
-Inside those DB/workflow boundaries, control storage is accessed through the
-database service's control pool and execution-owned storage is resolved by
-`run_id + run_shard`. Outside those boundaries, code should not care whether a
-run uses one database placement or many.
-
-This keeps topology decisions contained:
-
-- Evaluator registry workflows use control storage internally.
-- Run metadata workflows use control storage internally.
-- Chunk and execution workflows route execution-owned data by `run_id +
-  run_shard` internally.
-- Run finalization fans out across execution placements for shard summaries and
-  writes the global run outcome to control storage.
-- Run-level reporting and export workflows fan out across execution placements
-  internally.
-- Thin command dispatch and generic runtime code should not choose between
-  control and execution databases directly.
-
-## Adding An Execution Database
-
-The `database_placements` table is the authoritative placement catalog. Environment variables provide secret connection values and process-local defaults; they must not duplicate the placement catalog.
-
-When adding a shard placement, deploy the matching secret env var and add the
-database placement:
+Add a shard-capable placement by deploying the secret env var and registering
+the placement:
 
 ```text
 VIGILO_SHARD_001_DATABASE_URL=postgres://...
 vigilo shard databases add shard_001 --database-url-env VIGILO_SHARD_001_DATABASE_URL
 ```
 
-The command creates an active shard-only placement. It validates that the env
-var is present unless `--defer-env-validation` is passed deliberately.
-
-After that, new `shard_placements` rows can point selected execution shards at
-`shard_001`:
+Set the default for future run shards:
 
 ```text
-vigilo shard placements set <run_id> <run_shard> --alias shard_001
+VIGILO_DEFAULT_SHARD_DATABASE_ALIAS=shard_001
 ```
 
-This is only allowed for an empty or new `run_id + run_shard`. If the current
-active placement already has shard-owned rows, use the shard move workflow
-instead of directly changing the alias.
-
-The initial assignment rule is deliberately simple: every new run shard maps to
-`VIGILO_DEFAULT_SHARD_DATABASE_ALIAS` when placement rows are created. Richer
-policies should be introduced only with an explicit admin/config contract,
-because routing must read stored `shard_placements` rows instead of
-recalculating from current placement count.
-
-Useful inspection commands:
+Inspect routing metadata:
 
 ```text
 vigilo shard databases list
@@ -259,36 +148,26 @@ vigilo shard placements show <run_id> <run_shard>
 vigilo shard route <run_id> <run_shard>
 ```
 
-Use `vigilo shard route` when debugging one execution route. It reports the
-stored database alias, placement statuses, `database_url_env`, whether this
-process can resolve that env var, and whether the route is currently
-dispatchable, readable, or blocked. It does not print the database URL value.
+`vigilo shard route` reports the database alias, placement statuses,
+`database_url_env`, env-var availability, and whether the route is
+`dispatchable`, `read_only`, or `blocked`. It never prints the database URL.
 
-## Migration Runbook
+## Moving A Run Shard
 
-Use this procedure when moving logical shards to a new PostgreSQL placement.
-
-1. **Choose shard scope.** Select one `run_id + run_shard` pair.
-2. **Preview the move.** Run:
+Use shard move for a specific `run_id + run_shard`:
 
 ```text
 vigilo shard move <run_id> <run_shard> --alias <alias> --dry-run
-```
-
-3. **Move after work drains.** Run the move once selected chunks are no longer
-   `leased` and attempts are no longer `running`:
-
-```text
 vigilo shard move <run_id> <run_shard> --alias <alias>
+vigilo shard move <run_id> <run_shard> --alias <alias> --verify-only
 ```
 
-The normal command marks the shard placement `moving`, copies rows, verifies
-counts and checksums, then switches the placement to the target alias with
-status `active`. `--dry-run` and `--verify-only` are read-only. Use `--force`
-only for an explicit unsafe copy while active work remains.
+The normal move marks the shard placement `moving`, rejects active leased or
+running work unless `--force` is passed, copies shard-owned rows, verifies row
+counts and checksums, then switches the route to the target alias with status
+`active`.
 
-4. **Copy shard-owned rows.** The move workflow copies rows for the selected
-   shard scope from the source placement to the target placement:
+Moved shard-owned tables:
 
 ```text
 run_chunks
@@ -300,37 +179,31 @@ evaluator_results
 run_shard_summaries
 ```
 
-It also copies the required `dataset_versions` and `runs` rows to satisfy local
-foreign keys on the target placement. `run_shard_dispatch_cursors` remains
-control-plane metadata and is not copied between execution placements.
+The move also copies local FK prerequisites needed by the target placement.
+`run_shard_dispatch_cursors` stays in control storage and is never copied
+between execution placements. Source cleanup is intentionally outside the move
+command so teams can apply their own backup and retention policy.
 
-Dispatch locks and updates the control cursor in the control DB. The routed
-execution DB owns the local run snapshot, chunk updates, shard summary, and
-chunk-ready outbox event.
+## Current Scope
 
-5. **Verify data.** To compare an already-copied source and target without
-   copying or switching placement, run:
+Implemented today:
 
-```text
-vigilo shard move <run_id> <run_shard> --alias <alias> --verify-only
-```
+- Single-database default with a seeded `primary` placement.
+- 128 logical shards and partitioned execution tables.
+- Stored database and shard placement catalogs.
+- Routed run creation, dispatch, worker processing, lease recovery, outbox
+  publication, shard summaries, finalization, results, export, route
+  inspection, and explicit shard move.
+- CI coverage for the black-box multi-database route path: run creation to
+  `primary` and `shard_001`, route inspection, control-owned cursors, and shard
+  move.
 
-6. **Switch placement.** The successful move command updates the placement row
-to `active` on the new `database_alias`.
-7. **Resume dispatch.** Coordinators and workers resolve the same `run_id + run_shard` to the new database placement and continue processing.
-8. **Retain then clean up.** Keep source rows read-only for a retention window. Source cleanup is outside the move command and should happen only after verification and backup policy allow it.
+Intentionally deferred:
 
-## Migration Standards
+- Multi-placement assignment policy at run creation.
+- Evaluator metadata replication to execution placements.
+- Broader canonical case-data routing and replication.
+- Bulk rebalancing commands for adding or removing large numbers of placements.
 
-- `run_shard` is stable for the lifetime of a chunk and its child rows.
-- Do not recalculate `run_shard` when adding database capacity.
-- Queue messages must include `run_shard`; workers should not rediscover it with an extra lookup on the hot path.
-- Coordinator dispatch should claim `run_shard_dispatch_cursors` and select chunks by `run_id + run_shard`, not scan all chunks for a run.
-- Chunk-local worker queries should include `run_id` and `run_shard`.
-- Joins between shard-partitioned run tables must use the full logical key, including `run_shard` (for example `run_id + run_shard + execution_id`), so result queries preserve partition locality and cannot cross-match rows from different shards.
-- Run-level reporting may fan out across all 128 shards for the run.
-- Large payload artifacts should be moved outside PostgreSQL before cross-cluster movement becomes routine.
-
-## Recreating a Database
-
-For a fresh deployment, apply the original migration files normally. The 128-shard schema is part of the create-table migrations.
+These are product and operations contracts, not hidden formulas. Until they are
+designed explicitly, routing remains stored, inspectable, and conservative.

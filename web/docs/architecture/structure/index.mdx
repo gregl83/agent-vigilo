@@ -15,9 +15,9 @@ keywords:
 
 # System Structure
 
-This section describes the static structure of Agent Vigilo: the CLI runtime, coordinator, worker, PostgreSQL state store, RabbitMQ message broker, evaluator registry, and Wasmtime evaluator boundary.
+This section describes the static structure of Agent Vigilo: the CLI runtime, coordinator, worker, PostgreSQL placement model, RabbitMQ message broker, evaluator registry, and Wasmtime evaluator boundary.
 
-Agent Vigilo is structured as a distributed AI evaluation system. Runs are created through the CLI, dispatched by coordinators, processed by workers, evaluated through isolated WASM components, persisted in PostgreSQL, and signaled through durable outbox publication.
+Agent Vigilo is structured as a distributed AI evaluation system. Runs are created through the CLI, dispatched by coordinators, processed by workers, evaluated through isolated WASM components, persisted through routed PostgreSQL workflows, and signaled through durable outbox publication.
 
 ## What This Section Covers
 
@@ -103,7 +103,7 @@ Agent Vigilo is structured as a distributed AI evaluation system. Runs are creat
 - **CLI runtime** parses commands, initializes shared context, applies migrations, publishes evaluators, creates runs, starts services, and renders JSON or TOON output.
 - **Coordinator** recovers expired chunk leases, marks abandoned running attempts stale, claims coordinator leases, dispatches runnable chunks, finalizes completed runs, and publishes state-change events from the outbox delivery queue.
 - **Worker** consumes `run.chunk.ready` messages, claims chunk leases, allocates due attempts with worker and message ownership, renews chunk and attempt leases, delays retry-scheduled chunks until `retry_after`, invokes target agents, runs evaluator bindings, persists results, and settles RabbitMQ deliveries.
-- **PostgreSQL** is the authority for evaluators, datasets, runs, shard-partitioned chunks, attempts, evaluator results, execution aggregates, coordinator leases, outbox ledger rows, and hot delivery rows.
+- **PostgreSQL placements** hold control metadata and routed execution data: evaluators, datasets, runs, shard-partitioned chunks, attempts, evaluator results, execution aggregates, coordinator leases, outbox ledger rows, and hot delivery rows.
 - **RabbitMQ** distributes worker-ready chunk messages and receives confirmed durable event publications from the outbox publisher.
 - **Wasmtime** executes versioned WASI Preview 2 evaluator components with per-invocation store limits and a process-wide active-evaluation semaphore.
 

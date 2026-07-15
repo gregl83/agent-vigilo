@@ -9,7 +9,8 @@ config:
 sequenceDiagram
     actor User
     participant Vigilo
-    participant DB as Vigilo DB
+    participant ControlDB as Control DB
+    participant ExecutionDB as Execution DBs
     participant Queue as RabbitMQ
 
     User->>Vigilo: vigilo coordinator once
@@ -17,33 +18,42 @@ sequenceDiagram
     Vigilo->>Vigilo: Load throughput knobs and generate coordinator id
     Vigilo->>Vigilo: Load database and messaging contexts
 
-    Vigilo->>DB: Recover expired chunk leases
-    DB-->>Vigilo: Recovered chunks and poison chunks failed
+    Vigilo->>ControlDB: List active execution placements
+    ControlDB-->>Vigilo: Execution database aliases
+    Vigilo->>ExecutionDB: Recover expired chunk leases per alias
+    ExecutionDB-->>Vigilo: Recovered chunks and poison chunks failed
 
     loop Dispatch bounded run-shard windows
-        Vigilo->>DB: Claim open run-shard cursor and enqueue chunk window
-        DB-->>Vigilo: Dispatch shard window or no work
+        Vigilo->>ControlDB: Select and lock open run-shard cursor
+        ControlDB-->>Vigilo: Dispatch route or no work
+        Vigilo->>ExecutionDB: Upsert run snapshot and enqueue chunk-ready window
+        ExecutionDB-->>Vigilo: Dispatch shard window result
+        Vigilo->>ControlDB: Release or drain dispatch cursor
     end
 
     loop Finalize bounded terminal runs
-        Vigilo->>DB: Claim finalizable run
-        DB-->>Vigilo: Finalization claim or no work
+        Vigilo->>ControlDB: Claim finalizable run
+        ControlDB-->>Vigilo: Finalization claim or no work
         alt Run claimed
-            Vigilo->>DB: Roll up counts, set gate, and enqueue completion event
-            DB-->>Vigilo: Finalized run or no update
+            Vigilo->>ExecutionDB: Read routed shard summaries
+            ExecutionDB-->>Vigilo: Terminal summary rows
+            Vigilo->>ControlDB: Roll up counts, set gate, and enqueue completion event
+            ControlDB-->>Vigilo: Finalized run or no update
         end
     end
 
-    Vigilo->>DB: Claim publishable outbox delivery rows
-    DB-->>Vigilo: Joined event payload batch
+    Vigilo->>ControlDB: List active outbox placements
+    ControlDB-->>Vigilo: Database aliases
+    Vigilo->>ExecutionDB: Claim publishable outbox rows per alias
+    ExecutionDB-->>Vigilo: Joined event payload batches
 
     loop Bounded outbox publish concurrency
         Vigilo->>Queue: Declare durable topology and publish persistent mandatory event
         Queue-->>Vigilo: Confirmed routed publish or returned/nacked publish
         alt Publish confirmed and claim token current
-            Vigilo->>DB: Mark ledger published and delete delivery row
+            Vigilo->>ExecutionDB: Mark ledger published and delete delivery row
         else Publish failed or unroutable
-            Vigilo->>DB: Reschedule delivery row for retry with claim token
+            Vigilo->>ExecutionDB: Reschedule delivery row for retry with claim token
         else Claim token no longer current
             Vigilo->>Vigilo: Ignore stale publisher result
         end

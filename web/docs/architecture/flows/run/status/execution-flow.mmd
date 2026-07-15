@@ -9,13 +9,13 @@ config:
 sequenceDiagram
     actor User
     participant Vigilo
-    participant DB as Vigilo DB
+    participant ControlDB as Control DB
 
     User->>Vigilo: vigilo run status
     activate Vigilo
     Vigilo->>Vigilo: Parse run id
-    Vigilo->>DB: Load run
-    DB-->>Vigilo: Run snapshot
+    Vigilo->>ControlDB: Load run
+    ControlDB-->>Vigilo: Run snapshot
 
     alt Run loaded
         Vigilo->>Vigilo: Mark whether status is terminal

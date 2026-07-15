@@ -9,16 +9,19 @@ config:
 sequenceDiagram
     actor User
     participant Vigilo
-    participant DB as Vigilo DB
+    participant ControlDB as Control DB
+    participant ExecutionDB as Execution DBs
 
     User->>Vigilo: vigilo run results
     activate Vigilo
 
     Vigilo->>Vigilo: Validate run id
-    Vigilo->>DB: Load run
-    DB-->>Vigilo: Run record
-    Vigilo->>DB: Load results summary
-    DB-->>Vigilo: Summary counts and scores
+    Vigilo->>ControlDB: Load run
+    ControlDB-->>Vigilo: Run record
+    Vigilo->>ControlDB: Resolve readable execution routes
+    ControlDB-->>Vigilo: Run-shard database aliases
+    Vigilo->>ExecutionDB: Load routed shard summaries
+    ExecutionDB-->>Vigilo: Summary counts and scores
 
     alt Results loaded
         Vigilo->>Vigilo: Build summary-only payload

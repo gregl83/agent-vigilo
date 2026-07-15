@@ -19,8 +19,8 @@ flowchart TD
     Vigilo["fa:fa-terminal <br/> <b>Vigilo</b> <br/> <small>[Container: Rust]</small> <br/> <small>Provides evaluator and run management functionality via CLI.</small>"]:::component
     Coordinator["fa:fa-compass <br/> <b>Coordinator</b> <br/> <small>[Container: Rust]</small> <br/> <small>Chunks run cases, publishes work batches, tracks progress, and handles orchestration failures.</small>"]:::component
     Worker["fa:fa-gear <br/> <b>Worker</b> <br/> <small>[Container: Rust]</small> <br/> <small>Consumes work batches, prompts the target agent, runs evaluators, validates output, and persists normalized results.</small>"]:::component
-    Database[("<b>Database</b> <br/> <small>[Container: PostgreSQL]</small> <br/> <small>Stores evaluators, datasets, runs, case batches, results, events, and runtime state.</small>")]:::component
-    Queue[("<b>Queue</b> <br/> <small>[Container: RabbitMQ]</small> <br/> <small>Stores and distributes run dataset case batches.</small>")]:::component
+    Database[("<b>Database Placements</b> <br/> <small>[Container: PostgreSQL]</small> <br/> <small>Store control metadata and routed execution data across one or more placements.</small>")]:::component
+    Queue[("<b>Queue</b> <br/> <small>[Container: RabbitMQ]</small> <br/> <small>Stores and distributes routed run.chunk.ready events.</small>")]:::component
 
     %% system boundary
     subgraph VigiloSystem["&nbsp;"]
@@ -42,8 +42,8 @@ flowchart TD
     Vigilo -->|"Starts and stops <br/> service of type"| Coordinator
     Vigilo -->|"Starts and stops <br/> service of type"| Worker
     Coordinator -->|"Reads from <br/> and writes to <br> <small>[SQL/TCP]</small>"| Database
-    Coordinator -->|"Publishes run <br/> dataset case batches to <br> <small>[JSON/AMQP]</small>"| Queue
-    Queue -->|"Streams run dataset case batches to <br> <small>[JSON/AMQP]</small>"| Worker
+    Coordinator -->|"Publishes routed chunk-ready events to <br> <small>[JSON/AMQP]</small>"| Queue
+    Queue -->|"Streams routed chunk-ready events to <br> <small>[JSON/AMQP]</small>"| Worker
     Worker -->|"Reads from <br/> and writes to <br> <small>[SQL/TCP]</small>"| Database
     Worker -->|"Sends case prompts to and receives agent responses from <br> <small>[TEXT/HTTP]</small>"| TargetAgent
 

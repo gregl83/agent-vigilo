@@ -21,10 +21,10 @@ flowchart TD
     CycleOrchestrator["fa:fa-arrows-spin <br/> <b>Coordinator Cycle Orchestrator</b> <br/> <small>[Component: Rust]</small> <br/> <small>Runs lease recovery, dispatch, finalization, and outbox publication in deterministic order.</small>"]:::component
     LeaseRecovery["fa:fa-life-ring <br/> <b>Chunk Lease Recovery</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Recovers expired chunk leases or marks poison chunks failed after the recovery limit.</small>"]:::component
     DispatchDrainer["fa:fa-list-check <br/> <b>Dispatch Batch Drainer</b> <br/> <small>[Component: Rust]</small> <br/> <small>Bounds chunk-window dispatch work per coordinator cycle.</small>"]:::component
-    DispatchWorkflow["fa:fa-share-nodes <br/> <b>Run Dispatch Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Claims run-shard cursors, starts pending runs, and inserts bounded run.chunk.ready windows.</small>"]:::component
+    DispatchWorkflow["fa:fa-share-nodes <br/> <b>Run Dispatch Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Claims control cursors, prepares execution snapshots, and inserts bounded run.chunk.ready windows.</small>"]:::component
 
     FinalizeDrainer["fa:fa-flag-checkered <br/> <b>Finalization Batch Drainer</b> <br/> <small>[Component: Rust]</small> <br/> <small>Bounds finalizable-run work per coordinator cycle.</small>"]:::component
-    FinalizeWorkflow["fa:fa-calculator <br/> <b>Run Finalization Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Claims terminal runs, rolls up execution counts, sets gate status, and inserts run.completed events.</small>"]:::component
+    FinalizeWorkflow["fa:fa-calculator <br/> <b>Run Finalization Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Reads routed shard summaries, sets global gate status, and inserts run.completed events.</small>"]:::component
 
     OutboxPublisher["fa:fa-paper-plane <br/> <b>Outbox Publisher</b> <br/> <small>[Component: Rust / Tokio]</small> <br/> <small>Claims delivery queue batches with tokens, publishes with bounded concurrency, and deletes completed delivery rows.</small>"]:::component
     EventPublisher["fa:fa-plug <br/> <b>Event Publisher Boundary</b> <br/> <small>[Component: Rust Trait]</small> <br/> <small>Separates durable outbox handling from the broker transport.</small>"]:::component
@@ -48,7 +48,7 @@ flowchart TD
     style CoordinatorRuntime stroke-dasharray: 5 5,fill:none,stroke:#1168bd,stroke-width:2px
 
     %% external containers
-    Database[("<b>Database</b> <br/> <small>[Container: PostgreSQL]</small> <br/> <small>Stores run state, run-shard dispatch cursors, chunks, execution aggregates, durable outbox events, and the hot delivery queue.</small>")]:::component
+    Database[("<b>Database Placements</b> <br/> <small>[Container: PostgreSQL]</small> <br/> <small>Store control cursors, routed execution rows, shard summaries, local outbox events, and delivery queues.</small>")]:::component
     Queue[("<b>Queue</b> <br/> <small>[Container: RabbitMQ]</small> <br/> <small>Durably stores routed run lifecycle and chunk-ready events.</small>")]:::component
 
     %% edges
@@ -66,11 +66,11 @@ flowchart TD
 
     CycleOrchestrator -->|"Then drains"| DispatchDrainer
     DispatchDrainer -->|"Claims one dispatchable run window with"| DispatchWorkflow
-    DispatchWorkflow -->|"Claims one run-shard cursor, updates chunk dispatch markers, outbox events, and delivery rows in <br> <small>[SQL/TCP]</small>"| Database
+    DispatchWorkflow -->|"Claims one control cursor, then updates execution-local chunks, snapshots, outbox events, and delivery rows in <br> <small>[SQL/TCP]</small>"| Database
 
     CycleOrchestrator -->|"Then finalizes"| FinalizeDrainer
     FinalizeDrainer -->|"Claims and finalizes one terminal run at a time with"| FinalizeWorkflow
-    FinalizeWorkflow -->|"Reads aggregates and updates run summary in <br> <small>[SQL/TCP]</small>"| Database
+    FinalizeWorkflow -->|"Reads routed shard summaries and updates the control run summary in <br> <small>[SQL/TCP]</small>"| Database
 
     CycleOrchestrator -->|"Finally publishes with"| OutboxPublisher
     OutboxPublisher -->|"Claims delivery rows, marks ledgers, deletes completed rows, and reschedules retries in <br> <small>[SQL/TCP]</small>"| Database
