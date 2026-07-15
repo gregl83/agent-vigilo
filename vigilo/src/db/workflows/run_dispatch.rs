@@ -316,6 +316,45 @@ pub(crate) async fn select_next_dispatch_route(
     Ok(route)
 }
 
+/// Counts currently dispatchable control-plane cursor rows.
+///
+/// This mirrors [`select_next_dispatch_route`] without ordering or row return
+/// data. Coordinator structured logs use it as a backlog gauge for scale
+/// monitoring.
+pub(crate) async fn count_dispatch_cursor_backlog(db: &PgPool) -> anyhow::Result<i64> {
+    let count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM run_shard_dispatch_cursors c
+        JOIN runs r
+          ON r.id = c.run_id
+        JOIN shard_placements sp
+          ON sp.run_id = c.run_id
+         AND sp.run_shard = c.run_shard
+        JOIN database_placements dp
+          ON dp.alias = sp.database_alias
+        WHERE c.status = 'open'
+          AND sp.status = 'active'
+          AND dp.status = 'active'
+          AND dp.role IN ('shard', 'control_and_shard')
+          AND (
+              r.status = 'running'::run_status
+              OR (
+                  r.status = 'pending'::run_status
+                  AND (
+                      r.coordinator_leased_until IS NULL
+                      OR r.coordinator_leased_until < now()
+                  )
+              )
+          )
+        "#,
+    )
+    .fetch_one(db)
+    .await?;
+
+    Ok(count)
+}
+
 /// Starts a dispatchable run in control storage and returns its snapshot.
 ///
 /// The returned data is copied into execution storage by
@@ -1149,6 +1188,22 @@ mod tests {
         assert_eq!(route.run_shard, 1);
         assert_eq!(route.database_alias, "primary");
         assert_eq!(route.placement_status, "active");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn count_dispatch_cursor_backlog_matches_dispatchable_routes(pool: PgPool) {
+        let run_id = seed_pending_run(&pool, &[(0, 1), (1, 1), (2, 1)]).await;
+        insert_shard_placements(
+            &pool,
+            run_id,
+            &[(0, "active"), (1, "moving"), (2, "draining")],
+        )
+        .await;
+
+        let backlog = count_dispatch_cursor_backlog(&pool).await.unwrap();
+
+        assert_eq!(backlog, 1);
     }
 
     #[sqlx::test(migrations = "../migrations")]

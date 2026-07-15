@@ -30,6 +30,9 @@ END $$;
 CREATE INDEX idx_outbox_delivery_queue_available
     ON outbox_delivery_queue(claim_shard, available_at, event_id);
 
+CREATE INDEX idx_outbox_delivery_queue_available_global
+    ON outbox_delivery_queue(available_at, event_id);
+
 CREATE INDEX idx_outbox_delivery_queue_claim_token
     ON outbox_delivery_queue(claim_shard, event_id, claim_token)
     WHERE claim_token IS NOT NULL;
@@ -60,6 +63,9 @@ COMMENT ON TABLE outbox_delivery_queue IS
 
 COMMENT ON INDEX idx_outbox_delivery_queue_available IS
     'Hot index for high-throughput outbox publishers claiming available delivery rows by shard and availability time.';
+
+COMMENT ON INDEX idx_outbox_delivery_queue_available_global IS
+    'Hot index for publisher scans ordered by availability time across delivery shards.';
 
 COMMENT ON FUNCTION enqueue_outbox_delivery() IS
     'Creates the hot delivery-queue row for each newly inserted outbox ledger event inside the same transaction.';

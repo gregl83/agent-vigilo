@@ -28,14 +28,17 @@ sequenceDiagram
             Vigilo->>ControlDB: List active execution placements
             Vigilo->>ExecutionDB: Recover expired chunk leases per placement
             ExecutionDB-->>Vigilo: Recovered and failed chunk counts
+            Vigilo->>ControlDB: Log dispatch cursor backlog
             Vigilo->>ControlDB: Drain dispatchable run-shard cursors
             Vigilo->>ExecutionDB: Dispatch routed chunk windows
             ExecutionDB-->>Vigilo: Dispatch shard window count
+            Vigilo->>ControlDB: Log finalization candidate backlog
             Vigilo->>ControlDB: Claim finalizable runs
             Vigilo->>ExecutionDB: Read routed shard summaries
             Vigilo->>ControlDB: Write global finalization result
             ControlDB-->>Vigilo: Finalization count
             Vigilo->>ControlDB: List active outbox placements
+            Vigilo->>ExecutionDB: Log publishable outbox backlog per placement
             Vigilo->>ExecutionDB: Claim publishable outbox rows per placement
             ExecutionDB-->>Vigilo: Joined event payload batches
             loop Bounded outbox publish concurrency

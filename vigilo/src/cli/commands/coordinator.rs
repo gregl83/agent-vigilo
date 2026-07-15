@@ -5,7 +5,10 @@
 //! - finalizes runs whose chunks/executions are terminal
 //! - publishes outbox events from active database placements to messaging
 
-use std::time::Duration;
+use std::time::{
+    Duration,
+    Instant,
+};
 
 use async_trait::async_trait;
 use clap::{
@@ -24,10 +27,13 @@ use crate::{
         Context,
         database,
     },
-    db::workflows::{
-        run_dispatch,
-        run_finalize,
-        run_shard_summary,
+    db::{
+        tables::outbox_events,
+        workflows::{
+            run_dispatch,
+            run_finalize,
+            run_shard_summary,
+        },
     },
     outbox::{
         EventPublisher,
@@ -183,6 +189,7 @@ async fn run_coordinator_cycle(
     coordinator_id: Uuid,
     config: &CoordinatorRuntimeConfig,
 ) -> anyhow::Result<()> {
+    let cycle_started = Instant::now();
     // --- Acquire cycle services ---
     // The database service owns control and execution placement routing. The
     // queue handle is only needed for the final publish pass.
@@ -199,15 +206,21 @@ async fn run_coordinator_cycle(
     // --- Recover expired chunk leases ---
     // Recovery runs before new dispatch so dead workers do not block
     // finalization or leave ready work stranded.
+    let recovery_started = Instant::now();
     let recovery_stats = recover_expired_chunk_leases(database, coordinator_id, config).await?;
+    let recovery_ms = recovery_started.elapsed().as_millis() as u64;
 
     // --- Dispatch runnable chunk windows ---
     // Dispatch is drained before finalization so newly-created work gets
     // surfaced promptly.
+    let dispatch_started = Instant::now();
     let dispatch_count = drain_dispatch_batch(database, coordinator_id, config).await?;
+    let dispatch_ms = dispatch_started.elapsed().as_millis() as u64;
 
     // --- Finalize terminal runs ---
+    let finalization_started = Instant::now();
     let finalized_count = drain_finalize_batch(database, coordinator_id, config).await?;
+    let finalization_ms = finalization_started.elapsed().as_millis() as u64;
 
     // --- Publish durable outbox events ---
     // Failed broker publishes stay in the outbox delivery queue for retry.
@@ -219,18 +232,25 @@ async fn run_coordinator_cycle(
         lease_seconds: config.outbox_lease_seconds,
         retry_delay_seconds: config.outbox_retry_delay_seconds,
     };
+    let outbox_started = Instant::now();
     let publish_stats =
         publish_outbox_events(database, &publisher, &outbox_config, coordinator_id).await?;
+    let outbox_publish_ms = outbox_started.elapsed().as_millis() as u64;
     info!(
         expired_chunk_leases_recovered = recovery_stats.recovered,
         expired_chunk_leases_failed = recovery_stats.failed,
+        recovery_ms,
         dispatch_windows_prepared = dispatch_count,
+        dispatch_ms,
         runs_finalized = finalized_count,
+        finalization_ms,
         outbox_events_claimed = publish_stats.claimed,
         outbox_events_published = publish_stats.published,
         outbox_events_failed = publish_stats.failed,
         outbox_stale_claims = publish_stats.stale_claims,
-        "completed outbox publish cycle"
+        outbox_publish_ms,
+        coordinator_cycle_ms = cycle_started.elapsed().as_millis() as u64,
+        "completed coordinator cycle"
     );
 
     debug!(coordinator_id = %coordinator_id, "coordinator cycle complete");
@@ -248,17 +268,26 @@ async fn recover_expired_chunk_leases(
     // exhausting recovery attempts.
     debug!(coordinator_id = %coordinator_id, "recovering expired chunk leases");
 
+    let alias_list_started = Instant::now();
     let aliases = database.active_execution_database_aliases().await?;
+    debug!(
+        coordinator_id = %coordinator_id,
+        active_execution_placement_count = aliases.len(),
+        active_execution_alias_list_ms = alias_list_started.elapsed().as_millis() as u64,
+        "listed active execution placements for recovery"
+    );
     let mut stats = run_dispatch::ChunkLeaseRecoveryStats::default();
 
     for alias in aliases {
         let db = database.placement(&alias).await?;
+        let recovery_started = Instant::now();
         let alias_stats = run_dispatch::recover_expired_chunk_leases(
             db,
             config.chunk_lease_max_recoveries,
             config.chunk_lease_recovery_batch_size,
         )
         .await?;
+        let recovery_ms = recovery_started.elapsed().as_millis() as u64;
 
         stats.recovered += alias_stats.recovered;
         stats.failed += alias_stats.failed;
@@ -269,12 +298,14 @@ async fn recover_expired_chunk_leases(
                 database_alias = %alias,
                 expired_chunk_leases_recovered = alias_stats.recovered,
                 expired_chunk_leases_failed = alias_stats.failed,
+                recovery_ms,
                 "completed expired chunk lease recovery pass for execution placement"
             );
         } else {
             debug!(
                 coordinator_id = %coordinator_id,
                 database_alias = %alias,
+                recovery_ms,
                 "no expired chunk leases recovered for execution placement"
             );
         }
@@ -309,11 +340,20 @@ async fn drain_dispatch_batch(
 
     let mut dispatched = 0usize;
     let mut dispatched_by_alias = std::collections::BTreeMap::<String, usize>::new();
+    let control_db = database.control().await?;
+    let dispatch_backlog = run_dispatch::count_dispatch_cursor_backlog(control_db).await?;
+    info!(
+        coordinator_id = %coordinator_id,
+        dispatch_cursor_backlog = dispatch_backlog,
+        dispatch_cycle_limit = config.max_dispatch_per_cycle,
+        "measured dispatch cursor backlog"
+    );
     for _ in 0..config.max_dispatch_per_cycle {
-        let control_db = database.control().await?;
+        let select_started = Instant::now();
         let Some(route) = run_dispatch::select_next_dispatch_route(control_db).await? else {
             break;
         };
+        let dispatch_route_select_ms = select_started.elapsed().as_millis() as u64;
         let database_alias = route.database_alias.clone();
 
         debug!(
@@ -322,6 +362,7 @@ async fn drain_dispatch_batch(
             run_shard = route.run_shard,
             database_alias = %database_alias,
             placement_status = %route.placement_status,
+            dispatch_route_select_ms,
             routing_decision = "selected_dispatch_route",
             "selected dispatch route"
         );
@@ -337,7 +378,10 @@ async fn drain_dispatch_batch(
             continue;
         };
 
+        let execution_pool_started = Instant::now();
         let execution_db = database.execution(route.run_id, route.run_shard).await?;
+        let execution_pool_resolution_ms = execution_pool_started.elapsed().as_millis() as u64;
+        let dispatch_started = Instant::now();
         let Some(run) = run_dispatch::dispatch_routed_run_window(
             control_db,
             execution_db,
@@ -349,6 +393,7 @@ async fn drain_dispatch_batch(
         else {
             continue;
         };
+        let dispatch_window_ms = dispatch_started.elapsed().as_millis() as u64;
 
         dispatched += 1;
         *dispatched_by_alias
@@ -370,6 +415,8 @@ async fn drain_dispatch_batch(
             chunk_events_enqueued = run.chunk_events_enqueued,
             chunks_marked_dispatched = run.chunks_marked_dispatched,
             run_started_events_enqueued = run.run_started_events_enqueued,
+            execution_pool_resolution_ms,
+            dispatch_window_ms,
             "prepared bounded dispatch shard window"
         );
     }
@@ -401,12 +448,24 @@ async fn publish_outbox_events(
     config: &OutboxPublisherConfig,
     coordinator_id: Uuid,
 ) -> anyhow::Result<OutboxPublishStats> {
+    let alias_list_started = Instant::now();
     let aliases = database.active_outbox_database_aliases().await?;
+    debug!(
+        coordinator_id = %coordinator_id,
+        active_outbox_placement_count = aliases.len(),
+        active_outbox_alias_list_ms = alias_list_started.elapsed().as_millis() as u64,
+        "listed active outbox placements"
+    );
     let mut stats = OutboxPublishStats::default();
 
     for alias in aliases {
         let db = database.placement(&alias).await?;
+        let backlog_started = Instant::now();
+        let outbox_backlog = outbox_events::count_publishable_outbox_backlog(db).await?;
+        let outbox_backlog_query_ms = backlog_started.elapsed().as_millis() as u64;
+        let publish_started = Instant::now();
         let alias_stats = publish_pending_events(db, publisher, config).await?;
+        let outbox_publish_ms = publish_started.elapsed().as_millis() as u64;
 
         stats.claimed += alias_stats.claimed;
         stats.published += alias_stats.published;
@@ -417,16 +476,22 @@ async fn publish_outbox_events(
             info!(
                 coordinator_id = %coordinator_id,
                 database_alias = %alias,
+                outbox_backlog,
+                outbox_backlog_query_ms,
                 outbox_events_claimed = alias_stats.claimed,
                 outbox_events_published = alias_stats.published,
                 outbox_events_failed = alias_stats.failed,
                 outbox_stale_claims = alias_stats.stale_claims,
+                outbox_publish_ms,
                 "completed outbox publish pass for database placement"
             );
         } else {
             debug!(
                 coordinator_id = %coordinator_id,
                 database_alias = %alias,
+                outbox_backlog,
+                outbox_backlog_query_ms,
+                outbox_publish_ms,
                 "no publishable outbox events for database placement"
             );
         }
@@ -446,11 +511,23 @@ async fn drain_finalize_batch(
     debug!(coordinator_id = %coordinator_id, "draining finalizable runs");
 
     let mut finalized = 0usize;
+    let control_db = database.control().await?;
+    let finalization_backlog =
+        run_finalize::select_finalization_candidate_backlog(control_db).await?;
+    info!(
+        coordinator_id = %coordinator_id,
+        finalization_candidate_backlog = finalization_backlog.candidate_count,
+        finalization_oldest_candidate_lag_seconds =
+            finalization_backlog.oldest_candidate_lag_seconds,
+        finalization_cycle_limit = config.max_finalize_per_cycle,
+        "measured finalization candidate backlog"
+    );
     for _ in 0..config.max_finalize_per_cycle {
-        let control_db = database.control().await?;
+        let select_started = Instant::now();
         let Some(run) = run_finalize::select_next_finalization_candidate(control_db).await? else {
             break;
         };
+        let finalization_candidate_select_ms = select_started.elapsed().as_millis() as u64;
 
         let summaries = collect_run_shard_summaries(database, run.id).await?;
         if summaries.is_empty() || summaries.iter().any(|summary| !summary.is_terminal()) {
@@ -458,6 +535,7 @@ async fn drain_finalize_batch(
                 run_id = %run.id,
                 run_key = %run.run_key,
                 shard_summary_count = summaries.len(),
+                finalization_candidate_select_ms,
                 "finalization candidate is waiting for terminal shard summaries"
             );
             break;
@@ -475,6 +553,7 @@ async fn drain_finalize_batch(
         };
 
         debug!(run_id = %claimed.id, run_key = %claimed.run_key, "claimed run for finalization");
+        let finalize_started = Instant::now();
         if let Some(done) =
             run_finalize::finalize_claimed_run_from_summaries(control_db, claimed.id, &summaries)
                 .await?
@@ -488,6 +567,8 @@ async fn drain_finalize_batch(
                 passed_execution_count = done.passed_execution_count,
                 failed_execution_count = done.failed_execution_count,
                 errored_execution_count = done.errored_execution_count,
+                finalization_candidate_select_ms,
+                finalize_control_write_ms = finalize_started.elapsed().as_millis() as u64,
                 "finalized run and enqueued completion event"
             );
         } else {

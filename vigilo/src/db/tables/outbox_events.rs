@@ -177,6 +177,24 @@ pub(crate) async fn claim_publishable_outbox_events(
     Ok(events)
 }
 
+/// Counts delivery rows currently available for publication.
+///
+/// Coordinators log this as a per-placement outbox backlog gauge before
+/// claiming a bounded publish batch.
+pub(crate) async fn count_publishable_outbox_backlog(db: &PgPool) -> anyhow::Result<i64> {
+    let count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM outbox_delivery_queue
+        WHERE available_at <= now()
+        "#,
+    )
+    .fetch_one(db)
+    .await?;
+
+    Ok(count)
+}
+
 /// Marks an outbox event as successfully published and removes delivery work.
 pub(crate) async fn mark_outbox_event_published(
     db: &PgPool,
@@ -302,4 +320,36 @@ pub(crate) async fn delete_outbox_event_by_id(db: &PgPool, id: Uuid) -> anyhow::
     .await?;
 
     Ok(result.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::models::outbox_event::OutboxEventDraft;
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx outbox tests"]
+    async fn count_publishable_outbox_backlog_tracks_available_delivery_rows(pool: PgPool) {
+        insert_outbox_event(&pool, &draft("first")).await.unwrap();
+        insert_outbox_event(&pool, &draft("second")).await.unwrap();
+
+        assert_eq!(count_publishable_outbox_backlog(&pool).await.unwrap(), 2);
+
+        let claimed = claim_publishable_outbox_events(&pool, 1, 60).await.unwrap();
+
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(count_publishable_outbox_backlog(&pool).await.unwrap(), 1);
+    }
+
+    fn draft(label: &str) -> OutboxEventDraft {
+        OutboxEventDraft {
+            event_type: "test.event".to_string(),
+            aggregate_type: "test".to_string(),
+            aggregate_id: Uuid::now_v7(),
+            dedupe_key: format!("test:{label}"),
+        }
+    }
 }

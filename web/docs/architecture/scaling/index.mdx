@@ -142,6 +142,20 @@ Outbox publication is local to the database where the state changed. Control
 events publish from the control outbox. Execution events publish from the
 execution placement that owns the changed rows.
 
+## Control-Plane Scale
+
+The control database stays singular and authoritative. It is expected to scale
+vertically first, while execution rows spread across shard-capable placements.
+Coordinator hot paths emit structured log fields that can be treated as metrics:
+dispatch cursor backlog, finalization candidate backlog, per-placement outbox
+backlog, oldest finalization candidate lag, route resolution timing, pool
+acquisition timing, and stage timings for recovery, dispatch, finalization, and
+outbox publication.
+
+The hot outbox publisher scan is indexed by availability time. Worker runtime
+metadata reads remain centralized for now; evaluator metadata replication is an
+explicit future contract, not hidden routing behavior.
+
 ## Operating Placements
 
 Add a shard-capable placement by deploying the secret env var and registering
@@ -259,6 +273,8 @@ Implemented today:
   progress, results, export, route inspection, route fencing, placement
   assignment policy, explicit shard move, and persisted bulk rebalance
   operations.
+- Control-plane scale hardening through outbox queue indexing and structured
+  backlog/timing logs for coordinator and routing hot paths.
 - CI coverage for the black-box multi-database route path: run creation to
   `primary` and `shard_001`, route inspection, control-owned cursors, routed
   cancellation, spread-active assignment for one run, shard move, rebalance

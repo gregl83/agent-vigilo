@@ -29,6 +29,13 @@ pub(crate) struct FinalizedRun {
     pub(crate) errored_execution_count: i32,
 }
 
+/// Control-plane finalization backlog gauge.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub(crate) struct FinalizationCandidateBacklog {
+    pub(crate) candidate_count: i64,
+    pub(crate) oldest_candidate_lag_seconds: Option<i64>,
+}
+
 /// Selects the next run whose dispatch cursors are drained.
 ///
 /// Query behavior:
@@ -67,6 +74,50 @@ pub(crate) async fn select_next_finalization_candidate(
     .await?;
 
     Ok(candidate)
+}
+
+/// Measures control-plane runs that are eligible for finalization consideration.
+///
+/// This intentionally checks only control-owned dispatch cursor state. The
+/// coordinator still reads routed shard summaries before claiming and
+/// finalizing a candidate.
+pub(crate) async fn select_finalization_candidate_backlog(
+    db: &PgPool,
+) -> anyhow::Result<FinalizationCandidateBacklog> {
+    let backlog = sqlx::query_as::<_, FinalizationCandidateBacklog>(
+        r#"
+        WITH candidates AS (
+            SELECT r.updated_at
+            FROM runs r
+            WHERE r.status IN ('running'::run_status, 'finalizing'::run_status)
+              AND (
+                  r.status <> 'finalizing'::run_status
+                  OR r.coordinator_leased_until IS NULL
+                  OR r.coordinator_leased_until < now()
+              )
+              AND EXISTS (
+                  SELECT 1
+                  FROM run_shard_dispatch_cursors c
+                  WHERE c.run_id = r.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM run_shard_dispatch_cursors c
+                  WHERE c.run_id = r.id
+                    AND c.status = 'open'
+              )
+        )
+        SELECT
+            COUNT(*)::bigint AS candidate_count,
+            FLOOR(EXTRACT(EPOCH FROM now() - MIN(updated_at)))::bigint
+                AS oldest_candidate_lag_seconds
+        FROM candidates
+        "#,
+    )
+    .fetch_one(db)
+    .await?;
+
+    Ok(backlog)
 }
 
 /// Claims a finalization candidate in control storage.
@@ -424,6 +475,60 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(status, "finalizing");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx finalization tests"]
+    async fn select_finalization_candidate_backlog_matches_control_cursor_gate(pool: PgPool) {
+        let ready_run_id = Uuid::now_v7();
+        let open_run_id = Uuid::now_v7();
+        let leased_run_id = Uuid::now_v7();
+
+        seed_run(
+            &pool,
+            ready_run_id,
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "running",
+        )
+        .await;
+        seed_dispatch_cursor(&pool, ready_run_id, 3, "drained").await;
+
+        seed_run(
+            &pool,
+            open_run_id,
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "running",
+        )
+        .await;
+        seed_dispatch_cursor(&pool, open_run_id, 5, "open").await;
+
+        seed_run(
+            &pool,
+            leased_run_id,
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "finalizing",
+        )
+        .await;
+        seed_dispatch_cursor(&pool, leased_run_id, 7, "drained").await;
+        sqlx::query(
+            r#"
+            UPDATE runs
+            SET coordinator_leased_until = now() + interval '60 seconds'
+            WHERE id = $1::uuid
+            "#,
+        )
+        .bind(leased_run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let backlog = select_finalization_candidate_backlog(&pool).await.unwrap();
+
+        assert_eq!(backlog.candidate_count, 1);
+        assert!(backlog.oldest_candidate_lag_seconds.unwrap() >= 0);
     }
 
     #[derive(sqlx::FromRow)]

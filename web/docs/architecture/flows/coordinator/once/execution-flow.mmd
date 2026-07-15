@@ -24,6 +24,7 @@ sequenceDiagram
     ExecutionDB-->>Vigilo: Recovered chunks and poison chunks failed
 
     loop Dispatch bounded run-shard windows
+        Vigilo->>ControlDB: Count dispatchable cursor backlog
         Vigilo->>ControlDB: Select and lock open run-shard cursor
         ControlDB-->>Vigilo: Dispatch route or no work
         Vigilo->>ExecutionDB: Upsert run snapshot and enqueue chunk-ready window
@@ -32,6 +33,7 @@ sequenceDiagram
     end
 
     loop Finalize bounded terminal runs
+        Vigilo->>ControlDB: Count finalization candidate backlog
         Vigilo->>ControlDB: Claim finalizable run
         ControlDB-->>Vigilo: Finalization claim or no work
         alt Run claimed
@@ -44,6 +46,7 @@ sequenceDiagram
 
     Vigilo->>ControlDB: List active outbox placements
     ControlDB-->>Vigilo: Database aliases
+    Vigilo->>ExecutionDB: Count publishable outbox backlog per alias
     Vigilo->>ExecutionDB: Claim publishable outbox rows per alias
     ExecutionDB-->>Vigilo: Joined event payload batches
 

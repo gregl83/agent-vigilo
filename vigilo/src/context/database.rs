@@ -12,7 +12,10 @@
 
 use std::{
     collections::HashMap,
-    time::Duration,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use moka::future::Cache;
@@ -168,6 +171,7 @@ impl Db {
     /// The pool is initialized on first use, not when the database service is
     /// retrieved from [`crate::context::Context::db`].
     pub async fn control(&self) -> anyhow::Result<&PgPool> {
+        let started = Instant::now();
         self.cell
             .get_or_try_init(|| async {
                 debug!("initializing postgres database connection");
@@ -179,6 +183,13 @@ impl Db {
                     .map_err(|e| anyhow::anyhow!("database connection failed: {}", e))
             })
             .await
+            .inspect(|_| {
+                debug!(
+                    database_alias = %self.placement_config.control_database_alias,
+                    pool_acquisition_ms = started.elapsed().as_millis() as u64,
+                    "resolved control database pool"
+                );
+            })
     }
 
     pub(crate) fn default_execution_database_alias(&self) -> &str {
@@ -217,19 +228,34 @@ impl Db {
     /// placement directly.
     #[allow(dead_code)]
     pub async fn placement(&self, alias: &str) -> anyhow::Result<&PgPool> {
+        let started = Instant::now();
         let alias = normalize_alias(alias.to_string(), "database alias")?;
         let catalog = self.placement_catalog().await?;
         catalog.require_active_alias(&alias)?;
 
         if alias == self.placement_config.control_database_alias {
-            return self.control().await;
+            let pool = self.control().await?;
+            debug!(
+                database_alias = %alias,
+                placement_pool_acquisition_ms = started.elapsed().as_millis() as u64,
+                pool_source = "control",
+                "resolved database placement pool"
+            );
+            return Ok(pool);
         }
 
         let Some(pool) = catalog.pools_by_alias.get(&alias) else {
             anyhow::bail!("database placement alias {} is not configured", alias);
         };
 
-        pool.get(&alias, self.max_connections).await
+        let pool = pool.get(&alias, self.max_connections).await?;
+        debug!(
+            database_alias = %alias,
+            placement_pool_acquisition_ms = started.elapsed().as_millis() as u64,
+            pool_source = "placement",
+            "resolved database placement pool"
+        );
+        Ok(pool)
     }
 
     /// Resolves the stored execution placement for a run shard.
@@ -239,6 +265,7 @@ impl Db {
         run_id: Uuid,
         run_shard: i16,
     ) -> anyhow::Result<ShardPlacement> {
+        let started = Instant::now();
         validate_run_shard(run_shard)?;
 
         let key = ShardPlacementKey { run_id, run_shard };
@@ -255,6 +282,8 @@ impl Db {
                     database_alias = %placement.database_alias,
                     placement_status = %placement.status,
                     route_version = placement.route_version,
+                    route_resolution_ms = started.elapsed().as_millis() as u64,
+                    route_cache = "hit",
                     routing_decision = "cached_execution_placement",
                     "resolved execution placement from route-version cache"
                 );
@@ -272,6 +301,8 @@ impl Db {
                 database_alias = %current.database_alias,
                 placement_status = %current.status,
                 route_version = current.route_version,
+                route_resolution_ms = started.elapsed().as_millis() as u64,
+                route_cache = "stale_refresh",
                 routing_decision = "refreshed_stale_execution_placement",
                 "refreshed stale execution placement cache"
             );
@@ -292,6 +323,8 @@ impl Db {
             database_alias = %placement.database_alias,
             placement_status = %placement.status,
             route_version = placement.route_version,
+            route_resolution_ms = started.elapsed().as_millis() as u64,
+            route_cache = "miss",
             routing_decision = "control_lookup_execution_placement",
             "resolved execution placement from control metadata"
         );
