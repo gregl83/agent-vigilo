@@ -202,6 +202,14 @@ impl Db {
         let key = ShardPlacementKey { run_id, run_shard };
         if let Some(placement) = self.shard_placement_cache.get(&key).await {
             self.validate_shard_placement_alias(&placement).await?;
+            debug!(
+                run_id = %run_id,
+                run_shard,
+                database_alias = %placement.database_alias,
+                placement_status = %placement.status,
+                routing_decision = "cached_execution_placement",
+                "resolved execution placement from cache"
+            );
             return Ok(placement);
         }
 
@@ -213,6 +221,14 @@ impl Db {
         };
 
         self.validate_shard_placement_alias(&placement).await?;
+        debug!(
+            run_id = %run_id,
+            run_shard,
+            database_alias = %placement.database_alias,
+            placement_status = %placement.status,
+            routing_decision = "control_lookup_execution_placement",
+            "resolved execution placement from control metadata"
+        );
         self.shard_placement_cache
             .insert(key, placement.clone())
             .await;
@@ -229,6 +245,14 @@ impl Db {
         let placement = self.execution_placement(run_id, run_shard).await?;
 
         if !placement.is_dispatchable() {
+            debug!(
+                run_id = %run_id,
+                run_shard,
+                database_alias = %placement.database_alias,
+                placement_status = %placement.status,
+                routing_decision = "blocked_non_dispatchable",
+                "execution placement is not dispatchable"
+            );
             return Err(ExecutionRouteError::NonDispatchableShardPlacement {
                 run_id,
                 run_shard,
@@ -237,6 +261,14 @@ impl Db {
             .into());
         }
 
+        debug!(
+            run_id = %run_id,
+            run_shard,
+            database_alias = %placement.database_alias,
+            placement_status = %placement.status,
+            routing_decision = "dispatchable_execution_pool",
+            "resolved dispatchable execution pool"
+        );
         self.placement(&placement.database_alias).await
     }
 
@@ -253,6 +285,14 @@ impl Db {
         for placement in placements {
             self.validate_shard_placement_alias(&placement).await?;
             if !placement.is_dispatchable() {
+                debug!(
+                    run_id = %run_id,
+                    run_shard = placement.run_shard,
+                    database_alias = %placement.database_alias,
+                    placement_status = %placement.status,
+                    routing_decision = "blocked_non_dispatchable",
+                    "execution route is not dispatchable"
+                );
                 anyhow::bail!(
                     "shard placement for run {} shard {} has status {}, which is not dispatchable",
                     run_id,
@@ -262,6 +302,14 @@ impl Db {
             }
 
             let pool = self.placement(&placement.database_alias).await?.clone();
+            debug!(
+                run_id = %run_id,
+                run_shard = placement.run_shard,
+                database_alias = %placement.database_alias,
+                placement_status = %placement.status,
+                routing_decision = "dispatchable_execution_route",
+                "resolved dispatchable execution route"
+            );
             routed.push((placement.run_shard, placement.database_alias, pool));
         }
 
@@ -284,6 +332,14 @@ impl Db {
         for placement in placements {
             self.validate_shard_placement_alias(&placement).await?;
             let pool = self.placement(&placement.database_alias).await?.clone();
+            debug!(
+                run_id = %run_id,
+                run_shard = placement.run_shard,
+                database_alias = %placement.database_alias,
+                placement_status = %placement.status,
+                routing_decision = "readable_execution_route",
+                "resolved readable execution route"
+            );
             routed.push((placement.run_shard, placement.database_alias, pool));
         }
 
@@ -362,6 +418,10 @@ impl Db {
                 database_url_env
             )
         })
+    }
+
+    pub(crate) fn database_url_env_is_resolved(&self, database_url_env: &str) -> bool {
+        database_url_env == DEFAULT_DATABASE_URL_ENV || std::env::var_os(database_url_env).is_some()
     }
 
     #[allow(dead_code)]

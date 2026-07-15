@@ -46,6 +46,17 @@ async fn multi_database_routing_flow() -> anyhow::Result<()> {
         shard_placement_alias(&primary, default_run_id, 0).await?,
         PRIMARY_ALIAS
     );
+    let default_route = run_vigilo(
+        &config,
+        PRIMARY_ALIAS,
+        ["shard", "route", &default_run_id.to_string(), "0"],
+    )?;
+    assert_eq!(
+        default_route["data"]["database_alias"].as_str(),
+        Some(PRIMARY_ALIAS)
+    );
+    assert_eq!(default_route["data"]["dispatchable"], true);
+    assert_eq!(default_route["data"]["database_url_env_resolved"], true);
     assert_eq!(
         dispatch_cursor_count(&primary, default_run_id).await?,
         1,
@@ -64,6 +75,20 @@ async fn multi_database_routing_flow() -> anyhow::Result<()> {
         shard_placement_alias(&primary, routed_run_id, 1).await?,
         SHARD_ALIAS
     );
+    let routed_route = run_vigilo(
+        &config,
+        SHARD_ALIAS,
+        ["shard", "route", &routed_run_id.to_string(), "1"],
+    )?;
+    assert_eq!(
+        routed_route["data"]["database_alias"].as_str(),
+        Some(SHARD_ALIAS)
+    );
+    assert_eq!(
+        routed_route["data"]["database_url_env"].as_str(),
+        Some(SHARD_DATABASE_URL_ENV)
+    );
+    assert_eq!(routed_route["data"]["dispatchable"], true);
     assert_eq!(dispatch_cursor_count(&primary, routed_run_id).await?, 2);
     assert_eq!(dispatch_cursor_count(&shard, routed_run_id).await?, 0);
 
@@ -88,6 +113,16 @@ async fn multi_database_routing_flow() -> anyhow::Result<()> {
         shard_placement_alias(&primary, routed_run_id, 0).await?,
         PRIMARY_ALIAS
     );
+    let moved_route = run_vigilo(
+        &config,
+        PRIMARY_ALIAS,
+        ["shard", "route", &routed_run_id.to_string(), "0"],
+    )?;
+    assert_eq!(
+        moved_route["data"]["database_alias"].as_str(),
+        Some(PRIMARY_ALIAS)
+    );
+    assert_eq!(moved_route["data"]["routing_decision"], "dispatchable");
     assert_eq!(run_shard_chunk_count(&primary, routed_run_id, 0).await?, 1);
     assert_eq!(run_shard_chunk_count(&shard, routed_run_id, 0).await?, 1);
 

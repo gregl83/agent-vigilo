@@ -54,6 +54,8 @@ pub(crate) struct DispatchRunSnapshot {
 pub(crate) struct DispatchRoute {
     pub(crate) run_id: Uuid,
     pub(crate) run_shard: i16,
+    pub(crate) database_alias: String,
+    pub(crate) placement_status: String,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -279,7 +281,9 @@ pub(crate) async fn select_next_dispatch_route(
         r#"
         SELECT
             c.run_id,
-            c.run_shard
+            c.run_shard,
+            sp.database_alias,
+            sp.status AS placement_status
         FROM run_shard_dispatch_cursors c
         JOIN runs r
           ON r.id = c.run_id
@@ -1143,6 +1147,8 @@ mod tests {
 
         assert_eq!(route.run_id, run_id);
         assert_eq!(route.run_shard, 1);
+        assert_eq!(route.database_alias, "primary");
+        assert_eq!(route.placement_status, "active");
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -1152,6 +1158,8 @@ mod tests {
         let route = DispatchRoute {
             run_id,
             run_shard: 1,
+            database_alias: "primary".to_string(),
+            placement_status: "active".to_string(),
         };
         let snapshot = prepare_dispatch_run_snapshot(&pool, &route, Uuid::now_v7(), 60)
             .await

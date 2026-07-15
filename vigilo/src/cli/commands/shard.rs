@@ -40,6 +40,16 @@ pub(crate) enum SubCommand {
         command: PlacementSubCommand,
     },
 
+    /// Inspect the resolved route for one run shard
+    Route {
+        /// Run UUID
+        run_id: String,
+
+        /// Logical run shard
+        #[arg(value_parser = clap::value_parser!(i16).range(0..=127))]
+        run_shard: i16,
+    },
+
     /// Move one run shard to another database placement
     Move {
         /// Run UUID
@@ -160,6 +170,9 @@ impl Executable for Command {
                 .await
             }
             SubCommand::Placements { command } => exec_placement_command(context, command).await,
+            SubCommand::Route { run_id, run_shard } => {
+                exec_route_command(context, run_id, run_shard).await
+            }
         }
     }
 }
@@ -236,6 +249,28 @@ async fn exec_move_command(
         "completed shard move workflow"
     );
     out.write_value(&move_payload(&outcome))?;
+    Ok(())
+}
+
+async fn exec_route_command(
+    context: Context,
+    run_id: String,
+    run_shard: i16,
+) -> anyhow::Result<()> {
+    let run_id = parse_run_id(&run_id)?;
+    let database = context.db().await?;
+    let out = context.out().await?;
+    let route = shard_admin::inspect_shard_route(database, run_id, run_shard).await?;
+
+    info!(
+        run_id = %run_id,
+        run_shard,
+        database_alias = %route.database_alias,
+        placement_status = %route.shard_placement_status,
+        routing_decision = route.routing_decision,
+        "inspected shard route"
+    );
+    out.write_value(&route_payload(&route))?;
     Ok(())
 }
 
@@ -378,6 +413,24 @@ fn move_payload(outcome: &shard_admin::ShardMoveOutcome) -> Value {
     })
 }
 
+fn route_payload(route: &shard_admin::ShardRouteInspection) -> Value {
+    json!({
+        "data": {
+            "run_id": route.run_id,
+            "run_shard": route.run_shard,
+            "database_alias": route.database_alias,
+            "shard_placement_status": route.shard_placement_status,
+            "database_role": route.database_role,
+            "database_status": route.database_status,
+            "database_url_env": route.database_url_env,
+            "database_url_env_resolved": route.database_url_env_resolved,
+            "dispatchable": route.dispatchable,
+            "readable": route.readable,
+            "routing_decision": route.routing_decision,
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -440,6 +493,23 @@ mod tests {
         };
 
         assert_eq!(alias, "shard_001");
+    }
+
+    #[test]
+    fn route_command_matches_argument_shape() {
+        let run_id = Uuid::now_v7().to_string();
+        let cli = TestCli::try_parse_from(["vigilo", "route", &run_id, "4"]).unwrap();
+
+        let SubCommand::Route {
+            run_id: parsed_run_id,
+            run_shard,
+        } = cli.command
+        else {
+            panic!("expected shard route command");
+        };
+
+        assert_eq!(parsed_run_id, run_id);
+        assert_eq!(run_shard, 4);
     }
 
     #[test]
@@ -530,5 +600,40 @@ mod tests {
         assert_eq!(payload["meta"]["moved"], json!(true));
         assert_eq!(payload["meta"]["verified"], json!(true));
         assert_eq!(payload["data"]["tables"][0]["table"], json!("run_chunks"));
+    }
+
+    #[test]
+    fn route_payload_excludes_secret_url_value() {
+        let run_id = Uuid::now_v7();
+        let route = shard_admin::ShardRouteInspection {
+            run_id,
+            run_shard: 4,
+            database_alias: "shard_001".to_string(),
+            shard_placement_status: "active".to_string(),
+            database_role: "shard".to_string(),
+            database_status: "active".to_string(),
+            database_url_env: "VIGILO_SHARD_001_DATABASE_URL".to_string(),
+            database_url_env_resolved: true,
+            dispatchable: true,
+            readable: true,
+            routing_decision: "dispatchable",
+        };
+
+        let payload = route_payload(&route);
+
+        assert_eq!(payload["data"]["run_id"], json!(run_id));
+        assert_eq!(payload["data"]["run_shard"], json!(4));
+        assert_eq!(payload["data"]["database_alias"], json!("shard_001"));
+        assert_eq!(
+            payload["data"]["database_url_env"],
+            json!("VIGILO_SHARD_001_DATABASE_URL")
+        );
+        assert!(
+            payload
+                .to_string()
+                .contains("VIGILO_SHARD_001_DATABASE_URL")
+        );
+        assert!(!payload.to_string().contains("postgres://"));
+        assert_eq!(payload["data"]["routing_decision"], json!("dispatchable"));
     }
 }

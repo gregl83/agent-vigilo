@@ -308,11 +308,23 @@ async fn drain_dispatch_batch(
     debug!(coordinator_id = %coordinator_id, "draining dispatchable run-shard windows");
 
     let mut dispatched = 0usize;
+    let mut dispatched_by_alias = std::collections::BTreeMap::<String, usize>::new();
     for _ in 0..config.max_dispatch_per_cycle {
         let control_db = database.control().await?;
         let Some(route) = run_dispatch::select_next_dispatch_route(control_db).await? else {
             break;
         };
+        let database_alias = route.database_alias.clone();
+
+        debug!(
+            coordinator_id = %coordinator_id,
+            run_id = %route.run_id,
+            run_shard = route.run_shard,
+            database_alias = %database_alias,
+            placement_status = %route.placement_status,
+            routing_decision = "selected_dispatch_route",
+            "selected dispatch route"
+        );
 
         let Some(snapshot) = run_dispatch::prepare_dispatch_run_snapshot(
             control_db,
@@ -339,16 +351,22 @@ async fn drain_dispatch_batch(
         };
 
         dispatched += 1;
+        *dispatched_by_alias
+            .entry(database_alias.clone())
+            .or_default() += 1;
         debug!(
             run_id = %run.id,
             run_key = %run.run_key,
             run_shard = run.run_shard,
+            database_alias = %database_alias,
+            routing_decision = "dispatch_window_claimed",
             "claimed dispatchable run shard window"
         );
         info!(
             run_id = %run.id,
             run_key = %run.run_key,
             run_shard = run.run_shard,
+            database_alias = %database_alias,
             chunk_events_enqueued = run.chunk_events_enqueued,
             chunks_marked_dispatched = run.chunks_marked_dispatched,
             run_started_events_enqueued = run.run_started_events_enqueued,
@@ -364,6 +382,14 @@ async fn drain_dispatch_batch(
             dispatch_windows_prepared = dispatched,
             "completed coordinator dispatch drain pass"
         );
+        for (alias, alias_dispatched) in dispatched_by_alias {
+            info!(
+                coordinator_id = %coordinator_id,
+                database_alias = %alias,
+                dispatch_windows_prepared = alias_dispatched,
+                "completed coordinator dispatch drain pass for execution placement"
+            );
+        }
     }
 
     Ok(dispatched)
@@ -491,6 +517,7 @@ async fn collect_run_shard_summaries(
 ) -> anyhow::Result<Vec<run_shard_summary::RunShardSummary>> {
     let routes = database.execution_routes_for_run(run_id).await?;
     let mut summaries = Vec::with_capacity(routes.len());
+    let mut summaries_by_alias = std::collections::BTreeMap::<String, usize>::new();
 
     for (run_shard, alias, db) in routes {
         let Some(summary) =
@@ -514,7 +541,17 @@ async fn collect_run_shard_summaries(
             expected_execution_count = summary.expected_execution_count,
             "loaded run shard summary for finalization"
         );
+        *summaries_by_alias.entry(alias).or_default() += 1;
         summaries.push(summary);
+    }
+
+    for (alias, count) in summaries_by_alias {
+        debug!(
+            run_id = %run_id,
+            database_alias = %alias,
+            shard_summaries_loaded = count,
+            "loaded routed shard summaries for finalization from execution placement"
+        );
     }
 
     Ok(summaries)

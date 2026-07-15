@@ -68,6 +68,21 @@ pub(crate) struct ShardMoveOutcome {
     pub(crate) tables: Vec<ShardMoveTableReport>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ShardRouteInspection {
+    pub(crate) run_id: Uuid,
+    pub(crate) run_shard: i16,
+    pub(crate) database_alias: String,
+    pub(crate) shard_placement_status: String,
+    pub(crate) database_role: String,
+    pub(crate) database_status: String,
+    pub(crate) database_url_env: String,
+    pub(crate) database_url_env_resolved: bool,
+    pub(crate) dispatchable: bool,
+    pub(crate) readable: bool,
+    pub(crate) routing_decision: &'static str,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ShardMoveOptions {
     pub(crate) dry_run: bool,
@@ -188,6 +203,66 @@ pub(crate) async fn select_shard_placement(
 ) -> anyhow::Result<Option<ShardPlacement>> {
     validate_run_shard(run_shard)?;
     shard_placements::select_shard_placement(db, run_id, run_shard).await
+}
+
+/// Inspects the persisted route for one run shard.
+///
+/// This reads only control-plane metadata. It reports whether the current
+/// process can resolve the placement URL env var, but never returns the URL
+/// value.
+pub(crate) async fn inspect_shard_route(
+    database: &database::Db,
+    run_id: Uuid,
+    run_shard: i16,
+) -> anyhow::Result<ShardRouteInspection> {
+    validate_run_shard(run_shard)?;
+
+    let control_db = database.control().await?;
+    let placement = shard_placements::select_shard_placement(control_db, run_id, run_shard)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "shard placement for run {} shard {} was not found",
+                run_id,
+                run_shard
+            )
+        })?;
+    let database_placement =
+        database_placements::select_database_placement(control_db, &placement.database_alias)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "database placement alias {} was not found",
+                    placement.database_alias
+                )
+            })?;
+
+    let database_active = database_placement.status == DATABASE_PLACEMENT_STATUS_ACTIVE;
+    let shard_capable = database_placement.is_shard_capable();
+    let dispatchable = placement.is_dispatchable() && database_active && shard_capable;
+    let readable = database_active && shard_capable;
+    let routing_decision = if dispatchable {
+        "dispatchable"
+    } else if readable {
+        "read_only"
+    } else {
+        "blocked"
+    };
+
+    Ok(ShardRouteInspection {
+        run_id,
+        run_shard,
+        database_alias: placement.database_alias,
+        shard_placement_status: placement.status,
+        database_role: database_placement.role,
+        database_status: database_placement.status,
+        database_url_env_resolved: database
+            .database_url_env_is_resolved(&database_placement.database_url_env),
+        database_url_env: database_placement.database_url_env,
+        dispatchable,
+        readable,
+        routing_decision,
+    })
 }
 
 pub(crate) async fn set_shard_placement(
@@ -701,6 +776,97 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("control-capable and active"));
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn inspect_shard_route_reports_dispatchable_primary_route(pool: PgPool) {
+        let database_url = std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap();
+        let database = context_with_control_pool(pool.clone(), database_url);
+        let run_id = Uuid::now_v7();
+
+        sqlx::query(
+            r#"
+            INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
+            VALUES ($1::uuid, 4, 'primary', 'active')
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let route = inspect_shard_route(&database, run_id, 4).await.unwrap();
+
+        assert_eq!(route.database_alias, "primary");
+        assert_eq!(route.database_role, "control_and_shard");
+        assert_eq!(route.database_url_env, DEFAULT_DATABASE_URL_ENV);
+        assert!(route.database_url_env_resolved);
+        assert!(route.dispatchable);
+        assert!(route.readable);
+        assert_eq!(route.routing_decision, "dispatchable");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn inspect_shard_route_reports_moving_route_as_read_only(pool: PgPool) {
+        let database_url = std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap();
+        let database = context_with_control_pool(pool.clone(), database_url);
+        let run_id = Uuid::now_v7();
+
+        sqlx::query(
+            r#"
+            INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
+            VALUES ($1::uuid, 4, 'primary', 'moving')
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let route = inspect_shard_route(&database, run_id, 4).await.unwrap();
+
+        assert!(!route.dispatchable);
+        assert!(route.readable);
+        assert_eq!(route.routing_decision, "read_only");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn inspect_shard_route_reports_disabled_placement_as_blocked(pool: PgPool) {
+        let database_url = std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap();
+        let database = context_with_control_pool(pool.clone(), database_url);
+        let run_id = Uuid::now_v7();
+
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_disabled', 'VIGILO_TEST_MISSING_SHARD_URL', 'shard', 'disabled')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
+            VALUES ($1::uuid, 4, 'shard_disabled', 'active')
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let route = inspect_shard_route(&database, run_id, 4).await.unwrap();
+
+        assert_eq!(route.database_alias, "shard_disabled");
+        assert_eq!(route.database_status, "disabled");
+        assert!(!route.database_url_env_resolved);
+        assert!(!route.dispatchable);
+        assert!(!route.readable);
+        assert_eq!(route.routing_decision, "blocked");
     }
 
     #[sqlx::test(migrations = "../migrations")]

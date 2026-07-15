@@ -256,7 +256,13 @@ Useful inspection commands:
 vigilo shard databases list
 vigilo shard placements list <run_id>
 vigilo shard placements show <run_id> <run_shard>
+vigilo shard route <run_id> <run_shard>
 ```
+
+Use `vigilo shard route` when debugging one execution route. It reports the
+stored database alias, placement statuses, `database_url_env`, whether this
+process can resolve that env var, and whether the route is currently
+dispatchable, readable, or blocked. It does not print the database URL value.
 
 ## Migration Runbook
 
