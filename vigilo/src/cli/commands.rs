@@ -2,7 +2,7 @@
 //!
 //! This module owns the top-level command enum used by clap and delegates
 //! execution to feature-specific command modules (`run`, `evaluators`,
-//! `coordinator`, `worker`, `setup`).
+//! `coordinator`, `worker`, `shard`, `setup`).
 
 use async_trait::async_trait;
 use clap::Subcommand;
@@ -13,6 +13,7 @@ pub(super) mod coordinator;
 pub(super) mod evaluators;
 pub(super) mod run;
 pub(super) mod setup;
+pub(super) mod shard;
 pub(super) mod worker;
 
 use super::{
@@ -39,6 +40,9 @@ pub(crate) enum Command {
 
     /// Run worker processes
     Worker(worker::Command),
+
+    /// Manage shard database placements
+    Shard(shard::Command),
 }
 
 #[async_trait]
@@ -49,6 +53,7 @@ impl Executable for Command {
             Command::Coordinator(cmd) => cmd.exec(context).await,
             Command::Evaluators(cmd) => cmd.exec(context).await,
             Command::Run(cmd) => cmd.exec(context).await,
+            Command::Shard(cmd) => cmd.exec(context).await,
             Command::Setup(cmd) => cmd.exec(context).await,
             Command::Worker(cmd) => cmd.exec(context).await,
         }

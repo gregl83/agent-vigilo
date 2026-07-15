@@ -8,6 +8,23 @@ use sqlx::PgPool;
 
 use crate::models::database_placement::DatabasePlacement;
 
+/// Lists all database placements ordered by alias for admin output.
+pub(crate) async fn list_database_placements(
+    db: &PgPool,
+) -> anyhow::Result<Vec<DatabasePlacement>> {
+    let placements = sqlx::query_as::<_, DatabasePlacement>(
+        r#"
+        SELECT alias, database_url_env, role, status, created_at, updated_at
+        FROM database_placements
+        ORDER BY alias
+        "#,
+    )
+    .fetch_all(db)
+    .await?;
+
+    Ok(placements)
+}
+
 /// Lists active database placements ordered by alias for deterministic
 /// validation and diagnostics.
 pub(crate) async fn list_active_database_placements(
@@ -25,6 +42,68 @@ pub(crate) async fn list_active_database_placements(
     .await?;
 
     Ok(placements)
+}
+
+pub(crate) async fn select_database_placement(
+    db: &PgPool,
+    alias: &str,
+) -> anyhow::Result<Option<DatabasePlacement>> {
+    let placement = sqlx::query_as::<_, DatabasePlacement>(
+        r#"
+        SELECT alias, database_url_env, role, status, created_at, updated_at
+        FROM database_placements
+        WHERE alias = $1
+        "#,
+    )
+    .bind(alias)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(placement)
+}
+
+pub(crate) async fn insert_database_placement(
+    db: &PgPool,
+    alias: &str,
+    database_url_env: &str,
+    role: &str,
+    status: &str,
+) -> anyhow::Result<DatabasePlacement> {
+    let placement = sqlx::query_as::<_, DatabasePlacement>(
+        r#"
+        INSERT INTO database_placements (alias, database_url_env, role, status)
+        VALUES ($1, $2, $3, $4)
+        RETURNING alias, database_url_env, role, status, created_at, updated_at
+        "#,
+    )
+    .bind(alias)
+    .bind(database_url_env)
+    .bind(role)
+    .bind(status)
+    .fetch_one(db)
+    .await?;
+
+    Ok(placement)
+}
+
+pub(crate) async fn disable_database_placement(
+    db: &PgPool,
+    alias: &str,
+) -> anyhow::Result<Option<DatabasePlacement>> {
+    let placement = sqlx::query_as::<_, DatabasePlacement>(
+        r#"
+        UPDATE database_placements
+        SET status = 'disabled',
+            updated_at = now()
+        WHERE alias = $1
+        RETURNING alias, database_url_env, role, status, created_at, updated_at
+        "#,
+    )
+    .bind(alias)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(placement)
 }
 
 /// Lists every active database alias.

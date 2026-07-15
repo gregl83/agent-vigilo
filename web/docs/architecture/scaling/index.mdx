@@ -215,18 +215,41 @@ This keeps topology decisions contained:
 
 The `database_placements` table is the authoritative placement catalog. Environment variables provide secret connection values and process-local defaults; they must not duplicate the placement catalog.
 
-When adding a shard placement, insert a `database_placements` row and deploy the matching secret env var:
+When adding a shard placement, deploy the matching secret env var and add the
+database placement:
 
 ```text
-alias = shard_001
-database_url_env = VIGILO_SHARD_001_DATABASE_URL
-role = shard
-status = active
-
 VIGILO_SHARD_001_DATABASE_URL=postgres://...
+vigilo shard databases add shard_001 --database-url-env VIGILO_SHARD_001_DATABASE_URL
 ```
 
-After that, new `shard_placements` rows can point selected execution shards at `shard_001`. The initial assignment rule is deliberately simple: every new run shard maps to `VIGILO_DEFAULT_SHARD_DATABASE_ALIAS` when placement rows are created. Richer policies should be introduced only with an explicit admin/config contract, because routing must read stored `shard_placements` rows instead of recalculating from current placement count.
+The command creates an active shard-only placement. It validates that the env
+var is present unless `--defer-env-validation` is passed deliberately.
+
+After that, new `shard_placements` rows can point selected execution shards at
+`shard_001`:
+
+```text
+vigilo shard placements set <run_id> <run_shard> --alias shard_001
+```
+
+This is only allowed for an empty or new `run_id + run_shard`. If the current
+active placement already has shard-owned rows, use the shard move workflow
+instead of directly changing the alias.
+
+The initial assignment rule is deliberately simple: every new run shard maps to
+`VIGILO_DEFAULT_SHARD_DATABASE_ALIAS` when placement rows are created. Richer
+policies should be introduced only with an explicit admin/config contract,
+because routing must read stored `shard_placements` rows instead of
+recalculating from current placement count.
+
+Useful inspection commands:
+
+```text
+vigilo shard databases list
+vigilo shard placements list <run_id>
+vigilo shard placements show <run_id> <run_shard>
+```
 
 ## Migration Runbook
 

@@ -47,3 +47,29 @@ pub(crate) async fn list_shard_placements_for_run(
 
     Ok(placements)
 }
+
+pub(crate) async fn upsert_active_shard_placement(
+    db: &PgPool,
+    run_id: Uuid,
+    run_shard: i16,
+    database_alias: &str,
+) -> anyhow::Result<ShardPlacement> {
+    let placement = sqlx::query_as::<_, ShardPlacement>(
+        r#"
+        INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
+        VALUES ($1::uuid, $2, $3, 'active')
+        ON CONFLICT (run_id, run_shard) DO UPDATE
+        SET database_alias = EXCLUDED.database_alias,
+            status = EXCLUDED.status,
+            updated_at = now()
+        RETURNING run_id, run_shard, database_alias, status, created_at, updated_at
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(database_alias)
+    .fetch_one(db)
+    .await?;
+
+    Ok(placement)
+}

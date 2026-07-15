@@ -19,6 +19,8 @@ pub(crate) const DEFAULT_DATABASE_URL_ENV: &str = "DATABASE_URL";
 pub(crate) const DATABASE_PLACEMENT_ROLE_CONTROL: &str = "control";
 pub(crate) const DATABASE_PLACEMENT_ROLE_SHARD: &str = "shard";
 pub(crate) const DATABASE_PLACEMENT_ROLE_CONTROL_AND_SHARD: &str = "control_and_shard";
+pub(crate) const DATABASE_PLACEMENT_STATUS_ACTIVE: &str = "active";
+pub(crate) const DATABASE_PLACEMENT_STATUS_DISABLED: &str = "disabled";
 
 /// Persisted database placement row.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
