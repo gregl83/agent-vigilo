@@ -286,6 +286,12 @@ impl Db {
         Ok(routed)
     }
 
+    pub(crate) async fn invalidate_execution_placement(&self, run_id: Uuid, run_shard: i16) {
+        self.shard_placement_cache
+            .invalidate(&ShardPlacementKey { run_id, run_shard })
+            .await;
+    }
+
     pub(crate) async fn validate_placement_config(&self) -> anyhow::Result<()> {
         let db = self.control().await?;
         let placements = database_placements::list_active_database_placements(db).await?;

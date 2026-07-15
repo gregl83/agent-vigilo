@@ -1,8 +1,7 @@
 //! Shard placement administration commands.
 //!
-//! These commands inspect and update routing metadata. They do not move data;
-//! changing a placement that already owns shard-local rows is reserved for the
-//! shard move workflow.
+//! These commands inspect placement metadata, update empty shard routes, and
+//! run the explicit shard move workflow for routes that already own data.
 
 use async_trait::async_trait;
 use clap::{
@@ -39,6 +38,32 @@ pub(crate) enum SubCommand {
     Placements {
         #[command(subcommand)]
         command: PlacementSubCommand,
+    },
+
+    /// Move one run shard to another database placement
+    Move {
+        /// Run UUID
+        run_id: String,
+
+        /// Logical run shard
+        #[arg(value_parser = clap::value_parser!(i16).range(0..=127))]
+        run_shard: i16,
+
+        /// Target database placement alias
+        #[arg(long, alias = "to")]
+        alias: String,
+
+        /// Validate and report the move plan without writing data
+        #[arg(long, default_value_t = false, conflicts_with = "verify_only")]
+        dry_run: bool,
+
+        /// Verify source and target shard rows without copying or switching placement
+        #[arg(long, default_value_t = false)]
+        verify_only: bool,
+
+        /// Allow copying while leased chunks or running attempts still exist
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 }
 
@@ -115,6 +140,25 @@ impl Executable for Command {
     async fn exec(self, context: Context) -> anyhow::Result<()> {
         match self.command {
             SubCommand::Databases { command } => exec_database_command(context, command).await,
+            SubCommand::Move {
+                run_id,
+                run_shard,
+                alias,
+                dry_run,
+                verify_only,
+                force,
+            } => {
+                exec_move_command(
+                    context,
+                    run_id,
+                    run_shard,
+                    alias,
+                    dry_run,
+                    verify_only,
+                    force,
+                )
+                .await
+            }
             SubCommand::Placements { command } => exec_placement_command(context, command).await,
         }
     }
@@ -155,6 +199,43 @@ async fn exec_database_command(
         }
     }
 
+    Ok(())
+}
+
+async fn exec_move_command(
+    context: Context,
+    run_id: String,
+    run_shard: i16,
+    alias: String,
+    dry_run: bool,
+    verify_only: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    let run_id = parse_run_id(&run_id)?;
+    let database = context.db().await?;
+    let out = context.out().await?;
+    let outcome = shard_admin::move_shard_placement(
+        database,
+        run_id,
+        run_shard,
+        &alias,
+        shard_admin::ShardMoveOptions {
+            dry_run,
+            verify_only,
+            force,
+        },
+    )
+    .await?;
+
+    info!(
+        run_id = %run_id,
+        run_shard,
+        source_database_alias = %outcome.source_database_alias,
+        target_database_alias = %outcome.target_database_alias,
+        moved = outcome.moved,
+        "completed shard move workflow"
+    );
+    out.write_value(&move_payload(&outcome))?;
     Ok(())
 }
 
@@ -276,9 +357,31 @@ fn placement_set_payload(outcome: &shard_admin::ShardPlacementSetOutcome) -> Val
     })
 }
 
+fn move_payload(outcome: &shard_admin::ShardMoveOutcome) -> Value {
+    json!({
+        "data": {
+            "run_id": outcome.run_id,
+            "run_shard": outcome.run_shard,
+            "source_database_alias": outcome.source_database_alias,
+            "target_database_alias": outcome.target_database_alias,
+            "active_work_count": outcome.active_work_count,
+            "placement": outcome.placement,
+            "tables": outcome.tables,
+        },
+        "meta": {
+            "dry_run": outcome.dry_run,
+            "verify_only": outcome.verify_only,
+            "forced": outcome.forced,
+            "moved": outcome.moved,
+            "verified": outcome.tables.iter().all(|table| table.verified),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
+    use clap::Parser;
 
     use super::*;
     use crate::models::{
@@ -288,6 +391,56 @@ mod tests {
         },
         shard_placement::SHARD_PLACEMENT_STATUS_ACTIVE,
     };
+
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: SubCommand,
+    }
+
+    #[test]
+    fn move_command_matches_placement_argument_shape() {
+        let run_id = Uuid::now_v7().to_string();
+        let cli = TestCli::try_parse_from([
+            "vigilo",
+            "move",
+            &run_id,
+            "4",
+            "--alias",
+            "shard_001",
+            "--dry-run",
+        ])
+        .unwrap();
+
+        let SubCommand::Move {
+            run_id: parsed_run_id,
+            run_shard,
+            alias,
+            dry_run,
+            ..
+        } = cli.command
+        else {
+            panic!("expected shard move command");
+        };
+
+        assert_eq!(parsed_run_id, run_id);
+        assert_eq!(run_shard, 4);
+        assert_eq!(alias, "shard_001");
+        assert!(dry_run);
+    }
+
+    #[test]
+    fn move_command_accepts_to_as_alias_for_compatibility() {
+        let run_id = Uuid::now_v7().to_string();
+        let cli =
+            TestCli::try_parse_from(["vigilo", "move", &run_id, "4", "--to", "shard_001"]).unwrap();
+
+        let SubCommand::Move { alias, .. } = cli.command else {
+            panic!("expected shard move command");
+        };
+
+        assert_eq!(alias, "shard_001");
+    }
 
     #[test]
     fn database_list_payload_reports_count() {
@@ -337,5 +490,45 @@ mod tests {
             payload["data"]["shard_placement"]["database_alias"],
             json!("shard_002")
         );
+    }
+
+    #[test]
+    fn move_payload_reports_verification_state() {
+        let run_id = Uuid::now_v7();
+        let placement = ShardPlacement {
+            run_id,
+            run_shard: 4,
+            database_alias: "shard_001".to_string(),
+            status: SHARD_PLACEMENT_STATUS_ACTIVE.to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let outcome = shard_admin::ShardMoveOutcome {
+            run_id,
+            run_shard: 4,
+            source_database_alias: "primary".to_string(),
+            target_database_alias: "shard_001".to_string(),
+            dry_run: false,
+            verify_only: false,
+            forced: false,
+            active_work_count: 0,
+            moved: true,
+            placement,
+            tables: vec![shard_admin::ShardMoveTableReport {
+                table: "run_chunks",
+                source_row_count: 1,
+                target_row_count: 1,
+                copied_row_count: 1,
+                source_checksum: "a".to_string(),
+                target_checksum: "a".to_string(),
+                verified: true,
+            }],
+        };
+
+        let payload = move_payload(&outcome);
+
+        assert_eq!(payload["meta"]["moved"], json!(true));
+        assert_eq!(payload["meta"]["verified"], json!(true));
+        assert_eq!(payload["data"]["tables"][0]["table"], json!("run_chunks"));
     }
 }

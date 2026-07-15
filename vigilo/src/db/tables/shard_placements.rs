@@ -73,3 +73,56 @@ pub(crate) async fn upsert_active_shard_placement(
 
     Ok(placement)
 }
+
+pub(crate) async fn update_shard_placement_status(
+    db: &PgPool,
+    run_id: Uuid,
+    run_shard: i16,
+    status: &str,
+) -> anyhow::Result<Option<ShardPlacement>> {
+    let placement = sqlx::query_as::<_, ShardPlacement>(
+        r#"
+        UPDATE shard_placements
+        SET status = $3,
+            updated_at = now()
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+        RETURNING run_id, run_shard, database_alias, status, created_at, updated_at
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(status)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(placement)
+}
+
+pub(crate) async fn update_shard_placement_alias_and_status(
+    db: &PgPool,
+    run_id: Uuid,
+    run_shard: i16,
+    database_alias: &str,
+    status: &str,
+) -> anyhow::Result<Option<ShardPlacement>> {
+    let placement = sqlx::query_as::<_, ShardPlacement>(
+        r#"
+        UPDATE shard_placements
+        SET database_alias = $3,
+            status = $4,
+            updated_at = now()
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+        RETURNING run_id, run_shard, database_alias, status, created_at, updated_at
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(database_alias)
+    .bind(status)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(placement)
+}

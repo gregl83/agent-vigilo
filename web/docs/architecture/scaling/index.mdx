@@ -98,13 +98,15 @@ Implemented today:
 - Result/export read routing can inspect `moving` or `draining` shard
   placements; those states block new work, not reads from the current source
   placement.
+- `vigilo shard move` copies one `run_id + run_shard` to another execution
+  placement, verifies row counts and checksums, and switches the routing row
+  after verification.
 
 Not implemented yet:
 
 - Multi-placement assignment policy at run creation.
 - Cancellation, status fanout, evaluator metadata replication, and canonical
   case-data routing/replication paths migrated to execution placement routing.
-- Automated shard migration tooling.
 
 The current system should be read as **single-database operation by default,
 with routed execution workflows being introduced behind the database service
@@ -255,24 +257,53 @@ vigilo shard placements show <run_id> <run_shard>
 
 Use this procedure when moving logical shards to a new PostgreSQL placement.
 
-1. **Choose shard scope.** Select one or more `run_id + run_shard` pairs, or a whole `run_shard` range if the placement layer supports global shard ownership.
-2. **Mark placement moving.** Set selected placement rows to `moving` so coordinators stop dispatching new chunks for those shards. Existing workers may finish their current leases.
-3. **Drain open work.** Wait until selected chunks are no longer `leased`, or cancel/recover leases according to the chunk recovery policy.
-4. **Copy shard-owned rows.** Move rows for the selected shard scope from the source placement to the target placement:
+1. **Choose shard scope.** Select one `run_id + run_shard` pair.
+2. **Preview the move.** Run:
+
+```text
+vigilo shard move <run_id> <run_shard> --alias <alias> --dry-run
+```
+
+3. **Move after work drains.** Run the move once selected chunks are no longer
+   `leased` and attempts are no longer `running`:
+
+```text
+vigilo shard move <run_id> <run_shard> --alias <alias>
+```
+
+The normal command marks the shard placement `moving`, copies rows, verifies
+counts and checksums, then switches the placement to the target alias with
+status `active`. `--dry-run` and `--verify-only` are read-only. Use `--force`
+only for an explicit unsafe copy while active work remains.
+
+4. **Copy shard-owned rows.** The move workflow copies rows for the selected
+   shard scope from the source placement to the target placement:
 
 ```text
 run_chunks
-run_shard_dispatch_cursors
+run_snapshots
 executions
 execution_attempts
 execution_aggregates
 evaluator_results
+run_shard_summaries
 ```
 
-5. **Verify data.** Compare row counts and checksums per table for the selected `run_id + run_shard` scope.
-6. **Switch placement.** Update placement rows to `active` on the new `database_alias`.
+It also copies the required `dataset_versions` and `runs` rows to satisfy local
+foreign keys on the target placement. `run_shard_dispatch_cursors` remains
+control-plane metadata and is not copied between execution placements.
+
+5. **Verify data.** To compare an already-copied source and target without
+   copying or switching placement, run:
+
+```text
+vigilo shard move <run_id> <run_shard> --alias <alias> --verify-only
+```
+
+6. **Switch placement.** The successful move command updates the placement row
+to `active` on the new `database_alias`.
 7. **Resume dispatch.** Coordinators and workers resolve the same `run_id + run_shard` to the new database placement and continue processing.
-8. **Retain then clean up.** Keep source rows read-only for a retention window, then delete them after verification and backup policy allow it.
+8. **Retain then clean up.** Keep source rows read-only for a retention window. Source cleanup is outside the move command and should happen only after verification and backup policy allow it.
 
 ## Migration Standards
 
