@@ -26,6 +26,7 @@ use sqlx::{
     PgPool,
     Postgres,
     QueryBuilder,
+    types::Json,
 };
 use tokio::task::{
     self,
@@ -794,12 +795,12 @@ async fn allocate_execution_attempts_for_cases(
         b.push_bind(row.case.case_id)
             .push_bind(&row.case.case_hash)
             .push_bind(&row.case.task_type)
-            .push_bind(&row.tags)
-            .push_bind(&row.input_payload)
-            .push_bind(&row.expected_output)
-            .push_bind(&row.case_metadata)
+            .push_bind(Json(row.tags.clone()))
+            .push_bind(Json(row.input_payload.clone()))
+            .push_bind(Json(row.expected_output.clone()))
+            .push_bind(Json(row.case_metadata.clone()))
             .push_bind(row.profile_group_id)
-            .push_bind(&row.evaluator_manifest)
+            .push_bind(Json(row.evaluator_manifest.clone()))
             .push_bind(row.expected_evaluator_count)
             .push_bind(row.input_ordinal);
     });

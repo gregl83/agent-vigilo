@@ -15,6 +15,7 @@ use std::collections::{
 use sqlx::{
     Postgres,
     QueryBuilder,
+    types::Json,
 };
 use uuid::Uuid;
 
@@ -251,11 +252,11 @@ pub(crate) async fn bulk_insert_case_blobs(
             b.push_bind(&row.case_hash)
                 .push_bind(&row.task_type)
                 .push_bind(&row.case_group)
-                .push_bind(&row.input_payload)
-                .push_bind(&row.expected_output)
-                .push_bind(&row.context_payload)
-                .push_bind(&row.tags)
-                .push_bind(&row.metadata);
+                .push_bind(Json(row.input_payload.clone()))
+                .push_bind(Json(row.expected_output.clone()))
+                .push_bind(Json(row.context_payload.clone()))
+                .push_bind(Json(row.tags.clone()))
+                .push_bind(Json(row.metadata.clone()));
         });
 
         query_builder.push(" ON CONFLICT (case_hash) DO NOTHING");
@@ -737,6 +738,41 @@ mod tests {
         .unwrap();
 
         assert_eq!(rows, vec![(0, "open".to_string()), (1, "open".to_string())]);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn bulk_insert_case_blobs_preserves_json_null_context(pool: PgPool) {
+        let case_blob = CaseBlobDraft {
+            case_hash: format!("case-{}", Uuid::now_v7()),
+            task_type: "classification".to_string(),
+            case_group: None,
+            input_payload: serde_json::json!({"text": "hello"}),
+            expected_output: serde_json::Value::Null,
+            context_payload: serde_json::Value::Null,
+            tags: serde_json::json!([]),
+            metadata: serde_json::json!({}),
+        };
+
+        let mut tx = pool.begin().await.unwrap();
+        bulk_insert_case_blobs(&mut tx, std::slice::from_ref(&case_blob))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let context_payload = sqlx::query_scalar::<_, serde_json::Value>(
+            r#"
+            SELECT context_payload
+            FROM case_blobs
+            WHERE case_hash = $1
+            "#,
+        )
+        .bind(&case_blob.case_hash)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(context_payload, serde_json::Value::Null);
     }
 
     #[sqlx::test(migrations = "../migrations")]
