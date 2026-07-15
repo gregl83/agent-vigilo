@@ -96,6 +96,7 @@ async fn main() -> ExitCode {
             let placement_config = match PlacementConfig::new(
                 app.control_database_alias.clone(),
                 app.default_shard_database_alias.clone(),
+                app.shard_assignment_policy.clone(),
             ) {
                 Ok(config) => config,
                 Err(e) => {

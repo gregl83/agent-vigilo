@@ -10,7 +10,7 @@ sequenceDiagram
     actor User
     participant Vigilo
     participant ControlDB as Control DB
-    participant ExecutionDB as Execution DB
+    participant ExecutionDB as Execution DBs
 
     User->>Vigilo: vigilo run create
     activate Vigilo
@@ -20,9 +20,9 @@ sequenceDiagram
     Vigilo->>ControlDB: Validate profile executability
     ControlDB-->>Vigilo: Runnable evaluator summary
 
-    Vigilo->>Vigilo: Plan case blobs, dataset version, run, chunks, placements, and dispatch cursors
+    Vigilo->>Vigilo: Plan case blobs, dataset version, run, chunks, shard assignments, and dispatch cursors
     Vigilo->>ControlDB: Store run metadata, placement rows, cursors, and canonical dataset rows
-    Vigilo->>ExecutionDB: Store execution-local prerequisites and pending chunks
+    Vigilo->>ExecutionDB: Store execution-local prerequisites and owned pending chunks
 
     alt Run creation committed
         ControlDB-->>Vigilo: Control records saved

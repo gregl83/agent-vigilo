@@ -13,7 +13,7 @@ flowchart TD
     Parse{Profile and dataset schemas valid?}
     Cases{Dataset has cases?}
     Executable{Profile executable for dataset?}
-    Plan[Plan case, dataset, run, and chunk records]
+    Plan[Plan case, dataset, run, chunks, and shard assignments]
     Persist[Commit run creation transaction]
     Payload[Build run creation payload]
 

@@ -7,7 +7,10 @@
 //! paths are chunked to keep statement size and bind counts bounded for large
 //! datasets.
 
-use std::collections::BTreeSet;
+use std::collections::{
+    BTreeMap,
+    BTreeSet,
+};
 
 use sqlx::{
     Postgres,
@@ -16,7 +19,10 @@ use sqlx::{
 use uuid::Uuid;
 
 use crate::{
-    context::database,
+    context::database::{
+        self,
+        ShardAssignmentPolicy,
+    },
     models::{
         case_blob::CaseBlobDraft,
         database_placement::{
@@ -33,6 +39,12 @@ use crate::{
 const CASE_BLOB_INSERT_CHUNK_SIZE: usize = 500;
 const DATASET_MEMBERSHIP_INSERT_CHUNK_SIZE: usize = 2_000;
 const RUN_CHUNK_INSERT_CHUNK_SIZE: usize = 2_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunShardPlacementAssignment {
+    pub(crate) run_shard: i16,
+    pub(crate) database_alias: String,
+}
 
 struct RunSeedState<'a> {
     run_id: Uuid,
@@ -55,7 +67,7 @@ pub(crate) async fn insert_run_seed_state(
     case_blobs: &[CaseBlobDraft],
     dataset_cases: &[DatasetVersionCaseDraft],
     chunks: &[RunChunkDraft],
-    execution_database_alias: &str,
+    assignments: &[RunShardPlacementAssignment],
 ) -> anyhow::Result<()> {
     let seed = RunSeedState {
         run_id,
@@ -65,25 +77,22 @@ pub(crate) async fn insert_run_seed_state(
         chunks,
     };
     let control_db = database.control().await?;
-    let execution_in_control = execution_database_alias == database.control_database_alias();
-    let execution_db = if execution_in_control {
-        None
-    } else {
-        Some(database.placement(execution_database_alias).await?)
-    };
+    let chunks_by_alias = group_chunks_by_assigned_alias(chunks, assignments)?;
 
     let mut control_tx = control_db.begin().await?;
-    insert_control_seed_state(
-        &mut control_tx,
-        &seed,
-        execution_database_alias,
-        execution_in_control,
-    )
-    .await?;
+    let control_chunks = chunks_by_alias
+        .get(database.control_database_alias())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    insert_control_seed_state(&mut control_tx, &seed, assignments, control_chunks).await?;
 
-    if let Some(execution_db) = execution_db {
+    for (database_alias, execution_chunks) in chunks_by_alias {
+        if database_alias == database.control_database_alias() {
+            continue;
+        }
+        let execution_db = database.placement(&database_alias).await?;
         let mut execution_tx = execution_db.begin().await?;
-        insert_execution_seed_state(&mut execution_tx, &seed).await?;
+        insert_execution_seed_state(&mut execution_tx, &seed, &execution_chunks).await?;
         execution_tx.commit().await?;
     }
 
@@ -94,8 +103,8 @@ pub(crate) async fn insert_run_seed_state(
 async fn insert_control_seed_state(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     seed: &RunSeedState<'_>,
-    execution_database_alias: &str,
-    include_execution_chunks: bool,
+    assignments: &[RunShardPlacementAssignment],
+    control_chunks: &[RunChunkDraft],
 ) -> anyhow::Result<()> {
     bulk_insert_case_blobs(tx, seed.case_blobs).await?;
     upsert_dataset_version(
@@ -107,11 +116,17 @@ async fn insert_control_seed_state(
     .await?;
     bulk_insert_dataset_membership(tx, seed.draft.dataset_version_id, seed.dataset_cases).await?;
     insert_run_create(tx, seed.run_id, seed.draft).await?;
-    bulk_insert_shard_placements(tx, seed.run_id, seed.chunks, execution_database_alias).await?;
+    bulk_insert_shard_placements(tx, seed.run_id, assignments).await?;
     bulk_insert_run_shard_dispatch_cursors(tx, seed.run_id, seed.chunks).await?;
 
-    if include_execution_chunks {
-        bulk_insert_run_chunks(tx, seed.run_id, seed.draft.dataset_version_id, seed.chunks).await?;
+    if !control_chunks.is_empty() {
+        bulk_insert_run_chunks(
+            tx,
+            seed.run_id,
+            seed.draft.dataset_version_id,
+            control_chunks,
+        )
+        .await?;
     }
 
     Ok(())
@@ -120,6 +135,7 @@ async fn insert_control_seed_state(
 async fn insert_execution_seed_state(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     seed: &RunSeedState<'_>,
+    chunks: &[RunChunkDraft],
 ) -> anyhow::Result<()> {
     bulk_insert_case_blobs(tx, seed.case_blobs).await?;
     upsert_dataset_version(
@@ -131,7 +147,86 @@ async fn insert_execution_seed_state(
     .await?;
     bulk_insert_dataset_membership(tx, seed.draft.dataset_version_id, seed.dataset_cases).await?;
     insert_run_create(tx, seed.run_id, seed.draft).await?;
-    bulk_insert_run_chunks(tx, seed.run_id, seed.draft.dataset_version_id, seed.chunks).await
+    bulk_insert_run_chunks(tx, seed.run_id, seed.draft.dataset_version_id, chunks).await
+}
+
+/// Chooses initial execution placements for the run shards used by a new run.
+///
+/// The returned assignments are persisted to `shard_placements`; runtime
+/// routing reads those stored rows instead of recomputing this policy.
+pub(crate) async fn assign_run_shard_placements(
+    database: &database::Db,
+    chunks: &[RunChunkDraft],
+) -> anyhow::Result<Vec<RunShardPlacementAssignment>> {
+    let run_shards = chunks
+        .iter()
+        .map(|chunk| chunk.run_shard)
+        .collect::<BTreeSet<_>>();
+
+    let aliases = match database.shard_assignment_policy() {
+        ShardAssignmentPolicy::SingleDefault => {
+            vec![database.default_execution_database_alias().to_string()]
+        }
+        ShardAssignmentPolicy::SpreadActive => {
+            let mut aliases = database.active_shard_capable_database_aliases().await?;
+            if aliases.is_empty() {
+                anyhow::bail!("no active shard-capable database placements are configured");
+            }
+            if let Some(default_idx) = aliases
+                .iter()
+                .position(|alias| alias == database.default_execution_database_alias())
+            {
+                aliases.swap(0, default_idx);
+            }
+            aliases
+        }
+    };
+
+    Ok(assign_run_shards_to_aliases(&run_shards, &aliases))
+}
+
+pub(crate) fn assign_run_shards_to_aliases(
+    run_shards: &BTreeSet<i16>,
+    aliases: &[String],
+) -> Vec<RunShardPlacementAssignment> {
+    if aliases.is_empty() {
+        return Vec::new();
+    }
+
+    run_shards
+        .iter()
+        .enumerate()
+        .map(|(idx, run_shard)| RunShardPlacementAssignment {
+            run_shard: *run_shard,
+            database_alias: aliases[idx % aliases.len()].clone(),
+        })
+        .collect()
+}
+
+fn group_chunks_by_assigned_alias(
+    chunks: &[RunChunkDraft],
+    assignments: &[RunShardPlacementAssignment],
+) -> anyhow::Result<BTreeMap<String, Vec<RunChunkDraft>>> {
+    let aliases_by_shard = assignments
+        .iter()
+        .map(|assignment| (assignment.run_shard, assignment.database_alias.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut grouped = BTreeMap::<String, Vec<RunChunkDraft>>::new();
+
+    for chunk in chunks {
+        let Some(alias) = aliases_by_shard.get(&chunk.run_shard) else {
+            anyhow::bail!(
+                "missing shard placement assignment for run_shard {}",
+                chunk.run_shard
+            );
+        };
+        grouped
+            .entry(alias.clone())
+            .or_default()
+            .push(chunk.clone());
+    }
+
+    Ok(grouped)
 }
 
 /// Inserts case blob rows, ignoring already-known content hashes.
@@ -458,28 +553,28 @@ pub(crate) async fn bulk_insert_run_shard_dispatch_cursors(
 pub(crate) async fn bulk_insert_shard_placements(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     run_id: Uuid,
-    chunks: &[RunChunkDraft],
-    database_alias: &str,
+    assignments: &[RunShardPlacementAssignment],
 ) -> anyhow::Result<()> {
-    if chunks.is_empty() {
+    if assignments.is_empty() {
         return Ok(());
     }
 
-    validate_active_shard_capable_placement(tx, database_alias).await?;
-
-    let run_shards = chunks
+    let database_aliases = assignments
         .iter()
-        .map(|chunk| chunk.run_shard)
+        .map(|assignment| assignment.database_alias.as_str())
         .collect::<BTreeSet<_>>();
+    for database_alias in database_aliases {
+        validate_active_shard_capable_placement(tx, database_alias).await?;
+    }
 
     let mut query_builder = QueryBuilder::<Postgres>::new(
         "INSERT INTO shard_placements (run_id, run_shard, database_alias, status) ",
     );
 
-    query_builder.push_values(run_shards, |mut b, run_shard| {
+    query_builder.push_values(assignments, |mut b, assignment| {
         b.push_bind(run_id)
-            .push_bind(run_shard)
-            .push_bind(database_alias)
+            .push_bind(assignment.run_shard)
+            .push_bind(&assignment.database_alias)
             .push_bind(SHARD_PLACEMENT_STATUS_ACTIVE);
     });
 
@@ -650,9 +745,18 @@ mod tests {
         let run_id = Uuid::now_v7();
         insert_minimal_run(&pool, run_id).await;
 
-        let chunks = vec![chunk(0, 0), chunk(1, 1), chunk(1, 2)];
+        let assignments = vec![
+            RunShardPlacementAssignment {
+                run_shard: 0,
+                database_alias: "primary".to_string(),
+            },
+            RunShardPlacementAssignment {
+                run_shard: 1,
+                database_alias: "primary".to_string(),
+            },
+        ];
         let mut tx = pool.begin().await.unwrap();
-        bulk_insert_shard_placements(&mut tx, run_id, &chunks, "primary")
+        bulk_insert_shard_placements(&mut tx, run_id, &assignments)
             .await
             .unwrap();
         tx.commit().await.unwrap();
@@ -696,12 +800,49 @@ mod tests {
         .await
         .unwrap();
 
-        let chunks = vec![chunk(0, 0)];
+        let assignments = vec![RunShardPlacementAssignment {
+            run_shard: 0,
+            database_alias: "primary".to_string(),
+        }];
         let mut tx = pool.begin().await.unwrap();
-        let error = bulk_insert_shard_placements(&mut tx, run_id, &chunks, "primary")
+        let error = bulk_insert_shard_placements(&mut tx, run_id, &assignments)
             .await
             .unwrap_err();
 
         assert!(error.to_string().contains("not shard-capable"));
+    }
+
+    #[test]
+    fn assign_run_shards_to_aliases_spreads_in_order() {
+        let run_shards = [0, 1, 2, 3, 4].into_iter().collect::<BTreeSet<_>>();
+        let aliases = vec!["primary".to_string(), "shard_001".to_string()];
+
+        let assignments = assign_run_shards_to_aliases(&run_shards, &aliases);
+
+        assert_eq!(
+            assignments,
+            vec![
+                RunShardPlacementAssignment {
+                    run_shard: 0,
+                    database_alias: "primary".to_string(),
+                },
+                RunShardPlacementAssignment {
+                    run_shard: 1,
+                    database_alias: "shard_001".to_string(),
+                },
+                RunShardPlacementAssignment {
+                    run_shard: 2,
+                    database_alias: "primary".to_string(),
+                },
+                RunShardPlacementAssignment {
+                    run_shard: 3,
+                    database_alias: "shard_001".to_string(),
+                },
+                RunShardPlacementAssignment {
+                    run_shard: 4,
+                    database_alias: "primary".to_string(),
+                },
+            ]
+        );
     }
 }

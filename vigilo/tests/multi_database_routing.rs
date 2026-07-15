@@ -165,6 +165,23 @@ async fn multi_database_routing_flow() -> anyhow::Result<()> {
         0
     );
 
+    let spread_run_id =
+        create_run_with_policy(&config, PRIMARY_ALIAS, "spread-active", 201).await?;
+    assert_eq!(
+        shard_placement_alias(&primary, spread_run_id, 0).await?,
+        PRIMARY_ALIAS
+    );
+    assert_eq!(
+        shard_placement_alias(&primary, spread_run_id, 1).await?,
+        SHARD_ALIAS
+    );
+    assert_eq!(
+        shard_placement_alias(&primary, spread_run_id, 2).await?,
+        PRIMARY_ALIAS
+    );
+    assert_eq!(run_chunk_count(&primary, spread_run_id).await?, 2);
+    assert_eq!(run_chunk_count(&shard, spread_run_id).await?, 1);
+
     let move_payload = run_vigilo(
         &config,
         PRIMARY_ALIAS,
@@ -294,10 +311,26 @@ async fn create_run(
     default_execution_alias: &str,
     case_count: usize,
 ) -> anyhow::Result<Uuid> {
-    let test_files = write_run_inputs(case_count)?;
-    let payload = run_vigilo(
+    create_run_with_policy(
         config,
         default_execution_alias,
+        "single-default",
+        case_count,
+    )
+    .await
+}
+
+async fn create_run_with_policy(
+    config: &IntegrationConfig,
+    default_execution_alias: &str,
+    shard_assignment_policy: &str,
+    case_count: usize,
+) -> anyhow::Result<Uuid> {
+    let test_files = write_run_inputs(case_count)?;
+    let payload = run_vigilo_with_policy(
+        config,
+        default_execution_alias,
+        shard_assignment_policy,
         [
             "run",
             "create",
@@ -319,6 +352,15 @@ fn run_vigilo<'a>(
     default_execution_alias: &str,
     args: impl IntoIterator<Item = &'a str>,
 ) -> anyhow::Result<Value> {
+    run_vigilo_with_policy(config, default_execution_alias, "single-default", args)
+}
+
+fn run_vigilo_with_policy<'a>(
+    config: &IntegrationConfig,
+    default_execution_alias: &str,
+    shard_assignment_policy: &str,
+    args: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<Value> {
     let output = Command::new(env!("CARGO_BIN_EXE_vigilo"))
         .env(PRIMARY_DATABASE_URL_ENV, &config.primary_url)
         .env(SHARD_DATABASE_URL_ENV, &config.shard_url)
@@ -327,6 +369,7 @@ fn run_vigilo<'a>(
             "VIGILO_DEFAULT_SHARD_DATABASE_ALIAS",
             default_execution_alias,
         )
+        .env("VIGILO_SHARD_ASSIGNMENT_POLICY", shard_assignment_policy)
         .args(["-q", "-f", "json"])
         .args(args)
         .output()?;

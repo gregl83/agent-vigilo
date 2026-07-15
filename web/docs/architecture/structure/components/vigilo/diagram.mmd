@@ -25,7 +25,7 @@ flowchart TD
 
     RunPlanner["fa:fa-list-check <br/> <b>Run Input Planner</b> <br/> <small>[Component: Rust]</small> <br/> <small>Reads profile and dataset payloads, canonicalizes case data, and plans run chunks.</small>"]:::component
     RunValidator["fa:fa-shield-halved <br/> <b>Run Validation Service</b> <br/> <small>[Component: Rust]</small> <br/> <small>Checks agent settings, evaluator references, runnable evaluator state, and case group coverage.</small>"]:::component
-    RunPersistence["fa:fa-database <br/> <b>Run Persistence Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Persists control metadata, placement rows, and execution-local run seed data.</small>"]:::component
+    RunPersistence["fa:fa-database <br/> <b>Run Persistence Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Persists control metadata, shard assignments, and execution-local run seed data.</small>"]:::component
     RunQueries["fa:fa-magnifying-glass <br/> <b>Run Query and Export Component</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Serves status/watch from control plus shard summaries, and routes results/export through shard placements.</small>"]:::component
 
     CoordinatorFacade["fa:fa-compass <br/> <b>Coordinator Command Facade</b> <br/> <small>[Component: Rust]</small> <br/> <small>Starts or executes coordinator orchestration cycles.</small>"]:::component

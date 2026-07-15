@@ -92,10 +92,15 @@ Run creation writes both control metadata and execution seed data:
 
 - Control storage receives the run row, placement rows, dispatch cursors, and
   canonical dataset metadata.
-- The selected execution placement receives local prerequisites and pending
-  chunks.
-- The initial assignment rule is explicit and conservative: new run shards use
+- The shard assignment policy chooses the execution placement for each used
+  `run_shard` and persists the result in `shard_placements`.
+- Each selected execution placement receives local prerequisites and only the
+  pending chunks it owns.
+- The default policy is explicit and conservative:
+  `VIGILO_SHARD_ASSIGNMENT_POLICY=single-default` assigns all new run shards to
   `VIGILO_DEFAULT_SHARD_DATABASE_ALIAS`.
+- `VIGILO_SHARD_ASSIGNMENT_POLICY=spread-active` spreads one run's used shards
+  across active shard-capable placements.
 
 Coordinator dispatch is route-constrained:
 
@@ -152,6 +157,17 @@ Set the default for future run shards:
 ```text
 VIGILO_DEFAULT_SHARD_DATABASE_ALIAS=shard_001
 ```
+
+Choose how new run shards are assigned:
+
+```text
+VIGILO_SHARD_ASSIGNMENT_POLICY=single-default
+VIGILO_SHARD_ASSIGNMENT_POLICY=spread-active
+```
+
+`single-default` is the local/small-deployment default. `spread-active`
+deterministically assigns used logical shards across active shard-capable
+placements and stores each assignment in `shard_placements`.
 
 Inspect routing metadata:
 
@@ -222,16 +238,15 @@ Implemented today:
 - Stored database and shard placement catalogs.
 - Routed run creation, dispatch, worker processing, lease recovery, outbox
   publication, shard summaries, finalization, cancellation, live status/watch
-  progress, results, export, route inspection, route fencing, and explicit
-  shard move.
+  progress, results, export, route inspection, route fencing, placement
+  assignment policy, and explicit shard move.
 - CI coverage for the black-box multi-database route path: run creation to
   `primary` and `shard_001`, route inspection, control-owned cursors, routed
-  cancellation, shard move, route-version inspection, and prerequisite-copy
-  verification.
+  cancellation, spread-active assignment for one run, shard move,
+  route-version inspection, and prerequisite-copy verification.
 
 Intentionally deferred:
 
-- Multi-placement assignment policy at run creation.
 - Bulk rebalancing commands for adding or removing large numbers of placements.
 - Evaluator metadata replication to execution placements.
 - Broader canonical case-data routing and replication.

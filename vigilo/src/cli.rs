@@ -63,6 +63,14 @@ pub(crate) struct App {
     )]
     pub default_shard_database_alias: String,
 
+    /// Shard assignment policy for newly created runs
+    #[arg(
+        long,
+        env = "VIGILO_SHARD_ASSIGNMENT_POLICY",
+        default_value = "single-default"
+    )]
+    pub shard_assignment_policy: String,
+
     /// Messaging URL (connection string)
     #[arg(long, env = "MESSAGING_URL")]
     pub messaging_url: String,

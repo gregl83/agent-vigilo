@@ -123,6 +123,11 @@ pub(super) async fn exec(
     // Write control metadata, placement rows, dispatch cursors, and
     // execution-local seed rows. Coordinator dispatch owns worker visibility;
     // no queue-visible events are emitted here.
+    let shard_assignments = run_create::assign_run_shard_placements(database, &chunks).await?;
+    let shard_assignment_aliases = shard_assignments
+        .iter()
+        .map(|assignment| assignment.database_alias.clone())
+        .collect::<std::collections::BTreeSet<_>>();
     run_create::insert_run_seed_state(
         database,
         run_id,
@@ -130,7 +135,7 @@ pub(super) async fn exec(
         &case_blobs,
         &dataset_cases,
         &chunks,
-        &default_execution_database_alias,
+        &shard_assignments,
     )
     .await?;
 
@@ -150,6 +155,10 @@ pub(super) async fn exec(
             "case_count": dataset_cases.len(),
             "chunk_count": chunks.len(),
             "chunk_size": chunk_size,
+            "shard_assignment_policy": database.shard_assignment_policy().as_str(),
+            "default_execution_database_alias": default_execution_database_alias,
+            "execution_database_aliases": shard_assignment_aliases,
+            "shard_placement_count": shard_assignments.len(),
             "expected_evaluator_executions": executability.expected_evaluator_execution_count,
             "resolved_evaluator_refs": executability.runnable_evaluator_ref_count,
         }

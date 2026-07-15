@@ -58,23 +58,53 @@ pub(crate) enum ExecutionRouteError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShardAssignmentPolicy {
+    SingleDefault,
+    SpreadActive,
+}
+
+impl ShardAssignmentPolicy {
+    pub(crate) fn parse(raw: &str) -> anyhow::Result<Self> {
+        match normalize_alias(raw.to_string(), "shard assignment policy")?.as_str() {
+            "single-default" => Ok(Self::SingleDefault),
+            "spread-active" => Ok(Self::SpreadActive),
+            other => anyhow::bail!(
+                "unsupported shard assignment policy {}; expected single-default or spread-active",
+                other
+            ),
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::SingleDefault => "single-default",
+            Self::SpreadActive => "spread-active",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlacementConfig {
     pub(crate) control_database_alias: String,
     pub(crate) default_shard_database_alias: String,
+    pub(crate) shard_assignment_policy: ShardAssignmentPolicy,
 }
 
 impl PlacementConfig {
     pub(crate) fn new(
         control_database_alias: String,
         default_shard_database_alias: String,
+        shard_assignment_policy: String,
     ) -> anyhow::Result<Self> {
         let control_database_alias = normalize_alias(control_database_alias, "control alias")?;
         let default_shard_database_alias =
             normalize_alias(default_shard_database_alias, "default shard alias")?;
+        let shard_assignment_policy = ShardAssignmentPolicy::parse(&shard_assignment_policy)?;
 
         Ok(Self {
             control_database_alias,
             default_shard_database_alias,
+            shard_assignment_policy,
         })
     }
 
@@ -85,6 +115,7 @@ impl PlacementConfig {
                 .to_string(),
             default_shard_database_alias: crate::models::database_placement::DEFAULT_DATABASE_ALIAS
                 .to_string(),
+            shard_assignment_policy: ShardAssignmentPolicy::SingleDefault,
         }
     }
 }
@@ -154,8 +185,19 @@ impl Db {
         &self.placement_config.default_shard_database_alias
     }
 
+    pub(crate) fn shard_assignment_policy(&self) -> &ShardAssignmentPolicy {
+        &self.placement_config.shard_assignment_policy
+    }
+
     pub(crate) fn control_database_alias(&self) -> &str {
         &self.placement_config.control_database_alias
+    }
+
+    pub(crate) async fn active_shard_capable_database_aliases(
+        &self,
+    ) -> anyhow::Result<Vec<String>> {
+        let db = self.control().await?;
+        database_placements::list_active_shard_capable_database_aliases(db).await
     }
 
     pub(crate) async fn active_execution_database_aliases(&self) -> anyhow::Result<Vec<String>> {
@@ -642,19 +684,37 @@ mod tests {
 
         assert_eq!(config.control_database_alias, DEFAULT_DATABASE_ALIAS);
         assert_eq!(config.default_shard_database_alias, DEFAULT_DATABASE_ALIAS);
+        assert_eq!(
+            config.shard_assignment_policy,
+            ShardAssignmentPolicy::SingleDefault
+        );
     }
 
     #[test]
     fn config_normalizes_aliases() {
-        let config = PlacementConfig::new(" primary ".to_string(), " exec_a ".to_string()).unwrap();
+        let config = PlacementConfig::new(
+            " primary ".to_string(),
+            " exec_a ".to_string(),
+            " spread-active ".to_string(),
+        )
+        .unwrap();
 
         assert_eq!(config.control_database_alias, "primary");
         assert_eq!(config.default_shard_database_alias, "exec_a");
+        assert_eq!(
+            config.shard_assignment_policy,
+            ShardAssignmentPolicy::SpreadActive
+        );
     }
 
     #[test]
     fn config_rejects_empty_control_alias() {
-        let error = PlacementConfig::new(" ".to_string(), "primary".to_string()).unwrap_err();
+        let error = PlacementConfig::new(
+            " ".to_string(),
+            "primary".to_string(),
+            "single-default".to_string(),
+        )
+        .unwrap_err();
 
         assert!(
             error
@@ -665,12 +725,33 @@ mod tests {
 
     #[test]
     fn config_rejects_empty_default_shard_alias() {
-        let error = PlacementConfig::new("primary".to_string(), " ".to_string()).unwrap_err();
+        let error = PlacementConfig::new(
+            "primary".to_string(),
+            " ".to_string(),
+            "single-default".to_string(),
+        )
+        .unwrap_err();
 
         assert!(
             error
                 .to_string()
                 .contains("default shard alias must not be empty")
+        );
+    }
+
+    #[test]
+    fn config_rejects_unknown_shard_assignment_policy() {
+        let error = PlacementConfig::new(
+            "primary".to_string(),
+            "primary".to_string(),
+            "unknown".to_string(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported shard assignment policy")
         );
     }
 

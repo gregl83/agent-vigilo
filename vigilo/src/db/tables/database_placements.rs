@@ -125,6 +125,29 @@ pub(crate) async fn list_active_database_aliases(db: &PgPool) -> anyhow::Result<
     Ok(aliases)
 }
 
+/// Lists every active shard-capable database alias.
+///
+/// Run creation assignment policies use this to choose placements for new
+/// shards. This intentionally differs from lease recovery, which only scans
+/// aliases that already own active shard rows.
+pub(crate) async fn list_active_shard_capable_database_aliases(
+    db: &PgPool,
+) -> anyhow::Result<Vec<String>> {
+    let aliases = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT alias
+        FROM database_placements
+        WHERE status = 'active'
+          AND role IN ('shard', 'control_and_shard')
+        ORDER BY alias
+        "#,
+    )
+    .fetch_all(db)
+    .await?;
+
+    Ok(aliases)
+}
+
 /// Lists active shard-capable aliases that currently own active shard rows.
 ///
 /// Recovery scans run per execution placement, so aliases without active shard
@@ -234,6 +257,32 @@ mod tests {
         .unwrap();
 
         let aliases = list_active_shard_database_aliases(&pool).await.unwrap();
+
+        assert_eq!(
+            aliases,
+            vec!["primary".to_string(), "shard_001".to_string()]
+        );
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx placement tests"]
+    async fn list_active_shard_capable_database_aliases_includes_empty_active_shards(pool: PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES
+                ('control_only', 'VIGILO_CONTROL_ONLY_DATABASE_URL', 'control', 'disabled'),
+                ('shard_001', 'VIGILO_SHARD_001_DATABASE_URL', 'shard', 'active'),
+                ('shard_002', 'VIGILO_SHARD_002_DATABASE_URL', 'shard', 'disabled')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let aliases = list_active_shard_capable_database_aliases(&pool)
+            .await
+            .unwrap();
 
         assert_eq!(
             aliases,
