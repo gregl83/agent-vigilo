@@ -153,7 +153,7 @@ mod tests {
             r#"
             INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
             VALUES ($1::uuid, 42, 'primary', 'active')
-            RETURNING run_id, run_shard, database_alias, status, created_at, updated_at
+            RETURNING run_id, run_shard, database_alias, status, route_version, created_at, updated_at
             "#,
         )
         .bind(run_id)
@@ -165,6 +165,7 @@ mod tests {
         assert_eq!(placement.run_shard, 42);
         assert_eq!(placement.database_alias, DEFAULT_DATABASE_ALIAS);
         assert_eq!(placement.status, "active");
+        assert_eq!(placement.route_version, 1);
 
         let invalid_shard = sqlx::query(
             r#"

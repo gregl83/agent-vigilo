@@ -163,8 +163,9 @@ vigilo shard route <run_id> <run_shard>
 ```
 
 `vigilo shard route` reports the database alias, placement statuses,
-`database_url_env`, env-var availability, and whether the route is
-`dispatchable`, `read_only`, or `blocked`. It never prints the database URL.
+`route_version`, `database_url_env`, env-var availability, and whether the
+route is `dispatchable`, `read_only`, or `blocked`. It never prints the
+database URL.
 
 ## Moving A Run Shard
 
@@ -181,6 +182,11 @@ running work unless `--force` is passed, copies shard-owned rows, verifies row
 counts and checksums, then switches the route to the target alias with status
 `active`.
 
+Every route alias or status change increments `shard_placements.route_version`.
+Execution route caches are accepted only while alias, status, and
+`route_version` still match control metadata, so stale cached active routes are
+fenced before new dispatch or worker claims continue.
+
 Moved shard-owned tables:
 
 ```text
@@ -194,6 +200,15 @@ run_shard_summaries
 ```
 
 The move also copies local FK prerequisites needed by the target placement.
+Those prerequisites are:
+
+```text
+case_blobs
+dataset_versions
+dataset_version_cases
+runs
+```
+
 `run_shard_dispatch_cursors` stays in control storage and is never copied
 between execution placements. Source cleanup is intentionally outside the move
 command so teams can apply their own backup and retention policy.
@@ -207,17 +222,16 @@ Implemented today:
 - Stored database and shard placement catalogs.
 - Routed run creation, dispatch, worker processing, lease recovery, outbox
   publication, shard summaries, finalization, cancellation, live status/watch
-  progress, results, export, route inspection, and explicit shard move.
+  progress, results, export, route inspection, route fencing, and explicit
+  shard move.
 - CI coverage for the black-box multi-database route path: run creation to
   `primary` and `shard_001`, route inspection, control-owned cursors, routed
-  cancellation, and shard move.
+  cancellation, shard move, route-version inspection, and prerequisite-copy
+  verification.
 
 Intentionally deferred:
 
-- Route fencing for stale cached placements during movement.
 - Multi-placement assignment policy at run creation.
-- Full worker-required prerequisite closure for movement between execution-only
-  placements.
 - Bulk rebalancing commands for adding or removing large numbers of placements.
 - Evaluator metadata replication to execution placements.
 - Broader canonical case-data routing and replication.

@@ -74,6 +74,7 @@ pub(crate) struct ShardRouteInspection {
     pub(crate) run_shard: i16,
     pub(crate) database_alias: String,
     pub(crate) shard_placement_status: String,
+    pub(crate) route_version: i64,
     pub(crate) database_role: String,
     pub(crate) database_status: String,
     pub(crate) database_url_env: String,
@@ -101,7 +102,12 @@ struct TableFingerprint {
     checksum: String,
 }
 
-const PREREQUISITE_TABLES: &[&str] = &["dataset_versions", "runs"];
+const PREREQUISITE_TABLES: &[&str] = &[
+    "case_blobs",
+    "dataset_versions",
+    "dataset_version_cases",
+    "runs",
+];
 const SHARD_TABLES: &[ShardTable] = &[
     ShardTable { name: "run_chunks" },
     ShardTable {
@@ -254,6 +260,7 @@ pub(crate) async fn inspect_shard_route(
         run_shard,
         database_alias: placement.database_alias,
         shard_placement_status: placement.status,
+        route_version: placement.route_version,
         database_role: database_placement.role,
         database_status: database_placement.status,
         database_url_env_resolved: database
@@ -414,7 +421,7 @@ pub(crate) async fn move_shard_placement(
         }
     }
 
-    let reports = verify_shard_tables(
+    let reports = verify_move_tables(
         source_db,
         target_db,
         run_id,
@@ -577,6 +584,21 @@ async fn select_prerequisite_rows(
     run_id: Uuid,
 ) -> anyhow::Result<Vec<Value>> {
     let sql = match table {
+        "case_blobs" => {
+            r#"
+            SELECT to_jsonb(cb) AS row
+            FROM case_blobs cb
+            WHERE EXISTS (
+                SELECT 1
+                FROM runs r
+                JOIN dataset_version_cases cvc
+                  ON cvc.dataset_version_id = r.dataset_version_id
+                WHERE r.id = $1::uuid
+                  AND cvc.case_hash = cb.case_hash
+            )
+            ORDER BY cb.case_hash
+            "#
+        }
         "dataset_versions" => {
             r#"
             SELECT to_jsonb(dv) AS row
@@ -584,6 +606,16 @@ async fn select_prerequisite_rows(
             JOIN runs r
               ON r.dataset_version_id = dv.dataset_version_id
             WHERE r.id = $1::uuid
+            "#
+        }
+        "dataset_version_cases" => {
+            r#"
+            SELECT to_jsonb(cvc) AS row
+            FROM dataset_version_cases cvc
+            JOIN runs r
+              ON r.dataset_version_id = cvc.dataset_version_id
+            WHERE r.id = $1::uuid
+            ORDER BY cvc.case_ordinal, cvc.case_id
             "#
         }
         "runs" => {
@@ -650,14 +682,29 @@ async fn copy_json_rows(db: &PgPool, table: &str, rows: Vec<Value>) -> anyhow::R
     Ok(result.rows_affected())
 }
 
-async fn verify_shard_tables(
+async fn verify_move_tables(
     source_db: &PgPool,
     target_db: &PgPool,
     run_id: Uuid,
     run_shard: i16,
     copied_rows_by_table: &std::collections::BTreeMap<&'static str, u64>,
 ) -> anyhow::Result<Vec<ShardMoveTableReport>> {
-    let mut reports = Vec::with_capacity(SHARD_TABLES.len());
+    let mut reports = Vec::with_capacity(PREREQUISITE_TABLES.len() + SHARD_TABLES.len());
+
+    for table in PREREQUISITE_TABLES {
+        let source = prerequisite_table_fingerprint(source_db, table, run_id).await?;
+        let target = prerequisite_table_fingerprint(target_db, table, run_id).await?;
+        let verified = source.row_count == target.row_count && source.checksum == target.checksum;
+        reports.push(ShardMoveTableReport {
+            table,
+            source_row_count: source.row_count,
+            target_row_count: target.row_count,
+            copied_row_count: copied_rows_by_table.get(table).copied().unwrap_or_default(),
+            source_checksum: source.checksum,
+            target_checksum: target.checksum,
+            verified,
+        });
+    }
 
     for table in SHARD_TABLES {
         let source = table_fingerprint(source_db, table.name, run_id, run_shard).await?;
@@ -678,6 +725,82 @@ async fn verify_shard_tables(
     }
 
     Ok(reports)
+}
+
+async fn prerequisite_table_fingerprint(
+    db: &PgPool,
+    table: &str,
+    run_id: Uuid,
+) -> anyhow::Result<TableFingerprint> {
+    let sql = match table {
+        "case_blobs" => {
+            r#"
+            SELECT
+                COUNT(*)::bigint AS row_count,
+                COALESCE(md5(string_agg(row_json, E'\n' ORDER BY row_json)), '') AS checksum
+            FROM (
+                SELECT to_jsonb(cb)::text AS row_json
+                FROM case_blobs cb
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM runs r
+                    JOIN dataset_version_cases cvc
+                      ON cvc.dataset_version_id = r.dataset_version_id
+                    WHERE r.id = $1::uuid
+                      AND cvc.case_hash = cb.case_hash
+                )
+            ) rows
+            "#
+        }
+        "dataset_versions" => {
+            r#"
+            SELECT
+                COUNT(*)::bigint AS row_count,
+                COALESCE(md5(string_agg(row_json, E'\n' ORDER BY row_json)), '') AS checksum
+            FROM (
+                SELECT to_jsonb(dv)::text AS row_json
+                FROM dataset_versions dv
+                JOIN runs r
+                  ON r.dataset_version_id = dv.dataset_version_id
+                WHERE r.id = $1::uuid
+            ) rows
+            "#
+        }
+        "dataset_version_cases" => {
+            r#"
+            SELECT
+                COUNT(*)::bigint AS row_count,
+                COALESCE(md5(string_agg(row_json, E'\n' ORDER BY row_json)), '') AS checksum
+            FROM (
+                SELECT to_jsonb(cvc)::text AS row_json
+                FROM dataset_version_cases cvc
+                JOIN runs r
+                  ON r.dataset_version_id = cvc.dataset_version_id
+                WHERE r.id = $1::uuid
+            ) rows
+            "#
+        }
+        "runs" => {
+            r#"
+            SELECT
+                COUNT(*)::bigint AS row_count,
+                COALESCE(md5(string_agg(row_json, E'\n' ORDER BY row_json)), '') AS checksum
+            FROM (
+                SELECT to_jsonb(r)::text AS row_json
+                FROM runs r
+                WHERE r.id = $1::uuid
+            ) rows
+            "#
+        }
+        _ => anyhow::bail!("unsupported prerequisite table {}", table),
+    };
+
+    let fingerprint = sqlx::query_as::<_, TableFingerprint>(sql)
+        .bind(run_id)
+        .fetch_one(db)
+        .await?;
+
+    Ok(fingerprint)
 }
 
 async fn table_fingerprint(

@@ -15,7 +15,7 @@ pub(crate) async fn select_shard_placement(
 ) -> anyhow::Result<Option<ShardPlacement>> {
     let placement = sqlx::query_as::<_, ShardPlacement>(
         r#"
-        SELECT run_id, run_shard, database_alias, status, created_at, updated_at
+        SELECT run_id, run_shard, database_alias, status, route_version, created_at, updated_at
         FROM shard_placements
         WHERE run_id = $1
           AND run_shard = $2
@@ -35,7 +35,7 @@ pub(crate) async fn list_shard_placements_for_run(
 ) -> anyhow::Result<Vec<ShardPlacement>> {
     let placements = sqlx::query_as::<_, ShardPlacement>(
         r#"
-        SELECT run_id, run_shard, database_alias, status, created_at, updated_at
+        SELECT run_id, run_shard, database_alias, status, route_version, created_at, updated_at
         FROM shard_placements
         WHERE run_id = $1
         ORDER BY run_shard
@@ -61,8 +61,14 @@ pub(crate) async fn upsert_active_shard_placement(
         ON CONFLICT (run_id, run_shard) DO UPDATE
         SET database_alias = EXCLUDED.database_alias,
             status = EXCLUDED.status,
+            route_version = CASE
+                WHEN shard_placements.database_alias IS DISTINCT FROM EXCLUDED.database_alias
+                  OR shard_placements.status IS DISTINCT FROM EXCLUDED.status
+                THEN shard_placements.route_version + 1
+                ELSE shard_placements.route_version
+            END,
             updated_at = now()
-        RETURNING run_id, run_shard, database_alias, status, created_at, updated_at
+        RETURNING run_id, run_shard, database_alias, status, route_version, created_at, updated_at
         "#,
     )
     .bind(run_id)
@@ -84,10 +90,15 @@ pub(crate) async fn update_shard_placement_status(
         r#"
         UPDATE shard_placements
         SET status = $3,
+            route_version = CASE
+                WHEN status IS DISTINCT FROM $3
+                THEN route_version + 1
+                ELSE route_version
+            END,
             updated_at = now()
         WHERE run_id = $1::uuid
           AND run_shard = $2
-        RETURNING run_id, run_shard, database_alias, status, created_at, updated_at
+        RETURNING run_id, run_shard, database_alias, status, route_version, created_at, updated_at
         "#,
     )
     .bind(run_id)
@@ -111,10 +122,16 @@ pub(crate) async fn update_shard_placement_alias_and_status(
         UPDATE shard_placements
         SET database_alias = $3,
             status = $4,
+            route_version = CASE
+                WHEN database_alias IS DISTINCT FROM $3
+                  OR status IS DISTINCT FROM $4
+                THEN route_version + 1
+                ELSE route_version
+            END,
             updated_at = now()
         WHERE run_id = $1::uuid
           AND run_shard = $2
-        RETURNING run_id, run_shard, database_alias, status, created_at, updated_at
+        RETURNING run_id, run_shard, database_alias, status, route_version, created_at, updated_at
         "#,
     )
     .bind(run_id)

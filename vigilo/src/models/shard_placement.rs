@@ -42,6 +42,8 @@ pub(crate) struct ShardPlacement {
     pub(crate) database_alias: String,
     /// Placement lifecycle: active, moving, or draining.
     pub(crate) status: String,
+    /// Monotonic route fencing token.
+    pub(crate) route_version: i64,
     /// Time this placement row was inserted.
     pub(crate) created_at: DateTime<Utc>,
     /// Time this placement row was last updated.
@@ -51,5 +53,11 @@ pub(crate) struct ShardPlacement {
 impl ShardPlacement {
     pub(crate) fn is_dispatchable(&self) -> bool {
         self.status == SHARD_PLACEMENT_STATUS_ACTIVE
+    }
+
+    pub(crate) fn same_route_fence(&self, current: &Self) -> bool {
+        self.database_alias == current.database_alias
+            && self.status == current.status
+            && self.route_version == current.route_version
     }
 }

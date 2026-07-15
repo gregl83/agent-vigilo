@@ -63,6 +63,50 @@ async fn multi_database_routing_flow() -> anyhow::Result<()> {
         "dispatch cursors are control-plane state"
     );
     assert_eq!(dispatch_cursor_count(&shard, default_run_id).await?, 0);
+    assert_eq!(dataset_version_case_count(&shard, default_run_id).await?, 0);
+    assert_eq!(case_blob_count(&shard, default_run_id).await?, 0);
+
+    let moved_default_payload = run_vigilo(
+        &config,
+        PRIMARY_ALIAS,
+        [
+            "shard",
+            "move",
+            &default_run_id.to_string(),
+            "0",
+            "--alias",
+            SHARD_ALIAS,
+        ],
+    )?;
+    assert_eq!(moved_default_payload["meta"]["moved"], true);
+    assert_eq!(
+        shard_placement_alias(&primary, default_run_id, 0).await?,
+        SHARD_ALIAS
+    );
+    assert_eq!(
+        dataset_version_case_count(&shard, default_run_id).await?,
+        1,
+        "shard move copies dataset membership rows needed by workers"
+    );
+    assert_eq!(
+        case_blob_count(&shard, default_run_id).await?,
+        1,
+        "shard move copies case blobs needed by workers"
+    );
+    let moved_default_route = run_vigilo(
+        &config,
+        PRIMARY_ALIAS,
+        ["shard", "route", &default_run_id.to_string(), "0"],
+    )?;
+    assert_eq!(
+        moved_default_route["data"]["database_alias"].as_str(),
+        Some(SHARD_ALIAS)
+    );
+    assert!(
+        moved_default_route["data"]["route_version"]
+            .as_i64()
+            .is_some_and(|version| version > 1)
+    );
 
     let routed_run_id = create_run(&config, SHARD_ALIAS, 101).await?;
     assert_eq!(run_chunk_count(&primary, routed_run_id).await?, 0);
@@ -418,6 +462,41 @@ async fn dispatch_cursor_count(db: &PgPool, run_id: Uuid) -> anyhow::Result<i64>
         SELECT COUNT(*)::bigint
         FROM run_shard_dispatch_cursors
         WHERE run_id = $1::uuid
+        "#,
+    )
+    .bind(run_id)
+    .fetch_one(db)
+    .await?)
+}
+
+async fn dataset_version_case_count(db: &PgPool, run_id: Uuid) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM dataset_version_cases cvc
+        JOIN runs r
+          ON r.dataset_version_id = cvc.dataset_version_id
+        WHERE r.id = $1::uuid
+        "#,
+    )
+    .bind(run_id)
+    .fetch_one(db)
+    .await?)
+}
+
+async fn case_blob_count(db: &PgPool, run_id: Uuid) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM case_blobs cb
+        WHERE EXISTS (
+            SELECT 1
+            FROM runs r
+            JOIN dataset_version_cases cvc
+              ON cvc.dataset_version_id = r.dataset_version_id
+            WHERE r.id = $1::uuid
+              AND cvc.case_hash = cb.case_hash
+        )
         "#,
     )
     .bind(run_id)

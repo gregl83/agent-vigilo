@@ -3,6 +3,7 @@ CREATE TABLE shard_placements (
     run_shard SMALLINT NOT NULL CHECK (run_shard >= 0 AND run_shard < 128),
     database_alias TEXT NOT NULL REFERENCES database_placements(alias),
     status TEXT NOT NULL CHECK (status IN ('active', 'moving', 'draining')),
+    route_version BIGINT NOT NULL DEFAULT 1 CHECK (route_version > 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
@@ -26,6 +27,9 @@ COMMENT ON COLUMN shard_placements.database_alias IS
 
 COMMENT ON COLUMN shard_placements.status IS
     'Shard placement lifecycle. Active is dispatchable; moving and draining are reserved for shard movement workflows.';
+
+COMMENT ON COLUMN shard_placements.route_version IS
+    'Monotonic fencing token incremented whenever the route alias or lifecycle changes. Cached routes are valid only while alias, status, and route_version still match control metadata.';
 
 COMMENT ON INDEX idx_shard_placements_database_alias_status IS
     'Lookup index for routing and administrative scans grouped by database placement and dispatchability status.';

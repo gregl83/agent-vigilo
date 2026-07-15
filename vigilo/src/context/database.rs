@@ -201,24 +201,47 @@ impl Db {
 
         let key = ShardPlacementKey { run_id, run_shard };
         if let Some(placement) = self.shard_placement_cache.get(&key).await {
-            self.validate_shard_placement_alias(&placement).await?;
+            let current = self
+                .select_control_shard_placement(run_id, run_shard)
+                .await?;
+
+            if placement.same_route_fence(&current) {
+                self.validate_shard_placement_alias(&placement).await?;
+                debug!(
+                    run_id = %run_id,
+                    run_shard,
+                    database_alias = %placement.database_alias,
+                    placement_status = %placement.status,
+                    route_version = placement.route_version,
+                    routing_decision = "cached_execution_placement",
+                    "resolved execution placement from route-version cache"
+                );
+                return Ok(placement);
+            }
+
+            self.shard_placement_cache.invalidate(&key).await;
+            self.validate_shard_placement_alias(&current).await?;
             debug!(
                 run_id = %run_id,
                 run_shard,
-                database_alias = %placement.database_alias,
-                placement_status = %placement.status,
-                routing_decision = "cached_execution_placement",
-                "resolved execution placement from cache"
+                previous_database_alias = %placement.database_alias,
+                previous_placement_status = %placement.status,
+                previous_route_version = placement.route_version,
+                database_alias = %current.database_alias,
+                placement_status = %current.status,
+                route_version = current.route_version,
+                routing_decision = "refreshed_stale_execution_placement",
+                "refreshed stale execution placement cache"
             );
-            return Ok(placement);
+            self.shard_placement_cache
+                .insert(key, current.clone())
+                .await;
+            return Ok(current);
         }
 
-        let db = self.control().await?;
-        let Some(placement) =
-            shard_placements::select_shard_placement(db, run_id, run_shard).await?
-        else {
-            return Err(ExecutionRouteError::MissingShardPlacement { run_id, run_shard }.into());
-        };
+        let placement = self
+            .select_control_shard_placement(run_id, run_shard)
+            .await?;
 
         self.validate_shard_placement_alias(&placement).await?;
         debug!(
@@ -226,6 +249,7 @@ impl Db {
             run_shard,
             database_alias = %placement.database_alias,
             placement_status = %placement.status,
+            route_version = placement.route_version,
             routing_decision = "control_lookup_execution_placement",
             "resolved execution placement from control metadata"
         );
@@ -350,6 +374,17 @@ impl Db {
         self.shard_placement_cache
             .invalidate(&ShardPlacementKey { run_id, run_shard })
             .await;
+    }
+
+    async fn select_control_shard_placement(
+        &self,
+        run_id: Uuid,
+        run_shard: i16,
+    ) -> anyhow::Result<ShardPlacement> {
+        let db = self.control().await?;
+        shard_placements::select_shard_placement(db, run_id, run_shard)
+            .await?
+            .ok_or_else(|| ExecutionRouteError::MissingShardPlacement { run_id, run_shard }.into())
     }
 
     pub(crate) async fn validate_placement_config(&self) -> anyhow::Result<()> {
@@ -715,6 +750,42 @@ mod tests {
             SHARD_PLACEMENT_STATUS_MOVING,
         )
         .await;
+
+        let error = context.execution(run_id, 7).await.unwrap_err();
+        assert!(error.to_string().contains("not dispatchable"));
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
+    async fn execution_placement_refreshes_stale_cached_route_version(pool: PgPool) {
+        let context = context_with_control_pool(pool);
+        let run_id = Uuid::now_v7();
+
+        insert_shard_placement(
+            context.control().await.unwrap(),
+            run_id,
+            7,
+            DEFAULT_DATABASE_ALIAS,
+            SHARD_PLACEMENT_STATUS_ACTIVE,
+        )
+        .await;
+
+        let initial = context.execution_placement(run_id, 7).await.unwrap();
+        assert_eq!(initial.status, SHARD_PLACEMENT_STATUS_ACTIVE);
+        assert_eq!(initial.route_version, 1);
+
+        crate::db::tables::shard_placements::update_shard_placement_status(
+            context.control().await.unwrap(),
+            run_id,
+            7,
+            SHARD_PLACEMENT_STATUS_MOVING,
+        )
+        .await
+        .unwrap();
+
+        let refreshed = context.execution_placement(run_id, 7).await.unwrap();
+        assert_eq!(refreshed.status, SHARD_PLACEMENT_STATUS_MOVING);
+        assert_eq!(refreshed.route_version, 2);
 
         let error = context.execution(run_id, 7).await.unwrap_err();
         assert!(error.to_string().contains("not dispatchable"));

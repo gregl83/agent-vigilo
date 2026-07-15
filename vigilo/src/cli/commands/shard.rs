@@ -420,6 +420,7 @@ fn route_payload(route: &shard_admin::ShardRouteInspection) -> Value {
             "run_shard": route.run_shard,
             "database_alias": route.database_alias,
             "shard_placement_status": route.shard_placement_status,
+            "route_version": route.route_version,
             "database_role": route.database_role,
             "database_status": route.database_status,
             "database_url_env": route.database_url_env,
@@ -540,6 +541,7 @@ mod tests {
             run_shard: 7,
             database_alias: "shard_002".to_string(),
             status: SHARD_PLACEMENT_STATUS_ACTIVE.to_string(),
+            route_version: 1,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -570,6 +572,7 @@ mod tests {
             run_shard: 4,
             database_alias: "shard_001".to_string(),
             status: SHARD_PLACEMENT_STATUS_ACTIVE.to_string(),
+            route_version: 2,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -610,6 +613,7 @@ mod tests {
             run_shard: 4,
             database_alias: "shard_001".to_string(),
             shard_placement_status: "active".to_string(),
+            route_version: 7,
             database_role: "shard".to_string(),
             database_status: "active".to_string(),
             database_url_env: "VIGILO_SHARD_001_DATABASE_URL".to_string(),
@@ -624,6 +628,7 @@ mod tests {
         assert_eq!(payload["data"]["run_id"], json!(run_id));
         assert_eq!(payload["data"]["run_shard"], json!(4));
         assert_eq!(payload["data"]["database_alias"], json!("shard_001"));
+        assert_eq!(payload["data"]["route_version"], json!(7));
         assert_eq!(
             payload["data"]["database_url_env"],
             json!("VIGILO_SHARD_001_DATABASE_URL")
