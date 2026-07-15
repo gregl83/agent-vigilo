@@ -27,6 +27,7 @@ jobs:
       - test
       - coverage
       - migrations
+      - multi-database-integration
       - evaluator-wasm
       - web
     steps:
@@ -114,6 +115,45 @@ jobs:
       - run: cargo run --quiet -p vigilo --locked -- setup --skip-evaluators
         env:
           RUSTFLAGS: -Awarnings
+
+  multi-database-integration:
+    name: Multi-Database Integration
+    runs-on: ubuntu-latest
+    services:
+      postgres-primary:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: agent_vigilo
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d agent_vigilo"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+      postgres-shard:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: agent_vigilo
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d agent_vigilo"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:password@localhost:5432/agent_vigilo
+      VIGILO_TEST_SHARD_001_DATABASE_URL: postgresql://postgres:password@localhost:5433/agent_vigilo
+      MESSAGING_URL: amqp://guest:guest@localhost:5672
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p vigilo --locked --test multi_database_routing -- --nocapture
 
   evaluator-wasm:
     name: Evaluator Wasm

@@ -2,9 +2,9 @@
 //!
 //! Coordinators use this module to start pending runs in control storage,
 //! prepare execution-local run snapshots, and enqueue bounded windows of outbox
-//! events that make chunks visible to workers. Dispatch cursors keep chunk
-//! scans scoped to one run shard at a time while row locks prevent multiple
-//! coordinators from dispatching the same window.
+//! events that make chunks visible to workers. Dispatch cursors stay in control
+//! storage and serialize route claims while execution storage owns chunk scans
+//! and chunk-ready outbox events.
 
 use std::collections::BTreeSet;
 
@@ -54,6 +54,17 @@ pub(crate) struct DispatchRunSnapshot {
 pub(crate) struct DispatchRoute {
     pub(crate) run_id: Uuid,
     pub(crate) run_shard: i16,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct DispatchedRunWindow {
+    id: Uuid,
+    run_key: String,
+    run_shard: i16,
+    chunk_events_enqueued: i64,
+    chunks_marked_dispatched: i64,
+    run_started_events_enqueued: i64,
+    has_remaining_chunks: bool,
 }
 
 /// Counts returned after one expired chunk lease recovery pass.
@@ -411,17 +422,16 @@ pub(crate) async fn prepare_dispatch_run_snapshot(
 ///
 /// The caller first prepares a control-owned [`DispatchRunSnapshot`]. This
 /// function copies that snapshot into execution storage, claims one open
-/// `(run_id, run_shard)` dispatch cursor, scans only that shard's pending
-/// chunks, and releases or drains the cursor in the same statement so a
-/// rollback does not lose undispatched work.
+/// control cursor, scans only that shard's pending execution chunks, and then
+/// releases or drains the control cursor.
 ///
 /// Query behavior:
 /// - Upserts the execution-local snapshot before worker-visible events.
-/// - Selects the exact open shard cursor with `FOR UPDATE SKIP LOCKED`.
+/// - Selects the exact open control cursor with `FOR UPDATE SKIP LOCKED`.
 /// - Selects a bounded chunk window inside one `run_id + run_shard`, emits
 ///   idempotent `run.chunk.ready` events, and advances each chunk's
 ///   `dispatched_at` cursor in the same statement.
-/// - Releases the shard cursor if more undispatched chunks remain, or marks it
+/// - Releases the control cursor if more undispatched chunks remain, or marks it
 ///   drained when that shard has no undispatched pending chunks left.
 #[cfg(test)]
 async fn dispatch_next_run_window(
@@ -439,7 +449,7 @@ async fn dispatch_next_run_window(
         return Ok(None);
     };
 
-    dispatch_routed_run_window(db, chunk_window_size, &route, &snapshot).await
+    dispatch_routed_run_window(db, db, chunk_window_size, &route, &snapshot).await
 }
 
 /// Claims and dispatches one exact run-shard route.
@@ -448,7 +458,8 @@ async fn dispatch_next_run_window(
 /// execution placement. This function keeps the shard-local dispatch statement
 /// constrained to that routed `run_id + run_shard`.
 pub(crate) async fn dispatch_routed_run_window(
-    db: &PgPool,
+    control_db: &PgPool,
+    execution_db: &PgPool,
     chunk_window_size: i64,
     route: &DispatchRoute,
     snapshot: &DispatchRunSnapshot,
@@ -463,18 +474,38 @@ pub(crate) async fn dispatch_routed_run_window(
         );
     }
 
+    let mut control_tx = control_db.begin().await?;
+    let cursor_locked = sqlx::query_scalar::<_, i32>(
+        r#"
+        SELECT 1
+        FROM run_shard_dispatch_cursors
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+          AND status = 'open'
+        FOR UPDATE SKIP LOCKED
+        "#,
+    )
+    .bind(route.run_id)
+    .bind(route.run_shard)
+    .fetch_optional(&mut *control_tx)
+    .await?
+    .is_some();
+
+    if !cursor_locked {
+        control_tx.rollback().await?;
+        return Ok(None);
+    }
+
     // Query outline:
     //
     // snapshot_input    - control-owned run context for the selected route.
     // snapshot_upsert   - local execution snapshot prepared before dispatch.
-    // cursor_candidate - one shard cursor that can dispatch more chunks.
-    // claimed_cursor   - locked cursor identity for this dispatch statement.
     // claimed          - common run projection for the claimed shard cursor.
     // selected_chunks  - bounded undispatched pending chunk window for one shard.
     // chunk_events     - idempotent queue-visible chunk-ready ledger rows.
     // marked_chunks    - cursor update proving those chunks were dispatched.
-    // cursor_update    - release or drain the dispatch cursor.
-    let dispatched = sqlx::query_as::<_, DispatchedRun>(
+    // remaining_chunks - tells the control cursor whether another pass is needed.
+    let dispatched = sqlx::query_as::<_, DispatchedRunWindow>(
         r#"
         WITH snapshot_input AS (
             SELECT
@@ -570,40 +601,19 @@ pub(crate) async fn dispatch_routed_run_window(
                 updated_at = now()
             RETURNING run_id, run_shard, run_key
         ),
-        cursor_candidate AS (
-            SELECT c.run_id, c.run_shard
-            FROM run_shard_dispatch_cursors c
-            JOIN snapshot_upsert
-              ON snapshot_upsert.run_id = c.run_id
-             AND snapshot_upsert.run_shard = c.run_shard
-            WHERE c.status = 'open'
-              AND c.run_id = $2::uuid
-              AND c.run_shard = $3::smallint
-            FOR UPDATE OF c SKIP LOCKED
-            LIMIT 1
-        ),
-        claimed_cursor AS (
-            SELECT run_id, run_shard
-            FROM cursor_candidate
-        ),
         claimed AS (
             SELECT
                 snapshot_upsert.run_id AS id,
                 snapshot_upsert.run_key,
                 snapshot_upsert.run_shard
             FROM snapshot_upsert
-            JOIN claimed_cursor
-              ON claimed_cursor.run_id = snapshot_upsert.run_id
-             AND claimed_cursor.run_shard = snapshot_upsert.run_shard
         ),
         selected_chunks AS (
             SELECT rc.run_id, rc.run_shard, rc.id
             FROM run_chunks rc
-            JOIN claimed_cursor
-              ON claimed_cursor.run_id = rc.run_id
-             AND claimed_cursor.run_shard = rc.run_shard
             JOIN claimed
               ON claimed.id = rc.run_id
+             AND claimed.run_shard = rc.run_shard
             WHERE rc.status = 'pending'
               AND rc.dispatched_at IS NULL
             ORDER BY rc.ordinal_start ASC, rc.id ASC
@@ -639,11 +649,9 @@ pub(crate) async fn dispatch_routed_run_window(
             SELECT EXISTS (
                 SELECT 1
                 FROM run_chunks rc
-                JOIN claimed_cursor
-                  ON claimed_cursor.run_id = rc.run_id
-                 AND claimed_cursor.run_shard = rc.run_shard
                 JOIN claimed
                   ON claimed.id = rc.run_id
+                 AND claimed.run_shard = rc.run_shard
                 WHERE rc.status = 'pending'
                   AND rc.dispatched_at IS NULL
                   AND NOT EXISTS (
@@ -654,20 +662,6 @@ pub(crate) async fn dispatch_routed_run_window(
                         AND selected_chunks.id = rc.id
                   )
             ) AS has_remaining
-        ),
-        cursor_update AS (
-            UPDATE run_shard_dispatch_cursors c
-            SET status = CASE
-                    WHEN remaining_chunks.has_remaining THEN 'open'
-                    ELSE 'drained'
-                END,
-                updated_at = now()
-            FROM claimed_cursor, remaining_chunks, claimed
-            WHERE c.run_id = claimed_cursor.run_id
-              AND c.run_shard = claimed_cursor.run_shard
-              AND claimed.id = claimed_cursor.run_id
-              AND claimed.run_shard = claimed_cursor.run_shard
-            RETURNING c.run_id, c.run_shard, c.status
         )
         SELECT
             claimed.id,
@@ -675,11 +669,9 @@ pub(crate) async fn dispatch_routed_run_window(
             claimed.run_shard,
             (SELECT COUNT(*)::bigint FROM chunk_events) AS chunk_events_enqueued,
             (SELECT COUNT(*)::bigint FROM marked_chunks) AS chunks_marked_dispatched,
-            $21::bigint AS run_started_events_enqueued
-        FROM claimed
-        JOIN cursor_update
-          ON cursor_update.run_id = claimed.id
-         AND cursor_update.run_shard = claimed.run_shard
+            $21::bigint AS run_started_events_enqueued,
+            remaining_chunks.has_remaining AS has_remaining_chunks
+        FROM claimed, remaining_chunks
         "#,
     )
     .bind(chunk_window_size)
@@ -703,15 +695,49 @@ pub(crate) async fn dispatch_routed_run_window(
     .bind(&snapshot.prompt_config_version)
     .bind(&snapshot.config_snapshot)
     .bind(snapshot.run_started_events_enqueued)
-    .fetch_optional(db)
+    .fetch_optional(execution_db)
     .await?;
 
     if let Some(dispatched) = &dispatched {
-        run_shard_summary::refresh_run_shard_summary(db, dispatched.id, dispatched.run_shard)
-            .await?;
+        let next_status = if dispatched.has_remaining_chunks {
+            "open"
+        } else {
+            "drained"
+        };
+        sqlx::query(
+            r#"
+            UPDATE run_shard_dispatch_cursors
+            SET status = $3,
+                updated_at = now()
+            WHERE run_id = $1::uuid
+              AND run_shard = $2
+            "#,
+        )
+        .bind(dispatched.id)
+        .bind(dispatched.run_shard)
+        .bind(next_status)
+        .execute(&mut *control_tx)
+        .await?;
+        control_tx.commit().await?;
+
+        run_shard_summary::refresh_run_shard_summary(
+            execution_db,
+            dispatched.id,
+            dispatched.run_shard,
+        )
+        .await?;
+    } else {
+        control_tx.rollback().await?;
     }
 
-    Ok(dispatched)
+    Ok(dispatched.map(|dispatched| DispatchedRun {
+        id: dispatched.id,
+        run_key: dispatched.run_key,
+        run_shard: dispatched.run_shard,
+        chunk_events_enqueued: dispatched.chunk_events_enqueued,
+        chunks_marked_dispatched: dispatched.chunks_marked_dispatched,
+        run_started_events_enqueued: dispatched.run_started_events_enqueued,
+    }))
 }
 
 #[cfg(test)]
@@ -1132,7 +1158,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let dispatched = dispatch_routed_run_window(&pool, 10, &route, &snapshot)
+        let dispatched = dispatch_routed_run_window(&pool, &pool, 10, &route, &snapshot)
             .await
             .unwrap()
             .unwrap();

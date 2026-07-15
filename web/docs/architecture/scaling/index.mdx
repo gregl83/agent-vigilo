@@ -67,6 +67,9 @@ Implemented today:
 - Placement catalog validation during `vigilo setup`.
 - Run creation inserts one active `shard_placements` row for each `run_shard`
   used by the run.
+- Run creation writes pending chunks and local case/run prerequisites to the
+  selected execution placement, while control storage keeps placement rows and
+  dispatch cursors.
 - A database service/router that exposes `control()` and execution routing primitives to DB/workflow code.
 - Chunk-ready messages that carry `run_id`, `run_shard`, and `chunk_id`.
 - Worker chunk-local processing resolves the execution database by
@@ -101,6 +104,8 @@ Implemented today:
 - `vigilo shard move` copies one `run_id + run_shard` to another execution
   placement, verifies row counts and checksums, and switches the routing row
   after verification.
+- CI runs a two-Postgres integration test for routed dispatch, worker-owned
+  execution writes, results, export, finalization, and shard move.
 
 Not implemented yet:
 
@@ -292,6 +297,10 @@ run_shard_summaries
 It also copies the required `dataset_versions` and `runs` rows to satisfy local
 foreign keys on the target placement. `run_shard_dispatch_cursors` remains
 control-plane metadata and is not copied between execution placements.
+
+Dispatch locks and updates the control cursor in the control DB. The routed
+execution DB owns the local run snapshot, chunk updates, shard summary, and
+chunk-ready outbox event.
 
 5. **Verify data.** To compare an already-copied source and target without
    copying or switching placement, run:

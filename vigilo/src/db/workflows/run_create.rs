@@ -1,9 +1,9 @@
 //! Run creation persistence workflow helpers.
 //!
-//! These helpers write immutable dataset content, dataset membership, the run
-//! row, pending run chunks, and shard placement rows inside the caller's
-//! transaction. Dispatch owns chunk-ready event creation in bounded windows so
-//! workers cannot process a run before a coordinator marks it running. Bulk
+//! These helpers write immutable dataset content, dataset membership, control
+//! run metadata, shard placement rows, dispatch cursors, and execution-local
+//! pending chunks. Dispatch owns chunk-ready event creation in bounded windows
+//! so workers cannot process a run before a coordinator marks it running. Bulk
 //! paths are chunked to keep statement size and bind counts bounded for large
 //! datasets.
 
@@ -15,21 +15,124 @@ use sqlx::{
 };
 use uuid::Uuid;
 
-use crate::models::{
-    case_blob::CaseBlobDraft,
-    database_placement::{
-        DATABASE_PLACEMENT_ROLE_CONTROL_AND_SHARD,
-        DATABASE_PLACEMENT_ROLE_SHARD,
+use crate::{
+    context::database,
+    models::{
+        case_blob::CaseBlobDraft,
+        database_placement::{
+            DATABASE_PLACEMENT_ROLE_CONTROL_AND_SHARD,
+            DATABASE_PLACEMENT_ROLE_SHARD,
+        },
+        dataset_version_case::DatasetVersionCaseDraft,
+        run::RunDraft,
+        run_chunk::RunChunkDraft,
+        shard_placement::SHARD_PLACEMENT_STATUS_ACTIVE,
     },
-    dataset_version_case::DatasetVersionCaseDraft,
-    run::RunDraft,
-    run_chunk::RunChunkDraft,
-    shard_placement::SHARD_PLACEMENT_STATUS_ACTIVE,
 };
 
 const CASE_BLOB_INSERT_CHUNK_SIZE: usize = 500;
 const DATASET_MEMBERSHIP_INSERT_CHUNK_SIZE: usize = 2_000;
 const RUN_CHUNK_INSERT_CHUNK_SIZE: usize = 2_000;
+
+struct RunSeedState<'a> {
+    run_id: Uuid,
+    draft: &'a RunDraft,
+    case_blobs: &'a [CaseBlobDraft],
+    dataset_cases: &'a [DatasetVersionCaseDraft],
+    chunks: &'a [RunChunkDraft],
+}
+
+/// Persists a newly planned run across control and execution storage.
+///
+/// Control storage owns the authoritative run metadata, canonical dataset
+/// rows, placement rows, and dispatch cursors. Execution storage owns the
+/// pending chunks and local copies of the FK/case rows workers need to process
+/// those chunks.
+pub(crate) async fn insert_run_seed_state(
+    database: &database::Db,
+    run_id: Uuid,
+    draft: &RunDraft,
+    case_blobs: &[CaseBlobDraft],
+    dataset_cases: &[DatasetVersionCaseDraft],
+    chunks: &[RunChunkDraft],
+    execution_database_alias: &str,
+) -> anyhow::Result<()> {
+    let seed = RunSeedState {
+        run_id,
+        draft,
+        case_blobs,
+        dataset_cases,
+        chunks,
+    };
+    let control_db = database.control().await?;
+    let execution_in_control = execution_database_alias == database.control_database_alias();
+    let execution_db = if execution_in_control {
+        None
+    } else {
+        Some(database.placement(execution_database_alias).await?)
+    };
+
+    let mut control_tx = control_db.begin().await?;
+    insert_control_seed_state(
+        &mut control_tx,
+        &seed,
+        execution_database_alias,
+        execution_in_control,
+    )
+    .await?;
+
+    if let Some(execution_db) = execution_db {
+        let mut execution_tx = execution_db.begin().await?;
+        insert_execution_seed_state(&mut execution_tx, &seed).await?;
+        execution_tx.commit().await?;
+    }
+
+    control_tx.commit().await?;
+    Ok(())
+}
+
+async fn insert_control_seed_state(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    seed: &RunSeedState<'_>,
+    execution_database_alias: &str,
+    include_execution_chunks: bool,
+) -> anyhow::Result<()> {
+    bulk_insert_case_blobs(tx, seed.case_blobs).await?;
+    upsert_dataset_version(
+        tx,
+        seed.draft.dataset_version_id,
+        seed.draft.dataset_id,
+        &seed.draft.dataset_version,
+    )
+    .await?;
+    bulk_insert_dataset_membership(tx, seed.draft.dataset_version_id, seed.dataset_cases).await?;
+    insert_run_create(tx, seed.run_id, seed.draft).await?;
+    bulk_insert_shard_placements(tx, seed.run_id, seed.chunks, execution_database_alias).await?;
+    bulk_insert_run_shard_dispatch_cursors(tx, seed.run_id, seed.chunks).await?;
+
+    if include_execution_chunks {
+        bulk_insert_run_chunks(tx, seed.run_id, seed.draft.dataset_version_id, seed.chunks).await?;
+    }
+
+    Ok(())
+}
+
+async fn insert_execution_seed_state(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    seed: &RunSeedState<'_>,
+) -> anyhow::Result<()> {
+    bulk_insert_case_blobs(tx, seed.case_blobs).await?;
+    upsert_dataset_version(
+        tx,
+        seed.draft.dataset_version_id,
+        seed.draft.dataset_id,
+        &seed.draft.dataset_version,
+    )
+    .await?;
+    bulk_insert_dataset_membership(tx, seed.draft.dataset_version_id, seed.dataset_cases).await?;
+    insert_run_create(tx, seed.run_id, seed.draft).await?;
+    bulk_insert_run_chunks(tx, seed.run_id, seed.draft.dataset_version_id, seed.chunks).await
+}
 
 /// Inserts case blob rows, ignoring already-known content hashes.
 ///

@@ -327,6 +327,7 @@ async fn drain_dispatch_batch(
 
         let execution_db = database.execution(route.run_id, route.run_shard).await?;
         let Some(run) = run_dispatch::dispatch_routed_run_window(
+            control_db,
             execution_db,
             config.run_chunk_dispatch_window_size,
             &route,

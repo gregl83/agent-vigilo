@@ -120,33 +120,19 @@ pub(super) async fn exec(
     };
 
     // --- Persist pending run work ---
-    // Write immutable case blobs, dataset membership, the pending run, pending
-    // chunks, and shard placement rows in one transaction. Coordinator
-    // dispatch owns worker visibility; no queue-visible events are emitted
-    // here.
-    let mut tx = db.begin().await?;
-
-    run_create::bulk_insert_case_blobs(&mut tx, &case_blobs).await?;
-    run_create::upsert_dataset_version(
-        &mut tx,
-        dataset_version_id,
-        run_draft.dataset_id,
-        &run_draft.dataset_version,
-    )
-    .await?;
-    run_create::bulk_insert_dataset_membership(&mut tx, dataset_version_id, &dataset_cases).await?;
-    run_create::insert_run_create(&mut tx, run_id, &run_draft).await?;
-    run_create::bulk_insert_run_chunks(&mut tx, run_id, dataset_version_id, &chunks).await?;
-    run_create::bulk_insert_shard_placements(
-        &mut tx,
+    // Write control metadata, placement rows, dispatch cursors, and
+    // execution-local seed rows. Coordinator dispatch owns worker visibility;
+    // no queue-visible events are emitted here.
+    run_create::insert_run_seed_state(
+        database,
         run_id,
+        &run_draft,
+        &case_blobs,
+        &dataset_cases,
         &chunks,
         &default_execution_database_alias,
     )
     .await?;
-    run_create::bulk_insert_run_shard_dispatch_cursors(&mut tx, run_id, &chunks).await?;
-
-    tx.commit().await?;
 
     // --- Emit create response ---
     let payload = json!({

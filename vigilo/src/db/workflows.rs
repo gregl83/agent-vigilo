@@ -7,8 +7,8 @@
 //! outbox writes.
 //!
 //! Reading guide:
-//! - `run_create` writes immutable dataset/run/chunk seed state, but does not
-//!   make work visible to workers.
+//! - `run_create` writes control metadata plus execution-local seed state, but
+//!   does not make work visible to workers.
 //! - `run_dispatch` starts dispatchable runs, prepares execution-local run
 //!   snapshots, and owns chunk visibility plus expired chunk lease recovery.
 //! - `run_shard_summary` refreshes shard-local progress rollups used by later
