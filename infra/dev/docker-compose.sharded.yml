@@ -36,6 +36,8 @@ services:
       - agent_vigilo_cargo_git:/usr/local/cargo/git
       - agent_vigilo_target:/workspace/target
     depends_on:
+      setup:
+        condition: service_completed_successfully
       postgres-shard-001:
         condition: service_healthy
       rabbitmq:

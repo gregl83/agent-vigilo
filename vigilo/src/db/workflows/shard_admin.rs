@@ -1595,7 +1595,7 @@ async fn prerequisite_table_fingerprint(
                 COUNT(*)::bigint AS row_count,
                 COALESCE(md5(string_agg(row_json, E'\n' ORDER BY row_json)), '') AS checksum
             FROM (
-                SELECT to_jsonb(cb)::text AS row_json
+                SELECT (to_jsonb(cb) - 'created_at')::text AS row_json
                 FROM case_blobs cb
                 WHERE EXISTS (
                     SELECT 1
@@ -1614,7 +1614,7 @@ async fn prerequisite_table_fingerprint(
                 COUNT(*)::bigint AS row_count,
                 COALESCE(md5(string_agg(row_json, E'\n' ORDER BY row_json)), '') AS checksum
             FROM (
-                SELECT to_jsonb(dv)::text AS row_json
+                SELECT (to_jsonb(dv) - 'created_at' - 'updated_at')::text AS row_json
                 FROM dataset_versions dv
                 JOIN runs r
                   ON r.dataset_version_id = dv.dataset_version_id
@@ -1628,7 +1628,7 @@ async fn prerequisite_table_fingerprint(
                 COUNT(*)::bigint AS row_count,
                 COALESCE(md5(string_agg(row_json, E'\n' ORDER BY row_json)), '') AS checksum
             FROM (
-                SELECT to_jsonb(cvc)::text AS row_json
+                SELECT (to_jsonb(cvc) - 'created_at' - 'updated_at')::text AS row_json
                 FROM dataset_version_cases cvc
                 JOIN runs r
                   ON r.dataset_version_id = cvc.dataset_version_id
@@ -1642,7 +1642,26 @@ async fn prerequisite_table_fingerprint(
                 COUNT(*)::bigint AS row_count,
                 COALESCE(md5(string_agg(row_json, E'\n' ORDER BY row_json)), '') AS checksum
             FROM (
-                SELECT to_jsonb(r)::text AS row_json
+                SELECT (
+                    to_jsonb(r)
+                    - 'status'
+                    - 'gate_status'
+                    - 'coordinator_id'
+                    - 'coordinator_leased_until'
+                    - 'coordinator_heartbeat_at'
+                    - 'terminal_execution_count'
+                    - 'passed_execution_count'
+                    - 'failed_execution_count'
+                    - 'errored_execution_count'
+                    - 'summary'
+                    - 'error_message'
+                    - 'created_at'
+                    - 'started_at'
+                    - 'dispatched_at'
+                    - 'finalized_at'
+                    - 'completed_at'
+                    - 'updated_at'
+                )::text AS row_json
                 FROM runs r
                 WHERE r.id = $1::uuid
             ) rows
@@ -1957,6 +1976,80 @@ mod tests {
         assert_eq!(context_payload, Value::Null);
     }
 
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn prerequisite_fingerprints_ignore_local_timestamps_and_run_lifecycle(pool: PgPool) {
+        let run_id = Uuid::now_v7();
+        let dataset_id = Uuid::now_v7();
+        let dataset_version_id = Uuid::now_v7();
+        let case_id = Uuid::now_v7();
+        let case_hash = format!("case-{}", Uuid::now_v7());
+
+        seed_run(&pool, run_id, dataset_id, dataset_version_id).await;
+        seed_case(&pool, dataset_version_id, case_id, &case_hash).await;
+
+        let before = prerequisite_fingerprints(&pool, run_id).await;
+
+        sqlx::query(
+            r#"
+            UPDATE case_blobs
+            SET created_at = created_at + interval '1 second'
+            WHERE case_hash = $1
+            "#,
+        )
+        .bind(&case_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            UPDATE dataset_versions
+            SET created_at = created_at + interval '1 second',
+                updated_at = updated_at + interval '1 second'
+            WHERE dataset_version_id = $1::uuid
+            "#,
+        )
+        .bind(dataset_version_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            UPDATE dataset_version_cases
+            SET created_at = created_at + interval '1 second',
+                updated_at = updated_at + interval '1 second'
+            WHERE dataset_version_id = $1::uuid
+              AND case_id = $2::uuid
+            "#,
+        )
+        .bind(dataset_version_id)
+        .bind(case_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            UPDATE runs
+            SET status = 'completed'::run_status,
+                gate_status = 'pass'::gate_status,
+                terminal_execution_count = 1,
+                passed_execution_count = 1,
+                summary = '{"local":"changed"}'::jsonb,
+                completed_at = now(),
+                updated_at = now()
+            WHERE id = $1::uuid
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let after = prerequisite_fingerprints(&pool, run_id).await;
+
+        assert_eq!(before, after);
+    }
+
     #[test]
     fn validate_run_shard_rejects_out_of_range_values() {
         assert!(validate_run_shard(0).is_ok());
@@ -2045,6 +2138,55 @@ mod tests {
         };
         assert!(context.cell.set(pool).is_ok());
         context
+    }
+
+    async fn seed_case(pool: &PgPool, dataset_version_id: Uuid, case_id: Uuid, case_hash: &str) {
+        sqlx::query(
+            r#"
+            INSERT INTO case_blobs (
+                case_hash,
+                task_type,
+                input_payload,
+                expected_output
+            )
+            VALUES ($1, 'classification', '{"text":"hello"}'::jsonb, 'null'::jsonb)
+            "#,
+        )
+        .bind(case_hash)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO dataset_version_cases (
+                dataset_version_id,
+                case_id,
+                case_ordinal,
+                case_hash
+            )
+            VALUES ($1::uuid, $2::uuid, 0, $3)
+            "#,
+        )
+        .bind(dataset_version_id)
+        .bind(case_id)
+        .bind(case_hash)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn prerequisite_fingerprints(pool: &PgPool, run_id: Uuid) -> Vec<(i64, String)> {
+        let mut fingerprints = Vec::new();
+
+        for table in PREREQUISITE_TABLES {
+            let fingerprint = prerequisite_table_fingerprint(pool, table, run_id)
+                .await
+                .unwrap();
+            fingerprints.push((fingerprint.row_count, fingerprint.checksum));
+        }
+
+        fingerprints
     }
 
     async fn seed_run(pool: &PgPool, run_id: Uuid, dataset_id: Uuid, dataset_version_id: Uuid) {

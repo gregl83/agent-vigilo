@@ -11,3 +11,6 @@ The agent service expects this model file to exist before startup:
 ```text
 models/qwen2.5-0.5b-instruct-q4_k_m.gguf
 ```
+
+Set `VIGILO_AGENT_MODEL` in `infra/dev/.env.single` or
+`infra/dev/.env.sharded` when using a different GGUF filename.

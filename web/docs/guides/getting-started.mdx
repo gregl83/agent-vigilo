@@ -98,22 +98,44 @@ rustup target add wasm32-wasip2
 From the repository root:
 
 ```bash
-docker compose -f infra/dev/docker-compose.yml up -d postgres rabbitmq
+docker compose --env-file infra/dev/.env.single \
+  -f infra/dev/docker-compose.single.yml \
+  up -d postgres rabbitmq
 ```
 
 Set the local connection strings:
 
 ```bash
-export DATABASE_URL='postgres://postgres:password@localhost:5432/agent_vigilo'
-export MESSAGING_URL='amqp://guest:guest@localhost:5672/'
+export DATABASE_URL='postgresql://postgres:password@localhost:5432/agent_vigilo'
+export MESSAGING_URL='amqp://guest:guest@localhost:5672'
 ```
 
 On PowerShell:
 
 ```powershell
-$env:DATABASE_URL='postgres://postgres:password@localhost:5432/agent_vigilo'
-$env:MESSAGING_URL='amqp://guest:guest@localhost:5672/'
+$env:DATABASE_URL='postgresql://postgres:password@localhost:5432/agent_vigilo'
+$env:MESSAGING_URL='amqp://guest:guest@localhost:5672'
 ```
+
+For sharding tests, start the overlay instead:
+
+```bash
+docker compose --env-file infra/dev/.env.sharded \
+  -f infra/dev/docker-compose.single.yml \
+  -f infra/dev/docker-compose.sharded.yml \
+  up -d postgres postgres-shard-001 rabbitmq
+```
+
+Host-side tests use the published ports:
+
+```bash
+export DATABASE_URL='postgresql://postgres:password@localhost:5432/agent_vigilo'
+export VIGILO_TEST_SHARD_001_DATABASE_URL='postgresql://postgres:password@localhost:5433/agent_vigilo'
+export MESSAGING_URL='amqp://guest:guest@localhost:5672'
+```
+
+Inside Compose containers, services use Docker DNS names such as `postgres`,
+`postgres-shard-001`, and `rabbitmq`; see `infra/dev/README.md`.
 
 Apply migrations and publish the bundled evaluator:
 
@@ -140,7 +162,18 @@ This checks that the profile, dataset, evaluator references, and runnable evalua
 Start the full dev stack, including the local agent, coordinator, and worker:
 
 ```bash
-docker compose -f infra/dev/docker-compose.yml up -d
+docker compose --env-file infra/dev/.env.single \
+  -f infra/dev/docker-compose.single.yml \
+  up -d
+```
+
+For a full sharded runtime stack:
+
+```bash
+docker compose --env-file infra/dev/.env.sharded \
+  -f infra/dev/docker-compose.single.yml \
+  -f infra/dev/docker-compose.sharded.yml \
+  up -d
 ```
 
 Create a run:

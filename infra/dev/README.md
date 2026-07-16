@@ -1,20 +1,45 @@
 # Dev Infrastructure
 
-The single-database Compose file starts the default development stack. The
-sharded overlay adds a second PostgreSQL placement and registers it in the
-control database for local scale-out testing.
-
-Use the matching env file and Compose file together:
+This directory defines two local Docker Compose topologies:
 
 | Topology | Env file | Compose files |
 | --- | --- | --- |
 | Single database | `infra/dev/.env.single` | `infra/dev/docker-compose.single.yml` |
 | Sharded database | `infra/dev/.env.sharded` | `infra/dev/docker-compose.single.yml` + `infra/dev/docker-compose.sharded.yml` |
 
-There is no default `.env` file in this directory. Pass `--env-file`
-explicitly so the active topology is visible in the command.
+There is no default `.env` file in this directory. Always pass `--env-file`
+so the active topology is explicit.
+
+Compose is idempotent for the same project and file set. Running the same
+`docker compose up` command again reuses or recreates the same services; it
+does not create a second copy of `postgres`, `coordinator`, or `worker`.
+
+## Service Groups
+
+- Infrastructure: `postgres`, `postgres-shard-001`, `rabbitmq`
+- Bootstrap: `setup`, `setup-shard-001`, `configure-shard-001`
+- Runtime: `agent`, `coordinator`, `worker`
+
+Bootstrap services are one-shot jobs. Runtime services depend on bootstrap, so
+starting `coordinator` or `worker` may also start setup/config services.
+In the sharded topology, shard setup waits for primary setup so the shared
+Cargo cache is not written by two setup jobs at once.
+
+## Agent Model
+
+The `agent` service runs llama.cpp and expects this host file:
+
+```text
+models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+```
+
+Set `VIGILO_AGENT_MODEL` in the selected env file when using a different GGUF
+filename. Start database-only or bootstrap-only commands when you do not need
+the local agent container.
 
 ## Single Database
+
+Start only Postgres and RabbitMQ:
 
 ```bash
 docker compose --env-file infra/dev/.env.single \
@@ -22,14 +47,32 @@ docker compose --env-file infra/dev/.env.single \
   up -d postgres rabbitmq
 ```
 
-Run host-side commands with the host URLs from `infra/dev/.env.single`:
+Run setup:
+
+```bash
+docker compose --env-file infra/dev/.env.single \
+  -f infra/dev/docker-compose.single.yml \
+  up setup
+```
+
+Start the full single-database runtime:
+
+```bash
+docker compose --env-file infra/dev/.env.single \
+  -f infra/dev/docker-compose.single.yml \
+  up -d
+```
+
+Host-side commands use published ports:
 
 ```bash
 export DATABASE_URL=postgresql://postgres:password@localhost:5432/agent_vigilo
 export MESSAGING_URL=amqp://guest:guest@localhost:5672
 ```
 
-## Sharded
+## Sharded Database
+
+Start only Postgres primary, Postgres shard, and RabbitMQ:
 
 ```bash
 docker compose --env-file infra/dev/.env.sharded \
@@ -38,7 +81,25 @@ docker compose --env-file infra/dev/.env.sharded \
   up -d postgres postgres-shard-001 rabbitmq
 ```
 
-Host-side tests and CLI commands use the published ports:
+Bootstrap both databases and register `shard_001` in the control DB:
+
+```bash
+docker compose --env-file infra/dev/.env.sharded \
+  -f infra/dev/docker-compose.single.yml \
+  -f infra/dev/docker-compose.sharded.yml \
+  up setup setup-shard-001 configure-shard-001
+```
+
+Start the full sharded runtime:
+
+```bash
+docker compose --env-file infra/dev/.env.sharded \
+  -f infra/dev/docker-compose.single.yml \
+  -f infra/dev/docker-compose.sharded.yml \
+  up -d
+```
+
+Host-side tests and CLI commands use published ports:
 
 ```bash
 export DATABASE_URL=postgresql://postgres:password@localhost:5432/agent_vigilo
@@ -53,32 +114,70 @@ Run the CI-equivalent routing test:
 cargo test -p vigilo --locked --test multi_database_routing -- --nocapture
 ```
 
-For a full sharded runtime stack, start all services with the overlay:
+## Runtime Dependencies
+
+This command starts the runtime services:
 
 ```bash
 docker compose --env-file infra/dev/.env.sharded \
   -f infra/dev/docker-compose.single.yml \
   -f infra/dev/docker-compose.sharded.yml \
-  up -d
+  up -d agent coordinator worker
 ```
 
-The overlay migrates `postgres-shard-001` and upserts the `shard_001`
-placement row in the control database. Inside containers, database URLs use
-Compose service names such as `postgres` and `postgres-shard-001`; host-side
-tests use `localhost` and the published ports.
+Compose may also start `setup`, `setup-shard-001`, `configure-shard-001`,
+`postgres`, `postgres-shard-001`, and `rabbitmq` because they are dependencies.
+That is expected. `postgres` and `postgres-shard-001` are shared database
+services, not separate databases for the coordinator and worker.
+
+Inside containers, database URLs use Compose DNS names:
+
+```text
+postgres:5432
+postgres-shard-001:5432
+rabbitmq:5672
+```
+
+Host-side tests and CLI commands use `localhost` and the published ports.
 
 ## Reset
 
-Use the same file set for shutdown that you used for startup. Add `-v` when you
-need fresh databases.
+Use the same file set for shutdown that you used for startup.
+
+Single database:
 
 ```bash
-docker compose -f infra/dev/docker-compose.single.yml \
-  down -v
+docker compose --env-file infra/dev/.env.single \
+  -f infra/dev/docker-compose.single.yml \
+  down --remove-orphans
 ```
 
+Sharded database:
+
 ```bash
-docker compose -f infra/dev/docker-compose.single.yml \
+docker compose --env-file infra/dev/.env.sharded \
+  -f infra/dev/docker-compose.single.yml \
   -f infra/dev/docker-compose.sharded.yml \
-  down -v
+  down --remove-orphans
+```
+
+Add `-v` when you need fresh databases:
+
+```bash
+docker compose --env-file infra/dev/.env.sharded \
+  -f infra/dev/docker-compose.single.yml \
+  -f infra/dev/docker-compose.sharded.yml \
+  down -v --remove-orphans
+```
+
+If a setup job failed while Cargo was downloading crates, clear only the Cargo
+registry cache and rerun setup:
+
+```bash
+docker compose --env-file infra/dev/.env.sharded \
+  -f infra/dev/docker-compose.single.yml \
+  -f infra/dev/docker-compose.sharded.yml \
+  down --remove-orphans
+
+docker volume rm agent_vigilo_dev_agent_vigilo_cargo_registry
 ```
