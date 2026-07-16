@@ -685,11 +685,13 @@ fn make_test_case(case: &chunk_processing::WorkerCaseBatchItem) -> anyhow::Resul
 
 /// Allocates durable execution attempts for a chunk case batch.
 ///
-/// Query behavior:
+/// Transaction behavior:
 /// - Materializes the input cases as an inline table to preserve chunk order.
 /// - Takes a shared run-state guard so workers for other chunks can continue,
 ///   while cancellation/finalization still waits for this short write.
 /// - Upserts execution rows without resetting durable retry or terminal state.
+/// - Allocates attempts in a second statement so PostgreSQL can observe rows
+///   inserted or updated by the execution upsert.
 /// - Splits rows into terminal, retry-waiting, exhausted-open, and retry-eligible
 ///   buckets.
 /// - For eligible rows, marks older running attempts stale, increments the
@@ -763,19 +765,22 @@ async fn allocate_execution_attempts_for_cases(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    // Query outline:
+    // Transaction outline:
     //
-    // input             - chunk cases and resolved evaluator manifests.
-    // run_guard         - shared lifecycle check for the running run.
+    // upsert input      - chunk cases and resolved evaluator manifests.
+    // run_guard         - shared lifecycle lock held through attempt allocation.
+    // execution upsert  - create/update rows without clearing retry state.
+    // allocation input  - case ids and ordinals used to preserve chunk order.
     // attempt_policy    - max_attempts copied into SQL for retry decisions.
-    // upserted          - create/update execution rows without clearing retry state.
     // attempt_state     - durable state after the upsert.
     // terminal_or_closed - already terminal rows, skipped by worker.
     // retry_waiting     - retry_scheduled rows whose retry_after is not due.
     // exhausted_open    - open rows at max_attempts, failed by caller.
     // retry_eligible    - rows that should receive a new attempt now.
-    // superseded_attempts/bumped/inserted_attempt/updated_execution
-    //                   - authority handoff to the new running attempt.
+    // superseded_attempts/bumped/inserted_attempt
+    //                   - create the new running attempt.
+    // authority update  - point each execution at its new attempt.
+    let mut tx = db.begin().await?;
     let mut query_builder = QueryBuilder::<Postgres>::new(
         r#"
         WITH input (
@@ -832,45 +837,8 @@ async fn allocate_execution_attempts_for_cases(
     query_builder.push(
         r#"
             FOR SHARE
-        ),
-        attempt_policy AS (
-            SELECT
-        "#,
-    );
-    query_builder.push_bind(max_attempts);
-    query_builder.push(
-        r#"::int AS max_attempts
-        ),
-        attempt_lease AS (
-            SELECT
-                "#,
-    );
-    query_builder.push_bind(lease.worker_id);
-    query_builder.push(
-        r#"::uuid AS worker_id,
-                "#,
-    );
-    query_builder.push_bind(&lease.worker_host);
-    query_builder.push(
-        r#"::text AS worker_host,
-                "#,
-    );
-    query_builder.push_bind(lease.queue_message_id);
-    query_builder.push(
-        r#"::uuid AS queue_message_id,
-                "#,
-    );
-    query_builder.push_bind(&lease.broker_message_id);
-    query_builder.push(
-        r#"::text AS broker_message_id,
-                "#,
-    );
-    query_builder.push_bind(lease.lease_seconds);
-    query_builder.push(
-        r#"::int AS lease_seconds
-        ),
-        upserted AS (
-            INSERT INTO executions (
+        )
+        INSERT INTO executions (
                 run_id,
                 run_shard,
                 chunk_id,
@@ -942,26 +910,91 @@ async fn allocate_execution_attempts_for_cases(
                 evaluator_manifest = EXCLUDED.evaluator_manifest,
                 expected_evaluator_count = EXCLUDED.expected_evaluator_count,
                 updated_at = now()
-            RETURNING id, case_id, run_id, run_shard
+        "#,
+    );
+
+    let upserted = query_builder.build().execute(&mut *tx).await?;
+    if upserted.rows_affected() != cases.len() as u64 {
+        anyhow::bail!(
+            "upserted {} executions for {} cases",
+            upserted.rows_affected(),
+            cases.len()
+        );
+    }
+
+    let mut query_builder = QueryBuilder::<Postgres>::new(
+        r#"
+        WITH input (case_id, input_ordinal) AS (
+        "#,
+    );
+    query_builder.push_values(inputs.iter(), |mut b, row| {
+        b.push_bind(row.case.case_id).push_bind(row.input_ordinal);
+    });
+    query_builder.push(
+        r#"
+        ),
+        attempt_policy AS (
+            SELECT
+        "#,
+    );
+    query_builder.push_bind(max_attempts);
+    query_builder.push(
+        r#"::int AS max_attempts
+        ),
+        attempt_lease AS (
+            SELECT
+                "#,
+    );
+    query_builder.push_bind(lease.worker_id);
+    query_builder.push(
+        r#"::uuid AS worker_id,
+                "#,
+    );
+    query_builder.push_bind(&lease.worker_host);
+    query_builder.push(
+        r#"::text AS worker_host,
+                "#,
+    );
+    query_builder.push_bind(lease.queue_message_id);
+    query_builder.push(
+        r#"::uuid AS queue_message_id,
+                "#,
+    );
+    query_builder.push_bind(&lease.broker_message_id);
+    query_builder.push(
+        r#"::text AS broker_message_id,
+                "#,
+    );
+    query_builder.push_bind(lease.lease_seconds);
+    query_builder.push(
+        r#"::int AS lease_seconds
         ),
         attempt_state AS (
             SELECT
                 input.case_id,
                 input.input_ordinal,
-                upserted.id AS execution_id,
-                upserted.run_id,
-                upserted.run_shard,
+                executions.id AS execution_id,
+                executions.run_id,
+                executions.run_shard,
                 executions.status,
                 executions.current_attempt_id,
                 executions.current_attempt_no,
                 executions.retry_after
-            FROM upserted
+            FROM input
             JOIN executions
-              ON executions.run_id = upserted.run_id
-             AND executions.run_shard = upserted.run_shard
-             AND executions.id = upserted.id
-            JOIN input
-              ON input.case_id = upserted.case_id
+              ON executions.run_id =
+        "#,
+    );
+    query_builder.push_bind(run_id);
+    query_builder.push(
+        r#"::uuid
+             AND executions.run_shard =
+        "#,
+    );
+    query_builder.push_bind(run_shard);
+    query_builder.push(
+        r#"
+             AND executions.case_id = input.case_id
         ),
         terminal_or_closed AS (
             SELECT
@@ -1108,15 +1141,6 @@ async fn allocate_execution_attempts_for_cases(
             CROSS JOIN attempt_lease
             RETURNING id AS attempt_id, execution_id, run_id, run_shard, attempt_no
         ),
-        updated_execution AS (
-            UPDATE executions
-            SET current_attempt_id = inserted_attempt.attempt_id
-            FROM inserted_attempt
-            WHERE executions.run_id = inserted_attempt.run_id
-              AND executions.run_shard = inserted_attempt.run_shard
-              AND executions.id = inserted_attempt.execution_id
-            RETURNING executions.id
-        ),
         allocated AS (
             SELECT
                 retry_eligible.case_id,
@@ -1131,8 +1155,6 @@ async fn allocate_execution_attempts_for_cases(
             FROM inserted_attempt
             JOIN retry_eligible
               ON retry_eligible.id = inserted_attempt.execution_id
-            JOIN updated_execution
-              ON updated_execution.id = inserted_attempt.execution_id
             UNION ALL
             SELECT
                 terminal_or_closed.case_id,
@@ -1186,7 +1208,7 @@ async fn allocate_execution_attempts_for_cases(
 
     let allocations = query_builder
         .build_query_as::<AttemptAllocation>()
-        .fetch_all(db)
+        .fetch_all(&mut *tx)
         .await?;
 
     if allocations.len() != cases.len() {
@@ -1196,6 +1218,66 @@ async fn allocate_execution_attempts_for_cases(
             cases.len()
         );
     }
+
+    let new_attempts = allocations
+        .iter()
+        .filter(|allocation| allocation.should_process)
+        .map(|allocation| {
+            allocation
+                .attempt_id
+                .map(|attempt_id| (allocation.execution_id, attempt_id))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "execution '{}' was allocated without an attempt id",
+                        allocation.execution_id
+                    )
+                })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    if !new_attempts.is_empty() {
+        let mut authority_update = QueryBuilder::<Postgres>::new(
+            r#"
+            WITH input (execution_id, attempt_id) AS (
+            "#,
+        );
+        authority_update.push_values(&new_attempts, |mut b, (execution_id, attempt_id)| {
+            b.push_bind(execution_id).push_bind(attempt_id);
+        });
+        authority_update.push(
+            r#"
+            )
+            UPDATE executions
+            SET current_attempt_id = input.attempt_id,
+                updated_at = now()
+            FROM input
+            WHERE executions.run_id =
+            "#,
+        );
+        authority_update.push_bind(run_id);
+        authority_update.push(
+            r#"::uuid
+              AND executions.run_shard =
+            "#,
+        );
+        authority_update.push_bind(run_shard);
+        authority_update.push(
+            r#"
+              AND executions.id = input.execution_id
+            "#,
+        );
+
+        let updated = authority_update.build().execute(&mut *tx).await?;
+        if updated.rows_affected() != new_attempts.len() as u64 {
+            anyhow::bail!(
+                "updated {} current execution attempts for {} allocations",
+                updated.rows_affected(),
+                new_attempts.len()
+            );
+        }
+    }
+
+    tx.commit().await?;
 
     Ok(allocations)
 }
@@ -2242,7 +2324,7 @@ async fn persist_completed_execution_results_batch(
 
 /// Processes a chunk-sized batch of dataset cases.
 ///
-/// The function allocates authoritative attempts in one statement, runs cases
+/// The function allocates authoritative attempts in one transaction, runs cases
 /// with bounded chunk-local parallelism, runs each case's evaluators with
 /// bounded per-case parallelism, and persists all completed case results in one
 /// chunk-level transaction. Terminal execution transitions are returned for the

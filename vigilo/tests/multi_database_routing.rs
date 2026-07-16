@@ -4,6 +4,8 @@
 //! databases. It drives the `vigilo` binary for public CLI behavior and uses
 //! SQL only for schema setup, seed data, and persistence assertions.
 
+mod support;
+
 use std::{
     fs,
     path::{
@@ -31,6 +33,7 @@ async fn multi_database_routing_flow() -> anyhow::Result<()> {
     let Some(config) = IntegrationConfig::from_env() else {
         return Ok(());
     };
+    let config = config.isolated().await?;
 
     let primary = connect(&config.primary_url).await?;
     let shard = connect(&config.shard_url).await?;
@@ -305,6 +308,12 @@ impl IntegrationConfig {
             primary_url: std::env::var(PRIMARY_DATABASE_URL_ENV).ok()?,
             shard_url: std::env::var(SHARD_DATABASE_URL_ENV).ok()?,
         })
+    }
+
+    async fn isolated(mut self) -> anyhow::Result<Self> {
+        (self.primary_url, self.shard_url) =
+            support::isolated_postgres_urls(&self.primary_url, &self.shard_url).await?;
+        Ok(self)
     }
 }
 

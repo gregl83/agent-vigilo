@@ -5,6 +5,8 @@
 //! binary through create, dispatch, worker processing, finalization,
 //! results/export, cancellation, and validation failure paths.
 
+mod support;
+
 use std::{
     fs,
     io::{
@@ -54,6 +56,7 @@ async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
     let Some(config) = IntegrationConfig::from_env() else {
         return Ok(());
     };
+    let config = config.isolated().await?;
 
     let agent = MockAgent::start()?;
     let primary = connect(&config.primary_url).await?;
@@ -109,7 +112,7 @@ async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
         json!(101)
     );
 
-    let export = run_vigilo_output(
+    let export = run_vigilo_ok(
         &config,
         PRIMARY_ALIAS,
         "spread-active",
@@ -261,6 +264,12 @@ impl IntegrationConfig {
             messaging_url: std::env::var("MESSAGING_URL").ok()?,
             mq_namespace: format!("e2e-{}", Uuid::now_v7()),
         })
+    }
+
+    async fn isolated(mut self) -> anyhow::Result<Self> {
+        (self.primary_url, self.shard_url) =
+            support::isolated_postgres_urls(&self.primary_url, &self.shard_url).await?;
+        Ok(self)
     }
 }
 
@@ -789,7 +798,7 @@ async fn execution_status_count(db: &PgPool, run_id: Uuid, status: &str) -> anyh
         SELECT COUNT(*)::bigint
         FROM executions
         WHERE run_id = $1::uuid
-          AND status = $2
+          AND status = $2::execution_status
         "#,
     )
     .bind(run_id)

@@ -84,7 +84,7 @@ pub(crate) struct App {
     pub wasm_max_table_elements: u64,
 
     /// Maximum component instances per Wasm evaluator invocation
-    #[arg(long, env = "VIGILO_WASM_MAX_INSTANCES", default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=1024))]
+    #[arg(long, env = "VIGILO_WASM_MAX_INSTANCES", default_value_t = 3, value_parser = clap::value_parser!(u64).range(1..=1024))]
     pub wasm_max_instances: u64,
 
     /// Maximum linear memories per Wasm evaluator invocation
@@ -132,7 +132,6 @@ pub(crate) struct App {
         global = true,
         short = 'f',
         long = "output-format",
-        alias = "format",
         env = "VIGILO_OUTPUT_FORMAT",
         value_name = "FORMAT",
         default_value_t = OutputFormat::Json,
@@ -148,5 +147,17 @@ pub(crate) struct App {
 impl Executable for App {
     async fn exec(self, context: Context) -> anyhow::Result<()> {
         self.command.exec(context).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::App;
+
+    #[test]
+    fn cli_definition_has_no_argument_conflicts() {
+        App::command().debug_assert();
     }
 }
