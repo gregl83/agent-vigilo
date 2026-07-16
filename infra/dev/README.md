@@ -108,7 +108,17 @@ export VIGILO_SHARD_001_DATABASE_URL=postgresql://postgres:password@localhost:54
 export MESSAGING_URL=amqp://guest:guest@localhost:5672
 ```
 
-Run the CI-equivalent routing test:
+Run integration tests against infrastructure and bootstrap services only. Stop
+runtime services first so `coordinator` and `worker` do not mutate test runs:
+
+```bash
+docker compose --env-file infra/dev/.env.sharded \
+  -f infra/dev/docker-compose.single.yml \
+  -f infra/dev/docker-compose.sharded.yml \
+  stop agent coordinator worker
+```
+
+Run the CI-equivalent routing test after exporting the host-side variables:
 
 ```bash
 cargo test -p vigilo --locked --test multi_database_routing -- --nocapture
