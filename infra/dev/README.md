@@ -124,6 +124,19 @@ Run the CI-equivalent routing test after exporting the host-side variables:
 cargo test -p vigilo --locked --test multi_database_routing -- --nocapture
 ```
 
+Run the end-to-end multi-database harness when RabbitMQ is also running and the
+bundled evaluator WASM has been built:
+
+```bash
+cargo build -p sentiment-basic-en --target wasm32-wasip2 --release --locked
+
+VIGILO_E2E_MULTI_DATABASE=1 \
+cargo test -p vigilo --locked --test multi_database_e2e -- --nocapture
+```
+
+The E2E harness uses a per-run `VIGILO_MQ_NAMESPACE`, so it does not consume
+messages left by a previous local runtime stack.
+
 ## Runtime Dependencies
 
 This command starts the runtime services:

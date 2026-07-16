@@ -146,6 +146,19 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 5
+      rabbitmq:
+        image: rabbitmq:3-management
+        env:
+          RABBITMQ_DEFAULT_USER: guest
+          RABBITMQ_DEFAULT_PASS: guest
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --health-start-period 20s
     env:
       DATABASE_URL: postgresql://postgres:password@localhost:5432/agent_vigilo
       VIGILO_TEST_SHARD_001_DATABASE_URL: postgresql://postgres:password@localhost:5433/agent_vigilo
@@ -153,7 +166,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - run: cargo build -p sentiment-basic-en --target wasm32-wasip2 --release --locked
       - run: cargo test -p vigilo --locked --test multi_database_routing -- --nocapture
+      - run: cargo test -p vigilo --locked --test multi_database_e2e -- --nocapture
+        env:
+          VIGILO_E2E_MULTI_DATABASE: "1"
 
   evaluator-wasm:
     name: Evaluator Wasm

@@ -79,7 +79,29 @@ pub(crate) struct Config {
 
 impl Config {
     /// Builds default queue/exchange names around a caller-provided broker URI.
+    ///
+    /// Set `VIGILO_MQ_NAMESPACE` to isolate broker topology for integration
+    /// tests or parallel local stacks. When unset, the historic queue and
+    /// exchange names are preserved.
     pub(crate) fn new(uri: String) -> Self {
+        let namespace = std::env::var("VIGILO_MQ_NAMESPACE")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        if let Some(namespace) = namespace {
+            let prefix = format!("vigilo.{}", namespace);
+            return Self {
+                uri,
+                exchange: format!("{prefix}.events"),
+                event_queue: format!("{prefix}.events.domain"),
+                worker_queue: format!("{prefix}.worker"),
+                worker_retry_exchange: format!("{prefix}.worker.retry"),
+                worker_quarantine_exchange: format!("{prefix}.worker.quarantine"),
+                worker_quarantine_queue: format!("{prefix}.worker.quarantine"),
+            };
+        }
+
         Self {
             uri,
             exchange: "vigilo.events".to_string(),
@@ -206,6 +228,10 @@ impl Client {
         })
     }
 
+    fn retry_queue_name(&self, retry_bucket_name: &str) -> String {
+        retry_bucket_name.replacen("vigilo.worker.retry", &self.config.worker_retry_exchange, 1)
+    }
+
     /// Ensures durable queues and bindings exist on the provided channel.
     async fn declare_topology(&self, channel: &Channel) -> anyhow::Result<()> {
         channel
@@ -308,6 +334,7 @@ impl Client {
             })?;
 
         for (queue_name, ttl_ms) in WORKER_RETRY_BUCKETS {
+            let queue_name = self.retry_queue_name(queue_name);
             let mut retry_args = FieldTable::default();
             retry_args.insert("x-message-ttl".into(), AMQPValue::LongInt(ttl_ms));
             retry_args.insert(
@@ -321,7 +348,7 @@ impl Client {
 
             channel
                 .queue_declare(
-                    queue_name,
+                    &queue_name,
                     QueueDeclareOptions {
                         passive: false,
                         durable: true,
@@ -342,9 +369,9 @@ impl Client {
 
             channel
                 .queue_bind(
-                    queue_name,
+                    &queue_name,
                     &self.config.worker_retry_exchange,
-                    queue_name,
+                    &queue_name,
                     QueueBindOptions::default(),
                     FieldTable::default(),
                 )
@@ -645,23 +672,27 @@ impl Client {
             .max(0)
     }
 
-    fn retry_queue_for_attempt(attempt: i32) -> &'static str {
+    fn retry_queue_for_attempt(&self, attempt: i32) -> String {
         let index = usize::try_from(attempt.saturating_sub(1)).unwrap_or(usize::MAX);
-        WORKER_RETRY_BUCKETS
+        let queue_name = WORKER_RETRY_BUCKETS
             .get(index)
             .or_else(|| WORKER_RETRY_BUCKETS.last())
             .map(|(queue, _)| *queue)
-            .unwrap_or("vigilo.worker.retry.30m")
+            .unwrap_or("vigilo.worker.retry.30m");
+
+        self.retry_queue_name(queue_name)
     }
 
-    fn retry_queue_for_delay_seconds(delay_seconds: i64) -> &'static str {
+    fn retry_queue_for_delay_seconds(&self, delay_seconds: i64) -> String {
         let delay_ms = delay_seconds.max(1).saturating_mul(1_000);
-        WORKER_RETRY_BUCKETS
+        let queue_name = WORKER_RETRY_BUCKETS
             .iter()
             .find(|(_, ttl_ms)| i64::from(*ttl_ms) >= delay_ms)
             .or_else(|| WORKER_RETRY_BUCKETS.last())
             .map(|(queue, _)| *queue)
-            .unwrap_or("vigilo.worker.retry.30m")
+            .unwrap_or("vigilo.worker.retry.30m");
+
+        self.retry_queue_name(queue_name)
     }
 
     pub(crate) fn can_retry_worker_message(&self, message: &RawConsumedMessage) -> bool {
@@ -736,11 +767,11 @@ impl Client {
             return Ok(());
         }
 
-        let retry_queue = Self::retry_queue_for_attempt(next_retry_count);
+        let retry_queue = self.retry_queue_for_attempt(next_retry_count);
         let properties = Self::retry_properties(message, next_retry_count, reason, error_class);
         self.publish_bytes_with_properties(
             &self.config.worker_retry_exchange,
-            retry_queue,
+            &retry_queue,
             &message.body,
             properties,
         )
@@ -757,12 +788,12 @@ impl Client {
         reason: &str,
         error_class: &str,
     ) -> anyhow::Result<()> {
-        let retry_queue = Self::retry_queue_for_delay_seconds(delay_seconds);
+        let retry_queue = self.retry_queue_for_delay_seconds(delay_seconds);
         let retry_count = Self::retry_count(&message.properties);
         let properties = Self::retry_properties(message, retry_count, reason, error_class);
         self.publish_bytes_with_properties(
             &self.config.worker_retry_exchange,
-            retry_queue,
+            &retry_queue,
             &message.body,
             properties,
         )
@@ -819,5 +850,53 @@ impl Client {
         self.ack(message).await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::Config;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn mq_config_preserves_default_topology_without_namespace() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("VIGILO_MQ_NAMESPACE");
+        }
+
+        let config = Config::new("amqp://localhost".to_string());
+
+        assert_eq!(config.exchange, "vigilo.events");
+        assert_eq!(config.event_queue, "vigilo.events.domain");
+        assert_eq!(config.worker_queue, "vigilo.worker");
+        assert_eq!(config.worker_retry_exchange, "vigilo.worker.retry");
+        assert_eq!(config.worker_quarantine_queue, "vigilo.worker.quarantine");
+    }
+
+    #[test]
+    fn mq_config_scopes_topology_with_namespace() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("VIGILO_MQ_NAMESPACE", "test-123");
+        }
+
+        let config = Config::new("amqp://localhost".to_string());
+
+        assert_eq!(config.exchange, "vigilo.test-123.events");
+        assert_eq!(config.event_queue, "vigilo.test-123.events.domain");
+        assert_eq!(config.worker_queue, "vigilo.test-123.worker");
+        assert_eq!(config.worker_retry_exchange, "vigilo.test-123.worker.retry");
+        assert_eq!(
+            config.worker_quarantine_queue,
+            "vigilo.test-123.worker.quarantine"
+        );
+
+        unsafe {
+            std::env::remove_var("VIGILO_MQ_NAMESPACE");
+        }
     }
 }
