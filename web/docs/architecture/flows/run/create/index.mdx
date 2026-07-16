@@ -17,7 +17,15 @@ import decisionFlowDiagram from './decision-flow.mmd';
 
 # Run Create Command
 
-How `vigilo run create` validates run inputs, stores durable run work, and returns a run creation response.
+How `vigilo run create` validates run inputs, stores a recoverable creation plan,
+seeds routed execution databases, and activates the run for dispatch.
+
+The first control transaction assigns the durable `run_id` and records the run
+as `creating` before any remote database commit. Placement seed writes are
+idempotent. If immediate creation cannot finish, the command returns that same
+`run_id` and its creation progress; a coordinator later claims the expired
+creation lease and resumes the remaining placements. Dispatch cursors appear
+only in the transaction that changes a fully seeded run to `pending`.
 
 ## Execution Flow
 

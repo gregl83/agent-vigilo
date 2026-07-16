@@ -2,7 +2,7 @@
 title: Run Lifecycle
 sidebar_label: Run
 sidebar_position: 1
-description: State diagram for Agent Vigilo run lifecycle transitions from pending through running, finalizing, completed, canceled, and failed.
+description: State diagram for Agent Vigilo run lifecycle transitions from creating through pending, running, finalizing, completed, canceled, and failed.
 keywords:
   - Agent Vigilo run lifecycle
   - run state diagram
@@ -22,11 +22,18 @@ How `runs.status` and `runs.gate_status` move through creation, dispatch, finali
 
 ## Notes
 
-- `run create` inserts a run as `pending`.
+- `run create` first inserts a non-dispatchable `creating` run with a durable
+  placement ledger and chunk plan. Once every placement is seeded, one control
+  transaction creates dispatch cursors and changes the run to `pending`.
+- Coordinators claim expired creation leases before dispatch work and resume
+  pending placement seeds with the original `run_id`. Persisted-data conflicts
+  fail creation without opening dispatch cursors.
 - Coordinator dispatch claims an open `run_id + run_shard` cursor, marks a new `pending` run as `running`, and then enqueues a bounded shard-local chunk-ready window.
 - Before dispatch and finalization, the coordinator recovers expired worker chunk leases or marks exhausted chunks failed.
 - Finalization only claims runs whose chunks are all terminal and whose finalization lease is open; `pending` or `leased` chunks keep the run out of finalization, including chunks waiting for execution retry windows.
-- Cancellation is idempotent for already-cancelled runs and rejected for completed or failed runs.
+- Cancellation applies to `pending`, `running`, and `finalizing` runs. A
+  `creating` run is owned by the creation recovery workflow until it becomes
+  `pending` or `failed`.
 
 ## Related
 

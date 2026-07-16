@@ -8,6 +8,10 @@ config:
 ---
 flowchart TD
     Create([run create])
+    Creating[Run creating]
+    Seed[Seed pending database placements]
+    SeedGuard{Every placement seeded?}
+    Activate[Create cursors and delete temporary plan]
     Pending[Run pending]
     DispatchGuard{Pending or running with open shard cursor?}
     DispatchLock[Claim one run-shard dispatch cursor]
@@ -32,7 +36,11 @@ flowchart TD
     Noop[No transition]
     Reject([Cancellation error])
 
-    Create --> Pending
+    Create --> Creating
+    Creating --> Seed --> SeedGuard
+    SeedGuard -- Yes --> Activate --> Pending
+    SeedGuard -- Retryable failure --> Creating
+    SeedGuard -- Persisted-data conflict --> Failed
 
     Pending --> DispatchGuard
     DispatchGuard -- Yes --> DispatchLock --> Running --> DispatchEvents --> DispatchCursor
@@ -59,7 +67,7 @@ flowchart TD
     Running -. Unrecoverable system error .-> Failed
 
     class Create command
-    class Pending,Running,Finalizing,DispatchGuard,DispatchLock,DispatchEvents,DispatchCursor,FinalizeGuard,FinalizeCheck,Gate,CompletedEvent,CancelGuard,CancelCascade,CancelEvent system
+    class Creating,Seed,SeedGuard,Activate,Pending,Running,Finalizing,DispatchGuard,DispatchLock,DispatchEvents,DispatchCursor,FinalizeGuard,FinalizeCheck,Gate,CompletedEvent,CancelGuard,CancelCascade,CancelEvent system
     class CompletedPass success
     class CompletedFail,Cancelled,Failed,Reject error
     class Noop component

@@ -13,10 +13,11 @@ flowchart TD
     DB[(DB guards)]
     Queue[Message broker]
 
-    RunCreate[Create run and pending chunks]
+    RunCreate[Persist creating run and seed plan]
     RunCancel[Cancel run and open work]
     RunRead[Read status, watch, results, export]
 
+    RecoverCreation[Resume expired run creation]
     Dispatch[Dispatch chunk windows]
     RecoverLeases[Recover expired chunk leases]
     Finalize[Finalize terminal runs]
@@ -26,6 +27,7 @@ flowchart TD
     Execute[Allocate attempts, schedule retries, and persist results]
     CompleteChunk[Complete chunks]
 
+    GuardCreation[Creation ledger and coordinator lease]
     GuardRun[Run status and lifecycle lease]
     GuardDispatch[Run-shard dispatch cursor]
     GuardChunk[Chunk status and worker lease]
@@ -36,6 +38,7 @@ flowchart TD
     CLI --> RunCancel
     CLI --> RunRead
 
+    Coordinator --> RecoverCreation
     Coordinator --> Dispatch
     Coordinator --> RecoverLeases
     Coordinator --> Finalize
@@ -47,6 +50,7 @@ flowchart TD
 
     RunCreate --> DB
     RunCancel --> DB
+    RecoverCreation --> GuardCreation
     Dispatch --> GuardDispatch
     Dispatch --> GuardRun
     RecoverLeases --> GuardChunk
@@ -57,6 +61,7 @@ flowchart TD
     Execute --> GuardRun
     Execute --> GuardAttempt
 
+    GuardCreation --> DB
     GuardRun --> DB
     GuardDispatch --> DB
     GuardChunk --> DB
@@ -65,7 +70,7 @@ flowchart TD
     Publish --> Queue
 
     class CLI command
-    class Coordinator,Worker,GuardRun,GuardDispatch,GuardChunk,GuardAttempt,GuardOutbox system
-    class RunCreate,RunCancel,RunRead,Dispatch,RecoverLeases,Finalize,Publish,ChunkClaim,Execute,CompleteChunk component
+    class Coordinator,Worker,GuardCreation,GuardRun,GuardDispatch,GuardChunk,GuardAttempt,GuardOutbox system
+    class RunCreate,RunCancel,RunRead,RecoverCreation,Dispatch,RecoverLeases,Finalize,Publish,ChunkClaim,Execute,CompleteChunk component
     class DB success
     class Queue external

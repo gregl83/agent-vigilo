@@ -15,10 +15,13 @@ sequenceDiagram
     User->>Vigilo: vigilo run watch
     activate Vigilo
     Vigilo->>Vigilo: Parse run id and prepare watch loop
-    Vigilo->>ControlDB: Load run and execution routes
-    ControlDB-->>Vigilo: Run snapshot and route list
-    Vigilo->>ExecDB: Read shard summaries where available
-    ExecDB-->>Vigilo: Live progress summaries
+    Vigilo->>ControlDB: Load run status projection
+    alt Run is creating or failed during creation
+        ControlDB-->>Vigilo: Run and placement creation progress
+    else Run was activated
+        Vigilo->>ExecDB: Read routed shard summaries where available
+        ExecDB-->>Vigilo: Run and live execution progress
+    end
 
     loop Until terminal status or timeout
         Vigilo->>Vigilo: Compare control and live-progress snapshot
@@ -37,10 +40,13 @@ sequenceDiagram
             Vigilo-->>User: Timeout error
         else Run is still active
             Vigilo->>Vigilo: Wait for next poll interval
-            Vigilo->>ControlDB: Reload run and execution routes
-            ControlDB-->>Vigilo: Run snapshot and route list
-            Vigilo->>ExecDB: Refresh shard summaries
-            ExecDB-->>Vigilo: Live progress summaries
+            Vigilo->>ControlDB: Reload run status projection
+            alt Run is creating or failed during creation
+                ControlDB-->>Vigilo: Refreshed placement creation progress
+            else Run was activated
+                Vigilo->>ExecDB: Refresh routed shard summaries
+                ExecDB-->>Vigilo: Refreshed live execution progress
+            end
         end
     end
     deactivate Vigilo

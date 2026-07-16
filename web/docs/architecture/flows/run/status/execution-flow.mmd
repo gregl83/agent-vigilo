@@ -15,14 +15,20 @@ sequenceDiagram
     User->>Vigilo: vigilo run status
     activate Vigilo
     Vigilo->>Vigilo: Parse run id
-    Vigilo->>ControlDB: Load run and execution routes
-    ControlDB-->>Vigilo: Run snapshot and route list
+    Vigilo->>ControlDB: Load authoritative run row
+    ControlDB-->>Vigilo: Run snapshot
 
     alt Run loaded
-        Vigilo->>ExecDB: Read shard summaries where available
-        ExecDB-->>Vigilo: Live progress summaries
+        alt Run is creating or failed during creation
+            Vigilo->>ControlDB: Read placement seed progress and latest error
+            ControlDB-->>Vigilo: Control-only creation progress
+        else Run was activated
+            Vigilo->>ControlDB: Load execution routes
+            Vigilo->>ExecDB: Read shard summaries where available
+            ExecDB-->>Vigilo: Live progress summaries
+        end
         Vigilo->>Vigilo: Mark whether status is terminal
-        Vigilo->>Vigilo: Build status payload with live_progress
+        Vigilo->>Vigilo: Build status payload with creation or live progress
         Vigilo-->>User: Success response
     else Run lookup fails
         Vigilo-->>User: Status error

@@ -1,7 +1,7 @@
 ---
 title: Coordinator
 sidebar_position: 3
-description: Coordinator command flow index for dispatching run chunk windows, finalizing work, and publishing orchestration events.
+description: Coordinator command flow index for recovering creation, dispatching run chunk windows, finalizing work, and publishing orchestration events.
 keywords:
   - Agent Vigilo coordinator
   - coordinator command flow
@@ -13,14 +13,20 @@ keywords:
 
 # Coordinator Flows
 
-Command flows for dispatching run chunk windows, finalizing completed work, and publishing orchestration events.
+Command flows for resuming incomplete run creation, dispatching run chunk
+windows, finalizing completed work, and publishing orchestration events.
 
-These flows cover the orchestration process that turns persisted run state into worker-ready chunks, finalizes runs after chunk completion, and publishes queued state-change events with bounded outbox concurrency. The coordinator owns scheduling decisions, not evaluator execution.
+These flows cover the orchestration process that completes durable creation
+plans, turns activated run state into worker-ready chunks, finalizes runs after
+chunk completion, and publishes queued state-change events with bounded outbox
+concurrency. The coordinator owns scheduling decisions, not evaluator
+execution.
 
 Each command page includes:
 
 - an execution flow that shows the coordinator loop boundaries
-- a decision flow that shows dispatch, finalize, concurrent publish, idle, and error paths
+- a decision flow that shows creation recovery, dispatch, finalize, concurrent
+  publish, idle, and error paths
 
 ## Commands
 

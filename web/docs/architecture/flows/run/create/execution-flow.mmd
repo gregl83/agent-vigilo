@@ -20,18 +20,34 @@ sequenceDiagram
     Vigilo->>ControlDB: Validate profile executability
     ControlDB-->>Vigilo: Runnable evaluator summary
 
-    Vigilo->>Vigilo: Plan case blobs, dataset version, run, chunks, shard assignments, and dispatch cursors
-    Vigilo->>ControlDB: Store run metadata, placement rows, cursors, and canonical dataset rows
-    Vigilo->>ExecutionDB: Store execution-local prerequisites and owned pending chunks
+    Vigilo->>Vigilo: Plan case blobs, dataset version, run, chunks, and shard assignments
+    Vigilo->>ControlDB: Commit creating run, routes, placement ledger, and exact chunk plan
+    ControlDB-->>Vigilo: Durable run id and creation lease
 
-    alt Run creation committed
-        ControlDB-->>Vigilo: Control records saved
-        ExecutionDB-->>Vigilo: Execution seed rows saved
-        Vigilo->>Vigilo: Build run creation payload
-        Vigilo-->>User: Success response
-    else Validation or persistence fails
+    loop Each pending execution placement
+        Vigilo->>ExecutionDB: Idempotently store prerequisites, run snapshot, and owned chunks
+        alt Seed transaction committed
+            ExecutionDB-->>Vigilo: Placement seeded
+            Vigilo->>ControlDB: Mark placement seeded
+        else Retryable seed failure
+            ExecutionDB-->>Vigilo: Seed not confirmed
+            Vigilo->>ControlDB: Store error and next recovery time
+        else Persisted data conflicts with plan
+            ExecutionDB-->>Vigilo: Seed invariant error
+            Vigilo->>ControlDB: Mark placement and run failed
+        end
+    end
+
+    alt Every placement is seeded
+        Vigilo->>ControlDB: Create dispatch cursors, set pending, and delete chunk plan
+        ControlDB-->>Vigilo: Run activated
+        Vigilo-->>User: Pending run response
+    else Creation remains retryable
+        Vigilo-->>User: Creating run response with progress and run id
+        Note over ControlDB: A coordinator claims the expired lease and resumes this run
+    else Input validation or initial control commit fails
         ControlDB-->>Vigilo: Error
-        Vigilo-->>User: Run creation error
+        Vigilo-->>User: Creation error without a durable run
     end
 
     deactivate Vigilo

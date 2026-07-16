@@ -10,16 +10,16 @@ flowchart TD
     Start([vigilo run watch])
 
     RunId{Run id valid?}
-    LoadRun[Load control run and routes]
+    LoadRun[Load status projection]
     Found{Run exists?}
-    Summaries[Read routed shard summaries]
+    Progress[Read creation or routed execution progress]
     Emit{Control or live progress changed?}
     Write[Write watch update]
     Terminal{Terminal status?}
     Outcome{Terminal outcome accepted?}
     Deadline{Timeout reached?}
     Wait[Wait for next poll interval]
-    Reload[Reload control run and routes]
+    Reload[Reload status projection]
 
     Success([Success response])
 
@@ -39,10 +39,10 @@ flowchart TD
     LoadRun -. Lookup fails .-> ReloadFail
 
     Found -- No --> NotFoundFail
-    Found -- Yes --> Summaries
+    Found -- Yes --> Progress
 
-    Summaries --> Emit
-    Summaries -. Lookup fails .-> ReloadFail
+    Progress --> Emit
+    Progress -. Lookup fails .-> ReloadFail
 
     Emit -- Yes --> Write
     Emit -- No --> Terminal
@@ -60,10 +60,10 @@ flowchart TD
     Deadline -- No --> Wait
 
     Wait --> Reload
-    Reload --> Summaries
+    Reload --> Progress
     Reload -. Lookup fails .-> ReloadFail
 
     class Start command
     class Success success
-    class RunId,LoadRun,Found,Summaries,Emit,Write,Terminal,Outcome,Deadline,Wait,Reload system
+    class RunId,LoadRun,Found,Progress,Emit,Write,Terminal,Outcome,Deadline,Wait,Reload system
     class RunIdFail,NotFoundFail,OutputFail,TerminalFail,TimeoutFail,ReloadFail error

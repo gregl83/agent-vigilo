@@ -10,12 +10,14 @@ flowchart TD
     Start([vigilo coordinator once])
 
     CoordinatorId[Load throughput knobs and generate coordinator id]
-    Contexts{Runtime contexts available?}
+    Database{Database context available?}
+    RecoverCreation[Resume expired creating runs]
     Recover[Recover expired chunk leases]
     DispatchClaim{Dispatchable run-shard cursor claimed?}
     DispatchRun[Start run if needed and enqueue shard chunk window]
     FinalizeClaim{Finalizable run claimed?}
     FinalizeRun[Roll up counts, set gate, and enqueue completion event]
+    Messaging{Messaging context available?}
     ClaimOutbox[Claim publishable delivery rows]
     Events{Claimed delivery rows remain?}
     Publish[Publish event to queue with bounded concurrency]
@@ -27,18 +29,22 @@ flowchart TD
     Success([Success response])
 
     ContextFail([Runtime context error])
+    RecoveryFail([Recovery persistence error])
     DispatchFail([Dispatch persistence error])
     FinalizeFail([Finalization persistence error])
     OutboxFail([Outbox persistence error])
 
     Start --> CoordinatorId
-    CoordinatorId --> Contexts
+    CoordinatorId --> Database
 
-    Contexts -- No --> ContextFail
-    Contexts -- Yes --> Recover
+    Database -- No --> ContextFail
+    Database -- Yes --> RecoverCreation
+
+    RecoverCreation --> Recover
+    RecoverCreation -. Recovery fails .-> RecoveryFail
 
     Recover --> DispatchClaim
-    Recover -. Recovery fails .-> DispatchFail
+    Recover -. Recovery fails .-> RecoveryFail
 
     DispatchClaim -- Yes --> DispatchRun
     DispatchClaim -- No or batch limit reached --> FinalizeClaim
@@ -47,10 +53,13 @@ flowchart TD
     DispatchRun -. Update fails .-> DispatchFail
 
     FinalizeClaim -- Yes --> FinalizeRun
-    FinalizeClaim -- No or batch limit reached --> ClaimOutbox
+    FinalizeClaim -- No or batch limit reached --> Messaging
 
     FinalizeRun --> FinalizeClaim
     FinalizeRun -. Update fails .-> FinalizeFail
+
+    Messaging -- No --> ContextFail
+    Messaging -- Yes --> ClaimOutbox
 
     ClaimOutbox --> Events
     ClaimOutbox -. Claim fails .-> OutboxFail
@@ -73,6 +82,6 @@ flowchart TD
 
     class Start command
     class Success success
-    class CoordinatorId,Contexts,Recover,DispatchClaim,DispatchRun,FinalizeClaim,FinalizeRun,ClaimOutbox,Events,PublishResult,MarkPublished,Reschedule,Stats system
+    class CoordinatorId,Database,RecoverCreation,Recover,DispatchClaim,DispatchRun,FinalizeClaim,FinalizeRun,Messaging,ClaimOutbox,Events,PublishResult,MarkPublished,Reschedule,Stats system
     class Publish component
-    class ContextFail,DispatchFail,FinalizeFail,OutboxFail error
+    class ContextFail,RecoveryFail,DispatchFail,FinalizeFail,OutboxFail error

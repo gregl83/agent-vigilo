@@ -10,7 +10,10 @@ flowchart TD
     Start([vigilo run status])
 
     RunId{Run id valid?}
-    LoadRun[Load control run and routes]
+    LoadRun[Load control run]
+    Creating{Creating or creation-failed?}
+    Creation[Read control creation progress]
+    Routes[Load execution routes]
     Summaries[Read routed shard summaries]
     Terminal[Mark terminal status]
     Payload[Build status payload with live progress]
@@ -26,9 +29,11 @@ flowchart TD
     RunId -- No --> RunIdFail
     RunId -- Yes --> LoadRun
 
-    LoadRun --> Summaries
+    LoadRun --> Creating
     LoadRun -. Lookup fails .-> NotFoundFail
 
+    Creating -- Yes --> Creation --> Terminal
+    Creating -- No --> Routes --> Summaries
     Summaries --> Terminal
     Summaries -. Lookup fails .-> NotFoundFail
 
@@ -38,5 +43,5 @@ flowchart TD
 
     class Start command
     class Success success
-    class RunId,LoadRun,Summaries,Terminal,Payload system
+    class RunId,LoadRun,Creating,Creation,Routes,Summaries,Terminal,Payload system
     class RunIdFail,NotFoundFail,OutputFail error

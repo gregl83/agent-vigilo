@@ -25,6 +25,9 @@ sequenceDiagram
             Vigilo-->>User: Success response
         else Tick elapsed
             Vigilo->>Vigilo: Run coordinator cycle
+            Vigilo->>ControlDB: Claim bounded expired creating runs
+            Vigilo->>ExecutionDB: Idempotently seed remaining placements
+            Vigilo->>ControlDB: Persist creation progress or activate seeded runs
             Vigilo->>ControlDB: List active execution placements
             Vigilo->>ExecutionDB: Recover expired chunk leases per placement
             ExecutionDB-->>Vigilo: Recovered and failed chunk counts
@@ -37,6 +40,7 @@ sequenceDiagram
             Vigilo->>ExecutionDB: Read routed shard summaries
             Vigilo->>ControlDB: Write global finalization result
             ControlDB-->>Vigilo: Finalization count
+            Vigilo->>Vigilo: Load messaging context
             Vigilo->>ControlDB: List active outbox placements
             Vigilo->>ExecutionDB: Log publishable outbox backlog per placement
             Vigilo->>ExecutionDB: Claim publishable outbox rows per placement

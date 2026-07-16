@@ -12,10 +12,12 @@ flowchart TD
     CoordinatorId[Generate coordinator id]
     Runner[Start coordinator service runner]
     Event{Next service event?}
-    Contexts{Runtime contexts available?}
+    Database{Database context available?}
+    RecoverCreation[Resume expired creating runs]
     Recover[Recover expired chunk leases]
     Dispatch[Drain dispatchable run-shard windows]
     Finalize[Drain finalizable runs]
+    Messaging{Messaging context available?}
     Outbox[Claim delivery queue batch and publish with bounded concurrency]
     Wait[Wait for next tick]
     Shutdown[Cancel service loop]
@@ -31,11 +33,14 @@ flowchart TD
     CoordinatorId --> Runner
     Runner --> Event
 
-    Event -- Tick elapsed --> Contexts
+    Event -- Tick elapsed --> Database
     Event -- Shutdown signal --> Shutdown
 
-    Contexts -- No --> ContextFail
-    Contexts -- Yes --> Recover
+    Database -- No --> ContextFail
+    Database -- Yes --> RecoverCreation
+
+    RecoverCreation --> Recover
+    RecoverCreation -. Recovery fails .-> CycleFail
 
     Recover --> Dispatch
     Recover -. Recovery fails .-> CycleFail
@@ -43,8 +48,11 @@ flowchart TD
     Dispatch --> Finalize
     Dispatch -. Dispatch fails .-> CycleFail
 
-    Finalize --> Outbox
+    Finalize --> Messaging
     Finalize -. Finalization fails .-> CycleFail
+
+    Messaging -- No --> ContextFail
+    Messaging -- Yes --> Outbox
 
     Outbox --> Wait
     Outbox -. Publish pass fails .-> CycleFail
@@ -59,5 +67,5 @@ flowchart TD
 
     class Start command
     class Success success
-    class CoordinatorId,Runner,Event,Contexts,Recover,Dispatch,Finalize,Outbox,Wait,Shutdown,Stop system
+    class CoordinatorId,Runner,Event,Database,RecoverCreation,Recover,Dispatch,Finalize,Messaging,Outbox,Wait,Shutdown,Stop system
     class ContextFail,CycleFail,ShutdownFail error

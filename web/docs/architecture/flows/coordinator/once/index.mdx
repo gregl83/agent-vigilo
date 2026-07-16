@@ -2,7 +2,7 @@
 title: Once
 sidebar_label: Once
 sidebar_position: 1
-description: Flow diagrams for one bounded Agent Vigilo coordinator cycle that dispatches, finalizes, publishes, and exits.
+description: Flow diagrams for one bounded Agent Vigilo coordinator cycle that recovers creation, dispatches, finalizes, publishes, and exits.
 keywords:
   - vigilo coordinator once
   - coordinator once flow
@@ -17,7 +17,11 @@ import decisionFlowDiagram from './decision-flow.mmd';
 
 # Coordinator Once Command
 
-How `vigilo coordinator once` executes one configurable bounded orchestration cycle and exits. Dispatch work is claimed by `run_id + run_shard` cursor so each chunk-ready window is partition-local.
+How `vigilo coordinator once` executes one configurable bounded orchestration
+cycle and exits. It first resumes expired `creating` runs, then performs chunk
+lease recovery, dispatch, finalization, and outbox publication. Dispatch work is
+claimed by `run_id + run_shard` cursor so each chunk-ready window is
+partition-local.
 
 ## Execution Flow
 

@@ -25,7 +25,7 @@ flowchart TD
 
     RunPlanner["fa:fa-list-check <br/> <b>Run Input Planner</b> <br/> <small>[Component: Rust]</small> <br/> <small>Reads profile and dataset payloads, canonicalizes case data, and plans run chunks.</small>"]:::component
     RunValidator["fa:fa-shield-halved <br/> <b>Run Validation Service</b> <br/> <small>[Component: Rust]</small> <br/> <small>Checks agent settings, evaluator references, runnable evaluator state, and case group coverage.</small>"]:::component
-    RunPersistence["fa:fa-database <br/> <b>Run Persistence Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Persists control metadata, shard assignments, and execution-local run seed data.</small>"]:::component
+    RunPersistence["fa:fa-database <br/> <b>Run Persistence Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Persists recoverable control plans, shard assignments, and idempotent execution seed data.</small>"]:::component
     RunQueries["fa:fa-magnifying-glass <br/> <b>Run Query, Export, and Shard Admin Component</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Serves routed run reads and manages shard route inspection, move, and rebalance operations.</small>"]:::component
 
     CoordinatorFacade["fa:fa-compass <br/> <b>Coordinator Command Facade</b> <br/> <small>[Component: Rust]</small> <br/> <small>Starts or executes coordinator orchestration cycles.</small>"]:::component
@@ -51,9 +51,9 @@ flowchart TD
     style VigiloRuntime stroke-dasharray: 5 5,fill:none,stroke:#1168bd,stroke-width:2px
 
     %% external containers
-    Database[("<b>Database Placements</b> <br/> <small>[Container: PostgreSQL]</small> <br/> <small>Store control metadata, routed execution rows, outbox ledgers, delivery rows, and migrations.</small>")]:::component
+    Database[("<b>Database Placements</b> <br/> <small>[Container: PostgreSQL]</small> <br/> <small>Store control metadata, creation ledgers, routed execution rows, outbox ledgers, delivery rows, and migrations.</small>")]:::component
     Queue[("<b>Queue</b> <br/> <small>[Container: RabbitMQ]</small> <br/> <small>Distributes run chunk-ready events to workers.</small>")]:::component
-    Coordinator["fa:fa-compass <br/> <b>Coordinator</b> <br/> <small>[Container: Rust]</small> <br/> <small>Owns run dispatch, finalization, and outbox publication.</small>"]:::component
+    Coordinator["fa:fa-compass <br/> <b>Coordinator</b> <br/> <small>[Container: Rust]</small> <br/> <small>Owns run-creation recovery, dispatch, finalization, and outbox publication.</small>"]:::component
     Worker["fa:fa-gear <br/> <b>Worker</b> <br/> <small>[Container: Rust]</small> <br/> <small>Consumes chunks, invokes the target agent, runs evaluators, and persists results.</small>"]:::component
     EvaluatorPackages["fa:fa-folder-tree <br/> <b>Evaluator Packages</b> <br/> <small>[External Files]</small> <br/> <small>Local evaluator crates, Vigilo.toml manifests, WIT references, and compiled WASM artifacts.</small>"]:::external
 
@@ -83,7 +83,7 @@ flowchart TD
     RunPlanner -->|"Validates executability with"| RunValidator
     RunPlanner -->|"Persists planned runs through"| RunPersistence
     RunValidator -->|"Checks evaluator registry and profile data in <br> <small>[SQL/TCP]</small>"| Database
-    RunPersistence -->|"Writes control and execution seed records to <br> <small>[SQL/TCP]</small>"| Database
+    RunPersistence -->|"Writes recoverable control plans and idempotent execution seeds to <br> <small>[SQL/TCP]</small>"| Database
     RunQueries -->|"Reads and updates run state in <br> <small>[SQL/TCP]</small>"| Database
     RunQueries -->|"Writes formatted results using"| OutputRenderer
 

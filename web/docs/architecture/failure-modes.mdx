@@ -1,7 +1,7 @@
 ---
 title: Failure Modes
 sidebar_position: 6
-description: Failure-mode notes for Agent Vigilo worker crashes, duplicate execution, stale attempts, and partial persistence.
+description: Failure-mode notes for Agent Vigilo creation crashes, worker crashes, duplicate execution, stale attempts, and partial persistence.
 keywords:
   - Agent Vigilo failure modes
   - AI evaluation reliability
@@ -10,6 +10,18 @@ keywords:
   - duplicate execution guard
   - durable evaluation persistence
 ---
+
+## Run creation crash
+
+Run creation commits a control-owned `creating` run, placement ledger, and exact
+chunk plan before seeding remote execution databases. Each placement seed is an
+idempotent transaction. If the process exits after a remote commit but before
+its control acknowledgement, a coordinator claims the expired creation lease
+and safely applies the same seed again for the original `run_id`. Dispatch
+cursors are created only when every ledger row is seeded, in the same control
+transaction that moves the run to `pending` and deletes the temporary plan.
+Retryable failures leave progress durable; incompatible existing rows mark the
+run `failed` without making it dispatchable.
 
 ## Worker crash
 

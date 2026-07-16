@@ -17,7 +17,9 @@ import decisionFlowDiagram from './decision-flow.mmd';
 
 # Coordinator Start Command
 
-How `vigilo coordinator start` runs configurable coordinator cycles continuously until shutdown or service failure.
+How `vigilo coordinator start` runs configurable coordinator cycles continuously
+until shutdown or service failure. Each cycle resumes a bounded number of
+expired `creating` runs before chunk lease recovery and normal dispatch.
 
 Dispatch claims one open `run_id + run_shard` cursor per window, and dispatch and recovery events include each chunk's `run_shard` in the `run.chunk.ready` payload so workers can claim chunk-local work without an extra routing lookup.
 
