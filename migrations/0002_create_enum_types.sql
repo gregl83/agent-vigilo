@@ -18,6 +18,7 @@ COMMENT ON TYPE evaluator_http_policy_action IS
     'URI policy action for evaluator outbound HTTP requests; allow=whitelist, deny=blacklist.';
 
 CREATE TYPE run_status AS ENUM (
+  'creating', -- Run creation is durably planned but one or more execution placements still need to be seeded.
   'pending', -- Run has been created but no executions have been dispatched yet.
   'running', -- Executions have been dispatched and are actively being processed by workers.
   'finalizing', -- All executions are terminal; run-level aggregation, summary computation, and event emission are in progress.
@@ -27,7 +28,7 @@ CREATE TYPE run_status AS ENUM (
 );
 
 COMMENT ON TYPE run_status IS
-    'Lifecycle state of an evaluation run. Represents orchestration progress from creation through finalization.';
+    'Lifecycle state of an evaluation run, including durable creation, execution, finalization, and terminal outcomes.';
 
 CREATE TYPE gate_status AS ENUM (
   'unknown', -- Gate result has not yet been determined. Run is still in progress or has not been evaluated.

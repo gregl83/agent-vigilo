@@ -75,7 +75,10 @@ CREATE INDEX idx_runs_dataset ON runs(dataset_id, dataset_version);
 CREATE INDEX idx_runs_dataset_version_id ON runs(dataset_version_id);
 
 CREATE INDEX idx_runs_coordinator_lease ON runs(coordinator_leased_until)
-    WHERE status IN ('pending', 'running', 'finalizing');
+    WHERE status IN ('creating', 'pending', 'running', 'finalizing');
+
+CREATE INDEX idx_runs_creating_recovery ON runs(created_at, id)
+    WHERE status = 'creating';
 
 COMMENT ON TABLE runs IS
     'Represents a single evaluation run against a versioned agent target. A run defines the dataset, evaluation profile, and aggregation policy, and tracks lifecycle state from creation through finalization and gate decision.';
@@ -138,7 +141,7 @@ COMMENT ON COLUMN runs.config_snapshot IS
     'Compact frozen configuration snapshot capturing profile and durable dataset references needed for reproducibility and auditability.';
 
 COMMENT ON COLUMN runs.status IS
-    'Lifecycle state of the run. Tracks orchestration progress from creation through execution, finalization, and completion. See run_status enum for details.';
+    'Lifecycle state of the run. Creating is durable but non-dispatchable; pending begins only after all execution placements are seeded.';
 
 COMMENT ON COLUMN runs.gate_status IS
     'Final evaluation decision derived from execution results and aggregation policy. Independent of run lifecycle state.';

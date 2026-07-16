@@ -14,7 +14,7 @@ Quick-search overview of the main modules under `vigilo/src`.
 | `cli::commands::setup` | Applies database migrations and optionally publishes built-in evaluators. |
 | `cli::commands::evaluators` | Publish, search, show, test, and state-management commands for evaluator registry entries. |
 | `cli::commands::run` | Run creation, validation, status, watch, cancellation, result summary, and export commands. |
-| `cli::commands::coordinator` | Coordinator process modes and orchestration cycle for dispatch, finalization, and outbox publishing. |
+| `cli::commands::coordinator` | Coordinator process modes and orchestration cycle for creation recovery, dispatch, finalization, and outbox publishing. |
 | `cli::commands::worker` | Worker process modes and chunk execution flow for agent calls and evaluator processing. |
 | `cli::args` | Shared clap value parsers for existing files and directories. |
 | `context` | Lazy process-wide service container for database, HTTP, messaging, output, registry, and Wasm runtime. |
@@ -33,6 +33,7 @@ Quick-search overview of the main modules under `vigilo/src`.
 | `db::migrations` | SQL migration runner. |
 | `db::tables` | Narrow row-oriented database helpers. |
 | `db::workflows` | Transactional and concurrency-aware database operations for runs, chunks, executions, and cancellation. |
+| `db::workflows::run_creation` | Recoverable cross-database run creation, idempotent placement seeding, and atomic dispatch activation. |
 | `models` | Persistence model structs that mirror database rows and drafts. |
 | `agent_client` | Worker-side HTTP client for invoking configured agent endpoints and normalizing responses. |
 | `evaluators` | Built-in evaluator discovery, build, bootstrap, and publishing workflows. |

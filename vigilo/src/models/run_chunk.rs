@@ -21,7 +21,7 @@ pub(crate) fn run_shard_for_chunk_index(chunk_index: usize) -> i16 {
 }
 
 /// Insert payload for one run scheduling chunk.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub(crate) struct RunChunkDraft {
     /// Deterministic chunk id generated during run planning.
     pub(crate) chunk_id: Uuid,

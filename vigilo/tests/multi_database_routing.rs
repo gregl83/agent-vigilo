@@ -68,6 +68,14 @@ async fn multi_database_routing_flow() -> anyhow::Result<()> {
     assert_eq!(dispatch_cursor_count(&shard, default_run_id).await?, 0);
     assert_eq!(dataset_version_case_count(&shard, default_run_id).await?, 0);
     assert_eq!(case_blob_count(&shard, default_run_id).await?, 0);
+    assert_eq!(
+        run_creation_placement_state(&primary, default_run_id, PRIMARY_ALIAS).await?,
+        ("seeded".to_string(), 1)
+    );
+    assert_eq!(
+        run_creation_chunk_plan_count(&primary, default_run_id).await?,
+        0
+    );
 
     let moved_default_payload = run_vigilo(
         &config,
@@ -138,6 +146,14 @@ async fn multi_database_routing_flow() -> anyhow::Result<()> {
     assert_eq!(routed_route["data"]["dispatchable"], true);
     assert_eq!(dispatch_cursor_count(&primary, routed_run_id).await?, 2);
     assert_eq!(dispatch_cursor_count(&shard, routed_run_id).await?, 0);
+    assert_eq!(
+        run_creation_placement_state(&primary, routed_run_id, SHARD_ALIAS).await?,
+        ("seeded".to_string(), 1)
+    );
+    assert_eq!(
+        run_creation_chunk_plan_count(&primary, routed_run_id).await?,
+        0
+    );
 
     let cancelled_run_id = create_run(&config, SHARD_ALIAS, 101).await?;
     let cancel_payload = run_vigilo(
@@ -592,6 +608,34 @@ async fn dispatch_cursor_count(db: &PgPool, run_id: Uuid) -> anyhow::Result<i64>
         FROM run_shard_dispatch_cursors
         WHERE run_id = $1::uuid
         "#,
+    )
+    .bind(run_id)
+    .fetch_one(db)
+    .await?)
+}
+
+async fn run_creation_placement_state(
+    db: &PgPool,
+    run_id: Uuid,
+    database_alias: &str,
+) -> anyhow::Result<(String, i32)> {
+    Ok(sqlx::query_as::<_, (String, i32)>(
+        r#"
+        SELECT status, attempt_count
+        FROM run_creation_placements
+        WHERE run_id = $1::uuid
+          AND database_alias = $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(database_alias)
+    .fetch_one(db)
+    .await?)
+}
+
+async fn run_creation_chunk_plan_count(db: &PgPool, run_id: Uuid) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM run_creation_chunks WHERE run_id = $1::uuid",
     )
     .bind(run_id)
     .fetch_one(db)

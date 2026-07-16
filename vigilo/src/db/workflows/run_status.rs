@@ -1,15 +1,22 @@
 //! Routed run status projection helpers.
 //!
-//! Status reads keep the control run row authoritative while adding live
-//! progress from shard-local summaries when execution placements have produced
-//! them. The workflow avoids scanning execution hot tables on every status or
-//! watch poll.
+//! Status reads keep the control run row authoritative. Creating runs report
+//! control-owned placement progress without contacting unseeded databases;
+//! active runs add live progress from shard-local summaries. The workflow
+//! avoids scanning execution hot tables on every status or watch poll.
 
 use uuid::Uuid;
 
-use super::run_shard_summary::{
-    RunShardSummary,
-    select_run_shard_summary,
+use super::{
+    run_creation::{
+        RUN_STATUS_CREATING,
+        RunCreationProgress,
+        select_creation_progress,
+    },
+    run_shard_summary::{
+        RunShardSummary,
+        select_run_shard_summary,
+    },
 };
 use crate::{
     context::database,
@@ -50,6 +57,7 @@ pub(crate) struct RunStatusProjection {
     pub(crate) live_progress: RunProgressSummary,
     pub(crate) execution_route_count: usize,
     pub(crate) shard_summary_count: usize,
+    pub(crate) creation_progress: Option<RunCreationProgress>,
 }
 
 impl RunStatusProjection {
@@ -60,11 +68,14 @@ impl RunStatusProjection {
             live_progress,
             execution_route_count: 0,
             shard_summary_count: 0,
+            creation_progress: None,
         }
     }
 
     pub(crate) fn progress_source(&self) -> &'static str {
-        if self.shard_summary_count > 0 {
+        if self.creation_progress.is_some() {
+            "run_creation"
+        } else if self.shard_summary_count > 0 {
             "execution_shards"
         } else {
             "control_run"
@@ -95,7 +106,7 @@ pub(crate) fn combine_run_shard_progress(summaries: &[RunShardSummary]) -> RunPr
     progress
 }
 
-/// Reads the control run row plus routed shard-summary progress for a run.
+/// Reads a control-only creation projection or routed shard-summary progress.
 pub(crate) async fn select_run_status(
     database: &database::Db,
     run_id: Uuid,
@@ -104,6 +115,22 @@ pub(crate) async fn select_run_status(
     let Some(run) = runs::select_run_by_id(control_db, run_id).await? else {
         return Ok(None);
     };
+
+    let creation_owned_status = run.status == RUN_STATUS_CREATING
+        || (run.status == "failed" && run.started_at.is_none() && run.dispatched_at.is_none());
+    if creation_owned_status {
+        let live_progress = RunProgressSummary::from_control_run(&run);
+        let creation_progress = select_creation_progress(control_db, run_id).await?;
+        if run.status == RUN_STATUS_CREATING || creation_progress.placement_count > 0 {
+            return Ok(Some(RunStatusProjection {
+                run,
+                live_progress,
+                execution_route_count: 0,
+                shard_summary_count: 0,
+                creation_progress: Some(creation_progress),
+            }));
+        }
+    }
 
     let routes = database.execution_read_routes_for_run(run_id).await?;
     let mut summaries = Vec::with_capacity(routes.len());
@@ -126,14 +153,21 @@ pub(crate) async fn select_run_status(
         live_progress,
         execution_route_count: routes.len(),
         shard_summary_count,
+        creation_progress: None,
     }))
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::OnceCell;
     use uuid::Uuid;
 
     use super::*;
+    use crate::context::database::{
+        Db,
+        PlacementConfig,
+        new_shard_placement_cache,
+    };
 
     #[test]
     fn combine_run_shard_progress_rolls_up_live_counts() {
@@ -149,6 +183,103 @@ mod tests {
         assert_eq!(progress.failed_execution_count, 2);
         assert_eq!(progress.errored_execution_count, 2);
         assert_eq!(progress.cancelled_chunk_count, 2);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx status tests"]
+    async fn creation_failure_status_does_not_resolve_unseeded_routes(pool: sqlx::PgPool) {
+        let run_id = Uuid::now_v7();
+        let dataset_id = Uuid::now_v7();
+        let dataset_version_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO dataset_versions (dataset_version_id, dataset_id, dataset_version) VALUES ($1, $2, 'test')",
+        )
+        .bind(dataset_version_id)
+        .bind(dataset_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO runs (
+                id, run_key, dataset_id, dataset_version_id, dataset_version,
+                evaluation_profile_id, evaluation_profile_version,
+                profile_version_id, profile_hash, aggregation_policy_id,
+                aggregation_policy_version, aggregation_policy_hash,
+                agent_provider, agent_name, prompt_config_id,
+                prompt_config_version, status, error_message, completed_at
+            )
+            VALUES (
+                $1, $2, $3, $4, 'test', 'profile', '1.0.0', 'profile-version',
+                'profile-hash', 'aggregation', '1.0.0', 'aggregation-hash',
+                'example', 'agent', 'prompt', '1.0.0', 'failed'::run_status,
+                'immutable seed mismatch', now()
+            )
+            "#,
+        )
+        .bind(run_id)
+        .bind(format!("run-{run_id}"))
+        .bind(dataset_id)
+        .bind(dataset_version_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('unseeded', 'VIGILO_TEST_UNSEEDED_DATABASE_URL', 'shard', 'active')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
+            VALUES ($1, 0, 'unseeded', 'active')
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO run_creation_placements (
+                run_id, database_alias, status, attempt_count, last_error
+            )
+            VALUES ($1, 'unseeded', 'failed', 1, 'immutable seed mismatch')
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let database = context_with_control_pool(pool);
+
+        let status = select_run_status(&database, run_id).await.unwrap().unwrap();
+
+        assert_eq!(status.execution_route_count, 0);
+        assert_eq!(
+            status
+                .creation_progress
+                .as_ref()
+                .map(|progress| progress.failed_placement_count),
+            Some(1)
+        );
+    }
+
+    fn context_with_control_pool(pool: sqlx::PgPool) -> Db {
+        let database = Db {
+            uri: "postgres://injected-control-pool".to_string(),
+            max_connections: 5,
+            placement_config: PlacementConfig::default_single_database(),
+            cell: OnceCell::new(),
+            placement_catalog: OnceCell::new(),
+            shard_placement_cache: new_shard_placement_cache(),
+        };
+        assert!(database.cell.set(pool).is_ok());
+        database
     }
 
     fn summary(

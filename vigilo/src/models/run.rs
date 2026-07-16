@@ -15,7 +15,7 @@ use serde::{
 use uuid::Uuid;
 
 /// Insert payload for a new run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub(crate) struct RunDraft {
     /// Stable external key for idempotent creation and integrations.
     pub(crate) run_key: String,

@@ -14,7 +14,7 @@ use serde::{
 };
 
 /// Insert payload for a content-addressed case blob.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub(crate) struct CaseBlobDraft {
     /// Stable hash of the normalized case content.
     pub(crate) case_hash: String,

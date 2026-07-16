@@ -15,7 +15,7 @@ use serde::{
 use uuid::Uuid;
 
 /// Insert payload for one case in a dataset version.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub(crate) struct DatasetVersionCaseDraft {
     /// Case id as it appears in the dataset contract.
     pub(crate) case_id: Uuid,

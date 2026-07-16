@@ -389,6 +389,7 @@ pub(crate) async fn set_shard_placement(
     validate_non_empty(database_alias, "database alias")?;
 
     let control_db = database.control().await?;
+    ensure_run_creation_is_inactive(control_db, run_id).await?;
     let target = database_placements::select_database_placement(control_db, database_alias)
         .await?
         .ok_or_else(|| {
@@ -721,6 +722,7 @@ pub(crate) async fn move_shard_placement(
     }
 
     let control_db = database.control().await?;
+    ensure_run_creation_is_inactive(control_db, run_id).await?;
     let current = shard_placements::select_shard_placement(control_db, run_id, run_shard)
         .await?
         .ok_or_else(|| {
@@ -914,9 +916,11 @@ async fn list_active_rebalance_candidates(
         FROM shard_placements sp
         JOIN database_placements dp
           ON dp.alias = sp.database_alias
+        LEFT JOIN runs run ON run.id = sp.run_id
         WHERE sp.status = 'active'
           AND dp.status = 'active'
           AND dp.role IN ('shard', 'control_and_shard')
+          AND (run.id IS NULL OR run.status <> 'creating'::run_status)
         ORDER BY sp.database_alias, sp.run_id, sp.run_shard
         "#,
     )
@@ -1727,6 +1731,21 @@ fn validate_non_empty(value: &str, label: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn ensure_run_creation_is_inactive(db: &PgPool, run_id: Uuid) -> anyhow::Result<()> {
+    let status =
+        sqlx::query_scalar::<_, String>("SELECT status::text FROM runs WHERE id = $1::uuid")
+            .bind(run_id)
+            .fetch_optional(db)
+            .await?;
+    if status.as_deref() == Some("creating") {
+        anyhow::bail!(
+            "run {} is still creating; shard routes cannot change until creation finishes",
+            run_id
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::PgPool;
@@ -1865,6 +1884,60 @@ mod tests {
         assert!(!route.dispatchable);
         assert!(!route.readable);
         assert_eq!(route.routing_decision, "blocked");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn creating_run_rejects_route_changes(pool: PgPool) {
+        let database_url = std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap();
+        let database = context_with_control_pool(pool.clone(), database_url);
+        let run_id = Uuid::now_v7();
+
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'active')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        seed_run(&pool, run_id, Uuid::now_v7(), Uuid::now_v7()).await;
+        sqlx::query("UPDATE runs SET status = 'creating'::run_status WHERE id = $1::uuid")
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
+            VALUES ($1::uuid, 3, 'primary', 'active')
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let set_error = set_shard_placement(&database, run_id, 3, "shard_001")
+            .await
+            .unwrap_err();
+        let move_error = move_shard_placement(
+            &database,
+            run_id,
+            3,
+            "shard_001",
+            ShardMoveOptions {
+                dry_run: false,
+                verify_only: false,
+                force: false,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(set_error.to_string().contains("still creating"));
+        assert!(move_error.to_string().contains("still creating"));
     }
 
     #[sqlx::test(migrations = "../migrations")]

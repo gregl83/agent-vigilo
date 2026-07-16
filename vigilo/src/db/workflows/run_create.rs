@@ -1,11 +1,10 @@
-//! Run creation persistence workflow helpers.
+//! Run creation planning and idempotent seed persistence helpers.
 //!
-//! These helpers write immutable dataset content, dataset membership, control
-//! run metadata, shard placement rows, dispatch cursors, and execution-local
-//! pending chunks. Dispatch owns chunk-ready event creation in bounded windows
-//! so workers cannot process a run before a coordinator marks it running. Bulk
-//! paths are chunked to keep statement size and bind counts bounded for large
-//! datasets.
+//! Durable creation orchestration lives in `run_creation`; this module owns the
+//! placement policy and repeatable writes used for control and execution seed
+//! transactions. Dispatch owns chunk-ready event creation, so seed retries
+//! cannot make work visible to workers. Bulk paths keep statement size and bind
+//! counts bounded for large datasets.
 
 use std::collections::{
     BTreeMap,
@@ -40,6 +39,19 @@ const CASE_BLOB_INSERT_CHUNK_SIZE: usize = 500;
 const DATASET_MEMBERSHIP_INSERT_CHUNK_SIZE: usize = 2_000;
 const RUN_CHUNK_INSERT_CHUNK_SIZE: usize = 2_000;
 
+/// Deterministic seed data differs from a row already stored under the same id.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct RunSeedInvariantError(String);
+
+pub(crate) fn seed_invariant_error(message: impl Into<String>) -> anyhow::Error {
+    RunSeedInvariantError(message.into()).into()
+}
+
+pub(crate) fn is_seed_invariant_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RunSeedInvariantError>().is_some()
+}
+
 fn jsonb_text(value: &serde_json::Value) -> String {
     serde_json::to_string(value).expect("serializing serde_json::Value should not fail")
 }
@@ -48,110 +60,6 @@ fn jsonb_text(value: &serde_json::Value) -> String {
 pub(crate) struct RunShardPlacementAssignment {
     pub(crate) run_shard: i16,
     pub(crate) database_alias: String,
-}
-
-struct RunSeedState<'a> {
-    run_id: Uuid,
-    draft: &'a RunDraft,
-    case_blobs: &'a [CaseBlobDraft],
-    dataset_cases: &'a [DatasetVersionCaseDraft],
-    chunks: &'a [RunChunkDraft],
-}
-
-/// Persists a newly planned run across control and execution storage.
-///
-/// Control storage owns the authoritative run metadata, canonical dataset
-/// rows, placement rows, and dispatch cursors. Execution storage owns the
-/// pending chunks and local copies of the FK/case rows workers need to process
-/// those chunks.
-pub(crate) async fn insert_run_seed_state(
-    database: &database::Db,
-    run_id: Uuid,
-    draft: &RunDraft,
-    case_blobs: &[CaseBlobDraft],
-    dataset_cases: &[DatasetVersionCaseDraft],
-    chunks: &[RunChunkDraft],
-    assignments: &[RunShardPlacementAssignment],
-) -> anyhow::Result<()> {
-    let seed = RunSeedState {
-        run_id,
-        draft,
-        case_blobs,
-        dataset_cases,
-        chunks,
-    };
-    let control_db = database.control().await?;
-    let chunks_by_alias = group_chunks_by_assigned_alias(chunks, assignments)?;
-
-    let mut control_tx = control_db.begin().await?;
-    let control_chunks = chunks_by_alias
-        .get(database.control_database_alias())
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    insert_control_seed_state(&mut control_tx, &seed, assignments, control_chunks).await?;
-
-    for (database_alias, execution_chunks) in chunks_by_alias {
-        if database_alias == database.control_database_alias() {
-            continue;
-        }
-        let execution_db = database.placement(&database_alias).await?;
-        let mut execution_tx = execution_db.begin().await?;
-        insert_execution_seed_state(&mut execution_tx, &seed, &execution_chunks).await?;
-        execution_tx.commit().await?;
-    }
-
-    control_tx.commit().await?;
-    Ok(())
-}
-
-async fn insert_control_seed_state(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
-    seed: &RunSeedState<'_>,
-    assignments: &[RunShardPlacementAssignment],
-    control_chunks: &[RunChunkDraft],
-) -> anyhow::Result<()> {
-    bulk_insert_case_blobs(tx, seed.case_blobs).await?;
-    upsert_dataset_version(
-        tx,
-        seed.draft.dataset_version_id,
-        seed.draft.dataset_id,
-        &seed.draft.dataset_version,
-    )
-    .await?;
-    bulk_insert_dataset_membership(tx, seed.draft.dataset_version_id, seed.dataset_cases).await?;
-    insert_run_create(tx, seed.run_id, seed.draft).await?;
-    bulk_insert_shard_placements(tx, seed.run_id, assignments).await?;
-    bulk_insert_run_shard_dispatch_cursors(tx, seed.run_id, seed.chunks).await?;
-
-    if !control_chunks.is_empty() {
-        bulk_insert_run_chunks(
-            tx,
-            seed.run_id,
-            seed.draft.dataset_version_id,
-            control_chunks,
-        )
-        .await?;
-    }
-
-    Ok(())
-}
-
-async fn insert_execution_seed_state(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
-    seed: &RunSeedState<'_>,
-    chunks: &[RunChunkDraft],
-) -> anyhow::Result<()> {
-    bulk_insert_case_blobs(tx, seed.case_blobs).await?;
-    upsert_dataset_version(
-        tx,
-        seed.draft.dataset_version_id,
-        seed.draft.dataset_id,
-        &seed.draft.dataset_version,
-    )
-    .await?;
-    bulk_insert_dataset_membership(tx, seed.draft.dataset_version_id, seed.dataset_cases).await?;
-    insert_run_create(tx, seed.run_id, seed.draft).await?;
-    bulk_insert_run_chunks(tx, seed.run_id, seed.draft.dataset_version_id, chunks).await
 }
 
 /// Chooses initial execution placements for the run shards used by a new run.
@@ -207,7 +115,7 @@ pub(crate) fn assign_run_shards_to_aliases(
         .collect()
 }
 
-fn group_chunks_by_assigned_alias(
+pub(crate) fn group_chunks_by_assigned_alias(
     chunks: &[RunChunkDraft],
     assignments: &[RunShardPlacementAssignment],
 ) -> anyhow::Result<BTreeMap<String, Vec<RunChunkDraft>>> {
@@ -233,11 +141,11 @@ fn group_chunks_by_assigned_alias(
     Ok(grouped)
 }
 
-/// Inserts case blob rows, ignoring already-known content hashes.
+/// Inserts or verifies immutable case blob rows.
 ///
-/// Query behavior: bulk inserts immutable content-addressed case payloads in
-/// bounded batches. `ON CONFLICT (case_hash) DO NOTHING` makes shared case
-/// blobs reusable across runs and dataset versions.
+/// Query behavior: bulk inserts content-addressed payloads in bounded batches,
+/// then verifies conflicts contain the same immutable data. Matching blobs are
+/// reusable across runs; a hash collision or inconsistent row fails creation.
 pub(crate) async fn bulk_insert_case_blobs(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     case_blobs: &[CaseBlobDraft],
@@ -269,6 +177,64 @@ pub(crate) async fn bulk_insert_case_blobs(
 
         query_builder.push(" ON CONFLICT (case_hash) DO NOTHING");
         query_builder.build().execute(tx.as_mut()).await?;
+
+        let mut validation_query = QueryBuilder::<Postgres>::new(
+            r#"
+            WITH input (
+                case_hash,
+                task_type,
+                case_group,
+                input_payload,
+                expected_output,
+                context_payload,
+                tags,
+                metadata
+            ) AS (
+            "#,
+        );
+        validation_query.push_values(chunk, |mut b, row| {
+            b.push_bind(&row.case_hash)
+                .push_bind(&row.task_type)
+                .push_bind(&row.case_group)
+                .push_bind(jsonb_text(&row.input_payload))
+                .push_unseparated("::jsonb")
+                .push_bind(jsonb_text(&row.expected_output))
+                .push_unseparated("::jsonb")
+                .push_bind(jsonb_text(&row.context_payload))
+                .push_unseparated("::jsonb")
+                .push_bind(jsonb_text(&row.tags))
+                .push_unseparated("::jsonb")
+                .push_bind(jsonb_text(&row.metadata))
+                .push_unseparated("::jsonb");
+        });
+        validation_query.push(
+            r#"
+            )
+            SELECT input.case_hash
+            FROM input
+            LEFT JOIN case_blobs stored USING (case_hash)
+            WHERE stored.case_hash IS NULL
+               OR stored.task_type IS DISTINCT FROM input.task_type
+               OR stored.case_group IS DISTINCT FROM input.case_group
+               OR stored.input_payload IS DISTINCT FROM input.input_payload
+               OR stored.expected_output IS DISTINCT FROM input.expected_output
+               OR stored.context_payload IS DISTINCT FROM input.context_payload
+               OR stored.tags IS DISTINCT FROM input.tags
+               OR stored.metadata IS DISTINCT FROM input.metadata
+            LIMIT 1
+            "#,
+        );
+
+        if let Some(case_hash) = validation_query
+            .build_query_scalar::<String>()
+            .fetch_optional(tx.as_mut())
+            .await?
+        {
+            return Err(seed_invariant_error(format!(
+                "case_hash '{}' already exists with different immutable content",
+                case_hash
+            )));
+        }
     }
 
     Ok(())
@@ -308,10 +274,10 @@ pub(crate) async fn upsert_dataset_version(
     .rows_affected();
 
     if rows_affected != 1 {
-        anyhow::bail!(
+        return Err(seed_invariant_error(format!(
             "dataset_version_id '{}' already exists with different dataset identity",
             dataset_version_id
-        );
+        )));
     }
 
     Ok(())
@@ -388,33 +354,53 @@ pub(crate) async fn bulk_insert_dataset_membership(
             .fetch_optional(tx.as_mut())
             .await?;
         if let Some(case_id) = mismatch {
-            anyhow::bail!(
+            return Err(seed_invariant_error(format!(
                 "dataset_version_id '{}' already exists with different membership near case '{}'; dataset versions are immutable",
-                dataset_version_id,
-                case_id
-            );
+                dataset_version_id, case_id
+            )));
         }
+    }
+
+    let stored_count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM dataset_version_cases
+        WHERE dataset_version_id = $1::uuid
+        "#,
+    )
+    .bind(dataset_version_id)
+    .fetch_one(tx.as_mut())
+    .await?;
+    if stored_count != cases.len() as i64 {
+        return Err(seed_invariant_error(format!(
+            "dataset_version_id '{}' has {} persisted memberships but the seed contains {}; dataset versions are immutable",
+            dataset_version_id,
+            stored_count,
+            cases.len()
+        )));
     }
 
     Ok(())
 }
 
-/// Inserts the run row using the caller-provided id.
+/// Inserts or verifies a run row using the caller-provided id.
 ///
-/// Query behavior: writes the run metadata and immutable config/profile
-/// snapshots in `pending` state. No worker-visible chunk events are emitted
-/// here; dispatch owns making the run visible after validation and creation
-/// commit.
+/// The control copy starts in `creating`; execution copies start in `pending`
+/// but remain invisible because control dispatch cursors do not exist yet.
+/// Repeated seeds accept only an identical immutable run definition.
 pub(crate) async fn insert_run_create(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     run_id: Uuid,
     draft: &RunDraft,
+    status: &str,
 ) -> anyhow::Result<()> {
-    sqlx::query(
+    let rows_affected = sqlx::query(
         r#"
         INSERT INTO runs (
             id,
             run_key,
+            name,
+            description,
             dataset_id,
             dataset_version,
             evaluation_profile_id,
@@ -431,7 +417,8 @@ pub(crate) async fn insert_run_create(
             dataset_version_id,
             profile_version_id,
             profile_hash,
-            aggregation_policy_hash
+            aggregation_policy_hash,
+            status
         )
         VALUES (
             $1::uuid,
@@ -447,17 +434,45 @@ pub(crate) async fn insert_run_create(
             $11,
             $12,
             $13,
-            $14::jsonb,
+            $14,
             $15,
-            $16,
+            $16::jsonb,
             $17,
             $18,
-            $19
+            $19,
+            $20,
+            $21,
+            $22::run_status
         )
+        ON CONFLICT (id) DO UPDATE
+        SET updated_at = runs.updated_at
+        WHERE runs.run_key = EXCLUDED.run_key
+          AND runs.name IS NOT DISTINCT FROM EXCLUDED.name
+          AND runs.description IS NOT DISTINCT FROM EXCLUDED.description
+          AND runs.dataset_id = EXCLUDED.dataset_id
+          AND runs.dataset_version = EXCLUDED.dataset_version
+          AND runs.dataset_version_id = EXCLUDED.dataset_version_id
+          AND runs.evaluation_profile_id = EXCLUDED.evaluation_profile_id
+          AND runs.evaluation_profile_version = EXCLUDED.evaluation_profile_version
+          AND runs.profile_version_id = EXCLUDED.profile_version_id
+          AND runs.profile_hash = EXCLUDED.profile_hash
+          AND runs.aggregation_policy_id = EXCLUDED.aggregation_policy_id
+          AND runs.aggregation_policy_version = EXCLUDED.aggregation_policy_version
+          AND runs.aggregation_policy_hash = EXCLUDED.aggregation_policy_hash
+          AND runs.agent_provider = EXCLUDED.agent_provider
+          AND runs.agent_name = EXCLUDED.agent_name
+          AND runs.agent_version IS NOT DISTINCT FROM EXCLUDED.agent_version
+          AND runs.prompt_config_id = EXCLUDED.prompt_config_id
+          AND runs.prompt_config_version = EXCLUDED.prompt_config_version
+          AND runs.config_snapshot = EXCLUDED.config_snapshot
+          AND runs.expected_execution_count = EXCLUDED.expected_execution_count
+          AND runs.status = EXCLUDED.status
         "#,
     )
     .bind(run_id)
     .bind(&draft.run_key)
+    .bind(&draft.name)
+    .bind(&draft.description)
     .bind(draft.dataset_id)
     .bind(&draft.dataset_version)
     .bind(&draft.evaluation_profile_id)
@@ -475,8 +490,17 @@ pub(crate) async fn insert_run_create(
     .bind(&draft.profile_version_id)
     .bind(&draft.profile_hash)
     .bind(&draft.aggregation_policy_hash)
+    .bind(status)
     .execute(tx.as_mut())
-    .await?;
+    .await?
+    .rows_affected();
+
+    if rows_affected != 1 {
+        return Err(seed_invariant_error(format!(
+            "run_id '{}' already exists with different immutable creation data",
+            run_id
+        )));
+    }
 
     Ok(())
 }
@@ -486,9 +510,9 @@ pub(crate) async fn insert_run_create(
 /// Chunk-ready outbox events are created by dispatch windows after the run is
 /// marked running.
 ///
-/// Query behavior: bulk inserts run-local chunk ranges in bounded batches. Each
-/// chunk points at the immutable dataset version and starts as `pending` with
-/// no worker lease.
+/// Query behavior: bulk inserts run-local chunk ranges in bounded batches. A
+/// repeated seed accepts an existing chunk only when all immutable scheduling
+/// fields match and the chunk has not been dispatched.
 pub(crate) async fn bulk_insert_run_chunks(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     run_id: Uuid,
@@ -515,7 +539,30 @@ pub(crate) async fn bulk_insert_run_chunks(
                 .push_bind("pending");
         });
 
-        query_builder.build().execute(tx.as_mut()).await?;
+        query_builder.push(
+            r#"
+            ON CONFLICT (run_id, run_shard, id) DO UPDATE
+            SET updated_at = run_chunks.updated_at
+            WHERE run_chunks.dataset_version_id = EXCLUDED.dataset_version_id
+              AND run_chunks.profile_group_id = EXCLUDED.profile_group_id
+              AND run_chunks.ordinal_start = EXCLUDED.ordinal_start
+              AND run_chunks.ordinal_end = EXCLUDED.ordinal_end
+              AND run_chunks.status = 'pending'
+              AND run_chunks.dispatched_at IS NULL
+            "#,
+        );
+        let rows_affected = query_builder
+            .build()
+            .execute(tx.as_mut())
+            .await?
+            .rows_affected();
+
+        if rows_affected != chunk_batch.len() as u64 {
+            return Err(seed_invariant_error(format!(
+                "run_id '{}' has a chunk with different immutable creation data",
+                run_id
+            )));
+        }
     }
 
     Ok(())
@@ -719,6 +766,19 @@ mod tests {
         }
     }
 
+    fn case_blob(label: &str) -> CaseBlobDraft {
+        CaseBlobDraft {
+            case_hash: format!("case-{label}-{}", Uuid::now_v7()),
+            task_type: "classification".to_string(),
+            case_group: None,
+            input_payload: serde_json::json!({"text": label}),
+            expected_output: serde_json::Value::Null,
+            context_payload: serde_json::Value::Null,
+            tags: serde_json::json!([]),
+            metadata: serde_json::json!({}),
+        }
+    }
+
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
     async fn bulk_insert_run_shard_dispatch_cursors_inserts_distinct_open_shards(pool: PgPool) {
@@ -781,6 +841,108 @@ mod tests {
         .unwrap();
 
         assert_eq!(context_payload, serde_json::Value::Null);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn bulk_insert_case_blobs_rejects_hash_content_mismatch(pool: PgPool) {
+        let mut case_blob = CaseBlobDraft {
+            case_hash: format!("case-{}", Uuid::now_v7()),
+            task_type: "classification".to_string(),
+            case_group: None,
+            input_payload: serde_json::json!({"text": "original"}),
+            expected_output: serde_json::Value::Null,
+            context_payload: serde_json::Value::Null,
+            tags: serde_json::json!([]),
+            metadata: serde_json::json!({}),
+        };
+        let mut tx = pool.begin().await.unwrap();
+        bulk_insert_case_blobs(&mut tx, std::slice::from_ref(&case_blob))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        case_blob.input_payload = serde_json::json!({"text": "different"});
+        let mut tx = pool.begin().await.unwrap();
+        let error = bulk_insert_case_blobs(&mut tx, &[case_blob])
+            .await
+            .unwrap_err();
+
+        assert!(is_seed_invariant_error(&error));
+        assert!(error.to_string().contains("different immutable content"));
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn bulk_insert_dataset_membership_rejects_incomplete_seed(pool: PgPool) {
+        let dataset_id = Uuid::now_v7();
+        let dataset_version_id = Uuid::now_v7();
+        let blobs = [case_blob("first"), case_blob("second")];
+        let memberships = [
+            DatasetVersionCaseDraft {
+                case_id: Uuid::now_v7(),
+                case_ordinal: 0,
+                case_hash: blobs[0].case_hash.clone(),
+            },
+            DatasetVersionCaseDraft {
+                case_id: Uuid::now_v7(),
+                case_ordinal: 1,
+                case_hash: blobs[1].case_hash.clone(),
+            },
+        ];
+        let mut tx = pool.begin().await.unwrap();
+        bulk_insert_case_blobs(&mut tx, &blobs).await.unwrap();
+        upsert_dataset_version(&mut tx, dataset_version_id, dataset_id, "test")
+            .await
+            .unwrap();
+        bulk_insert_dataset_membership(&mut tx, dataset_version_id, &memberships)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let error = bulk_insert_dataset_membership(
+            &mut tx,
+            dataset_version_id,
+            std::slice::from_ref(&memberships[0]),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(is_seed_invariant_error(&error));
+        assert!(error.to_string().contains("persisted memberships"));
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn bulk_insert_run_chunks_is_idempotent(pool: PgPool) {
+        let run_id = Uuid::now_v7();
+        insert_minimal_run(&pool, run_id).await;
+        let dataset_version_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT dataset_version_id FROM runs WHERE id = $1::uuid",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let chunks = vec![chunk(0, 0)];
+
+        for _ in 0..2 {
+            let mut tx = pool.begin().await.unwrap();
+            bulk_insert_run_chunks(&mut tx, run_id, dataset_version_id, &chunks)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)::bigint FROM run_chunks WHERE run_id = $1::uuid",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[sqlx::test(migrations = "../migrations")]

@@ -44,6 +44,7 @@ use crate::{
         workflows::{
             run_cancel,
             run_create,
+            run_creation,
             run_export as run_export_workflow,
             run_profile_validation,
             run_results::{
@@ -320,6 +321,7 @@ fn load_run_inputs(
 struct RunWatchSnapshotKey {
     status: String,
     gate_status: String,
+    error_message: Option<String>,
     expected_execution_count: i32,
     terminal_execution_count: i32,
     passed_execution_count: i32,
@@ -333,6 +335,12 @@ struct RunWatchSnapshotKey {
     live_errored_execution_count: i64,
     live_cancelled_chunk_count: i64,
     shard_summary_count: usize,
+    creation_placement_count: i64,
+    creation_placements_pending: i64,
+    creation_placements_seeded: i64,
+    creation_placements_failed: i64,
+    creation_seed_attempt_count: i64,
+    creation_last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -354,6 +362,7 @@ impl From<&run_status_workflow::RunStatusProjection> for RunWatchSnapshotKey {
         Self {
             status: status.run.status.clone(),
             gate_status: status.run.gate_status.clone(),
+            error_message: status.run.error_message.clone(),
             expected_execution_count: status.run.expected_execution_count,
             terminal_execution_count: status.run.terminal_execution_count,
             passed_execution_count: status.run.passed_execution_count,
@@ -367,6 +376,30 @@ impl From<&run_status_workflow::RunStatusProjection> for RunWatchSnapshotKey {
             live_errored_execution_count: status.live_progress.errored_execution_count,
             live_cancelled_chunk_count: status.live_progress.cancelled_chunk_count,
             shard_summary_count: status.shard_summary_count,
+            creation_placement_count: status
+                .creation_progress
+                .as_ref()
+                .map_or(0, |progress| progress.placement_count),
+            creation_placements_pending: status
+                .creation_progress
+                .as_ref()
+                .map_or(0, |progress| progress.pending_placement_count),
+            creation_placements_seeded: status
+                .creation_progress
+                .as_ref()
+                .map_or(0, |progress| progress.seeded_placement_count),
+            creation_placements_failed: status
+                .creation_progress
+                .as_ref()
+                .map_or(0, |progress| progress.failed_placement_count),
+            creation_seed_attempt_count: status
+                .creation_progress
+                .as_ref()
+                .map_or(0, |progress| progress.attempt_count),
+            creation_last_error: status
+                .creation_progress
+                .as_ref()
+                .and_then(|progress| progress.last_error.clone()),
         }
     }
 }
@@ -447,6 +480,14 @@ fn run_watch_payload_from_status(
                 "failed_chunk_count": status.live_progress.failed_chunk_count,
                 "cancelled_chunk_count": status.live_progress.cancelled_chunk_count,
             },
+            "creation_progress": status.creation_progress.as_ref().map(|progress| json!({
+                "placement_count": progress.placement_count,
+                "pending_placement_count": progress.pending_placement_count,
+                "seeded_placement_count": progress.seeded_placement_count,
+                "failed_placement_count": progress.failed_placement_count,
+                "attempt_count": progress.attempt_count,
+                "last_error": progress.last_error,
+            })),
         },
         "meta": {
             "terminal": terminal,
@@ -860,6 +901,7 @@ mod tests {
         assert!(is_terminal_run_status("completed"));
         assert!(is_terminal_run_status("failed"));
         assert!(is_terminal_run_status("cancelled"));
+        assert!(!is_terminal_run_status("creating"));
         assert!(!is_terminal_run_status("pending"));
         assert!(!is_terminal_run_status("running"));
         assert!(!is_terminal_run_status("finalizing"));
@@ -990,6 +1032,7 @@ mod tests {
             },
             execution_route_count: 2,
             shard_summary_count: 1,
+            creation_progress: None,
         };
 
         let payload = run_watch_payload_from_status(&status, false);

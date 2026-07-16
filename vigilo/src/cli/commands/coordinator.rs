@@ -1,7 +1,8 @@
 //! Coordinator process command.
 //!
 //! The coordinator drives run-level orchestration:
-//! - atomically starts pending runs and dispatches chunk-ready event windows
+//! - resumes durable multi-database run creation
+//! - atomically starts fully created runs and dispatches chunk-ready windows
 //! - finalizes runs whose chunks/executions are terminal
 //! - publishes outbox events from active database placements to messaging
 
@@ -30,6 +31,7 @@ use crate::{
     db::{
         tables::outbox_events,
         workflows::{
+            run_creation,
             run_dispatch,
             run_finalize,
             run_shard_summary,
@@ -50,6 +52,7 @@ mod start;
 
 const COORDINATOR_TICK_SECONDS: u64 = 5;
 const COORDINATOR_LEASE_SECONDS: i32 = 60;
+const COORDINATOR_MAX_CREATE_RECOVERY_PER_CYCLE: u64 = 16;
 const COORDINATOR_MAX_DISPATCH_PER_CYCLE: u64 = 64;
 const COORDINATOR_MAX_FINALIZE_PER_CYCLE: u64 = 64;
 const RUN_CHUNK_DISPATCH_WINDOW_SIZE: i64 = 512;
@@ -64,6 +67,7 @@ const OUTBOX_RETRY_DELAY_SECONDS: i32 = 10;
 struct CoordinatorRuntimeConfig {
     tick_seconds: u64,
     lease_seconds: i32,
+    max_create_recovery_per_cycle: usize,
     max_dispatch_per_cycle: usize,
     max_finalize_per_cycle: usize,
     run_chunk_dispatch_window_size: i64,
@@ -96,9 +100,13 @@ pub(crate) struct Command {
     #[arg(long, env = "VIGILO_COORDINATOR_TICK_SECONDS", default_value_t = COORDINATOR_TICK_SECONDS, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub tick_seconds: u64,
 
-    /// Coordinator lease duration for run dispatch/finalization
+    /// Coordinator lease duration for creation recovery, dispatch, and finalization
     #[arg(long, env = "VIGILO_COORDINATOR_LEASE_SECONDS", default_value_t = COORDINATOR_LEASE_SECONDS, value_parser = clap::value_parser!(i32).range(1..=86400))]
     pub lease_seconds: i32,
+
+    /// Maximum incomplete run creations recovered per coordinator cycle
+    #[arg(long, env = "VIGILO_COORDINATOR_MAX_CREATE_RECOVERY_PER_CYCLE", default_value_t = COORDINATOR_MAX_CREATE_RECOVERY_PER_CYCLE, value_parser = clap::value_parser!(u64).range(1..=100_000))]
+    pub max_create_recovery_per_cycle: u64,
 
     /// Maximum run-shard dispatch windows prepared per coordinator cycle
     #[arg(long, env = "VIGILO_COORDINATOR_MAX_DISPATCH_PER_CYCLE", default_value_t = COORDINATOR_MAX_DISPATCH_PER_CYCLE, value_parser = clap::value_parser!(u64).range(1..=100_000))]
@@ -145,6 +153,7 @@ impl Command {
         CoordinatorRuntimeConfig {
             tick_seconds: self.tick_seconds,
             lease_seconds: self.lease_seconds,
+            max_create_recovery_per_cycle: self.max_create_recovery_per_cycle as usize,
             max_dispatch_per_cycle: self.max_dispatch_per_cycle as usize,
             max_finalize_per_cycle: self.max_finalize_per_cycle as usize,
             run_chunk_dispatch_window_size: self.run_chunk_dispatch_window_size,
@@ -180,10 +189,11 @@ impl Executable for Command {
 /// Executes one full coordinator cycle.
 ///
 /// The cycle is intentionally ordered to keep run progression deterministic:
-/// 1. recover expired worker chunk leases
-/// 2. atomically start pending runs and dispatch chunk-ready windows
-/// 3. claim/finalize finalizable runs (bounded batch)
-/// 4. publish bounded batches of pending outbox events from active placements
+/// 1. resume stale multi-database run creation
+/// 2. recover expired worker chunk leases
+/// 3. atomically start pending runs and dispatch chunk-ready windows
+/// 4. claim/finalize finalizable runs (bounded batch)
+/// 5. publish bounded batches of pending outbox events from active placements
 async fn run_coordinator_cycle(
     context: Context,
     coordinator_id: Uuid,
@@ -192,16 +202,23 @@ async fn run_coordinator_cycle(
     let cycle_started = Instant::now();
     // --- Acquire cycle services ---
     // The database service owns control and execution placement routing. The
-    // queue handle is only needed for the final publish pass.
+    // queue handle is acquired only after database-only recovery and dispatch.
     debug!(coordinator_id = %coordinator_id, "starting coordinator cycle pre-flight");
 
     debug!(coordinator_id = %coordinator_id, "acquiring database context");
     let database = context.db().await?;
     debug!(coordinator_id = %coordinator_id, "database context ready");
 
-    debug!(coordinator_id = %coordinator_id, "acquiring messaging context");
-    let mq = context.mq().await?;
-    debug!(coordinator_id = %coordinator_id, "messaging context ready");
+    // --- Resume incomplete run creation ---
+    let creation_recovery_started = Instant::now();
+    let creation_recovery = run_creation::recover_creating_runs(
+        database,
+        coordinator_id,
+        config.lease_seconds,
+        config.max_create_recovery_per_cycle,
+    )
+    .await?;
+    let creation_recovery_ms = creation_recovery_started.elapsed().as_millis() as u64;
 
     // --- Recover expired chunk leases ---
     // Recovery runs before new dispatch so dead workers do not block
@@ -224,6 +241,9 @@ async fn run_coordinator_cycle(
 
     // --- Publish durable outbox events ---
     // Failed broker publishes stay in the outbox delivery queue for retry.
+    debug!(coordinator_id = %coordinator_id, "acquiring messaging context");
+    let mq = context.mq().await?;
+    debug!(coordinator_id = %coordinator_id, "messaging context ready");
     debug!(coordinator_id = %coordinator_id, "starting outbox publish pass");
     let publisher = MqEventPublisher::new(mq);
     let outbox_config = OutboxPublisherConfig {
@@ -237,6 +257,11 @@ async fn run_coordinator_cycle(
         publish_outbox_events(database, &publisher, &outbox_config, coordinator_id).await?;
     let outbox_publish_ms = outbox_started.elapsed().as_millis() as u64;
     info!(
+        run_creations_claimed = creation_recovery.claimed,
+        run_creations_completed = creation_recovery.completed,
+        run_creations_deferred = creation_recovery.deferred,
+        run_creations_failed = creation_recovery.failed,
+        creation_recovery_ms,
         expired_chunk_leases_recovered = recovery_stats.recovered,
         expired_chunk_leases_failed = recovery_stats.failed,
         recovery_ms,

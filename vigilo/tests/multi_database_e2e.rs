@@ -2,8 +2,8 @@
 //!
 //! This harness is opt-in because it requires two PostgreSQL databases,
 //! RabbitMQ, and a built evaluator WASM artifact. It drives the public `vigilo`
-//! binary through create, dispatch, worker processing, finalization,
-//! results/export, cancellation, and validation failure paths.
+//! binary through recoverable creation, dispatch, worker processing,
+//! finalization, results/export, cancellation, and validation failure paths.
 
 mod support;
 
@@ -65,6 +65,78 @@ async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
     migrate(&shard).await?;
     seed_sentiment_evaluator(&primary).await?;
     configure_shard_placement(&primary).await?;
+
+    install_seed_status_failure(&primary).await?;
+    let recoverable_output = create_run_output(
+        &config,
+        RunCreateInput {
+            default_execution_alias: SHARD_ALIAS,
+            shard_assignment_policy: "single-default",
+            agent_url: &agent.url,
+            profile_id: "e2e_creation_recovery",
+            case_count: 1,
+            case_mode: CaseMode::Passing,
+            evaluator_ref: SENTIMENT_EVALUATOR_REF,
+        },
+    )?;
+    remove_seed_status_failure(&primary).await?;
+    if !recoverable_output.status.success() {
+        anyhow::bail!(
+            "recoverable run create failed with status {}\nstdout:\n{}\nstderr:\n{}",
+            recoverable_output.status,
+            String::from_utf8_lossy(&recoverable_output.stdout),
+            String::from_utf8_lossy(&recoverable_output.stderr)
+        );
+    }
+    let recoverable_payload: Value = serde_json::from_slice(&recoverable_output.stdout)?;
+    let recoverable_run_id = Uuid::parse_str(
+        recoverable_payload["data"]["run_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("recoverable create response omitted data.run_id"))?,
+    )?;
+    assert_eq!(recoverable_payload["data"]["status"], "creating");
+    assert_eq!(
+        recoverable_payload["meta"]["creation_placements_pending"],
+        1
+    );
+    assert_eq!(run_chunk_count(&shard, recoverable_run_id).await?, 1);
+    assert_eq!(
+        dispatch_cursor_count(&primary, recoverable_run_id).await?,
+        0
+    );
+
+    let creating_status = run_vigilo_json(
+        &config,
+        SHARD_ALIAS,
+        "single-default",
+        ["run", "status", &recoverable_run_id.to_string()],
+    )?;
+    assert_eq!(creating_status["data"]["status"], "creating");
+    assert_eq!(
+        creating_status["data"]["creation_progress"]["pending_placement_count"],
+        1
+    );
+
+    expire_run_creation_lease(&primary, recoverable_run_id).await?;
+    run_vigilo_ok(
+        &config,
+        SHARD_ALIAS,
+        "single-default",
+        ["coordinator", "once"],
+    )?;
+    assert_eq!(run_chunk_count(&shard, recoverable_run_id).await?, 1);
+    assert_eq!(
+        dispatch_cursor_count(&primary, recoverable_run_id).await?,
+        1
+    );
+    assert_eq!(
+        run_creation_placement_state(&primary, recoverable_run_id, SHARD_ALIAS).await?,
+        ("seeded".to_string(), 2)
+    );
+    assert_eq!(
+        run_creation_chunk_plan_count(&primary, recoverable_run_id).await?,
+        0
+    );
 
     let completed_run_id = create_run(
         &config,
@@ -468,6 +540,65 @@ async fn configure_shard_placement(primary: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn install_seed_status_failure(primary: &PgPool) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        CREATE OR REPLACE FUNCTION fail_run_creation_seed_status()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF OLD.status = 'pending'
+               AND NEW.status = 'seeded'
+               AND NEW.database_alias = 'shard_001'
+            THEN
+                RAISE EXCEPTION 'injected failure after execution seed commit';
+            END IF;
+            RETURN NEW;
+        END;
+        $$
+        "#,
+    )
+    .execute(primary)
+    .await?;
+    sqlx::query(
+        r#"
+        CREATE TRIGGER fail_run_creation_seed_status
+        BEFORE UPDATE ON run_creation_placements
+        FOR EACH ROW
+        EXECUTE FUNCTION fail_run_creation_seed_status()
+        "#,
+    )
+    .execute(primary)
+    .await?;
+    Ok(())
+}
+
+async fn remove_seed_status_failure(primary: &PgPool) -> anyhow::Result<()> {
+    sqlx::query("DROP TRIGGER IF EXISTS fail_run_creation_seed_status ON run_creation_placements")
+        .execute(primary)
+        .await?;
+    sqlx::query("DROP FUNCTION IF EXISTS fail_run_creation_seed_status()")
+        .execute(primary)
+        .await?;
+    Ok(())
+}
+
+async fn expire_run_creation_lease(primary: &PgPool, run_id: Uuid) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE runs
+        SET coordinator_leased_until = now() - interval '1 second'
+        WHERE id = $1::uuid
+          AND status = 'creating'::run_status
+        "#,
+    )
+    .bind(run_id)
+    .execute(primary)
+    .await?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CaseMode {
     Passing,
@@ -690,7 +821,7 @@ fn profile_yaml(profile_id: &str, agent_url: &str, evaluator_ref: &str) -> Strin
         r#"
 profile_id: {profile_id}
 profile_version: 1.0.0
-description: Phase 23 end-to-end multi-database profile.
+description: End-to-end multi-database runtime profile.
 defaults:
   max_attempts: 1
   request_timeout_secs: 10
@@ -803,6 +934,52 @@ async fn execution_status_count(db: &PgPool, run_id: Uuid, status: &str) -> anyh
     )
     .bind(run_id)
     .bind(status)
+    .fetch_one(db)
+    .await?)
+}
+
+async fn run_chunk_count(db: &PgPool, run_id: Uuid) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM run_chunks WHERE run_id = $1::uuid",
+    )
+    .bind(run_id)
+    .fetch_one(db)
+    .await?)
+}
+
+async fn dispatch_cursor_count(db: &PgPool, run_id: Uuid) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM run_shard_dispatch_cursors WHERE run_id = $1::uuid",
+    )
+    .bind(run_id)
+    .fetch_one(db)
+    .await?)
+}
+
+async fn run_creation_placement_state(
+    db: &PgPool,
+    run_id: Uuid,
+    database_alias: &str,
+) -> anyhow::Result<(String, i32)> {
+    Ok(sqlx::query_as::<_, (String, i32)>(
+        r#"
+        SELECT status, attempt_count
+        FROM run_creation_placements
+        WHERE run_id = $1::uuid
+          AND database_alias = $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(database_alias)
+    .fetch_one(db)
+    .await?)
+}
+
+async fn run_creation_chunk_plan_count(db: &PgPool, run_id: Uuid) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM run_creation_chunks WHERE run_id = $1::uuid",
+    )
+    .bind(run_id)
     .fetch_one(db)
     .await?)
 }

@@ -119,16 +119,16 @@ pub(super) async fn exec(
         expected_execution_count: dataset_cases.len() as i32,
     };
 
-    // --- Persist pending run work ---
-    // Write control metadata, placement rows, dispatch cursors, and
-    // execution-local seed rows. Coordinator dispatch owns worker visibility;
-    // no queue-visible events are emitted here.
+    // --- Persist recoverable run work ---
+    // Commit the control creation plan before seeding execution placements.
+    // Dispatch cursors appear only when every placement is seeded, so no
+    // queue-visible work can escape a partial creation.
     let shard_assignments = run_create::assign_run_shard_placements(database, &chunks).await?;
     let shard_assignment_aliases = shard_assignments
         .iter()
         .map(|assignment| assignment.database_alias.clone())
         .collect::<std::collections::BTreeSet<_>>();
-    run_create::insert_run_seed_state(
+    let creation = run_creation::create_run(
         database,
         run_id,
         &run_draft,
@@ -149,7 +149,8 @@ pub(super) async fn exec(
             "profile_hash": profile_hash,
             "dataset_hash": dataset_hash,
             "aggregation_policy_hash": aggregation_policy_hash,
-            "status": "pending",
+            "status": creation.status,
+            "error_message": creation.error_message,
         },
         "meta": {
             "case_count": dataset_cases.len(),
@@ -159,6 +160,11 @@ pub(super) async fn exec(
             "default_execution_database_alias": default_execution_database_alias,
             "execution_database_aliases": shard_assignment_aliases,
             "shard_placement_count": shard_assignments.len(),
+            "creation_placement_count": creation.progress.placement_count,
+            "creation_placements_pending": creation.progress.pending_placement_count,
+            "creation_placements_seeded": creation.progress.seeded_placement_count,
+            "creation_placements_failed": creation.progress.failed_placement_count,
+            "creation_seed_attempt_count": creation.progress.attempt_count,
             "expected_evaluator_executions": executability.expected_evaluator_execution_count,
             "resolved_evaluator_refs": executability.runnable_evaluator_ref_count,
         }
