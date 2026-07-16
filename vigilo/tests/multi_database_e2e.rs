@@ -24,6 +24,7 @@ use std::{
         Output,
     },
     thread,
+    time::Duration,
 };
 
 use serde_json::{
@@ -45,6 +46,8 @@ const SHARD_DATABASE_URL_ENV_VALUE: &str = "VIGILO_TEST_SHARD_001_DATABASE_URL";
 const SENTIMENT_EVALUATOR_REF: &str = "vigilo/sentiment-basic-en:0.1.0";
 const SENTIMENT_WASM_PATH_ENV: &str = "VIGILO_E2E_SENTIMENT_WASM_PATH";
 const SENTIMENT_WASM_TARGET_PATH: &str = "wasm32-wasip2/release/sentiment_basic_en.wasm";
+const E2E_MAX_RUNTIME_CYCLES: usize = 8;
+const E2E_WORKER_PASSES_PER_CYCLE: usize = 4;
 
 #[tokio::test]
 async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
@@ -82,31 +85,12 @@ async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
         SHARD_ALIAS
     );
 
-    run_vigilo_ok(
+    let status = drive_run_to_status(
         &config,
         PRIMARY_ALIAS,
         "spread-active",
-        [
-            "coordinator",
-            "--run-chunk-dispatch-window-size",
-            "512",
-            "once",
-        ],
-    )?;
-    run_vigilo_ok(&config, PRIMARY_ALIAS, "spread-active", ["worker", "once"])?;
-    run_vigilo_ok(&config, PRIMARY_ALIAS, "spread-active", ["worker", "once"])?;
-    run_vigilo_ok(
-        &config,
-        PRIMARY_ALIAS,
-        "spread-active",
-        ["coordinator", "once"],
-    )?;
-
-    let status = run_vigilo_json(
-        &config,
-        PRIMARY_ALIAS,
-        "spread-active",
-        ["run", "status", &completed_run_id.to_string()],
+        completed_run_id,
+        "completed",
     )?;
     assert_eq!(status["data"]["status"].as_str(), Some("completed"));
     assert_eq!(status["data"]["gate_status"].as_str(), Some("pass"));
@@ -185,25 +169,12 @@ async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
             evaluator_ref: SENTIMENT_EVALUATOR_REF,
         },
     )?;
-    run_vigilo_ok(
+    let failed_status = drive_run_to_status(
         &config,
         PRIMARY_ALIAS,
         "single-default",
-        ["coordinator", "once"],
-    )?;
-    run_vigilo_ok(&config, PRIMARY_ALIAS, "single-default", ["worker", "once"])?;
-    run_vigilo_ok(
-        &config,
-        PRIMARY_ALIAS,
-        "single-default",
-        ["coordinator", "once"],
-    )?;
-
-    let failed_status = run_vigilo_json(
-        &config,
-        PRIMARY_ALIAS,
-        "single-default",
-        ["run", "status", &failing_run_id.to_string()],
+        failing_run_id,
+        "completed",
     )?;
     assert_eq!(failed_status["data"]["status"].as_str(), Some("completed"));
     assert_eq!(failed_status["data"]["gate_status"].as_str(), Some("fail"));
@@ -548,6 +519,70 @@ fn create_run_output(
             path_arg(&test_files.dataset)?,
         ],
     )
+}
+
+fn drive_run_to_status(
+    config: &IntegrationConfig,
+    default_execution_alias: &str,
+    shard_assignment_policy: &str,
+    run_id: Uuid,
+    expected_status: &str,
+) -> anyhow::Result<Value> {
+    let run_id_arg = run_id.to_string();
+    let mut last_status = None;
+
+    for cycle in 1..=E2E_MAX_RUNTIME_CYCLES {
+        run_vigilo_ok(
+            config,
+            default_execution_alias,
+            shard_assignment_policy,
+            [
+                "coordinator",
+                "--run-chunk-dispatch-window-size",
+                "512",
+                "once",
+            ],
+        )?;
+
+        for _ in 0..E2E_WORKER_PASSES_PER_CYCLE {
+            run_vigilo_ok(
+                config,
+                default_execution_alias,
+                shard_assignment_policy,
+                ["worker", "once"],
+            )?;
+        }
+
+        run_vigilo_ok(
+            config,
+            default_execution_alias,
+            shard_assignment_policy,
+            ["coordinator", "once"],
+        )?;
+
+        let status = run_vigilo_json(
+            config,
+            default_execution_alias,
+            shard_assignment_policy,
+            ["run", "status", run_id_arg.as_str()],
+        )?;
+        if status["data"]["status"].as_str() == Some(expected_status) {
+            return Ok(status);
+        }
+
+        last_status = Some(status);
+        if cycle < E2E_MAX_RUNTIME_CYCLES {
+            thread::sleep(Duration::from_millis(150));
+        }
+    }
+
+    let last_status = match last_status {
+        Some(status) => serde_json::to_string_pretty(&status)?,
+        None => "<none>".to_owned(),
+    };
+    anyhow::bail!(
+        "run {run_id} did not reach status {expected_status} after {E2E_MAX_RUNTIME_CYCLES} cycles; last status:\n{last_status}"
+    );
 }
 
 fn run_vigilo_json<'a>(
