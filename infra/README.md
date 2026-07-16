@@ -4,7 +4,7 @@ System components for running Agent Vigilo.
 
 ## Dev Compose
 
-`infra/dev/docker-compose.yml` starts Postgres, RabbitMQ, Vigilo services, and a local llama.cpp-backed agent service for the example profile.
+`infra/dev/docker-compose.single.yml` starts Postgres, RabbitMQ, Vigilo services, and a local llama.cpp-backed agent service for the example profile. Add `infra/dev/docker-compose.sharded.yml` for a second PostgreSQL shard placement.
 
 The agent service expects this model file to exist before startup:
 

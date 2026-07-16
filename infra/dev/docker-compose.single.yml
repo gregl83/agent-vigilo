@@ -1,9 +1,27 @@
 name: agent_vigilo_dev
 
+x-vigilo-env: &vigilo-env
+  DATABASE_URL: ${VIGILO_CONTAINER_DATABASE_URL:-postgresql://postgres:password@postgres:5432/agent_vigilo}
+  DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-5}
+  MESSAGING_URL: ${VIGILO_CONTAINER_MESSAGING_URL:-amqp://guest:guest@rabbitmq:5672}
+  VIGILO_CONTROL_DATABASE_ALIAS: ${VIGILO_CONTROL_DATABASE_ALIAS:-primary}
+  VIGILO_DEFAULT_SHARD_DATABASE_ALIAS: ${VIGILO_DEFAULT_SHARD_DATABASE_ALIAS:-primary}
+  VIGILO_SHARD_ASSIGNMENT_POLICY: ${VIGILO_SHARD_ASSIGNMENT_POLICY:-single-default}
+
+x-vigilo-rust-service: &vigilo-rust-service
+  image: rust:latest
+  working_dir: /workspace
+  volumes:
+    - ../../:/workspace
+    - agent_vigilo_cargo_registry:/usr/local/cargo/registry
+    - agent_vigilo_cargo_git:/usr/local/cargo/git
+    - agent_vigilo_target:/workspace/target
+  networks:
+    - agent_vigilo_network
+
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: agent_vigilo_db
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: password
@@ -23,7 +41,6 @@ services:
 
   rabbitmq:
     image: rabbitmq:3-management
-    container_name: agent_vigilo_mq
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
@@ -43,7 +60,6 @@ services:
 
   agent:
     image: ghcr.io/ggml-org/llama.cpp:server
-    container_name: agent_vigilo_agent
     command:
       - -m
       - /models/qwen2.5-0.5b-instruct-q4_k_m.gguf
@@ -60,40 +76,20 @@ services:
     restart: unless-stopped
 
   setup:
-    image: rust:latest
-    container_name: agent_vigilo_setup
-    working_dir: /workspace
+    <<: *vigilo-rust-service
     command: ["cargo", "run", "-p", "vigilo", "--", "setup"]
-    environment:
-      DATABASE_URL: postgresql://postgres:password@agent_vigilo_db:5432/agent_vigilo
-      MESSAGING_URL: amqp://guest:guest@agent_vigilo_mq:5672
-    volumes:
-      - ../../:/workspace
-      - agent_vigilo_cargo_registry:/usr/local/cargo/registry
-      - agent_vigilo_cargo_git:/usr/local/cargo/git
-      - agent_vigilo_target:/workspace/target
+    environment: *vigilo-env
     depends_on:
       postgres:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-    networks:
-      - agent_vigilo_network
     restart: "no"
 
   coordinator:
-    image: rust:latest
-    container_name: agent_vigilo_coordinator
-    working_dir: /workspace
+    <<: *vigilo-rust-service
     command: ["cargo", "run", "-p", "vigilo", "--", "coordinator", "start"]
-    environment:
-      DATABASE_URL: postgresql://postgres:password@agent_vigilo_db:5432/agent_vigilo
-      MESSAGING_URL: amqp://guest:guest@agent_vigilo_mq:5672
-    volumes:
-      - ../../:/workspace
-      - agent_vigilo_cargo_registry:/usr/local/cargo/registry
-      - agent_vigilo_cargo_git:/usr/local/cargo/git
-      - agent_vigilo_target:/workspace/target
+    environment: *vigilo-env
     depends_on:
       postgres:
         condition: service_healthy
@@ -101,23 +97,12 @@ services:
         condition: service_healthy
       setup:
         condition: service_completed_successfully
-    networks:
-      - agent_vigilo_network
     restart: unless-stopped
 
   worker:
-    image: rust:latest
-    container_name: agent_vigilo_worker
-    working_dir: /workspace
+    <<: *vigilo-rust-service
     command: ["cargo", "run", "-p", "vigilo", "--", "worker", "start"]
-    environment:
-      DATABASE_URL: postgresql://postgres:password@agent_vigilo_db:5432/agent_vigilo
-      MESSAGING_URL: amqp://guest:guest@agent_vigilo_mq:5672
-    volumes:
-      - ../../:/workspace
-      - agent_vigilo_cargo_registry:/usr/local/cargo/registry
-      - agent_vigilo_cargo_git:/usr/local/cargo/git
-      - agent_vigilo_target:/workspace/target
+    environment: *vigilo-env
     depends_on:
       postgres:
         condition: service_healthy
@@ -127,8 +112,6 @@ services:
         condition: service_started
       setup:
         condition: service_completed_successfully
-    networks:
-      - agent_vigilo_network
     restart: unless-stopped
     deploy:
       replicas: ${WORKER_REPLICAS:-1}

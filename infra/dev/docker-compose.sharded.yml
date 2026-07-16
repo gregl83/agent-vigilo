@@ -1,0 +1,102 @@
+services:
+  postgres-shard-001:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: agent_vigilo
+    ports:
+      - "5433:5432"
+    volumes:
+      - agent_vigilo_db_shard_001_data:/var/lib/postgresql/data
+    networks:
+      - agent_vigilo_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d agent_vigilo"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  setup-shard-001:
+    image: rust:latest
+    working_dir: /workspace
+    command:
+      ["cargo", "run", "-p", "vigilo", "--", "setup", "--skip-evaluators"]
+    environment:
+      DATABASE_URL: ${VIGILO_CONTAINER_SHARD_001_DATABASE_URL:-postgresql://postgres:password@postgres-shard-001:5432/agent_vigilo}
+      DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-5}
+      MESSAGING_URL: ${VIGILO_CONTAINER_MESSAGING_URL:-amqp://guest:guest@rabbitmq:5672}
+      VIGILO_CONTROL_DATABASE_ALIAS: primary
+      VIGILO_DEFAULT_SHARD_DATABASE_ALIAS: primary
+      VIGILO_SHARD_ASSIGNMENT_POLICY: single-default
+    volumes:
+      - ../../:/workspace
+      - agent_vigilo_cargo_registry:/usr/local/cargo/registry
+      - agent_vigilo_cargo_git:/usr/local/cargo/git
+      - agent_vigilo_target:/workspace/target
+    depends_on:
+      postgres-shard-001:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - agent_vigilo_network
+    restart: "no"
+
+  configure-shard-001:
+    image: postgres:16-alpine
+    command:
+      - sh
+      - -c
+      - |
+        psql "$$DATABASE_URL" -v ON_ERROR_STOP=1 -c "
+          INSERT INTO database_placements (
+            alias,
+            database_url_env,
+            role,
+            status
+          )
+          VALUES (
+            'shard_001',
+            'VIGILO_SHARD_001_DATABASE_URL',
+            'shard',
+            'active'
+          )
+          ON CONFLICT (alias) DO UPDATE
+          SET database_url_env = EXCLUDED.database_url_env,
+              role = EXCLUDED.role,
+              status = EXCLUDED.status,
+              updated_at = now();
+        "
+    environment:
+      DATABASE_URL: ${VIGILO_CONTAINER_DATABASE_URL:-postgresql://postgres:password@postgres:5432/agent_vigilo}
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+      setup-shard-001:
+        condition: service_completed_successfully
+    networks:
+      - agent_vigilo_network
+    restart: "no"
+
+  setup:
+    environment:
+      VIGILO_SHARD_001_DATABASE_URL: ${VIGILO_CONTAINER_SHARD_001_DATABASE_URL:-postgresql://postgres:password@postgres-shard-001:5432/agent_vigilo}
+
+  coordinator:
+    environment:
+      VIGILO_SHARD_001_DATABASE_URL: ${VIGILO_CONTAINER_SHARD_001_DATABASE_URL:-postgresql://postgres:password@postgres-shard-001:5432/agent_vigilo}
+    depends_on:
+      configure-shard-001:
+        condition: service_completed_successfully
+
+  worker:
+    environment:
+      VIGILO_SHARD_001_DATABASE_URL: ${VIGILO_CONTAINER_SHARD_001_DATABASE_URL:-postgresql://postgres:password@postgres-shard-001:5432/agent_vigilo}
+    depends_on:
+      configure-shard-001:
+        condition: service_completed_successfully
+
+volumes:
+  agent_vigilo_db_shard_001_data:
