@@ -43,7 +43,8 @@ const PRIMARY_ALIAS: &str = "primary";
 const SHARD_ALIAS: &str = "shard_001";
 const SHARD_DATABASE_URL_ENV_VALUE: &str = "VIGILO_TEST_SHARD_001_DATABASE_URL";
 const SENTIMENT_EVALUATOR_REF: &str = "vigilo/sentiment-basic-en:0.1.0";
-const SENTIMENT_WASM_PATH: &str = "target/wasm32-wasip2/release/sentiment_basic_en.wasm";
+const SENTIMENT_WASM_PATH_ENV: &str = "VIGILO_E2E_SENTIMENT_WASM_PATH";
+const SENTIMENT_WASM_TARGET_PATH: &str = "wasm32-wasip2/release/sentiment_basic_en.wasm";
 
 #[tokio::test]
 async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
@@ -347,10 +348,11 @@ async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
 }
 
 async fn seed_sentiment_evaluator(primary: &PgPool) -> anyhow::Result<()> {
-    let wasm_bytes = fs::read(SENTIMENT_WASM_PATH).map_err(|err| {
+    let wasm_path = sentiment_wasm_path()?;
+    let wasm_bytes = fs::read(&wasm_path).map_err(|err| {
         anyhow::anyhow!(
             "failed to read {}; build it first with `cargo build -p sentiment-basic-en --target wasm32-wasip2 --release --locked`: {}",
-            SENTIMENT_WASM_PATH,
+            wasm_path.display(),
             err
         )
     })?;
@@ -419,6 +421,51 @@ async fn seed_sentiment_evaluator(primary: &PgPool) -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+fn sentiment_wasm_path() -> anyhow::Result<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(path) = std::env::var(SENTIMENT_WASM_PATH_ENV) {
+        candidates.push(PathBuf::from(path));
+    }
+
+    if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+        candidates.push(Path::new(&target_dir).join(SENTIMENT_WASM_TARGET_PATH));
+    }
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if let Some(workspace_root) = manifest_dir.parent() {
+        candidates.push(
+            workspace_root
+                .join("target")
+                .join(SENTIMENT_WASM_TARGET_PATH),
+        );
+    }
+
+    candidates.push(manifest_dir.join("target").join(SENTIMENT_WASM_TARGET_PATH));
+    candidates.push(Path::new("target").join(SENTIMENT_WASM_TARGET_PATH));
+
+    let mut searched = Vec::new();
+    for candidate in candidates {
+        if searched.iter().any(|path: &PathBuf| path == &candidate) {
+            continue;
+        }
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+        searched.push(candidate);
+    }
+
+    anyhow::bail!(
+        "failed to find sentiment evaluator WASM; build it first with `cargo build -p sentiment-basic-en --target wasm32-wasip2 --release --locked` or set {}. Searched: {}",
+        SENTIMENT_WASM_PATH_ENV,
+        searched
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 async fn configure_shard_placement(primary: &PgPool) -> anyhow::Result<()> {
