@@ -44,6 +44,10 @@ pub(crate) async fn list_active_database_placements(
     Ok(placements)
 }
 
+/// Reads one database placement directly from the authoritative control table.
+///
+/// Runtime admission uses this query for live status and role checks. Connection
+/// parameters remain process-local and are not refreshed by this lookup.
 pub(crate) async fn select_database_placement(
     db: &PgPool,
     alias: &str,

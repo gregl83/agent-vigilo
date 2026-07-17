@@ -275,7 +275,7 @@ mod tests {
             max_connections: 5,
             placement_config: PlacementConfig::default_single_database(),
             cell: OnceCell::new(),
-            placement_catalog: OnceCell::new(),
+            placement_pools: OnceCell::new(),
             shard_placement_cache: new_shard_placement_cache(),
         };
         assert!(database.cell.set(pool).is_ok());

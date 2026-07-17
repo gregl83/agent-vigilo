@@ -2,9 +2,10 @@
 //!
 //! Commands call this module through [`crate::context::Context::db`] when they
 //! first need database access. This context initializes the database service
-//! once, then the service lazily initializes its control pool, placement
-//! catalog, and per-placement pools. The placement catalog lives in the
-//! database; environment variables only provide secret connection values.
+//! once, then the service lazily initializes its control pool and per-placement
+//! pools. Connection parameters remain fixed for the process lifetime, while
+//! placement status and role are read from control storage before new work is
+//! admitted. Environment variables only provide secret connection values.
 //!
 //! Keep topology choices behind DB workflow boundaries. Thin command dispatch,
 //! generic runtime code, and arbitrary domain callers should prefer workflows
@@ -34,6 +35,7 @@ use crate::{
     },
     models::{
         database_placement::{
+            DATABASE_PLACEMENT_STATUS_ACTIVE,
             DEFAULT_DATABASE_URL_ENV,
             DatabasePlacement,
         },
@@ -149,7 +151,7 @@ pub(crate) struct Db {
     pub(crate) placement_config: PlacementConfig,
     pub(crate) cell: OnceCell<PgPool>,
     #[allow(dead_code)]
-    pub(crate) placement_catalog: OnceCell<PlacementCatalog>,
+    pub(crate) placement_pools: OnceCell<PlacementPools>,
     #[allow(dead_code)]
     pub(crate) shard_placement_cache: Cache<ShardPlacementKey, ShardPlacement>,
 }
@@ -161,7 +163,7 @@ impl Db {
             max_connections: config.max_connections,
             placement_config: config.placement_config,
             cell: OnceCell::new(),
-            placement_catalog: OnceCell::new(),
+            placement_pools: OnceCell::new(),
             shard_placement_cache: new_shard_placement_cache(),
         }
     }
@@ -221,22 +223,60 @@ impl Db {
         database_placements::list_active_database_aliases(db).await
     }
 
-    /// Returns a pool for an explicit placement alias.
+    /// Returns a pool for an explicit active placement alias.
     ///
     /// This is an infrastructure hook for router/admin workflows. Most callers
     /// should use a domain workflow or [`Self::execution`] instead of naming a
-    /// placement directly.
+    /// placement directly. Status is read from control storage on every call;
+    /// connection parameters and pools remain fixed for the process lifetime.
     #[allow(dead_code)]
     pub async fn placement(&self, alias: &str) -> anyhow::Result<&PgPool> {
         let started = Instant::now();
         let alias = normalize_alias(alias.to_string(), "database alias")?;
-        let catalog = self.placement_catalog().await?;
-        catalog.require_active_alias(&alias)?;
+        let placement = self.require_active_placement(&alias).await?;
 
-        if alias == self.placement_config.control_database_alias {
+        self.resolve_placement_pool(&placement, started).await
+    }
+
+    /// Returns a pool for an active shard-capable database placement.
+    ///
+    /// Execution workflows use this entry point so a live role change prevents
+    /// new shard work even when a connection pool for the alias already exists.
+    pub(crate) async fn execution_database(&self, alias: &str) -> anyhow::Result<&PgPool> {
+        let started = Instant::now();
+        let alias = normalize_alias(alias.to_string(), "database alias")?;
+        let placement = self.require_active_placement(&alias).await?;
+        require_shard_capable_placement(&placement)?;
+
+        self.resolve_placement_pool(&placement, started).await
+    }
+
+    async fn resolve_placement_pool(
+        &self,
+        placement: &DatabasePlacement,
+        started: Instant,
+    ) -> anyhow::Result<&PgPool> {
+        let pools = self.placement_pools().await?;
+        let Some(pool) = pools.pools_by_alias.get(&placement.alias) else {
+            anyhow::bail!(
+                "database placement alias {} has no process-local connection configuration; restart Vigilo after adding database placements",
+                placement.alias
+            );
+        };
+
+        if pool.database_url_env != placement.database_url_env {
+            anyhow::bail!(
+                "database placement alias {} changed database_url_env from {} to {}; restart Vigilo to load new connection parameters",
+                placement.alias,
+                pool.database_url_env,
+                placement.database_url_env
+            );
+        }
+
+        if placement.alias == self.placement_config.control_database_alias {
             let pool = self.control().await?;
             debug!(
-                database_alias = %alias,
+                database_alias = %placement.alias,
                 placement_pool_acquisition_ms = started.elapsed().as_millis() as u64,
                 pool_source = "control",
                 "resolved database placement pool"
@@ -244,13 +284,9 @@ impl Db {
             return Ok(pool);
         }
 
-        let Some(pool) = catalog.pools_by_alias.get(&alias) else {
-            anyhow::bail!("database placement alias {} is not configured", alias);
-        };
-
-        let pool = pool.get(&alias, self.max_connections).await?;
+        let pool = pool.get(&placement.alias, self.max_connections).await?;
         debug!(
-            database_alias = %alias,
+            database_alias = %placement.alias,
             placement_pool_acquisition_ms = started.elapsed().as_millis() as u64,
             pool_source = "placement",
             "resolved database placement pool"
@@ -265,6 +301,16 @@ impl Db {
         run_id: Uuid,
         run_shard: i16,
     ) -> anyhow::Result<ShardPlacement> {
+        let placement = self.resolve_execution_placement(run_id, run_shard).await?;
+        self.validate_shard_placement_alias(&placement).await?;
+        Ok(placement)
+    }
+
+    async fn resolve_execution_placement(
+        &self,
+        run_id: Uuid,
+        run_shard: i16,
+    ) -> anyhow::Result<ShardPlacement> {
         let started = Instant::now();
         validate_run_shard(run_shard)?;
 
@@ -275,7 +321,6 @@ impl Db {
                 .await?;
 
             if placement.same_route_fence(&current) {
-                self.validate_shard_placement_alias(&placement).await?;
                 debug!(
                     run_id = %run_id,
                     run_shard,
@@ -291,7 +336,6 @@ impl Db {
             }
 
             self.shard_placement_cache.invalidate(&key).await;
-            self.validate_shard_placement_alias(&current).await?;
             debug!(
                 run_id = %run_id,
                 run_shard,
@@ -316,7 +360,6 @@ impl Db {
             .select_control_shard_placement(run_id, run_shard)
             .await?;
 
-        self.validate_shard_placement_alias(&placement).await?;
         debug!(
             run_id = %run_id,
             run_shard,
@@ -341,7 +384,7 @@ impl Db {
     /// not own execution storage should use a workflow that hides this choice.
     #[allow(dead_code)]
     pub async fn execution(&self, run_id: Uuid, run_shard: i16) -> anyhow::Result<&PgPool> {
-        let placement = self.execution_placement(run_id, run_shard).await?;
+        let placement = self.resolve_execution_placement(run_id, run_shard).await?;
 
         if !placement.is_dispatchable() {
             debug!(
@@ -368,7 +411,7 @@ impl Db {
             routing_decision = "dispatchable_execution_pool",
             "resolved dispatchable execution pool"
         );
-        self.placement(&placement.database_alias).await
+        self.execution_database(&placement.database_alias).await
     }
 
     /// Returns all dispatchable execution routes for a run.
@@ -382,7 +425,6 @@ impl Db {
         let mut routed = Vec::with_capacity(placements.len());
 
         for placement in placements {
-            self.validate_shard_placement_alias(&placement).await?;
             if !placement.is_dispatchable() {
                 debug!(
                     run_id = %run_id,
@@ -400,7 +442,10 @@ impl Db {
                 );
             }
 
-            let pool = self.placement(&placement.database_alias).await?.clone();
+            let pool = self
+                .execution_database(&placement.database_alias)
+                .await?
+                .clone();
             debug!(
                 run_id = %run_id,
                 run_shard = placement.run_shard,
@@ -429,8 +474,10 @@ impl Db {
         let mut routed = Vec::with_capacity(placements.len());
 
         for placement in placements {
-            self.validate_shard_placement_alias(&placement).await?;
-            let pool = self.placement(&placement.database_alias).await?.clone();
+            let pool = self
+                .execution_database(&placement.database_alias)
+                .await?
+                .clone();
             debug!(
                 run_id = %run_id,
                 run_shard = placement.run_shard,
@@ -535,8 +582,8 @@ impl Db {
     }
 
     #[allow(dead_code)]
-    async fn placement_catalog(&self) -> anyhow::Result<&PlacementCatalog> {
-        self.placement_catalog
+    async fn placement_pools(&self) -> anyhow::Result<&PlacementPools> {
+        self.placement_pools
             .get_or_try_init(|| async {
                 let db = self.control().await?;
                 let placements = database_placements::list_active_database_placements(db).await?;
@@ -545,7 +592,6 @@ impl Db {
                     anyhow::bail!("database_placements has no active placements");
                 }
 
-                let mut placements_by_alias = HashMap::with_capacity(placements.len());
                 let mut pools_by_alias = HashMap::with_capacity(placements.len());
 
                 for placement in placements {
@@ -553,21 +599,35 @@ impl Db {
                         self.resolve_database_url_env(&placement.database_url_env)?;
                     let alias = placement.alias.clone();
                     pools_by_alias.insert(
-                        alias.clone(),
+                        alias,
                         PlacementPool {
+                            database_url_env: placement.database_url_env,
                             database_url,
                             cell: OnceCell::new(),
                         },
                     );
-                    placements_by_alias.insert(alias, placement);
                 }
 
-                Ok(PlacementCatalog {
-                    placements_by_alias,
-                    pools_by_alias,
-                })
+                Ok(PlacementPools { pools_by_alias })
             })
             .await
+    }
+
+    async fn require_active_placement(&self, alias: &str) -> anyhow::Result<DatabasePlacement> {
+        let db = self.control().await?;
+        let placement = database_placements::select_database_placement(db, alias)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("database placement alias {} was not found", alias))?;
+
+        if placement.status != DATABASE_PLACEMENT_STATUS_ACTIVE {
+            anyhow::bail!(
+                "database placement alias {} has status {}, which is not active",
+                alias,
+                placement.status
+            );
+        }
+
+        Ok(placement)
     }
 
     #[allow(dead_code)]
@@ -575,8 +635,11 @@ impl Db {
         &self,
         placement: &ShardPlacement,
     ) -> anyhow::Result<()> {
-        let catalog = self.placement_catalog().await?;
-        catalog.require_shard_capable_alias(&placement.database_alias)
+        let database_placement = self
+            .require_active_placement(&placement.database_alias)
+            .await?;
+
+        require_shard_capable_placement(&database_placement)
     }
 }
 
@@ -587,38 +650,13 @@ pub(crate) fn new_shard_placement_cache() -> Cache<ShardPlacementKey, ShardPlace
         .build()
 }
 
-pub(crate) struct PlacementCatalog {
-    #[allow(dead_code)]
-    placements_by_alias: HashMap<String, DatabasePlacement>,
+pub(crate) struct PlacementPools {
     #[allow(dead_code)]
     pools_by_alias: HashMap<String, PlacementPool>,
 }
 
-impl PlacementCatalog {
-    #[allow(dead_code)]
-    fn require_active_alias(&self, alias: &str) -> anyhow::Result<&DatabasePlacement> {
-        self.placements_by_alias
-            .get(alias)
-            .ok_or_else(|| anyhow::anyhow!("database placement alias {} is not active", alias))
-    }
-
-    #[allow(dead_code)]
-    fn require_shard_capable_alias(&self, alias: &str) -> anyhow::Result<()> {
-        let placement = self.require_active_alias(alias)?;
-
-        if !placement.is_shard_capable() {
-            anyhow::bail!(
-                "database placement alias {} has role {}, which is not shard-capable",
-                alias,
-                placement.role
-            );
-        }
-
-        Ok(())
-    }
-}
-
 pub(crate) struct PlacementPool {
+    database_url_env: String,
     #[allow(dead_code)]
     database_url: String,
     #[allow(dead_code)]
@@ -677,6 +715,18 @@ fn validate_shard_capable_alias(
             "{}={} points to placement role {}, which is not shard-capable",
             config_name,
             alias,
+            placement.role
+        );
+    }
+
+    Ok(())
+}
+
+fn require_shard_capable_placement(placement: &DatabasePlacement) -> anyhow::Result<()> {
+    if !placement.is_shard_capable() {
+        anyhow::bail!(
+            "database placement alias {} has role {}, which is not shard-capable",
+            placement.alias,
             placement.role
         );
     }
@@ -979,6 +1029,114 @@ mod tests {
 
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
+    async fn placement_rejects_alias_disabled_after_pool_initialization(pool: PgPool) {
+        let context = context_with_control_pool(pool);
+
+        context.placement(DEFAULT_DATABASE_ALIAS).await.unwrap();
+        assert!(context.placement_pools.get().is_some());
+
+        sqlx::query(
+            r#"
+            UPDATE database_placements
+            SET status = 'disabled', updated_at = now()
+            WHERE alias = $1
+            "#,
+        )
+        .bind(DEFAULT_DATABASE_ALIAS)
+        .execute(context.control().await.unwrap())
+        .await
+        .unwrap();
+
+        let error = context.placement(DEFAULT_DATABASE_ALIAS).await.unwrap_err();
+        assert!(error.to_string().contains("status disabled"));
+        assert!(context.placement_pools.get().is_some());
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
+    async fn execution_rejects_live_non_shard_role(pool: PgPool) {
+        let context = context_with_control_pool(pool);
+        let run_id = Uuid::now_v7();
+
+        insert_shard_placement(
+            context.control().await.unwrap(),
+            run_id,
+            7,
+            DEFAULT_DATABASE_ALIAS,
+            SHARD_PLACEMENT_STATUS_ACTIVE,
+        )
+        .await;
+        context.execution(run_id, 7).await.unwrap();
+
+        sqlx::query(
+            r#"
+            UPDATE database_placements
+            SET role = 'control', updated_at = now()
+            WHERE alias = $1
+            "#,
+        )
+        .bind(DEFAULT_DATABASE_ALIAS)
+        .execute(context.control().await.unwrap())
+        .await
+        .unwrap();
+
+        context.placement(DEFAULT_DATABASE_ALIAS).await.unwrap();
+        let error = context.execution(run_id, 7).await.unwrap_err();
+        assert!(error.to_string().contains("role control"));
+        assert!(error.to_string().contains("not shard-capable"));
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
+    async fn placement_requires_restart_for_alias_added_after_pool_initialization(pool: PgPool) {
+        let context = context_with_control_pool(pool);
+        context.placement(DEFAULT_DATABASE_ALIAS).await.unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_late', 'VIGILO_TEST_LATE_SHARD_URL', 'shard', 'active')
+            "#,
+        )
+        .execute(context.control().await.unwrap())
+        .await
+        .unwrap();
+
+        let error = context.placement("shard_late").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no process-local connection configuration")
+        );
+        assert!(error.to_string().contains("restart Vigilo"));
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
+    async fn placement_requires_restart_after_connection_metadata_changes(pool: PgPool) {
+        let context = context_with_control_pool(pool);
+        context.placement(DEFAULT_DATABASE_ALIAS).await.unwrap();
+
+        sqlx::query(
+            r#"
+            UPDATE database_placements
+            SET database_url_env = 'VIGILO_TEST_REPLACED_DATABASE_URL',
+                updated_at = now()
+            WHERE alias = $1
+            "#,
+        )
+        .bind(DEFAULT_DATABASE_ALIAS)
+        .execute(context.control().await.unwrap())
+        .await
+        .unwrap();
+
+        let error = context.placement(DEFAULT_DATABASE_ALIAS).await.unwrap_err();
+        assert!(error.to_string().contains("changed database_url_env"));
+        assert!(error.to_string().contains("restart Vigilo"));
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
     async fn active_placement_with_missing_env_var_fails_clearly(pool: PgPool) {
         let context = context_with_control_pool(pool);
 
@@ -1006,7 +1164,7 @@ mod tests {
             max_connections: 5,
             placement_config: PlacementConfig::default_single_database(),
             cell: OnceCell::new(),
-            placement_catalog: OnceCell::new(),
+            placement_pools: OnceCell::new(),
             shard_placement_cache: new_shard_placement_cache(),
         };
         assert!(context.cell.set(pool).is_ok());

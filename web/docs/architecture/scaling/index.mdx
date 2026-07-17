@@ -61,6 +61,17 @@ There is one active control-capable placement. Additional placements can have
 role `shard` and store execution data. Environment variables hold connection
 secrets; the placement catalog in PostgreSQL is the routing authority.
 
+Placement status and role are checked in control storage before Vigilo admits
+new database work. Disabling a placement therefore blocks new pool lookups
+even when that process already has a pool for the alias. Work that already
+acquired the pool may finish.
+
+Connection parameters are process-lifetime configuration. Adding an alias,
+changing `database_url_env`, changing its URL value, or rotating credentials
+requires the catalog row and secret to be present before the relevant Vigilo
+processes start or restart. Runtime metadata checks do not distribute or reload
+database secrets.
+
 ## Logical Shards
 
 The system uses 128 stable logical shards:
@@ -293,6 +304,8 @@ Implemented today:
   rebalance operations.
 - Control-plane scale hardening through outbox queue indexing and structured
   backlog/timing logs for coordinator and routing hot paths.
+- Live placement admission checks that reject disabled targets and role changes
+  without discarding reusable connection pools.
 - CI coverage for the black-box and runtime multi-database paths: run creation
   to `primary` and `shard_001`, recovery after a remote seed commit, route
   inspection, control-owned cursors, coordinator dispatch, worker execution,
@@ -304,8 +317,8 @@ Intentionally deferred:
 
 - Evaluator metadata replication to execution placements.
 - Broader canonical case-data routing and replication.
-- Placement-catalog refresh in long-running processes and broader
-  shard-isolated coordinator failure handling.
+- Runtime database-secret and connection-parameter refresh.
+- Broader shard-isolated coordinator failure handling.
 
 These are product and operations contracts, not hidden formulas. Until they are
 designed explicitly, routing remains stored, inspectable, and conservative.

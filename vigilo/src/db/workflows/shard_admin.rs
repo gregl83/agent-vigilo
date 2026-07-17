@@ -416,7 +416,9 @@ pub(crate) async fn set_shard_placement(
     if let Some(existing) = &existing {
         let changing_alias = existing.database_alias != database_alias;
         if existing.status == SHARD_PLACEMENT_STATUS_ACTIVE && changing_alias {
-            let source_db = database.placement(&existing.database_alias).await?;
+            let source_db = database
+                .execution_database(&existing.database_alias)
+                .await?;
             let row_count = count_shard_owned_rows(source_db, run_id, run_shard).await?;
             if row_count > 0 {
                 anyhow::bail!(
@@ -631,8 +633,12 @@ pub(crate) async fn verify_shard_rebalance(
     let mut verified_items = Vec::with_capacity(items.len());
 
     for item in items {
-        let source_db = database.placement(&item.source_database_alias).await?;
-        let target_db = database.placement(&item.target_database_alias).await?;
+        let source_db = database
+            .execution_database(&item.source_database_alias)
+            .await?;
+        let target_db = database
+            .execution_database(&item.target_database_alias)
+            .await?;
         let reports = verify_move_tables(
             source_db,
             target_db,
@@ -744,8 +750,8 @@ pub(crate) async fn move_shard_placement(
         );
     }
 
-    let source_db = database.placement(&current.database_alias).await?;
-    let target_db = database.placement(target_database_alias).await?;
+    let source_db = database.execution_database(&current.database_alias).await?;
+    let target_db = database.execution_database(target_database_alias).await?;
     let active_work_count = count_active_shard_work(source_db, run_id, run_shard).await?;
 
     if active_work_count > 0 && !options.force && !options.verify_only {
@@ -2206,7 +2212,7 @@ mod tests {
             max_connections: 5,
             placement_config: PlacementConfig::default_single_database(),
             cell: OnceCell::new(),
-            placement_catalog: OnceCell::new(),
+            placement_pools: OnceCell::new(),
             shard_placement_cache: new_shard_placement_cache(),
         };
         assert!(context.cell.set(pool).is_ok());

@@ -304,7 +304,7 @@ async fn recover_expired_chunk_leases(
     let mut stats = run_dispatch::ChunkLeaseRecoveryStats::default();
 
     for alias in aliases {
-        let db = database.placement(&alias).await?;
+        let db = database.execution_database(&alias).await?;
         let recovery_started = Instant::now();
         let alias_stats = run_dispatch::recover_expired_chunk_leases(
             db,

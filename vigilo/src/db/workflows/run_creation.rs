@@ -538,7 +538,7 @@ async fn seed_execution_placement(
     dataset_cases: &[DatasetVersionCaseDraft],
     chunks: &[RunChunkDraft],
 ) -> anyhow::Result<()> {
-    let db = database.placement(database_alias).await?;
+    let db = database.execution_database(database_alias).await?;
     let mut tx = db.begin().await?;
     run_create::bulk_insert_case_blobs(&mut tx, case_blobs).await?;
     run_create::upsert_dataset_version(

@@ -18,7 +18,7 @@ Quick-search overview of the main modules under `vigilo/src`.
 | `cli::commands::worker` | Worker process modes and chunk execution flow for agent calls and evaluator processing. |
 | `cli::args` | Shared clap value parsers for existing files and directories. |
 | `context` | Lazy process-wide service container for database, HTTP, messaging, output, registry, and Wasm runtime. |
-| `context::database` | Lazy PostgreSQL pool initialization. |
+| `context::database` | Lifetime PostgreSQL connection configuration and lazy pools with live placement status and role admission. |
 | `context::http` | Lazy shared `reqwest` client initialization. |
 | `context::messaging` | Lazy RabbitMQ client initialization. |
 | `context::output` | Structured stdout writer for JSON and TOON command output. |
