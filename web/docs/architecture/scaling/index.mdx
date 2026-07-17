@@ -131,6 +131,9 @@ Coordinator dispatch is route-constrained:
 - The execution placement upserts `run_snapshots`, marks pending chunks
   dispatched, and writes `run.chunk.ready` outbox events.
 - The control cursor is released or marked drained.
+- If an execution placement operation fails, the cursor remains open and that
+  database alias is excluded from the rest of the current dispatch pass.
+  Healthy aliases continue within the same cycle.
 
 Workers stay chunk-local:
 
@@ -145,6 +148,9 @@ Finalization fans in:
 - Each execution placement maintains `run_shard_summaries`.
 - The coordinator reads routed summaries for the run.
 - Control storage writes the global run outcome and emits `run.completed`.
+- A failed placement read defers that run without discarding summaries already
+  read from healthy placements. The run cannot finalize until every routed
+  summary is available and terminal.
 
 Cancellation fans out:
 
@@ -165,7 +171,9 @@ Status and watch reads fan in lightweight progress:
 
 Outbox publication is local to the database where the state changed. Control
 events publish from the control outbox. Execution events publish from the
-execution placement that owns the changed rows.
+execution placement that owns the changed rows. Lease recovery and outbox
+publication iterate placements independently; a failed alias is logged and
+skipped while healthy aliases finish the pass.
 
 ## Control-Plane Scale
 
@@ -175,7 +183,10 @@ Coordinator hot paths emit structured log fields that can be treated as metrics:
 dispatch cursor backlog, finalization candidate backlog, per-placement outbox
 backlog, oldest finalization candidate lag, route resolution timing, pool
 acquisition timing, and stage timings for recovery, dispatch, finalization, and
-outbox publication.
+outbox publication. Each completed cycle also reports unique skipped
+placements, failed placement operations, and retryable versus terminal
+placement errors. Contained failure logs include the database alias, operation,
+error kind, and retryability.
 
 The hot outbox publisher scan is indexed by availability time. Worker runtime
 metadata reads remain centralized for now; evaluator metadata replication is an
@@ -306,19 +317,23 @@ Implemented today:
   backlog/timing logs for coordinator and routing hot paths.
 - Live placement admission checks that reject disabled targets and role changes
   without discarding reusable connection pools.
+- Placement-isolated coordinator recovery, dispatch, finalization reads, and
+  outbox publication with per-cycle failure classification and counters.
 - CI coverage for the black-box and runtime multi-database paths: run creation
   to `primary` and `shard_001`, recovery after a remote seed commit, route
   inspection, control-owned cursors, coordinator dispatch, worker execution,
   finalization, routed cancellation, spread-active assignment for one run,
   shard move, rebalance plan/apply resume/verify, route-version inspection, and
-  prerequisite-copy verification.
+  prerequisite-copy verification. The runtime harness also verifies that an
+  unavailable shard does not stop healthy dispatch, lease recovery, or outbox
+  publication.
 
 Intentionally deferred:
 
 - Evaluator metadata replication to execution placements.
 - Broader canonical case-data routing and replication.
 - Runtime database-secret and connection-parameter refresh.
-- Broader shard-isolated coordinator failure handling.
+- Leased rebalance apply claims and fair multi-candidate finalization scanning.
 
 These are product and operations contracts, not hidden formulas. Until they are
 designed explicitly, routing remains stored, inspectable, and conservative.

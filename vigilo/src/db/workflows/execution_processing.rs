@@ -3194,12 +3194,13 @@ mod tests {
     async fn expired_chunk_recovery_stales_attempt_and_requeues_chunk(pool: PgPool) {
         let seed = seed_running_attempt(&pool, -5, -5).await;
 
-        let stats = run_dispatch::recover_expired_chunk_leases(&pool, 3, 10)
+        let outcome = run_dispatch::recover_expired_chunk_leases(&pool, 3, 10)
             .await
             .unwrap();
 
-        assert_eq!(stats.recovered, 1);
-        assert_eq!(stats.failed, 0);
+        assert_eq!(outcome.stats.recovered, 1);
+        assert_eq!(outcome.stats.failed, 0);
+        assert!(outcome.summary_refresh_errors.is_empty());
 
         let (chunk_status, recovery_count) = sqlx::query_as::<_, (String, i32)>(
             r#"

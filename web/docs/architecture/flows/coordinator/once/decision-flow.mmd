@@ -12,18 +12,26 @@ flowchart TD
     CoordinatorId[Load throughput knobs and generate coordinator id]
     Database{Database context available?}
     RecoverCreation[Resume expired creating runs]
+    RecoveryCatalog{Execution placement catalog available?}
+    RecoveryPlacement{Execution placements remain?}
     Recover[Recover expired chunk leases]
+    RecoveryIsolated[Classify failure, count it, and skip alias]
     DispatchClaim{Dispatchable run-shard cursor claimed?}
     DispatchRun[Start run if needed and enqueue shard chunk window]
+    DispatchIsolated[Leave cursor open and exclude alias for this pass]
     FinalizeClaim{Finalizable run claimed?}
     FinalizeRun[Roll up counts, set gate, and enqueue completion event]
+    FinalizeIsolated[Defer run and retain healthy summary reads]
     Messaging{Messaging context available?}
+    OutboxCatalog{Outbox placement catalog available?}
+    OutboxPlacement{Database placements remain?}
     ClaimOutbox[Claim publishable delivery rows]
     Events{Claimed delivery rows remain?}
     Publish[Publish event to queue with bounded concurrency]
     PublishResult{Publish succeeded?}
     MarkPublished[Mark ledger published and delete delivery row]
     Reschedule[Reschedule delivery row for retry]
+    OutboxIsolated[Classify failure, count it, and skip alias]
     Stats[Log cycle statistics]
 
     Success([Success response])
@@ -40,32 +48,46 @@ flowchart TD
     Database -- No --> ContextFail
     Database -- Yes --> RecoverCreation
 
-    RecoverCreation --> Recover
+    RecoverCreation --> RecoveryCatalog
     RecoverCreation -. Recovery fails .-> RecoveryFail
 
-    Recover --> DispatchClaim
-    Recover -. Recovery fails .-> RecoveryFail
+    RecoveryCatalog -- No --> RecoveryFail
+    RecoveryCatalog -- Yes --> RecoveryPlacement
+    RecoveryPlacement -- Yes --> Recover
+    RecoveryPlacement -- No --> DispatchClaim
+    Recover --> RecoveryPlacement
+    Recover -. Placement operation fails .-> RecoveryIsolated
+    RecoveryIsolated --> RecoveryPlacement
 
     DispatchClaim -- Yes --> DispatchRun
     DispatchClaim -- No or batch limit reached --> FinalizeClaim
 
     DispatchRun --> DispatchClaim
-    DispatchRun -. Update fails .-> DispatchFail
+    DispatchRun -. Execution placement fails .-> DispatchIsolated
+    DispatchRun -. Control update fails .-> DispatchFail
+    DispatchIsolated --> DispatchClaim
 
     FinalizeClaim -- Yes --> FinalizeRun
     FinalizeClaim -- No or batch limit reached --> Messaging
 
     FinalizeRun --> FinalizeClaim
-    FinalizeRun -. Update fails .-> FinalizeFail
+    FinalizeRun -. Placement summary read fails .-> FinalizeIsolated
+    FinalizeRun -. Control update fails .-> FinalizeFail
+    FinalizeIsolated --> Messaging
 
     Messaging -- No --> ContextFail
-    Messaging -- Yes --> ClaimOutbox
+    Messaging -- Yes --> OutboxCatalog
+
+    OutboxCatalog -- No --> OutboxFail
+    OutboxCatalog -- Yes --> OutboxPlacement
+    OutboxPlacement -- Yes --> ClaimOutbox
+    OutboxPlacement -- No --> Stats
 
     ClaimOutbox --> Events
-    ClaimOutbox -. Claim fails .-> OutboxFail
+    ClaimOutbox -. Placement operation fails .-> OutboxIsolated
 
     Events -- Yes --> Publish
-    Events -- No --> Stats
+    Events -- No --> OutboxPlacement
 
     Publish --> PublishResult
 
@@ -73,15 +95,17 @@ flowchart TD
     PublishResult -- No --> Reschedule
 
     MarkPublished --> Events
-    MarkPublished -. Update fails .-> OutboxFail
+    MarkPublished -. Placement operation fails .-> OutboxIsolated
 
     Reschedule --> Events
-    Reschedule -. Update fails .-> OutboxFail
+    Reschedule -. Placement operation fails .-> OutboxIsolated
+
+    OutboxIsolated --> OutboxPlacement
 
     Stats --> Success
 
     class Start command
     class Success success
-    class CoordinatorId,Database,RecoverCreation,Recover,DispatchClaim,DispatchRun,FinalizeClaim,FinalizeRun,Messaging,ClaimOutbox,Events,PublishResult,MarkPublished,Reschedule,Stats system
+    class CoordinatorId,Database,RecoverCreation,RecoveryCatalog,RecoveryPlacement,Recover,RecoveryIsolated,DispatchClaim,DispatchRun,DispatchIsolated,FinalizeClaim,FinalizeRun,FinalizeIsolated,Messaging,OutboxCatalog,OutboxPlacement,ClaimOutbox,Events,PublishResult,MarkPublished,Reschedule,OutboxIsolated,Stats system
     class Publish component
     class ContextFail,RecoveryFail,DispatchFail,FinalizeFail,OutboxFail error

@@ -232,6 +232,80 @@ async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
         2
     );
 
+    let isolation_config = IntegrationConfig {
+        mq_namespace: format!("{}-phase26", config.mq_namespace),
+        ..config.clone()
+    };
+    let unavailable_run_id = create_run(
+        &isolation_config,
+        RunCreateInput {
+            default_execution_alias: SHARD_ALIAS,
+            shard_assignment_policy: "single-default",
+            agent_url: &agent.url,
+            profile_id: "e2e_unavailable_shard",
+            case_count: 1,
+            case_mode: CaseMode::Passing,
+            evaluator_ref: SENTIMENT_EVALUATOR_REF,
+        },
+    )?;
+    let healthy_run_id = create_run(
+        &isolation_config,
+        RunCreateInput {
+            default_execution_alias: PRIMARY_ALIAS,
+            shard_assignment_policy: "single-default",
+            agent_url: &agent.url,
+            profile_id: "e2e_healthy_placement",
+            case_count: 1,
+            case_mode: CaseMode::Passing,
+            evaluator_ref: SENTIMENT_EVALUATOR_REF,
+        },
+    )?;
+    age_dispatch_cursor(&primary, unavailable_run_id).await?;
+    let unavailable_config = IntegrationConfig {
+        shard_url: unavailable_postgres_url()?,
+        ..isolation_config.clone()
+    };
+
+    run_vigilo_ok(
+        &unavailable_config,
+        PRIMARY_ALIAS,
+        "single-default",
+        ["coordinator", "--max-dispatch-per-cycle", "1", "once"],
+    )?;
+    assert_eq!(
+        dispatch_cursor_status_count(&primary, unavailable_run_id, "open").await?,
+        1,
+        "a failed execution write must leave its control cursor retryable"
+    );
+    assert_eq!(
+        dispatch_cursor_status_count(&primary, healthy_run_id, "drained").await?,
+        1,
+        "dispatch must continue on healthy placements after excluding the failed alias"
+    );
+    assert_eq!(
+        published_outbox_event_count(&primary, healthy_run_id, "run.chunk.ready").await?,
+        1,
+        "the healthy placement outbox must still publish"
+    );
+
+    expire_chunk_lease(&primary, healthy_run_id).await?;
+    run_vigilo_ok(
+        &unavailable_config,
+        PRIMARY_ALIAS,
+        "single-default",
+        ["coordinator", "--max-dispatch-per-cycle", "1", "once"],
+    )?;
+    assert_eq!(
+        run_chunk_recovery_state(&primary, healthy_run_id).await?,
+        ("pending".to_string(), 1),
+        "lease recovery must continue on the healthy placement"
+    );
+    assert_eq!(
+        published_outbox_event_count(&primary, healthy_run_id, "run.chunk.ready").await?,
+        2,
+        "the recovery event must publish despite the unavailable shard"
+    );
+
     let failing_run_id = create_run(
         &config,
         RunCreateInput {
@@ -363,6 +437,13 @@ impl MockAgent {
             url: format!("http://{addr}/v1/agent/invoke"),
         })
     }
+}
+
+fn unavailable_postgres_url() -> anyhow::Result<String> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    drop(listener);
+    Ok(format!("postgres://vigilo@{address}/vigilo"))
 }
 
 fn handle_agent_request(mut stream: TcpStream) -> anyhow::Result<()> {
@@ -591,6 +672,36 @@ async fn expire_run_creation_lease(primary: &PgPool, run_id: Uuid) -> anyhow::Re
         SET coordinator_leased_until = now() - interval '1 second'
         WHERE id = $1::uuid
           AND status = 'creating'::run_status
+        "#,
+    )
+    .bind(run_id)
+    .execute(primary)
+    .await?;
+    Ok(())
+}
+
+async fn age_dispatch_cursor(primary: &PgPool, run_id: Uuid) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE run_shard_dispatch_cursors
+        SET updated_at = now() - interval '1 hour'
+        WHERE run_id = $1::uuid
+        "#,
+    )
+    .bind(run_id)
+    .execute(primary)
+    .await?;
+    Ok(())
+}
+
+async fn expire_chunk_lease(primary: &PgPool, run_id: Uuid) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE run_chunks
+        SET status = 'leased',
+            leased_until = now() - interval '1 second',
+            updated_at = now()
+        WHERE run_id = $1::uuid
         "#,
     )
     .bind(run_id)
@@ -999,6 +1110,19 @@ async fn run_chunk_status_count(db: &PgPool, run_id: Uuid, status: &str) -> anyh
     .await?)
 }
 
+async fn run_chunk_recovery_state(db: &PgPool, run_id: Uuid) -> anyhow::Result<(String, i32)> {
+    Ok(sqlx::query_as::<_, (String, i32)>(
+        r#"
+        SELECT status, recovery_count
+        FROM run_chunks
+        WHERE run_id = $1::uuid
+        "#,
+    )
+    .bind(run_id)
+    .fetch_one(db)
+    .await?)
+}
+
 async fn dispatch_cursor_status_count(
     db: &PgPool,
     run_id: Uuid,
@@ -1025,6 +1149,26 @@ async fn outbox_event_count(db: &PgPool, run_id: Uuid, event_type: &str) -> anyh
         FROM outbox_events
         WHERE aggregate_id = $1::uuid
           AND event_type = $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(event_type)
+    .fetch_one(db)
+    .await?)
+}
+
+async fn published_outbox_event_count(
+    db: &PgPool,
+    run_id: Uuid,
+    event_type: &str,
+) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM outbox_events
+        WHERE aggregate_id = $1::uuid
+          AND event_type = $2
+          AND status = 'published'::outbox_status
         "#,
     )
     .bind(run_id)

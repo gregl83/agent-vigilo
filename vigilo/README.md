@@ -14,7 +14,7 @@ Quick-search overview of the main modules under `vigilo/src`.
 | `cli::commands::setup` | Applies database migrations and optionally publishes built-in evaluators. |
 | `cli::commands::evaluators` | Publish, search, show, test, and state-management commands for evaluator registry entries. |
 | `cli::commands::run` | Run creation, validation, status, watch, cancellation, result summary, and export commands. |
-| `cli::commands::coordinator` | Coordinator process modes and orchestration cycle for creation recovery, dispatch, finalization, and outbox publishing. |
+| `cli::commands::coordinator` | Coordinator process modes, orchestration cycle, and placement-scoped failure handling for creation recovery, dispatch, finalization, and outbox publishing. |
 | `cli::commands::worker` | Worker process modes and chunk execution flow for agent calls and evaluator processing. |
 | `cli::args` | Shared clap value parsers for existing files and directories. |
 | `context` | Lazy process-wide service container for database, HTTP, messaging, output, registry, and Wasm runtime. |

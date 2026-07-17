@@ -182,7 +182,10 @@ impl Db {
                     .max_connections(self.max_connections)
                     .connect(&self.uri)
                     .await
-                    .map_err(|e| anyhow::anyhow!("database connection failed: {}", e))
+                    .map_err(|error| {
+                        let message = format!("database connection failed: {error}");
+                        anyhow::Error::new(error).context(message)
+                    })
             })
             .await
             .inspect(|_| {
@@ -420,8 +423,7 @@ impl Db {
         &self,
         run_id: Uuid,
     ) -> anyhow::Result<Vec<(i16, String, PgPool)>> {
-        let db = self.control().await?;
-        let placements = shard_placements::list_shard_placements_for_run(db, run_id).await?;
+        let placements = self.execution_placements_for_run(run_id).await?;
         let mut routed = Vec::with_capacity(placements.len());
 
         for placement in placements {
@@ -458,6 +460,19 @@ impl Db {
         }
 
         Ok(routed)
+    }
+
+    /// Returns stored execution placement rows without resolving their pools.
+    ///
+    /// Placement-scoped coordinator passes use this to open and inspect each
+    /// database independently, so one unavailable target does not discard
+    /// successful reads from other placements.
+    pub(crate) async fn execution_placements_for_run(
+        &self,
+        run_id: Uuid,
+    ) -> anyhow::Result<Vec<ShardPlacement>> {
+        let db = self.control().await?;
+        shard_placements::list_shard_placements_for_run(db, run_id).await
     }
 
     /// Returns all readable execution routes for a run.
@@ -674,8 +689,10 @@ impl PlacementPool {
                     .max_connections(max_connections)
                     .connect(&self.database_url)
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("database placement {} connection failed: {}", alias, e)
+                    .map_err(|error| {
+                        let message =
+                            format!("database placement {alias} connection failed: {error}");
+                        anyhow::Error::new(error).context(message)
                     })
             })
             .await

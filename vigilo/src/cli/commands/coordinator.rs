@@ -5,10 +5,14 @@
 //! - atomically starts fully created runs and dispatches chunk-ready windows
 //! - finalizes runs whose chunks/executions are terminal
 //! - publishes outbox events from active database placements to messaging
+//! - contains placement-scoped database failures so healthy aliases continue
 
-use std::time::{
-    Duration,
-    Instant,
+use std::{
+    collections::BTreeMap,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use async_trait::async_trait;
@@ -49,6 +53,14 @@ use crate::{
 
 mod once;
 mod start;
+
+use placement::{
+    Failure as PlacementOperationFailure,
+    FailureStats as PlacementFailureStats,
+    PlacementAware,
+    record_failure as record_placement_failure,
+    run_operations as run_placement_operations,
+};
 
 const COORDINATOR_TICK_SECONDS: u64 = 5;
 const COORDINATOR_LEASE_SECONDS: i32 = 60;
@@ -224,19 +236,19 @@ async fn run_coordinator_cycle(
     // Recovery runs before new dispatch so dead workers do not block
     // finalization or leave ready work stranded.
     let recovery_started = Instant::now();
-    let recovery_stats = recover_expired_chunk_leases(database, coordinator_id, config).await?;
+    let recovery = recover_expired_chunk_leases(database, coordinator_id, config).await?;
     let recovery_ms = recovery_started.elapsed().as_millis() as u64;
 
     // --- Dispatch runnable chunk windows ---
     // Dispatch is drained before finalization so newly-created work gets
     // surfaced promptly.
     let dispatch_started = Instant::now();
-    let dispatch_count = drain_dispatch_batch(database, coordinator_id, config).await?;
+    let dispatch = drain_dispatch_batch(database, coordinator_id, config).await?;
     let dispatch_ms = dispatch_started.elapsed().as_millis() as u64;
 
     // --- Finalize terminal runs ---
     let finalization_started = Instant::now();
-    let finalized_count = drain_finalize_batch(database, coordinator_id, config).await?;
+    let finalization = drain_finalize_batch(database, coordinator_id, config).await?;
     let finalization_ms = finalization_started.elapsed().as_millis() as u64;
 
     // --- Publish durable outbox events ---
@@ -253,27 +265,37 @@ async fn run_coordinator_cycle(
         retry_delay_seconds: config.outbox_retry_delay_seconds,
     };
     let outbox_started = Instant::now();
-    let publish_stats =
+    let publication =
         publish_outbox_events(database, &publisher, &outbox_config, coordinator_id).await?;
     let outbox_publish_ms = outbox_started.elapsed().as_millis() as u64;
+
+    let mut placement_failures = PlacementFailureStats::default();
+    placement_failures.merge(recovery.failures);
+    placement_failures.merge(dispatch.failures);
+    placement_failures.merge(finalization.failures);
+    placement_failures.merge(publication.failures);
     info!(
         run_creations_claimed = creation_recovery.claimed,
         run_creations_completed = creation_recovery.completed,
         run_creations_deferred = creation_recovery.deferred,
         run_creations_failed = creation_recovery.failed,
         creation_recovery_ms,
-        expired_chunk_leases_recovered = recovery_stats.recovered,
-        expired_chunk_leases_failed = recovery_stats.failed,
+        expired_chunk_leases_recovered = recovery.output.recovered,
+        expired_chunk_leases_failed = recovery.output.failed,
         recovery_ms,
-        dispatch_windows_prepared = dispatch_count,
+        dispatch_windows_prepared = dispatch.output,
         dispatch_ms,
-        runs_finalized = finalized_count,
+        runs_finalized = finalization.output,
         finalization_ms,
-        outbox_events_claimed = publish_stats.claimed,
-        outbox_events_published = publish_stats.published,
-        outbox_events_failed = publish_stats.failed,
-        outbox_stale_claims = publish_stats.stale_claims,
+        outbox_events_claimed = publication.output.claimed,
+        outbox_events_published = publication.output.published,
+        outbox_events_failed = publication.output.failed,
+        outbox_stale_claims = publication.output.stale_claims,
         outbox_publish_ms,
+        skipped_placements = placement_failures.skipped_placement_count(),
+        failed_placement_operations = placement_failures.failed_operation_count(),
+        retryable_placement_errors = placement_failures.retryable_error_count(),
+        terminal_placement_errors = placement_failures.terminal_error_count(),
         coordinator_cycle_ms = cycle_started.elapsed().as_millis() as u64,
         "completed coordinator cycle"
     );
@@ -287,7 +309,7 @@ async fn recover_expired_chunk_leases(
     database: &database::Db,
     coordinator_id: Uuid,
     config: &CoordinatorRuntimeConfig,
-) -> anyhow::Result<run_dispatch::ChunkLeaseRecoveryStats> {
+) -> anyhow::Result<PlacementAware<run_dispatch::ChunkLeaseRecoveryStats>> {
     // --- Expired lease recovery pass ---
     // The workflow returns both recovered chunks and chunks failed after
     // exhausting recovery attempts.
@@ -301,19 +323,23 @@ async fn recover_expired_chunk_leases(
         active_execution_alias_list_ms = alias_list_started.elapsed().as_millis() as u64,
         "listed active execution placements for recovery"
     );
-    let mut stats = run_dispatch::ChunkLeaseRecoveryStats::default();
-
-    for alias in aliases {
+    let batch = run_placement_operations(aliases, |alias| async move {
         let db = database.execution_database(&alias).await?;
         let recovery_started = Instant::now();
-        let alias_stats = run_dispatch::recover_expired_chunk_leases(
+        let outcome = run_dispatch::recover_expired_chunk_leases(
             db,
             config.chunk_lease_max_recoveries,
             config.chunk_lease_recovery_batch_size,
         )
         .await?;
-        let recovery_ms = recovery_started.elapsed().as_millis() as u64;
+        Ok((outcome, recovery_started.elapsed().as_millis() as u64))
+    })
+    .await;
 
+    let mut stats = run_dispatch::ChunkLeaseRecoveryStats::default();
+    let mut failures = PlacementFailureStats::default();
+    for (alias, (outcome, recovery_ms)) in batch.completed {
+        let alias_stats = outcome.stats;
         stats.recovered += alias_stats.recovered;
         stats.failed += alias_stats.failed;
 
@@ -334,6 +360,24 @@ async fn recover_expired_chunk_leases(
                 "no expired chunk leases recovered for execution placement"
             );
         }
+
+        for error in outcome.summary_refresh_errors {
+            record_placement_failure(
+                &mut failures,
+                coordinator_id,
+                "lease_recovery_summary_refresh",
+                PlacementOperationFailure::new(alias.clone(), error),
+            );
+        }
+    }
+
+    for failure in batch.failed {
+        record_placement_failure(
+            &mut failures,
+            coordinator_id,
+            "chunk_lease_recovery",
+            failure,
+        );
     }
 
     if stats.recovered == 0 && stats.failed == 0 {
@@ -350,32 +394,49 @@ async fn recover_expired_chunk_leases(
         );
     }
 
-    Ok(stats)
+    Ok(PlacementAware {
+        output: stats,
+        failures,
+    })
 }
 
 async fn drain_dispatch_batch(
     database: &database::Db,
     coordinator_id: Uuid,
     config: &CoordinatorRuntimeConfig,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<PlacementAware<usize>> {
     // --- Dispatch drain pass ---
     // Repeatedly claim one dispatchable run/window until the cycle limit is
     // reached or no pending dispatch work remains.
     debug!(coordinator_id = %coordinator_id, "draining dispatchable run-shard windows");
 
     let mut dispatched = 0usize;
-    let mut dispatched_by_alias = std::collections::BTreeMap::<String, usize>::new();
+    let mut dispatched_by_alias = BTreeMap::<String, usize>::new();
+    let mut failures = PlacementFailureStats::default();
     let control_db = database.control().await?;
+    // A failed alias is excluded after one attempt, so this allowance keeps
+    // placement failures from reducing the successful-window budget.
+    let placement_failure_allowance = database.active_execution_database_aliases().await?.len();
+    let dispatch_attempt_limit = config
+        .max_dispatch_per_cycle
+        .saturating_add(placement_failure_allowance);
     let dispatch_backlog = run_dispatch::count_dispatch_cursor_backlog(control_db).await?;
     info!(
         coordinator_id = %coordinator_id,
         dispatch_cursor_backlog = dispatch_backlog,
         dispatch_cycle_limit = config.max_dispatch_per_cycle,
+        dispatch_attempt_limit,
         "measured dispatch cursor backlog"
     );
-    for _ in 0..config.max_dispatch_per_cycle {
+    for _ in 0..dispatch_attempt_limit {
+        if dispatched >= config.max_dispatch_per_cycle {
+            break;
+        }
         let select_started = Instant::now();
-        let Some(route) = run_dispatch::select_next_dispatch_route(control_db).await? else {
+        let excluded_aliases = failures.excluded_aliases();
+        let Some(route) =
+            run_dispatch::select_next_dispatch_route(control_db, &excluded_aliases).await?
+        else {
             break;
         };
         let dispatch_route_select_ms = select_started.elapsed().as_millis() as u64;
@@ -404,19 +465,50 @@ async fn drain_dispatch_batch(
         };
 
         let execution_pool_started = Instant::now();
-        let execution_db = database.execution(route.run_id, route.run_shard).await?;
+        let execution_db = match database.execution(route.run_id, route.run_shard).await {
+            Ok(db) => db,
+            Err(error) => {
+                record_placement_failure(
+                    &mut failures,
+                    coordinator_id,
+                    "dispatch_execution_pool",
+                    PlacementOperationFailure::new(database_alias, error),
+                );
+                continue;
+            }
+        };
         let execution_pool_resolution_ms = execution_pool_started.elapsed().as_millis() as u64;
         let dispatch_started = Instant::now();
-        let Some(run) = run_dispatch::dispatch_routed_run_window(
+        let dispatch_result = run_dispatch::dispatch_routed_run_window(
             control_db,
             execution_db,
             config.run_chunk_dispatch_window_size,
             &route,
             &snapshot,
         )
-        .await?
-        else {
-            continue;
+        .await;
+        let (run, shard_summary_refreshed) = match dispatch_result {
+            Ok(Some(run)) => (run, true),
+            Ok(None) => continue,
+            Err(run_dispatch::RoutedDispatchError::ExecutionWrite(error)) => {
+                record_placement_failure(
+                    &mut failures,
+                    coordinator_id,
+                    "dispatch_execution_write",
+                    PlacementOperationFailure::new(database_alias, error),
+                );
+                continue;
+            }
+            Err(run_dispatch::RoutedDispatchError::SummaryRefresh { dispatched, source }) => {
+                record_placement_failure(
+                    &mut failures,
+                    coordinator_id,
+                    "dispatch_summary_refresh",
+                    PlacementOperationFailure::new(database_alias.clone(), source),
+                );
+                (dispatched, false)
+            }
+            Err(error) => return Err(error.into()),
         };
         let dispatch_window_ms = dispatch_started.elapsed().as_millis() as u64;
 
@@ -440,6 +532,7 @@ async fn drain_dispatch_batch(
             chunk_events_enqueued = run.chunk_events_enqueued,
             chunks_marked_dispatched = run.chunks_marked_dispatched,
             run_started_events_enqueued = run.run_started_events_enqueued,
+            shard_summary_refreshed,
             execution_pool_resolution_ms,
             dispatch_window_ms,
             "prepared bounded dispatch shard window"
@@ -464,7 +557,10 @@ async fn drain_dispatch_batch(
         }
     }
 
-    Ok(dispatched)
+    Ok(PlacementAware {
+        output: dispatched,
+        failures,
+    })
 }
 
 async fn publish_outbox_events(
@@ -472,7 +568,7 @@ async fn publish_outbox_events(
     publisher: &dyn EventPublisher,
     config: &OutboxPublisherConfig,
     coordinator_id: Uuid,
-) -> anyhow::Result<OutboxPublishStats> {
+) -> anyhow::Result<PlacementAware<OutboxPublishStats>> {
     let alias_list_started = Instant::now();
     let aliases = database.active_outbox_database_aliases().await?;
     debug!(
@@ -481,9 +577,7 @@ async fn publish_outbox_events(
         active_outbox_alias_list_ms = alias_list_started.elapsed().as_millis() as u64,
         "listed active outbox placements"
     );
-    let mut stats = OutboxPublishStats::default();
-
-    for alias in aliases {
+    let batch = run_placement_operations(aliases, |alias| async move {
         let db = database.placement(&alias).await?;
         let backlog_started = Instant::now();
         let outbox_backlog = outbox_events::count_publishable_outbox_backlog(db).await?;
@@ -491,7 +585,19 @@ async fn publish_outbox_events(
         let publish_started = Instant::now();
         let alias_stats = publish_pending_events(db, publisher, config).await?;
         let outbox_publish_ms = publish_started.elapsed().as_millis() as u64;
+        Ok((
+            alias_stats,
+            outbox_backlog,
+            outbox_backlog_query_ms,
+            outbox_publish_ms,
+        ))
+    })
+    .await;
 
+    let mut stats = OutboxPublishStats::default();
+    for (alias, (alias_stats, outbox_backlog, outbox_backlog_query_ms, outbox_publish_ms)) in
+        batch.completed
+    {
         stats.claimed += alias_stats.claimed;
         stats.published += alias_stats.published;
         stats.failed += alias_stats.failed;
@@ -522,20 +628,29 @@ async fn publish_outbox_events(
         }
     }
 
-    Ok(stats)
+    let mut failures = PlacementFailureStats::default();
+    for failure in batch.failed {
+        record_placement_failure(&mut failures, coordinator_id, "outbox_publication", failure);
+    }
+
+    Ok(PlacementAware {
+        output: stats,
+        failures,
+    })
 }
 
 async fn drain_finalize_batch(
     database: &database::Db,
     coordinator_id: Uuid,
     config: &CoordinatorRuntimeConfig,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<PlacementAware<usize>> {
     // --- Finalization drain pass ---
     // Repeatedly claim one finalizable run until the cycle limit is reached or
     // no run has all chunks terminal.
     debug!(coordinator_id = %coordinator_id, "draining finalizable runs");
 
     let mut finalized = 0usize;
+    let mut failures = PlacementFailureStats::default();
     let control_db = database.control().await?;
     let finalization_backlog =
         run_finalize::select_finalization_candidate_backlog(control_db).await?;
@@ -554,12 +669,19 @@ async fn drain_finalize_batch(
         };
         let finalization_candidate_select_ms = select_started.elapsed().as_millis() as u64;
 
-        let summaries = collect_run_shard_summaries(database, run.id).await?;
-        if summaries.is_empty() || summaries.iter().any(|summary| !summary.is_terminal()) {
+        let collection = collect_run_shard_summaries(database, coordinator_id, run.id).await?;
+        let placement_failure_count = collection.failures.failed_operation_count();
+        failures.merge(collection.failures);
+        let summaries = collection.output.summaries;
+        if !collection.output.complete
+            || summaries.is_empty()
+            || summaries.iter().any(|summary| !summary.is_terminal())
+        {
             debug!(
                 run_id = %run.id,
                 run_key = %run.run_key,
                 shard_summary_count = summaries.len(),
+                failed_placement_operations = placement_failure_count,
                 finalization_candidate_select_ms,
                 "finalization candidate is waiting for terminal shard summaries"
             );
@@ -614,51 +736,440 @@ async fn drain_finalize_batch(
         );
     }
 
-    Ok(finalized)
+    Ok(PlacementAware {
+        output: finalized,
+        failures,
+    })
+}
+
+#[derive(Debug)]
+struct RunShardSummaryCollection {
+    summaries: Vec<run_shard_summary::RunShardSummary>,
+    complete: bool,
 }
 
 async fn collect_run_shard_summaries(
     database: &database::Db,
+    coordinator_id: Uuid,
     run_id: Uuid,
-) -> anyhow::Result<Vec<run_shard_summary::RunShardSummary>> {
-    let routes = database.execution_routes_for_run(run_id).await?;
-    let mut summaries = Vec::with_capacity(routes.len());
-    let mut summaries_by_alias = std::collections::BTreeMap::<String, usize>::new();
-
-    for (run_shard, alias, db) in routes {
-        let Some(summary) =
-            run_shard_summary::select_run_shard_summary(&db, run_id, run_shard).await?
-        else {
-            debug!(
-                run_id = %run_id,
-                run_shard,
-                database_alias = %alias,
-                "run shard summary is not available yet"
-            );
-            return Ok(Vec::new());
-        };
-
-        debug!(
-            run_id = %summary.run_id,
-            run_shard = summary.run_shard,
-            database_alias = %alias,
-            status = %summary.status,
-            terminal_execution_count = summary.terminal_execution_count,
-            expected_execution_count = summary.expected_execution_count,
-            "loaded run shard summary for finalization"
-        );
-        *summaries_by_alias.entry(alias).or_default() += 1;
-        summaries.push(summary);
+) -> anyhow::Result<PlacementAware<RunShardSummaryCollection>> {
+    let placements = database.execution_placements_for_run(run_id).await?;
+    let mut placements_by_alias = BTreeMap::new();
+    for placement in placements {
+        placements_by_alias
+            .entry(placement.database_alias.clone())
+            .or_insert_with(Vec::new)
+            .push(placement);
     }
 
-    for (alias, count) in summaries_by_alias {
+    let aliases = placements_by_alias.keys().cloned().collect::<Vec<_>>();
+    let batch = run_placement_operations(aliases, |alias| {
+        let placements = placements_by_alias.get(&alias).cloned().unwrap_or_default();
+        async move {
+            let db = database.execution_database(&alias).await?;
+            let mut summaries = Vec::with_capacity(placements.len());
+            let mut complete = true;
+
+            for placement in placements {
+                if !placement.is_dispatchable() {
+                    return Err(
+                        database::ExecutionRouteError::NonDispatchableShardPlacement {
+                            run_id,
+                            run_shard: placement.run_shard,
+                            status: placement.status,
+                        }
+                        .into(),
+                    );
+                }
+
+                let Some(summary) =
+                    run_shard_summary::select_run_shard_summary(db, run_id, placement.run_shard)
+                        .await?
+                else {
+                    complete = false;
+                    debug!(
+                        run_id = %run_id,
+                        run_shard = placement.run_shard,
+                        database_alias = %alias,
+                        "run shard summary is not available yet"
+                    );
+                    continue;
+                };
+
+                debug!(
+                    run_id = %summary.run_id,
+                    run_shard = summary.run_shard,
+                    database_alias = %alias,
+                    status = %summary.status,
+                    terminal_execution_count = summary.terminal_execution_count,
+                    expected_execution_count = summary.expected_execution_count,
+                    "loaded run shard summary for finalization"
+                );
+                summaries.push(summary);
+            }
+
+            Ok((summaries, complete))
+        }
+    })
+    .await;
+
+    let mut summaries = Vec::new();
+    let mut complete = true;
+    for (alias, (mut alias_summaries, alias_complete)) in batch.completed {
         debug!(
             run_id = %run_id,
             database_alias = %alias,
-            shard_summaries_loaded = count,
+            shard_summaries_loaded = alias_summaries.len(),
             "loaded routed shard summaries for finalization from execution placement"
+        );
+        complete &= alias_complete;
+        summaries.append(&mut alias_summaries);
+    }
+
+    let mut failures = PlacementFailureStats::default();
+    for failure in batch.failed {
+        complete = false;
+        record_placement_failure(
+            &mut failures,
+            coordinator_id,
+            "finalization_summary_read",
+            failure,
         );
     }
 
-    Ok(summaries)
+    Ok(PlacementAware {
+        output: RunShardSummaryCollection {
+            summaries,
+            complete,
+        },
+        failures,
+    })
+}
+
+/// Placement-scoped work-unit support for the coordinator cycle.
+///
+/// Operations retain independent outcomes but own neither transaction nor
+/// retry policy. Control operations stay outside this module and remain hard
+/// cycle boundaries.
+///
+/// This stays inline so files under `commands/coordinator/` continue to map to
+/// actual coordinator subcommands while batching and classification retain a
+/// focused private namespace.
+mod placement {
+    use std::{
+        collections::BTreeSet,
+        future::Future,
+    };
+
+    use tracing::warn;
+    use uuid::Uuid;
+
+    use crate::context::database;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ErrorKind {
+        DatabaseUnavailable,
+        DatabaseContention,
+        DatabaseContract,
+        RouteState,
+        PlacementConfiguration,
+    }
+
+    impl ErrorKind {
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::DatabaseUnavailable => "database_unavailable",
+                Self::DatabaseContention => "database_contention",
+                Self::DatabaseContract => "database_contract",
+                Self::RouteState => "route_state",
+                Self::PlacementConfiguration => "placement_configuration",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ErrorClassification {
+        kind: ErrorKind,
+        retryable: bool,
+    }
+
+    #[derive(Debug)]
+    pub(super) struct Failure {
+        database_alias: String,
+        error: anyhow::Error,
+        classification: ErrorClassification,
+    }
+
+    impl Failure {
+        pub(super) fn new(database_alias: String, error: anyhow::Error) -> Self {
+            let classification = classify_error(&error);
+            Self {
+                database_alias,
+                error,
+                classification,
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub(super) struct OperationBatch<T> {
+        pub(super) completed: Vec<(String, T)>,
+        pub(super) failed: Vec<Failure>,
+    }
+
+    #[derive(Debug, Default)]
+    pub(super) struct FailureStats {
+        skipped_database_aliases: BTreeSet<String>,
+        failed_operations: usize,
+        retryable_errors: usize,
+        terminal_errors: usize,
+    }
+
+    impl FailureStats {
+        fn record(&mut self, failure: &Failure) {
+            self.skipped_database_aliases
+                .insert(failure.database_alias.clone());
+            self.failed_operations += 1;
+            if failure.classification.retryable {
+                self.retryable_errors += 1;
+            } else {
+                self.terminal_errors += 1;
+            }
+        }
+
+        pub(super) fn merge(&mut self, other: Self) {
+            self.skipped_database_aliases
+                .extend(other.skipped_database_aliases);
+            self.failed_operations += other.failed_operations;
+            self.retryable_errors += other.retryable_errors;
+            self.terminal_errors += other.terminal_errors;
+        }
+
+        pub(super) fn excluded_aliases(&self) -> Vec<String> {
+            self.skipped_database_aliases.iter().cloned().collect()
+        }
+
+        pub(super) fn skipped_placement_count(&self) -> usize {
+            self.skipped_database_aliases.len()
+        }
+
+        pub(super) fn failed_operation_count(&self) -> usize {
+            self.failed_operations
+        }
+
+        pub(super) fn retryable_error_count(&self) -> usize {
+            self.retryable_errors
+        }
+
+        pub(super) fn terminal_error_count(&self) -> usize {
+            self.terminal_errors
+        }
+    }
+
+    #[derive(Debug)]
+    pub(super) struct PlacementAware<T> {
+        pub(super) output: T,
+        pub(super) failures: FailureStats,
+    }
+
+    /// Runs independent placement work sequentially and retains every outcome.
+    pub(super) async fn run_operations<T, Operation, OperationFuture>(
+        aliases: Vec<String>,
+        mut operation: Operation,
+    ) -> OperationBatch<T>
+    where
+        Operation: FnMut(String) -> OperationFuture,
+        OperationFuture: Future<Output = anyhow::Result<T>>,
+    {
+        let mut completed = Vec::with_capacity(aliases.len());
+        let mut failed = Vec::new();
+
+        for alias in aliases {
+            match operation(alias.clone()).await {
+                Ok(output) => completed.push((alias, output)),
+                Err(error) => failed.push(Failure::new(alias, error)),
+            }
+        }
+
+        OperationBatch { completed, failed }
+    }
+
+    pub(super) fn record_failure(
+        failures: &mut FailureStats,
+        coordinator_id: Uuid,
+        operation: &'static str,
+        failure: Failure,
+    ) {
+        warn!(
+            coordinator_id = %coordinator_id,
+            database_alias = %failure.database_alias,
+            operation,
+            error_kind = failure.classification.kind.as_str(),
+            retryable = failure.classification.retryable,
+            error = ?failure.error,
+            "placement-scoped coordinator operation failed; containing failure"
+        );
+        failures.record(&failure);
+    }
+
+    fn classify_error(error: &anyhow::Error) -> ErrorClassification {
+        if error.chain().any(|cause| {
+            cause
+                .downcast_ref::<database::ExecutionRouteError>()
+                .is_some()
+        }) {
+            return ErrorClassification {
+                kind: ErrorKind::RouteState,
+                retryable: false,
+            };
+        }
+
+        let Some(error) = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<sqlx::Error>())
+        else {
+            return ErrorClassification {
+                kind: ErrorKind::PlacementConfiguration,
+                retryable: false,
+            };
+        };
+
+        match error {
+            sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
+            | sqlx::Error::Protocol(_)
+            | sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed
+            | sqlx::Error::WorkerCrashed
+            | sqlx::Error::BeginFailed => ErrorClassification {
+                kind: ErrorKind::DatabaseUnavailable,
+                retryable: true,
+            },
+            sqlx::Error::Database(error) => classify_database_error_code(error.code().as_deref()),
+            _ => ErrorClassification {
+                kind: ErrorKind::DatabaseContract,
+                retryable: false,
+            },
+        }
+    }
+
+    fn classify_database_error_code(code: Option<&str>) -> ErrorClassification {
+        let Some(code) = code else {
+            return ErrorClassification {
+                kind: ErrorKind::DatabaseContract,
+                retryable: false,
+            };
+        };
+
+        if matches!(code, "40001" | "40P01" | "55P03") {
+            return ErrorClassification {
+                kind: ErrorKind::DatabaseContention,
+                retryable: true,
+            };
+        }
+
+        if code.starts_with("08")
+            || code.starts_with("53")
+            || matches!(code, "57P01" | "57P02" | "57P03" | "58030")
+        {
+            return ErrorClassification {
+                kind: ErrorKind::DatabaseUnavailable,
+                retryable: true,
+            };
+        }
+
+        ErrorClassification {
+            kind: ErrorKind::DatabaseContract,
+            retryable: false,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn placement_operations_preserve_successes_and_classify_failures() {
+            let run_id = Uuid::now_v7();
+            let aliases = ["primary", "shard_001", "shard_002", "shard_003"]
+                .map(str::to_string)
+                .to_vec();
+
+            let batch = run_operations(aliases, |alias| async move {
+                match alias.as_str() {
+                    "shard_001" => Err(anyhow::Error::new(sqlx::Error::PoolTimedOut)),
+                    "shard_002" => Err(
+                        database::ExecutionRouteError::NonDispatchableShardPlacement {
+                            run_id,
+                            run_shard: 2,
+                            status: "moving".to_string(),
+                        }
+                        .into(),
+                    ),
+                    _ => Ok(format!("completed:{alias}")),
+                }
+            })
+            .await;
+
+            assert_eq!(
+                batch.completed,
+                vec![
+                    ("primary".to_string(), "completed:primary".to_string()),
+                    ("shard_003".to_string(), "completed:shard_003".to_string()),
+                ]
+            );
+            assert_eq!(batch.failed.len(), 2);
+            assert_eq!(
+                batch.failed[0].classification,
+                ErrorClassification {
+                    kind: ErrorKind::DatabaseUnavailable,
+                    retryable: true,
+                }
+            );
+            assert_eq!(
+                batch.failed[1].classification,
+                ErrorClassification {
+                    kind: ErrorKind::RouteState,
+                    retryable: false,
+                }
+            );
+
+            let mut stats = FailureStats::default();
+            for failure in &batch.failed {
+                stats.record(failure);
+            }
+            assert_eq!(
+                stats.skipped_database_aliases,
+                BTreeSet::from(["shard_001".to_string(), "shard_002".to_string()])
+            );
+            assert_eq!(stats.failed_operations, 2);
+            assert_eq!(stats.retryable_errors, 1);
+            assert_eq!(stats.terminal_errors, 1);
+        }
+
+        #[test]
+        fn postgres_retryable_codes_are_classified_by_failure_kind() {
+            assert_eq!(
+                classify_database_error_code(Some("40001")),
+                ErrorClassification {
+                    kind: ErrorKind::DatabaseContention,
+                    retryable: true,
+                }
+            );
+            assert_eq!(
+                classify_database_error_code(Some("08006")),
+                ErrorClassification {
+                    kind: ErrorKind::DatabaseUnavailable,
+                    retryable: true,
+                }
+            );
+            assert_eq!(
+                classify_database_error_code(Some("23505")),
+                ErrorClassification {
+                    kind: ErrorKind::DatabaseContract,
+                    retryable: false,
+                }
+            );
+        }
+    }
 }

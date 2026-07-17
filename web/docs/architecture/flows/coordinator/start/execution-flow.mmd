@@ -29,27 +29,49 @@ sequenceDiagram
             Vigilo->>ExecutionDB: Idempotently seed remaining placements
             Vigilo->>ControlDB: Persist creation progress or activate seeded runs
             Vigilo->>ControlDB: List active execution placements
-            Vigilo->>ExecutionDB: Recover expired chunk leases per placement
-            ExecutionDB-->>Vigilo: Recovered and failed chunk counts
+            loop Active execution placements
+                Vigilo->>ExecutionDB: Recover expired chunk leases for alias
+                alt Placement succeeds
+                    ExecutionDB-->>Vigilo: Recovered and failed chunk counts
+                else Placement fails
+                    Vigilo->>Vigilo: Classify, count, and continue aliases
+                end
+            end
             Vigilo->>ControlDB: Log dispatch cursor backlog
-            Vigilo->>ControlDB: Drain dispatchable run-shard cursors
-            Vigilo->>ExecutionDB: Dispatch routed chunk windows
-            ExecutionDB-->>Vigilo: Dispatch shard window count
+            loop Bounded dispatch windows
+                Vigilo->>ControlDB: Select dispatchable run-shard cursor
+                Vigilo->>ExecutionDB: Dispatch routed chunk window
+                alt Execution placement succeeds
+                    ExecutionDB-->>Vigilo: Dispatch shard window result
+                    Vigilo->>ControlDB: Release or drain cursor
+                else Execution placement fails
+                    Note over Vigilo,ControlDB: Cursor stays open
+                    Vigilo->>Vigilo: Count failure and exclude alias for this pass
+                end
+            end
             Vigilo->>ControlDB: Log finalization candidate backlog
-            Vigilo->>ControlDB: Claim finalizable runs
+            Vigilo->>ControlDB: Select finalization candidate
             Vigilo->>ExecutionDB: Read routed shard summaries
-            Vigilo->>ControlDB: Write global finalization result
-            ControlDB-->>Vigilo: Finalization count
+            alt Summary reads succeed and all shards are terminal
+                Vigilo->>ControlDB: Claim and write global finalization result
+                ControlDB-->>Vigilo: Finalization count
+            else Placement read fails or summary is incomplete
+                Vigilo->>Vigilo: Defer run and continue cycle
+            end
             Vigilo->>Vigilo: Load messaging context
             Vigilo->>ControlDB: List active outbox placements
-            Vigilo->>ExecutionDB: Log publishable outbox backlog per placement
-            Vigilo->>ExecutionDB: Claim publishable outbox rows per placement
-            ExecutionDB-->>Vigilo: Joined event payload batches
-            loop Bounded outbox publish concurrency
-                Vigilo->>Queue: Declare durable topology and publish persistent mandatory events
+            loop Active outbox placements
+                Vigilo->>ExecutionDB: Count and claim publishable rows for alias
+                alt Placement succeeds
+                    ExecutionDB-->>Vigilo: Joined event payload batch
+                    Vigilo->>Queue: Publish with bounded concurrency
+                else Placement fails
+                    Vigilo->>Vigilo: Classify, count, and continue aliases
+                end
             end
             Queue-->>Vigilo: Confirmed routed publishes or returned/nacked publishes
             Vigilo->>ExecutionDB: Mark ledger published and delete or retry delivery rows
+            Vigilo->>Vigilo: Log cycle totals and placement failure counters
         else Cycle or shutdown fails
             Vigilo-->>User: Service error
         end

@@ -69,11 +69,54 @@ struct DispatchedRunWindow {
     has_remaining_chunks: bool,
 }
 
+impl From<&DispatchedRunWindow> for DispatchedRun {
+    fn from(dispatched: &DispatchedRunWindow) -> Self {
+        Self {
+            id: dispatched.id,
+            run_key: dispatched.run_key.clone(),
+            run_shard: dispatched.run_shard,
+            chunk_events_enqueued: dispatched.chunk_events_enqueued,
+            chunks_marked_dispatched: dispatched.chunks_marked_dispatched,
+            run_started_events_enqueued: dispatched.run_started_events_enqueued,
+        }
+    }
+}
+
 /// Counts returned after one expired chunk lease recovery pass.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ChunkLeaseRecoveryStats {
     pub(crate) recovered: i64,
     pub(crate) failed: i64,
+}
+
+/// Committed lease-recovery counts plus non-transactional follow-up failures.
+#[derive(Debug)]
+pub(crate) struct ChunkLeaseRecoveryOutcome {
+    pub(crate) stats: ChunkLeaseRecoveryStats,
+    pub(crate) summary_refresh_errors: Vec<anyhow::Error>,
+}
+
+/// Identifies which database boundary failed during a routed dispatch.
+///
+/// Execution write failures are safe for the coordinator to isolate because
+/// the control cursor transaction rolls back and leaves the cursor open.
+/// Summary refresh failures happen after a successful cursor update and are
+/// identified separately. Control failures remain cycle-fatal because cursor
+/// ownership can no longer be determined reliably.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RoutedDispatchError {
+    #[error("dispatch invariant failed: {0}")]
+    Invariant(#[source] anyhow::Error),
+    #[error("control-plane dispatch operation failed: {0}")]
+    Control(#[source] anyhow::Error),
+    #[error("execution placement dispatch write failed: {0}")]
+    ExecutionWrite(#[source] anyhow::Error),
+    #[error("execution placement shard-summary refresh failed: {source}")]
+    SummaryRefresh {
+        dispatched: DispatchedRun,
+        #[source]
+        source: anyhow::Error,
+    },
 }
 
 /// Recovers expired worker chunk leases for prepared run snapshots.
@@ -93,11 +136,13 @@ pub(crate) struct ChunkLeaseRecoveryStats {
 ///   limit and marks them `failed`.
 /// - `SKIP LOCKED` lets multiple coordinators run recovery without blocking
 ///   each other on the same chunk rows.
+/// - After commit, failed-shard summaries are refreshed. Those follow-up
+///   errors are returned separately so committed recovery counts are retained.
 pub(crate) async fn recover_expired_chunk_leases(
     db: &PgPool,
     max_recoveries: i32,
     batch_size: i64,
-) -> anyhow::Result<ChunkLeaseRecoveryStats> {
+) -> anyhow::Result<ChunkLeaseRecoveryOutcome> {
     let mut tx = db.begin().await?;
 
     // Query outline:
@@ -258,13 +303,21 @@ pub(crate) async fn recover_expired_chunk_leases(
     tx.commit().await?;
 
     let failed_shards = failed_rows.iter().copied().collect::<BTreeSet<_>>();
+    let mut summary_refresh_errors = Vec::new();
     for (run_id, run_shard) in failed_shards {
-        run_shard_summary::refresh_run_shard_summary(db, run_id, run_shard).await?;
+        if let Err(error) =
+            run_shard_summary::refresh_run_shard_summary(db, run_id, run_shard).await
+        {
+            summary_refresh_errors.push(error);
+        }
     }
 
-    Ok(ChunkLeaseRecoveryStats {
-        recovered,
-        failed: i64::try_from(failed_rows.len())?,
+    Ok(ChunkLeaseRecoveryOutcome {
+        stats: ChunkLeaseRecoveryStats {
+            recovered,
+            failed: i64::try_from(failed_rows.len())?,
+        },
+        summary_refresh_errors,
     })
 }
 
@@ -273,9 +326,12 @@ pub(crate) async fn recover_expired_chunk_leases(
 /// This query does not claim execution rows. It chooses one open
 /// `(run_id, run_shard)` cursor whose shard placement is active and whose
 /// database placement can hold execution data. The execution dispatch query
-/// then locks and advances that exact cursor on the resolved placement.
+/// then locks and advances that exact cursor on the resolved placement. Aliases
+/// that already failed in the current coordinator cycle are excluded so they
+/// cannot consume the remaining dispatch budget.
 pub(crate) async fn select_next_dispatch_route(
     db: &PgPool,
+    excluded_database_aliases: &[String],
 ) -> anyhow::Result<Option<DispatchRoute>> {
     let route = sqlx::query_as::<_, DispatchRoute>(
         r#"
@@ -296,6 +352,7 @@ pub(crate) async fn select_next_dispatch_route(
           AND sp.status = 'active'
           AND dp.status = 'active'
           AND dp.role IN ('shard', 'control_and_shard')
+          AND NOT (sp.database_alias = ANY($1::text[]))
           AND (
               r.status = 'running'::run_status
               OR (
@@ -310,6 +367,7 @@ pub(crate) async fn select_next_dispatch_route(
         LIMIT 1
         "#,
     )
+    .bind(excluded_database_aliases)
     .fetch_optional(db)
     .await?;
 
@@ -483,7 +541,7 @@ async fn dispatch_next_run_window(
     lease_seconds: i32,
     chunk_window_size: i64,
 ) -> anyhow::Result<Option<DispatchedRun>> {
-    let Some(route) = select_next_dispatch_route(db).await? else {
+    let Some(route) = select_next_dispatch_route(db, &[]).await? else {
         return Ok(None);
     };
     let Some(snapshot) =
@@ -492,7 +550,7 @@ async fn dispatch_next_run_window(
         return Ok(None);
     };
 
-    dispatch_routed_run_window(db, db, chunk_window_size, &route, &snapshot).await
+    Ok(dispatch_routed_run_window(db, db, chunk_window_size, &route, &snapshot).await?)
 }
 
 /// Claims and dispatches one exact run-shard route.
@@ -506,18 +564,22 @@ pub(crate) async fn dispatch_routed_run_window(
     chunk_window_size: i64,
     route: &DispatchRoute,
     snapshot: &DispatchRunSnapshot,
-) -> anyhow::Result<Option<DispatchedRun>> {
+) -> Result<Option<DispatchedRun>, RoutedDispatchError> {
     if snapshot.run_id != route.run_id || snapshot.run_shard != route.run_shard {
-        anyhow::bail!(
+        return Err(RoutedDispatchError::Invariant(anyhow::anyhow!(
             "dispatch snapshot route mismatch: route {} shard {}, snapshot {} shard {}",
             route.run_id,
             route.run_shard,
             snapshot.run_id,
             snapshot.run_shard
-        );
+        )));
     }
 
-    let mut control_tx = control_db.begin().await?;
+    let mut control_tx = control_db
+        .begin()
+        .await
+        .map_err(anyhow::Error::from)
+        .map_err(RoutedDispatchError::Control)?;
     let cursor_locked = sqlx::query_scalar::<_, i32>(
         r#"
         SELECT 1
@@ -531,11 +593,17 @@ pub(crate) async fn dispatch_routed_run_window(
     .bind(route.run_id)
     .bind(route.run_shard)
     .fetch_optional(&mut *control_tx)
-    .await?
+    .await
+    .map_err(anyhow::Error::from)
+    .map_err(RoutedDispatchError::Control)?
     .is_some();
 
     if !cursor_locked {
-        control_tx.rollback().await?;
+        control_tx
+            .rollback()
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(RoutedDispatchError::Control)?;
         return Ok(None);
     }
 
@@ -739,7 +807,9 @@ pub(crate) async fn dispatch_routed_run_window(
     .bind(&snapshot.config_snapshot)
     .bind(snapshot.run_started_events_enqueued)
     .fetch_optional(execution_db)
-    .await?;
+    .await
+    .map_err(anyhow::Error::from)
+    .map_err(RoutedDispatchError::ExecutionWrite)?;
 
     if let Some(dispatched) = &dispatched {
         let next_status = if dispatched.has_remaining_chunks {
@@ -760,27 +830,36 @@ pub(crate) async fn dispatch_routed_run_window(
         .bind(dispatched.run_shard)
         .bind(next_status)
         .execute(&mut *control_tx)
-        .await?;
-        control_tx.commit().await?;
+        .await
+        .map_err(anyhow::Error::from)
+        .map_err(RoutedDispatchError::Control)?;
+        control_tx
+            .commit()
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(RoutedDispatchError::Control)?;
 
-        run_shard_summary::refresh_run_shard_summary(
+        if let Err(source) = run_shard_summary::refresh_run_shard_summary(
             execution_db,
             dispatched.id,
             dispatched.run_shard,
         )
-        .await?;
+        .await
+        {
+            return Err(RoutedDispatchError::SummaryRefresh {
+                dispatched: dispatched.into(),
+                source,
+            });
+        }
     } else {
-        control_tx.rollback().await?;
+        control_tx
+            .rollback()
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(RoutedDispatchError::Control)?;
     }
 
-    Ok(dispatched.map(|dispatched| DispatchedRun {
-        id: dispatched.id,
-        run_key: dispatched.run_key,
-        run_shard: dispatched.run_shard,
-        chunk_events_enqueued: dispatched.chunk_events_enqueued,
-        chunks_marked_dispatched: dispatched.chunks_marked_dispatched,
-        run_started_events_enqueued: dispatched.run_started_events_enqueued,
-    }))
+    Ok(dispatched.as_ref().map(DispatchedRun::from))
 }
 
 #[cfg(test)]
@@ -790,7 +869,10 @@ mod tests {
         time::Duration,
     };
 
-    use sqlx::PgPool;
+    use sqlx::{
+        PgPool,
+        postgres::PgPoolOptions,
+    };
 
     use super::*;
     use crate::db::workflows::{
@@ -1182,12 +1264,27 @@ mod tests {
         let run_id = seed_pending_run(&pool, &[(0, 1), (1, 1)]).await;
         insert_shard_placements(&pool, run_id, &[(0, "moving"), (1, "active")]).await;
 
-        let route = select_next_dispatch_route(&pool).await.unwrap().unwrap();
+        let route = select_next_dispatch_route(&pool, &[])
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(route.run_id, run_id);
         assert_eq!(route.run_shard, 1);
         assert_eq!(route.database_alias, "primary");
         assert_eq!(route.placement_status, "active");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn select_next_dispatch_route_excludes_failed_aliases(pool: PgPool) {
+        seed_pending_run(&pool, &[(0, 1)]).await;
+
+        let route = select_next_dispatch_route(&pool, &["primary".to_string()])
+            .await
+            .unwrap();
+
+        assert!(route.is_none());
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -1231,6 +1328,31 @@ mod tests {
         assert_eq!(dispatched_chunk_count(&pool, run_id, 0).await, 0);
         assert_eq!(dispatched_chunk_count(&pool, run_id, 1).await, 1);
         assert_eq!(run_snapshot_count(&pool, run_id, 1).await, 1);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn failed_execution_write_leaves_control_cursor_open(pool: PgPool) {
+        let run_id = seed_pending_run(&pool, &[(0, 1)]).await;
+        let route = select_next_dispatch_route(&pool, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        let snapshot = prepare_dispatch_run_snapshot(&pool, &route, Uuid::now_v7(), 60)
+            .await
+            .unwrap()
+            .unwrap();
+        let unavailable = PgPoolOptions::new()
+            .connect_lazy("postgres://vigilo@127.0.0.1/vigilo")
+            .unwrap();
+        unavailable.close().await;
+
+        let error = dispatch_routed_run_window(&pool, &unavailable, 10, &route, &snapshot)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, RoutedDispatchError::ExecutionWrite(_)));
+        assert_eq!(cursor_status(&pool, run_id, 0).await, "open");
     }
 
     #[sqlx::test(migrations = "../migrations")]
