@@ -662,12 +662,16 @@ async fn drain_finalize_batch(
         finalization_cycle_limit = config.max_finalize_per_cycle,
         "measured finalization candidate backlog"
     );
+    let mut checked_run_ids = Vec::with_capacity(config.max_finalize_per_cycle);
     for _ in 0..config.max_finalize_per_cycle {
         let select_started = Instant::now();
-        let Some(run) = run_finalize::select_next_finalization_candidate(control_db).await? else {
+        let Some(run) =
+            run_finalize::select_next_finalization_candidate(control_db, &checked_run_ids).await?
+        else {
             break;
         };
         let finalization_candidate_select_ms = select_started.elapsed().as_millis() as u64;
+        checked_run_ids.push(run.id);
 
         let collection = collect_run_shard_summaries(database, coordinator_id, run.id).await?;
         let placement_failure_count = collection.failures.failed_operation_count();
@@ -685,7 +689,8 @@ async fn drain_finalize_batch(
                 finalization_candidate_select_ms,
                 "finalization candidate is waiting for terminal shard summaries"
             );
-            break;
+            run_finalize::mark_finalization_candidate_checked(control_db, run.id).await?;
+            continue;
         }
 
         let Some(claimed) = run_finalize::claim_finalization_candidate(

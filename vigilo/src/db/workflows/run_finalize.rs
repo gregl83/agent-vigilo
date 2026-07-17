@@ -42,8 +42,11 @@ pub(crate) struct FinalizationCandidateBacklog {
 /// - Does not inspect execution-owned rows.
 /// - Requires all control dispatch cursors for the run to be drained.
 /// - Returns `finalizing` runs only when their coordinator lease has expired.
+/// - Excludes candidates already inspected by the current coordinator cycle.
+/// - Orders candidates by their last coordinator heartbeat for bounded fairness.
 pub(crate) async fn select_next_finalization_candidate(
     db: &PgPool,
+    excluded_run_ids: &[Uuid],
 ) -> anyhow::Result<Option<ClaimedRunForFinalization>> {
     let candidate = sqlx::query_as::<_, ClaimedRunForFinalization>(
         r#"
@@ -66,14 +69,40 @@ pub(crate) async fn select_next_finalization_candidate(
               WHERE c.run_id = r.id
                 AND c.status = 'open'
           )
-        ORDER BY r.updated_at ASC, r.id ASC
+          AND NOT (r.id = ANY($1::uuid[]))
+        ORDER BY COALESCE(r.coordinator_heartbeat_at, r.updated_at) ASC, r.id ASC
         LIMIT 1
         "#,
     )
+    .bind(excluded_run_ids)
     .fetch_optional(db)
     .await?;
 
     Ok(candidate)
+}
+
+/// Records that a coordinator inspected a candidate that is not ready yet.
+///
+/// Candidate selection orders by this heartbeat so bounded coordinator cycles
+/// rotate past nonterminal runs instead of repeatedly selecting the oldest one.
+/// The run lifecycle and user-visible `updated_at` timestamp are unchanged.
+pub(crate) async fn mark_finalization_candidate_checked(
+    db: &PgPool,
+    run_id: Uuid,
+) -> anyhow::Result<bool> {
+    let result = sqlx::query(
+        r#"
+        UPDATE runs
+        SET coordinator_heartbeat_at = now()
+        WHERE id = $1::uuid
+          AND status IN ('running'::run_status, 'finalizing'::run_status)
+        "#,
+    )
+    .bind(run_id)
+    .execute(db)
+    .await?;
+
+    Ok(result.rows_affected() == 1)
 }
 
 /// Measures control-plane runs that are eligible for finalization consideration.
@@ -168,7 +197,7 @@ pub(crate) async fn claim_next_finalizable_run(
     coordinator_id: Uuid,
     lease_seconds: i32,
 ) -> anyhow::Result<Option<ClaimedRunForFinalization>> {
-    let Some(candidate) = select_next_finalization_candidate(db).await? else {
+    let Some(candidate) = select_next_finalization_candidate(db, &[]).await? else {
         return Ok(None);
     };
 
@@ -529,6 +558,58 @@ mod tests {
 
         assert_eq!(backlog.candidate_count, 1);
         assert!(backlog.oldest_candidate_lag_seconds.unwrap() >= 0);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx finalization tests"]
+    async fn checked_finalization_candidate_rotates_behind_unchecked_candidate(pool: PgPool) {
+        let older_run_id = Uuid::now_v7();
+        let newer_run_id = Uuid::now_v7();
+
+        for run_id in [older_run_id, newer_run_id] {
+            seed_run(&pool, run_id, Uuid::now_v7(), Uuid::now_v7(), "running").await;
+            seed_dispatch_cursor(&pool, run_id, 0, "drained").await;
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE runs
+            SET coordinator_heartbeat_at = CASE id
+                WHEN $1::uuid THEN now() - interval '2 hours'
+                WHEN $2::uuid THEN now() - interval '1 hour'
+            END
+            WHERE id IN ($1::uuid, $2::uuid)
+            "#,
+        )
+        .bind(older_run_id)
+        .bind(newer_run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let selected = select_next_finalization_candidate(&pool, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.id, older_run_id);
+
+        assert!(
+            mark_finalization_candidate_checked(&pool, older_run_id)
+                .await
+                .unwrap()
+        );
+
+        let rotated = select_next_finalization_candidate(&pool, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rotated.id, newer_run_id);
+
+        let excluded = select_next_finalization_candidate(&pool, &[newer_run_id])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(excluded.id, older_run_id);
     }
 
     #[derive(sqlx::FromRow)]

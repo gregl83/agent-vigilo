@@ -52,34 +52,25 @@ const E2E_MAX_RUNTIME_CYCLES: usize = 8;
 const E2E_WORKER_PASSES_PER_CYCLE: usize = 4;
 
 #[tokio::test]
-async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
-    let Some(config) = IntegrationConfig::from_env() else {
+async fn run_creation_recovers_after_cross_database_seed_status_failure() -> anyhow::Result<()> {
+    let Some(fixture) = E2eFixture::setup().await? else {
         return Ok(());
     };
-    let config = config.isolated().await?;
 
-    let agent = MockAgent::start()?;
-    let primary = connect(&config.primary_url).await?;
-    let shard = connect(&config.shard_url).await?;
-    migrate(&primary).await?;
-    migrate(&shard).await?;
-    seed_sentiment_evaluator(&primary).await?;
-    configure_shard_placement(&primary).await?;
-
-    install_seed_status_failure(&primary).await?;
+    install_seed_status_failure(&fixture.primary).await?;
     let recoverable_output = create_run_output(
-        &config,
+        &fixture.config,
         RunCreateInput {
             default_execution_alias: SHARD_ALIAS,
             shard_assignment_policy: "single-default",
-            agent_url: &agent.url,
+            agent_url: &fixture.agent.url,
             profile_id: "e2e_creation_recovery",
             case_count: 1,
             case_mode: CaseMode::Passing,
             evaluator_ref: SENTIMENT_EVALUATOR_REF,
         },
     )?;
-    remove_seed_status_failure(&primary).await?;
+    remove_seed_status_failure(&fixture.primary).await?;
     if !recoverable_output.status.success() {
         anyhow::bail!(
             "recoverable run create failed with status {}\nstdout:\n{}\nstderr:\n{}",
@@ -99,14 +90,17 @@ async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
         recoverable_payload["meta"]["creation_placements_pending"],
         1
     );
-    assert_eq!(run_chunk_count(&shard, recoverable_run_id).await?, 1);
     assert_eq!(
-        dispatch_cursor_count(&primary, recoverable_run_id).await?,
+        run_chunk_count(&fixture.shard, recoverable_run_id).await?,
+        1
+    );
+    assert_eq!(
+        dispatch_cursor_count(&fixture.primary, recoverable_run_id).await?,
         0
     );
 
     let creating_status = run_vigilo_json(
-        &config,
+        &fixture.config,
         SHARD_ALIAS,
         "single-default",
         ["run", "status", &recoverable_run_id.to_string()],
@@ -117,33 +111,45 @@ async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
         1
     );
 
-    expire_run_creation_lease(&primary, recoverable_run_id).await?;
+    expire_run_creation_lease(&fixture.primary, recoverable_run_id).await?;
     run_vigilo_ok(
-        &config,
+        &fixture.config,
         SHARD_ALIAS,
         "single-default",
         ["coordinator", "once"],
     )?;
-    assert_eq!(run_chunk_count(&shard, recoverable_run_id).await?, 1);
     assert_eq!(
-        dispatch_cursor_count(&primary, recoverable_run_id).await?,
+        run_chunk_count(&fixture.shard, recoverable_run_id).await?,
         1
     );
     assert_eq!(
-        run_creation_placement_state(&primary, recoverable_run_id, SHARD_ALIAS).await?,
+        dispatch_cursor_count(&fixture.primary, recoverable_run_id).await?,
+        1
+    );
+    assert_eq!(
+        run_creation_placement_state(&fixture.primary, recoverable_run_id, SHARD_ALIAS).await?,
         ("seeded".to_string(), 2)
     );
     assert_eq!(
-        run_creation_chunk_plan_count(&primary, recoverable_run_id).await?,
+        run_creation_chunk_plan_count(&fixture.primary, recoverable_run_id).await?,
         0
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn cross_shard_run_completes_and_exports_results() -> anyhow::Result<()> {
+    let Some(fixture) = E2eFixture::setup().await? else {
+        return Ok(());
+    };
+
     let completed_run_id = create_run(
-        &config,
+        &fixture.config,
         RunCreateInput {
             default_execution_alias: PRIMARY_ALIAS,
             shard_assignment_policy: "spread-active",
-            agent_url: &agent.url,
+            agent_url: &fixture.agent.url,
             profile_id: "e2e_completed",
             case_count: 101,
             case_mode: CaseMode::Passing,
@@ -152,28 +158,30 @@ async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
     )?;
 
     assert_eq!(
-        shard_placement_alias(&primary, completed_run_id, 0).await?,
+        shard_placement_alias(&fixture.primary, completed_run_id, 0).await?,
         PRIMARY_ALIAS
     );
     assert_eq!(
-        shard_placement_alias(&primary, completed_run_id, 1).await?,
+        shard_placement_alias(&fixture.primary, completed_run_id, 1).await?,
         SHARD_ALIAS
     );
 
     let status = drive_run_to_status(
-        &config,
+        &fixture,
+        "cross-shard completion",
         PRIMARY_ALIAS,
         "spread-active",
         completed_run_id,
         "completed",
-    )?;
+    )
+    .await?;
     assert_eq!(status["data"]["status"].as_str(), Some("completed"));
     assert_eq!(status["data"]["gate_status"].as_str(), Some("pass"));
     assert_eq!(status["data"]["expected_execution_count"], 101);
     assert_eq!(status["data"]["terminal_execution_count"], 101);
 
     let results = run_vigilo_json(
-        &config,
+        &fixture.config,
         PRIMARY_ALIAS,
         "spread-active",
         ["run", "results", &completed_run_id.to_string()],
@@ -185,7 +193,7 @@ async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
     );
 
     let export = run_vigilo_ok(
-        &config,
+        &fixture.config,
         PRIMARY_ALIAS,
         "spread-active",
         [
@@ -213,35 +221,47 @@ async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
         line["type"] == "execution_route" && line["database_alias"] == SHARD_ALIAS
     }));
 
-    assert_eq!(execution_count(&primary, completed_run_id).await?, 100);
-    assert_eq!(execution_count(&shard, completed_run_id).await?, 1);
     assert_eq!(
-        outbox_event_count(&primary, completed_run_id, "run.completed").await?,
+        execution_count(&fixture.primary, completed_run_id).await?,
+        100
+    );
+    assert_eq!(execution_count(&fixture.shard, completed_run_id).await?, 1);
+    assert_eq!(
+        outbox_event_count(&fixture.primary, completed_run_id, "run.completed").await?,
         1
     );
     assert_eq!(
-        outbox_event_count(&shard, completed_run_id, "run.completed").await?,
+        outbox_event_count(&fixture.shard, completed_run_id, "run.completed").await?,
         0
     );
     assert_eq!(
-        outbox_event_count(&shard, completed_run_id, "run.chunk.ready").await?,
+        outbox_event_count(&fixture.shard, completed_run_id, "run.chunk.ready").await?,
         1
     );
     assert_eq!(
-        dispatch_cursor_status_count(&primary, completed_run_id, "drained").await?,
+        dispatch_cursor_status_count(&fixture.primary, completed_run_id, "drained").await?,
         2
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn unavailable_shard_does_not_block_healthy_placement_work() -> anyhow::Result<()> {
+    let Some(fixture) = E2eFixture::setup().await? else {
+        return Ok(());
+    };
+
     let isolation_config = IntegrationConfig {
-        mq_namespace: format!("{}-phase26", config.mq_namespace),
-        ..config.clone()
+        mq_namespace: format!("{}-placement-isolation", fixture.config.mq_namespace),
+        ..fixture.config.clone()
     };
     let unavailable_run_id = create_run(
         &isolation_config,
         RunCreateInput {
             default_execution_alias: SHARD_ALIAS,
             shard_assignment_policy: "single-default",
-            agent_url: &agent.url,
+            agent_url: &fixture.agent.url,
             profile_id: "e2e_unavailable_shard",
             case_count: 1,
             case_mode: CaseMode::Passing,
@@ -253,14 +273,14 @@ async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
         RunCreateInput {
             default_execution_alias: PRIMARY_ALIAS,
             shard_assignment_policy: "single-default",
-            agent_url: &agent.url,
+            agent_url: &fixture.agent.url,
             profile_id: "e2e_healthy_placement",
             case_count: 1,
             case_mode: CaseMode::Passing,
             evaluator_ref: SENTIMENT_EVALUATOR_REF,
         },
     )?;
-    age_dispatch_cursor(&primary, unavailable_run_id).await?;
+    age_dispatch_cursor(&fixture.primary, unavailable_run_id).await?;
     let unavailable_config = IntegrationConfig {
         shard_url: unavailable_postgres_url()?,
         ..isolation_config.clone()
@@ -273,22 +293,22 @@ async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
         ["coordinator", "--max-dispatch-per-cycle", "1", "once"],
     )?;
     assert_eq!(
-        dispatch_cursor_status_count(&primary, unavailable_run_id, "open").await?,
+        dispatch_cursor_status_count(&fixture.primary, unavailable_run_id, "open").await?,
         1,
         "a failed execution write must leave its control cursor retryable"
     );
     assert_eq!(
-        dispatch_cursor_status_count(&primary, healthy_run_id, "drained").await?,
+        dispatch_cursor_status_count(&fixture.primary, healthy_run_id, "drained").await?,
         1,
         "dispatch must continue on healthy placements after excluding the failed alias"
     );
     assert_eq!(
-        published_outbox_event_count(&primary, healthy_run_id, "run.chunk.ready").await?,
+        published_outbox_event_count(&fixture.primary, healthy_run_id, "run.chunk.ready").await?,
         1,
         "the healthy placement outbox must still publish"
     );
 
-    expire_chunk_lease(&primary, healthy_run_id).await?;
+    expire_chunk_lease(&fixture.primary, healthy_run_id).await?;
     run_vigilo_ok(
         &unavailable_config,
         PRIMARY_ALIAS,
@@ -296,22 +316,98 @@ async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
         ["coordinator", "--max-dispatch-per-cycle", "1", "once"],
     )?;
     assert_eq!(
-        run_chunk_recovery_state(&primary, healthy_run_id).await?,
+        run_chunk_recovery_state(&fixture.primary, healthy_run_id).await?,
         ("pending".to_string(), 1),
         "lease recovery must continue on the healthy placement"
     );
     assert_eq!(
-        published_outbox_event_count(&primary, healthy_run_id, "run.chunk.ready").await?,
+        published_outbox_event_count(&fixture.primary, healthy_run_id, "run.chunk.ready").await?,
         2,
         "the recovery event must publish despite the unavailable shard"
     );
 
-    let failing_run_id = create_run(
-        &config,
+    Ok(())
+}
+
+#[tokio::test]
+async fn older_nonterminal_run_does_not_block_newer_terminal_run() -> anyhow::Result<()> {
+    let Some(fixture) = E2eFixture::setup().await? else {
+        return Ok(());
+    };
+
+    let blocked_config = IntegrationConfig {
+        mq_namespace: format!("{}-blocked-run", fixture.config.mq_namespace),
+        ..fixture.config.clone()
+    };
+    let blocked_run_id = create_run(
+        &blocked_config,
         RunCreateInput {
             default_execution_alias: PRIMARY_ALIAS,
             shard_assignment_policy: "single-default",
-            agent_url: &agent.url,
+            agent_url: &fixture.agent.url,
+            profile_id: "e2e_nonterminal_blocker",
+            case_count: 1,
+            case_mode: CaseMode::Passing,
+            evaluator_ref: SENTIMENT_EVALUATOR_REF,
+        },
+    )?;
+    run_vigilo_ok(
+        &blocked_config,
+        PRIMARY_ALIAS,
+        "single-default",
+        ["coordinator", "once"],
+    )?;
+    assert_eq!(
+        dispatch_cursor_status_count(&fixture.primary, blocked_run_id, "drained").await?,
+        1
+    );
+
+    let terminal_run_id = create_run(
+        &fixture.config,
+        RunCreateInput {
+            default_execution_alias: PRIMARY_ALIAS,
+            shard_assignment_policy: "single-default",
+            agent_url: &fixture.agent.url,
+            profile_id: "e2e_newer_terminal",
+            case_count: 1,
+            case_mode: CaseMode::Passing,
+            evaluator_ref: SENTIMENT_EVALUATOR_REF,
+        },
+    )?;
+    let terminal_status = drive_run_to_status(
+        &fixture,
+        "finalization fairness",
+        PRIMARY_ALIAS,
+        "single-default",
+        terminal_run_id,
+        "completed",
+    )
+    .await?;
+    assert_eq!(terminal_status["data"]["gate_status"], "pass");
+
+    let blocked_status = run_vigilo_json(
+        &fixture.config,
+        PRIMARY_ALIAS,
+        "single-default",
+        ["run", "status", &blocked_run_id.to_string()],
+    )?;
+    assert_eq!(blocked_status["data"]["status"], "running");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_failure_completes_run_with_failed_gate() -> anyhow::Result<()> {
+    let Some(fixture) = E2eFixture::setup().await? else {
+        return Ok(());
+    };
+
+    let failing_run_id = create_run(
+        &fixture.config,
+        RunCreateInput {
+            default_execution_alias: PRIMARY_ALIAS,
+            shard_assignment_policy: "single-default",
+            agent_url: &fixture.agent.url,
             profile_id: "e2e_agent_failure",
             case_count: 1,
             case_mode: CaseMode::AgentFailure,
@@ -319,26 +415,37 @@ async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
         },
     )?;
     let failed_status = drive_run_to_status(
-        &config,
+        &fixture,
+        "agent failure finalization",
         PRIMARY_ALIAS,
         "single-default",
         failing_run_id,
         "completed",
-    )?;
+    )
+    .await?;
     assert_eq!(failed_status["data"]["status"].as_str(), Some("completed"));
     assert_eq!(failed_status["data"]["gate_status"].as_str(), Some("fail"));
     assert_eq!(failed_status["data"]["errored_execution_count"], 1);
     assert_eq!(
-        execution_status_count(&primary, failing_run_id, "failed").await?,
+        execution_status_count(&fixture.primary, failing_run_id, "failed").await?,
         1
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_cancellation_updates_routed_storage() -> anyhow::Result<()> {
+    let Some(fixture) = E2eFixture::setup().await? else {
+        return Ok(());
+    };
+
     let cancel_run_id = create_run(
-        &config,
+        &fixture.config,
         RunCreateInput {
             default_execution_alias: SHARD_ALIAS,
             shard_assignment_policy: "single-default",
-            agent_url: &agent.url,
+            agent_url: &fixture.agent.url,
             profile_id: "e2e_cancelled",
             case_count: 1,
             case_mode: CaseMode::Passing,
@@ -346,31 +453,40 @@ async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
         },
     )?;
     let cancel_payload = run_vigilo_json(
-        &config,
+        &fixture.config,
         SHARD_ALIAS,
         "single-default",
         ["run", "cancel", &cancel_run_id.to_string()],
     )?;
     assert_eq!(cancel_payload["meta"]["cancelled"], true);
     assert_eq!(
-        run_chunk_status_count(&shard, cancel_run_id, "cancelled").await?,
+        run_chunk_status_count(&fixture.shard, cancel_run_id, "cancelled").await?,
         1
     );
     assert_eq!(
-        outbox_event_count(&primary, cancel_run_id, "run.cancelled").await?,
+        outbox_event_count(&fixture.primary, cancel_run_id, "run.cancelled").await?,
         1
     );
     assert_eq!(
-        outbox_event_count(&shard, cancel_run_id, "run.cancelled").await?,
+        outbox_event_count(&fixture.shard, cancel_run_id, "run.cancelled").await?,
         0
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn unpublished_evaluator_is_rejected() -> anyhow::Result<()> {
+    let Some(fixture) = E2eFixture::setup().await? else {
+        return Ok(());
+    };
+
     let invalid = create_run_output(
-        &config,
+        &fixture.config,
         RunCreateInput {
             default_execution_alias: PRIMARY_ALIAS,
             shard_assignment_policy: "single-default",
-            agent_url: &agent.url,
+            agent_url: &fixture.agent.url,
             profile_id: "e2e_invalid_evaluator",
             case_count: 1,
             case_mode: CaseMode::Passing,
@@ -390,6 +506,36 @@ async fn multi_database_end_to_end_runtime_flow() -> anyhow::Result<()> {
     Ok(())
 }
 
+struct E2eFixture {
+    config: IntegrationConfig,
+    agent: MockAgent,
+    primary: PgPool,
+    shard: PgPool,
+}
+
+impl E2eFixture {
+    async fn setup() -> anyhow::Result<Option<Self>> {
+        let Some(config) = IntegrationConfig::from_env()? else {
+            return Ok(None);
+        };
+        let config = config.isolated().await?;
+        let agent = MockAgent::start()?;
+        let primary = connect(&config.primary_url).await?;
+        let shard = connect(&config.shard_url).await?;
+        migrate(&primary).await?;
+        migrate(&shard).await?;
+        seed_sentiment_evaluator(&primary).await?;
+        configure_shard_placement(&primary).await?;
+
+        Ok(Some(Self {
+            config,
+            agent,
+            primary,
+            shard,
+        }))
+    }
+}
+
 #[derive(Clone)]
 struct IntegrationConfig {
     primary_url: String,
@@ -399,17 +545,17 @@ struct IntegrationConfig {
 }
 
 impl IntegrationConfig {
-    fn from_env() -> Option<Self> {
+    fn from_env() -> anyhow::Result<Option<Self>> {
         if std::env::var(E2E_ENABLED_ENV).ok().as_deref() != Some("1") {
-            return None;
+            return Ok(None);
         }
 
-        Some(Self {
-            primary_url: std::env::var(PRIMARY_DATABASE_URL_ENV).ok()?,
-            shard_url: std::env::var(SHARD_DATABASE_URL_ENV).ok()?,
-            messaging_url: std::env::var("MESSAGING_URL").ok()?,
+        Ok(Some(Self {
+            primary_url: std::env::var(PRIMARY_DATABASE_URL_ENV)?,
+            shard_url: std::env::var(SHARD_DATABASE_URL_ENV)?,
+            messaging_url: std::env::var("MESSAGING_URL")?,
             mq_namespace: format!("e2e-{}", Uuid::now_v7()),
-        })
+        }))
     }
 
     async fn isolated(mut self) -> anyhow::Result<Self> {
@@ -772,8 +918,9 @@ fn create_run_output(
     )
 }
 
-fn drive_run_to_status(
-    config: &IntegrationConfig,
+async fn drive_run_to_status(
+    fixture: &E2eFixture,
+    phase: &str,
     default_execution_alias: &str,
     shard_assignment_policy: &str,
     run_id: Uuid,
@@ -784,7 +931,7 @@ fn drive_run_to_status(
 
     for cycle in 1..=E2E_MAX_RUNTIME_CYCLES {
         run_vigilo_ok(
-            config,
+            &fixture.config,
             default_execution_alias,
             shard_assignment_policy,
             [
@@ -795,24 +942,36 @@ fn drive_run_to_status(
             ],
         )?;
 
-        for _ in 0..E2E_WORKER_PASSES_PER_CYCLE {
-            run_vigilo_ok(
-                config,
-                default_execution_alias,
-                shard_assignment_policy,
-                ["worker", "once"],
-            )?;
+        let status = run_vigilo_json(
+            &fixture.config,
+            default_execution_alias,
+            shard_assignment_policy,
+            ["run", "status", run_id_arg.as_str()],
+        )?;
+        if status["data"]["status"].as_str() == Some(expected_status) {
+            return Ok(status);
+        }
+
+        if !run_has_terminal_live_progress(&status) {
+            for _ in 0..E2E_WORKER_PASSES_PER_CYCLE {
+                run_vigilo_ok(
+                    &fixture.config,
+                    default_execution_alias,
+                    shard_assignment_policy,
+                    ["worker", "once"],
+                )?;
+            }
         }
 
         run_vigilo_ok(
-            config,
+            &fixture.config,
             default_execution_alias,
             shard_assignment_policy,
             ["coordinator", "once"],
         )?;
 
         let status = run_vigilo_json(
-            config,
+            &fixture.config,
             default_execution_alias,
             shard_assignment_policy,
             ["run", "status", run_id_arg.as_str()],
@@ -823,7 +982,7 @@ fn drive_run_to_status(
 
         last_status = Some(status);
         if cycle < E2E_MAX_RUNTIME_CYCLES {
-            thread::sleep(Duration::from_millis(150));
+            tokio::time::sleep(Duration::from_millis(150)).await;
         }
     }
 
@@ -831,9 +990,322 @@ fn drive_run_to_status(
         Some(status) => serde_json::to_string_pretty(&status)?,
         None => "<none>".to_owned(),
     };
+    let diagnostics = match collect_runtime_diagnostics(fixture, run_id).await {
+        Ok(diagnostics) => serde_json::to_string_pretty(&diagnostics)?,
+        Err(error) => format!("<failed to collect diagnostics: {error:#}>"),
+    };
     anyhow::bail!(
-        "run {run_id} did not reach status {expected_status} after {E2E_MAX_RUNTIME_CYCLES} cycles; last status:\n{last_status}"
+        "phase {phase:?}: run {run_id} did not reach status {expected_status} after {E2E_MAX_RUNTIME_CYCLES} cycles; last status:\n{last_status}\nruntime diagnostics:\n{diagnostics}"
     );
+}
+
+fn run_has_terminal_live_progress(status: &Value) -> bool {
+    let progress = &status["data"]["live_progress"];
+    let expected = progress["expected_execution_count"]
+        .as_i64()
+        .unwrap_or_default();
+    let terminal = progress["terminal_execution_count"]
+        .as_i64()
+        .unwrap_or_default();
+    let failed_chunks = progress["failed_chunk_count"].as_i64().unwrap_or_default();
+    let cancelled_chunks = progress["cancelled_chunk_count"]
+        .as_i64()
+        .unwrap_or_default();
+
+    (expected > 0 && terminal >= expected) || failed_chunks > 0 || cancelled_chunks > 0
+}
+
+#[test]
+fn terminal_live_progress_requires_execution_coverage_or_terminal_chunk_failure() {
+    let mut status = json!({
+        "data": {
+            "live_progress": {
+                "expected_execution_count": 1,
+                "terminal_execution_count": 0,
+                "failed_chunk_count": 0,
+                "cancelled_chunk_count": 0
+            }
+        },
+        "meta": {
+            "live_progress_complete": true
+        }
+    });
+
+    assert!(!run_has_terminal_live_progress(&status));
+
+    status["data"]["live_progress"]["terminal_execution_count"] = json!(1);
+    assert!(run_has_terminal_live_progress(&status));
+
+    status["data"]["live_progress"]["terminal_execution_count"] = json!(0);
+    status["data"]["live_progress"]["failed_chunk_count"] = json!(1);
+    assert!(run_has_terminal_live_progress(&status));
+}
+
+async fn collect_runtime_diagnostics(fixture: &E2eFixture, run_id: Uuid) -> anyhow::Result<Value> {
+    let target_control = sqlx::query_scalar::<_, Value>(
+        r#"
+        SELECT COALESCE(
+            (
+                SELECT jsonb_build_object(
+                    'run_id', r.id,
+                    'run_key', r.run_key,
+                    'status', r.status::text,
+                    'gate_status', r.gate_status::text,
+                    'expected_execution_count', r.expected_execution_count,
+                    'terminal_execution_count', r.terminal_execution_count,
+                    'passed_execution_count', r.passed_execution_count,
+                    'failed_execution_count', r.failed_execution_count,
+                    'errored_execution_count', r.errored_execution_count,
+                    'coordinator_leased_until', r.coordinator_leased_until,
+                    'coordinator_heartbeat_at', r.coordinator_heartbeat_at,
+                    'updated_at', r.updated_at,
+                    'dispatch_cursors', COALESCE(
+                        (
+                            SELECT jsonb_agg(
+                                jsonb_build_object(
+                                    'run_shard', c.run_shard,
+                                    'status', c.status,
+                                    'updated_at', c.updated_at
+                                )
+                                ORDER BY c.run_shard
+                            )
+                            FROM run_shard_dispatch_cursors c
+                            WHERE c.run_id = r.id
+                        ),
+                        '[]'::jsonb
+                    ),
+                    'placements', COALESCE(
+                        (
+                            SELECT jsonb_agg(
+                                jsonb_build_object(
+                                    'run_shard', sp.run_shard,
+                                    'database_alias', sp.database_alias,
+                                    'status', sp.status,
+                                    'route_version', sp.route_version
+                                )
+                                ORDER BY sp.run_shard
+                            )
+                            FROM shard_placements sp
+                            WHERE sp.run_id = r.id
+                        ),
+                        '[]'::jsonb
+                    )
+                )
+                FROM runs r
+                WHERE r.id = $1::uuid
+            ),
+            'null'::jsonb
+        )
+        "#,
+    )
+    .bind(run_id)
+    .fetch_one(&fixture.primary)
+    .await?;
+
+    let finalization_candidates = sqlx::query_scalar::<_, Value>(
+        r#"
+        SELECT COALESCE(
+            jsonb_agg(
+                jsonb_build_object(
+                    'run_id', r.id,
+                    'run_key', r.run_key,
+                    'status', r.status::text,
+                    'expected_execution_count', r.expected_execution_count,
+                    'terminal_execution_count', r.terminal_execution_count,
+                    'coordinator_heartbeat_at', r.coordinator_heartbeat_at,
+                    'updated_at', r.updated_at,
+                    'cursor_count', (
+                        SELECT COUNT(*)
+                        FROM run_shard_dispatch_cursors c
+                        WHERE c.run_id = r.id
+                    ),
+                    'open_cursor_count', (
+                        SELECT COUNT(*)
+                        FROM run_shard_dispatch_cursors c
+                        WHERE c.run_id = r.id
+                          AND c.status = 'open'
+                    )
+                )
+                ORDER BY COALESCE(r.coordinator_heartbeat_at, r.updated_at), r.id
+            ),
+            '[]'::jsonb
+        )
+        FROM runs r
+        WHERE r.status IN ('running'::run_status, 'finalizing'::run_status)
+          AND (
+              r.status <> 'finalizing'::run_status
+              OR r.coordinator_leased_until IS NULL
+              OR r.coordinator_leased_until < now()
+          )
+          AND EXISTS (
+              SELECT 1
+              FROM run_shard_dispatch_cursors c
+              WHERE c.run_id = r.id
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM run_shard_dispatch_cursors c
+              WHERE c.run_id = r.id
+                AND c.status = 'open'
+          )
+        "#,
+    )
+    .fetch_one(&fixture.primary)
+    .await?;
+
+    let mut execution_storage = serde_json::Map::new();
+    execution_storage.insert(
+        PRIMARY_ALIAS.to_owned(),
+        execution_storage_diagnostics(&fixture.primary, run_id).await?,
+    );
+    execution_storage.insert(
+        SHARD_ALIAS.to_owned(),
+        execution_storage_diagnostics(&fixture.shard, run_id).await?,
+    );
+
+    Ok(json!({
+        "target_control": target_control,
+        "eligible_finalization_candidates": finalization_candidates,
+        "execution_storage": execution_storage,
+    }))
+}
+
+async fn execution_storage_diagnostics(db: &PgPool, run_id: Uuid) -> anyhow::Result<Value> {
+    Ok(sqlx::query_scalar::<_, Value>(
+        r#"
+        SELECT jsonb_build_object(
+            'chunks', COALESCE(
+                (
+                    SELECT jsonb_agg(
+                        jsonb_build_object(
+                            'chunk_id', rc.id,
+                            'run_shard', rc.run_shard,
+                            'status', rc.status,
+                            'dispatched_at', rc.dispatched_at,
+                            'leased_until', rc.leased_until,
+                            'recovery_count', rc.recovery_count,
+                            'updated_at', rc.updated_at
+                        )
+                        ORDER BY rc.run_shard, rc.ordinal_start
+                    )
+                    FROM run_chunks rc
+                    WHERE rc.run_id = $1::uuid
+                ),
+                '[]'::jsonb
+            ),
+            'execution_status_counts', COALESCE(
+                (
+                    SELECT jsonb_object_agg(counts.status, counts.execution_count)
+                    FROM (
+                        SELECT e.status::text AS status, COUNT(*) AS execution_count
+                        FROM executions e
+                        WHERE e.run_id = $1::uuid
+                        GROUP BY e.status
+                    ) counts
+                ),
+                '{}'::jsonb
+            ),
+            'problem_executions', COALESCE(
+                (
+                    SELECT jsonb_agg(problem ORDER BY run_shard, execution_id)
+                    FROM (
+                        SELECT
+                            jsonb_build_object(
+                                'execution_id', e.id,
+                                'run_shard', e.run_shard,
+                                'status', e.status::text,
+                                'current_attempt_no', e.current_attempt_no,
+                                'current_attempt_id', e.current_attempt_id,
+                                'last_error_message', e.last_error_message,
+                                'retry_count', e.retry_count,
+                                'retry_after', e.retry_after,
+                                'updated_at', e.updated_at
+                            ) AS problem,
+                            e.run_shard,
+                            e.id AS execution_id
+                        FROM executions e
+                        WHERE e.run_id = $1::uuid
+                          AND (
+                              e.status <> 'completed'::execution_status
+                              OR e.last_error_message IS NOT NULL
+                          )
+                        ORDER BY e.run_shard, e.id
+                        LIMIT 50
+                    ) problems
+                ),
+                '[]'::jsonb
+            ),
+            'attempts', COALESCE(
+                (
+                    SELECT jsonb_agg(
+                        jsonb_build_object(
+                            'attempt_id', ea.id,
+                            'execution_id', ea.execution_id,
+                            'run_shard', ea.run_shard,
+                            'attempt_no', ea.attempt_no,
+                            'status', ea.status::text,
+                            'error_message', ea.error_message,
+                            'leased_until', ea.leased_until,
+                            'updated_at', ea.updated_at
+                        )
+                        ORDER BY ea.run_shard, ea.execution_id, ea.attempt_no
+                    )
+                    FROM execution_attempts ea
+                    WHERE ea.run_id = $1::uuid
+                ),
+                '[]'::jsonb
+            ),
+            'aggregates', COALESCE(
+                (
+                    SELECT jsonb_agg(
+                        jsonb_build_object(
+                            'execution_id', agg.execution_id,
+                            'run_shard', agg.run_shard,
+                            'attempt_id', agg.attempt_id,
+                            'overall_status', agg.overall_status::text,
+                            'aggregate_score', agg.aggregate_score,
+                            'evaluator_result_count', agg.evaluator_result_count,
+                            'blocking_failures', agg.blocking_failures,
+                            'updated_at', agg.updated_at
+                        )
+                        ORDER BY agg.run_shard, agg.execution_id
+                    )
+                    FROM execution_aggregates agg
+                    WHERE agg.run_id = $1::uuid
+                ),
+                '[]'::jsonb
+            ),
+            'shard_summaries', COALESCE(
+                (
+                    SELECT jsonb_agg(
+                        jsonb_build_object(
+                            'run_shard', summary.run_shard,
+                            'status', summary.status,
+                            'expected_execution_count', summary.expected_execution_count,
+                            'execution_count', summary.execution_count,
+                            'terminal_execution_count', summary.terminal_execution_count,
+                            'aggregate_count', summary.aggregate_count,
+                            'passed_execution_count', summary.passed_execution_count,
+                            'failed_execution_count', summary.failed_execution_count,
+                            'errored_execution_count', summary.errored_execution_count,
+                            'missing_aggregate_count', summary.missing_aggregate_count,
+                            'failed_chunk_count', summary.failed_chunk_count,
+                            'cancelled_chunk_count', summary.cancelled_chunk_count,
+                            'updated_at', summary.updated_at
+                        )
+                        ORDER BY summary.run_shard
+                    )
+                    FROM run_shard_summaries summary
+                    WHERE summary.run_id = $1::uuid
+                ),
+                '[]'::jsonb
+            )
+        )
+        "#,
+    )
+    .bind(run_id)
+    .fetch_one(db)
+    .await?)
 }
 
 fn run_vigilo_json<'a>(
@@ -857,6 +1329,8 @@ fn run_vigilo_ok<'a>(
     shard_assignment_policy: &str,
     args: impl IntoIterator<Item = &'a str>,
 ) -> anyhow::Result<Output> {
+    let args = args.into_iter().collect::<Vec<_>>();
+    let command = format!("vigilo {}", args.join(" "));
     let output = run_vigilo_output(
         config,
         default_execution_alias,
@@ -865,7 +1339,7 @@ fn run_vigilo_ok<'a>(
     )?;
     if !output.status.success() {
         anyhow::bail!(
-            "vigilo command failed with status {}\nstdout:\n{}\nstderr:\n{}",
+            "command {command:?} failed with status {}\nstdout:\n{}\nstderr:\n{}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
