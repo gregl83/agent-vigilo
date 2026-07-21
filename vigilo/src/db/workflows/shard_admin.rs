@@ -17,6 +17,10 @@ use sqlx::{
     PgPool,
     types::Json,
 };
+use tracing::{
+    info,
+    warn,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -120,6 +124,9 @@ pub(crate) struct ShardRebalanceItem {
     pub(crate) planned_route_version: i64,
     pub(crate) status: String,
     pub(crate) error_message: Option<String>,
+    pub(crate) claim_token: Option<Uuid>,
+    pub(crate) claimed_by: Option<Uuid>,
+    pub(crate) claimed_until: Option<DateTime<Utc>>,
     pub(crate) started_at: Option<DateTime<Utc>>,
     pub(crate) completed_at: Option<DateTime<Utc>>,
     pub(crate) updated_at: DateTime<Utc>,
@@ -152,6 +159,7 @@ pub(crate) struct ShardRebalancePlanOutcome {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ShardRebalanceApplyOptions {
     pub(crate) max_items: usize,
+    pub(crate) lease_seconds: i32,
     pub(crate) force: bool,
 }
 
@@ -187,6 +195,27 @@ struct ShardRebalanceCandidate {
     run_shard: i16,
     source_database_alias: String,
     route_version: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ClaimedShardRebalanceItem {
+    #[sqlx(flatten)]
+    item: ShardRebalanceItem,
+    reclaimed: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "planned route is stale for run {run_id} shard {run_shard}; expected {expected_alias} version {expected_version}, found {actual_alias} status {actual_status} version {actual_version}"
+)]
+struct StaleRebalancePlanError {
+    run_id: Uuid,
+    run_shard: i16,
+    expected_alias: String,
+    expected_version: i64,
+    actual_alias: String,
+    actual_status: String,
+    actual_version: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -232,6 +261,7 @@ const REBALANCE_OPERATION_STATUS_RUNNING: &str = "running";
 const REBALANCE_OPERATION_STATUS_COMPLETED: &str = "completed";
 const REBALANCE_OPERATION_STATUS_CANCELLED: &str = "cancelled";
 const REBALANCE_OPERATION_STATUS_FAILED: &str = "failed";
+const REBALANCE_ITEM_STATUS_CANCELLED: &str = "cancelled";
 const REBALANCE_ITEM_STATUS_COMPLETED: &str = "completed";
 const REBALANCE_ITEM_STATUS_FAILED: &str = "failed";
 
@@ -532,10 +562,11 @@ pub(crate) async fn plan_shard_rebalance(
     })
 }
 
-/// Applies up to `max_items` pending moves from a persisted rebalance plan.
+/// Applies up to `max_items` leased moves from a persisted rebalance plan.
 ///
-/// Re-running apply resumes from remaining pending items. Failed items retain
-/// their error in the item ledger; pending items are left untouched.
+/// Each move is claimed immediately before it starts. Re-running apply resumes
+/// pending items and running items whose prior claim expired. Terminal writes
+/// are fenced by the opaque token returned with the claim.
 pub(crate) async fn apply_shard_rebalance(
     database: &database::Db,
     operation_id: Uuid,
@@ -543,6 +574,9 @@ pub(crate) async fn apply_shard_rebalance(
 ) -> anyhow::Result<ShardRebalanceApplyOutcome> {
     if options.max_items == 0 {
         anyhow::bail!("max_items must be greater than zero");
+    }
+    if options.lease_seconds <= 0 {
+        anyhow::bail!("lease_seconds must be greater than zero");
     }
 
     let control_db = database.control().await?;
@@ -565,36 +599,106 @@ pub(crate) async fn apply_shard_rebalance(
         );
     }
 
-    mark_rebalance_operation_running(control_db, operation_id).await?;
-    let pending_items =
-        list_rebalance_apply_items(control_db, operation_id, options.max_items).await?;
-    let mut processed_items = Vec::with_capacity(pending_items.len());
+    let claimed_by = Uuid::now_v7();
+    let mut processed_items = Vec::with_capacity(options.max_items);
 
-    for item in pending_items {
-        mark_rebalance_item_running(control_db, &item).await?;
+    for _ in 0..options.max_items {
+        let Some(claim) = claim_next_rebalance_apply_item(
+            control_db,
+            operation_id,
+            claimed_by,
+            options.lease_seconds,
+        )
+        .await?
+        else {
+            break;
+        };
+        let item = claim.item;
+        let claim_token = item.claim_token.ok_or_else(|| {
+            anyhow::anyhow!(
+                "claimed rebalance item {} shard {} did not return a claim token",
+                item.run_id,
+                item.run_shard
+            )
+        })?;
+
+        if claim.reclaimed {
+            info!(
+                operation_id = %operation_id,
+                sequence_no = item.sequence_no,
+                run_id = %item.run_id,
+                run_shard = item.run_shard,
+                claim_token = %claim_token,
+                claimed_by = %claimed_by,
+                claimed_until = ?item.claimed_until,
+                "re-claimed expired shard rebalance apply item"
+            );
+        } else {
+            info!(
+                operation_id = %operation_id,
+                sequence_no = item.sequence_no,
+                run_id = %item.run_id,
+                run_shard = item.run_shard,
+                claim_token = %claim_token,
+                claimed_by = %claimed_by,
+                claimed_until = ?item.claimed_until,
+                "claimed shard rebalance apply item"
+            );
+        }
+
+        if rebalance_operation_is_cancelled(control_db, operation_id).await? {
+            let settled = mark_rebalance_item_cancelled(control_db, &item, claim_token).await?;
+            record_rebalance_item_settlement(
+                &mut processed_items,
+                settled,
+                &item,
+                claim_token,
+                claimed_by,
+                REBALANCE_ITEM_STATUS_CANCELLED,
+            );
+            continue;
+        }
+
         let result = apply_rebalance_item(database, &item, options.force).await;
         match result {
             Ok(()) => {
-                processed_items.push(
-                    mark_rebalance_item_completed(
-                        control_db,
-                        operation_id,
-                        item.run_id,
-                        item.run_shard,
-                    )
-                    .await?,
+                let settled = mark_rebalance_item_completed(control_db, &item, claim_token).await?;
+                record_rebalance_item_settlement(
+                    &mut processed_items,
+                    settled,
+                    &item,
+                    claim_token,
+                    claimed_by,
+                    REBALANCE_ITEM_STATUS_COMPLETED,
                 );
             }
             Err(error) => {
-                processed_items.push(
-                    mark_rebalance_item_failed(
-                        control_db,
-                        operation_id,
-                        item.run_id,
-                        item.run_shard,
-                        &error.to_string(),
-                    )
-                    .await?,
+                if let Some(stale) = error.downcast_ref::<StaleRebalancePlanError>() {
+                    warn!(
+                        operation_id = %operation_id,
+                        sequence_no = item.sequence_no,
+                        run_id = %item.run_id,
+                        run_shard = item.run_shard,
+                        claim_token = %claim_token,
+                        claimed_by = %claimed_by,
+                        expected_database_alias = %stale.expected_alias,
+                        expected_route_version = stale.expected_version,
+                        actual_database_alias = %stale.actual_alias,
+                        actual_route_status = %stale.actual_status,
+                        actual_route_version = stale.actual_version,
+                        "shard rebalance apply item failed stale-plan check"
+                    );
+                }
+                let settled =
+                    mark_rebalance_item_failed(control_db, &item, claim_token, &error.to_string())
+                        .await?;
+                record_rebalance_item_settlement(
+                    &mut processed_items,
+                    settled,
+                    &item,
+                    claim_token,
+                    claimed_by,
+                    REBALANCE_ITEM_STATUS_FAILED,
                 );
             }
         }
@@ -666,51 +770,83 @@ pub(crate) async fn cancel_shard_rebalance(
     operation_id: Uuid,
 ) -> anyhow::Result<ShardRebalanceOperation> {
     let control_db = database.control().await?;
-    let operation = select_rebalance_operation(control_db, operation_id)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!("shard rebalance operation {} was not found", operation_id)
-        })?;
+    let mut tx = control_db.begin().await?;
+    let operation = sqlx::query_as::<_, ShardRebalanceOperation>(
+        r#"
+        SELECT *
+        FROM shard_rebalance_operations
+        WHERE id = $1::uuid
+        FOR UPDATE
+        "#,
+    )
+    .bind(operation_id)
+    .fetch_optional(tx.as_mut())
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("shard rebalance operation {} was not found", operation_id))?;
 
     if matches!(
         operation.status.as_str(),
-        REBALANCE_OPERATION_STATUS_COMPLETED
-            | REBALANCE_OPERATION_STATUS_CANCELLED
-            | REBALANCE_OPERATION_STATUS_FAILED
+        REBALANCE_OPERATION_STATUS_COMPLETED | REBALANCE_OPERATION_STATUS_FAILED
     ) {
+        tx.commit().await?;
         return Ok(operation);
     }
 
     sqlx::query(
         r#"
-        WITH cancelled AS (
-            UPDATE shard_rebalance_items
-            SET status = 'cancelled',
-                completed_at = now(),
-                updated_at = now()
-            WHERE operation_id = $1::uuid
-              AND status IN ('pending', 'running')
-            RETURNING 1
-        )
         UPDATE shard_rebalance_operations
         SET status = 'cancelled',
-            cancelled_item_count = (
-                SELECT COUNT(*)::int
-                FROM shard_rebalance_items
-                WHERE operation_id = $1::uuid
-                  AND status = 'cancelled'
-            ),
-            cancelled_at = now(),
+            cancelled_at = COALESCE(cancelled_at, now()),
             updated_at = now()
         WHERE id = $1::uuid
-        RETURNING *
         "#,
     )
     .bind(operation_id)
-    .fetch_one(control_db)
+    .execute(tx.as_mut())
     .await?;
 
-    Ok(operation)
+    sqlx::query(
+        r#"
+        WITH cancellable AS (
+            SELECT
+                operation_id,
+                run_id,
+                run_shard,
+                status,
+                claim_token
+            FROM shard_rebalance_items
+            WHERE operation_id = $1::uuid
+              AND (
+                    status = 'pending'
+                    OR (
+                        status = 'running'
+                        AND claimed_until <= now()
+                    )
+              )
+            FOR UPDATE
+        )
+        UPDATE shard_rebalance_items item
+        SET status = 'cancelled',
+            error_message = NULL,
+            claim_token = NULL,
+            claimed_by = NULL,
+            claimed_until = NULL,
+            completed_at = now(),
+            updated_at = now()
+        FROM cancellable
+        WHERE item.operation_id = cancellable.operation_id
+          AND item.run_id = cancellable.run_id
+          AND item.run_shard = cancellable.run_shard
+          AND item.status = cancellable.status
+          AND item.claim_token IS NOT DISTINCT FROM cancellable.claim_token
+        "#,
+    )
+    .bind(operation_id)
+    .execute(tx.as_mut())
+    .await?;
+
+    tx.commit().await?;
+    refresh_rebalance_operation_status(control_db, operation_id).await
 }
 
 pub(crate) async fn move_shard_placement(
@@ -1021,24 +1157,6 @@ async fn select_rebalance_operation(
     Ok(operation)
 }
 
-async fn mark_rebalance_operation_running(db: &PgPool, operation_id: Uuid) -> anyhow::Result<()> {
-    sqlx::query(
-        r#"
-        UPDATE shard_rebalance_operations
-        SET status = 'running',
-            started_at = COALESCE(started_at, now()),
-            updated_at = now()
-        WHERE id = $1::uuid
-          AND status IN ('planned', 'running')
-        "#,
-    )
-    .bind(operation_id)
-    .execute(db)
-    .await?;
-
-    Ok(())
-}
-
 async fn list_rebalance_items_by_status(
     db: &PgPool,
     operation_id: Uuid,
@@ -1064,116 +1182,218 @@ async fn list_rebalance_items_by_status(
     Ok(items)
 }
 
-async fn list_rebalance_apply_items(
+async fn claim_next_rebalance_apply_item(
     db: &PgPool,
     operation_id: Uuid,
-    limit: usize,
-) -> anyhow::Result<Vec<ShardRebalanceItem>> {
-    let items = sqlx::query_as::<_, ShardRebalanceItem>(
+    claimed_by: Uuid,
+    lease_seconds: i32,
+) -> anyhow::Result<Option<ClaimedShardRebalanceItem>> {
+    let item = sqlx::query_as::<_, ClaimedShardRebalanceItem>(
         r#"
+        WITH active_operation AS (
+            UPDATE shard_rebalance_operations
+            SET status = 'running',
+                started_at = COALESCE(started_at, now()),
+                updated_at = now()
+            WHERE id = $1::uuid
+              AND status IN ('planned', 'running')
+            RETURNING id
+        ),
+        candidate AS (
+            SELECT
+                i.operation_id,
+                i.run_id,
+                i.run_shard,
+                i.status = 'running' AS reclaimed
+            FROM shard_rebalance_items i
+            JOIN active_operation operation
+              ON operation.id = i.operation_id
+            WHERE i.status = 'pending'
+               OR (
+                    i.status = 'running'
+                    AND i.claimed_until <= now()
+               )
+            ORDER BY i.sequence_no
+            FOR UPDATE OF i SKIP LOCKED
+            LIMIT 1
+        ),
+        claimed AS (
+            UPDATE shard_rebalance_items i
+            SET status = 'running',
+                error_message = NULL,
+                claim_token = gen_random_uuid(),
+                claimed_by = $2::uuid,
+                claimed_until = now() + ($3::int * interval '1 second'),
+                started_at = COALESCE(i.started_at, now()),
+                completed_at = NULL,
+                updated_at = now()
+            FROM candidate
+            WHERE i.operation_id = candidate.operation_id
+              AND i.run_id = candidate.run_id
+              AND i.run_shard = candidate.run_shard
+            RETURNING i.*, candidate.reclaimed
+        )
         SELECT *
-        FROM shard_rebalance_items
-        WHERE operation_id = $1::uuid
-          AND status IN ('pending', 'running')
-        ORDER BY sequence_no
-        LIMIT $2
+        FROM claimed
         "#,
     )
     .bind(operation_id)
-    .bind(limit as i64)
-    .fetch_all(db)
+    .bind(claimed_by)
+    .bind(lease_seconds)
+    .fetch_optional(db)
     .await?;
 
-    Ok(items)
+    Ok(item)
 }
 
-async fn mark_rebalance_item_running(db: &PgPool, item: &ShardRebalanceItem) -> anyhow::Result<()> {
-    sqlx::query(
-        r#"
-        UPDATE shard_rebalance_items
-        SET status = 'running',
-            started_at = COALESCE(started_at, now()),
-            updated_at = now()
-        WHERE operation_id = $1::uuid
-          AND run_id = $2::uuid
-          AND run_shard = $3
-          AND status = 'pending'
-        "#,
-    )
-    .bind(item.operation_id)
-    .bind(item.run_id)
-    .bind(item.run_shard)
-    .execute(db)
-    .await?;
-
-    Ok(())
+#[cfg(test)]
+fn rebalance_item_is_claim_eligible(
+    status: &str,
+    claimed_until: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    status == "pending"
+        || (status == "running" && claimed_until.is_some_and(|deadline| deadline <= now))
 }
 
 async fn mark_rebalance_item_completed(
     db: &PgPool,
-    operation_id: Uuid,
-    run_id: Uuid,
-    run_shard: i16,
-) -> anyhow::Result<ShardRebalanceItem> {
-    mark_rebalance_item_status(
-        db,
-        operation_id,
-        run_id,
-        run_shard,
-        REBALANCE_ITEM_STATUS_COMPLETED,
-        None,
-    )
-    .await
+    item: &ShardRebalanceItem,
+    claim_token: Uuid,
+) -> anyhow::Result<Option<ShardRebalanceItem>> {
+    mark_rebalance_item_status(db, item, claim_token, REBALANCE_ITEM_STATUS_COMPLETED, None).await
 }
 
 async fn mark_rebalance_item_failed(
     db: &PgPool,
-    operation_id: Uuid,
-    run_id: Uuid,
-    run_shard: i16,
+    item: &ShardRebalanceItem,
+    claim_token: Uuid,
     error_message: &str,
-) -> anyhow::Result<ShardRebalanceItem> {
+) -> anyhow::Result<Option<ShardRebalanceItem>> {
     mark_rebalance_item_status(
         db,
-        operation_id,
-        run_id,
-        run_shard,
+        item,
+        claim_token,
         REBALANCE_ITEM_STATUS_FAILED,
         Some(error_message),
     )
     .await
 }
 
+async fn mark_rebalance_item_cancelled(
+    db: &PgPool,
+    item: &ShardRebalanceItem,
+    claim_token: Uuid,
+) -> anyhow::Result<Option<ShardRebalanceItem>> {
+    mark_rebalance_item_status(db, item, claim_token, REBALANCE_ITEM_STATUS_CANCELLED, None).await
+}
+
 async fn mark_rebalance_item_status(
     db: &PgPool,
-    operation_id: Uuid,
-    run_id: Uuid,
-    run_shard: i16,
+    item: &ShardRebalanceItem,
+    claim_token: Uuid,
     status: &str,
     error_message: Option<&str>,
-) -> anyhow::Result<ShardRebalanceItem> {
+) -> anyhow::Result<Option<ShardRebalanceItem>> {
     let item = sqlx::query_as::<_, ShardRebalanceItem>(
         r#"
         UPDATE shard_rebalance_items
-        SET status = $4,
-            error_message = $5,
-            completed_at = CASE WHEN $4 IN ('completed', 'failed', 'cancelled') THEN now() ELSE completed_at END,
+        SET status = $5,
+            error_message = $6,
+            claim_token = NULL,
+            claimed_by = NULL,
+            claimed_until = NULL,
+            completed_at = now(),
             updated_at = now()
         WHERE operation_id = $1::uuid
           AND run_id = $2::uuid
           AND run_shard = $3
+          AND status = 'running'
+          AND claim_token = $4::uuid
         RETURNING *
         "#,
     )
-    .bind(operation_id)
-    .bind(run_id)
-    .bind(run_shard)
+    .bind(item.operation_id)
+    .bind(item.run_id)
+    .bind(item.run_shard)
+    .bind(claim_token)
     .bind(status)
     .bind(error_message)
-    .fetch_one(db)
+    .fetch_optional(db)
     .await?;
 
     Ok(item)
+}
+
+async fn rebalance_operation_is_cancelled(db: &PgPool, operation_id: Uuid) -> anyhow::Result<bool> {
+    let cancelled = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT status = 'cancelled'
+        FROM shard_rebalance_operations
+        WHERE id = $1::uuid
+        "#,
+    )
+    .bind(operation_id)
+    .fetch_one(db)
+    .await?;
+
+    Ok(cancelled)
+}
+
+fn record_rebalance_item_settlement(
+    processed_items: &mut Vec<ShardRebalanceItem>,
+    settled: Option<ShardRebalanceItem>,
+    claimed_item: &ShardRebalanceItem,
+    claim_token: Uuid,
+    claimed_by: Uuid,
+    status: &str,
+) {
+    let Some(settled) = settled else {
+        warn!(
+            operation_id = %claimed_item.operation_id,
+            sequence_no = claimed_item.sequence_no,
+            run_id = %claimed_item.run_id,
+            run_shard = claimed_item.run_shard,
+            claim_token = %claim_token,
+            claimed_by = %claimed_by,
+            attempted_status = status,
+            "stale shard rebalance apply worker was fenced from settling item"
+        );
+        return;
+    };
+
+    match status {
+        REBALANCE_ITEM_STATUS_COMPLETED => info!(
+            operation_id = %settled.operation_id,
+            sequence_no = settled.sequence_no,
+            run_id = %settled.run_id,
+            run_shard = settled.run_shard,
+            claim_token = %claim_token,
+            claimed_by = %claimed_by,
+            "completed shard rebalance apply item"
+        ),
+        REBALANCE_ITEM_STATUS_FAILED => warn!(
+            operation_id = %settled.operation_id,
+            sequence_no = settled.sequence_no,
+            run_id = %settled.run_id,
+            run_shard = settled.run_shard,
+            claim_token = %claim_token,
+            claimed_by = %claimed_by,
+            error = ?settled.error_message,
+            "failed shard rebalance apply item"
+        ),
+        REBALANCE_ITEM_STATUS_CANCELLED => info!(
+            operation_id = %settled.operation_id,
+            sequence_no = settled.sequence_no,
+            run_id = %settled.run_id,
+            run_shard = settled.run_shard,
+            claim_token = %claim_token,
+            claimed_by = %claimed_by,
+            "cancelled claimed shard rebalance apply item"
+        ),
+        _ => {}
+    }
+    processed_items.push(settled);
 }
 
 async fn apply_rebalance_item(
@@ -1202,16 +1422,16 @@ async fn apply_rebalance_item(
         || current.route_version != item.planned_route_version
         || current.status != SHARD_PLACEMENT_STATUS_ACTIVE
     {
-        anyhow::bail!(
-            "planned route is stale for run {} shard {}; expected {} version {}, found {} status {} version {}",
-            item.run_id,
-            item.run_shard,
-            item.source_database_alias,
-            item.planned_route_version,
-            current.database_alias,
-            current.status,
-            current.route_version
-        );
+        return Err(StaleRebalancePlanError {
+            run_id: item.run_id,
+            run_shard: item.run_shard,
+            expected_alias: item.source_database_alias.clone(),
+            expected_version: item.planned_route_version,
+            actual_alias: current.database_alias,
+            actual_status: current.status,
+            actual_version: current.route_version,
+        }
+        .into());
     }
 
     move_shard_placement(
@@ -1234,6 +1454,18 @@ async fn refresh_rebalance_operation_status(
     db: &PgPool,
     operation_id: Uuid,
 ) -> anyhow::Result<ShardRebalanceOperation> {
+    let mut tx = db.begin().await?;
+    let current_status = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT status
+        FROM shard_rebalance_operations
+        WHERE id = $1::uuid
+        FOR UPDATE
+        "#,
+    )
+    .bind(operation_id)
+    .fetch_one(tx.as_mut())
+    .await?;
     let (pending, running, completed, failed, cancelled) =
         sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
             r#"
@@ -1248,14 +1480,15 @@ async fn refresh_rebalance_operation_status(
             "#,
         )
         .bind(operation_id)
-        .fetch_one(db)
+        .fetch_one(tx.as_mut())
         .await?;
-    let status = if pending == 0 && running == 0 && failed == 0 {
-        REBALANCE_OPERATION_STATUS_COMPLETED
-    } else if pending == 0 && running == 0 && failed > 0 {
-        REBALANCE_OPERATION_STATUS_FAILED
-    } else {
-        REBALANCE_OPERATION_STATUS_RUNNING
+    let status = match current_status.as_str() {
+        REBALANCE_OPERATION_STATUS_CANCELLED => REBALANCE_OPERATION_STATUS_CANCELLED,
+        REBALANCE_OPERATION_STATUS_COMPLETED => REBALANCE_OPERATION_STATUS_COMPLETED,
+        REBALANCE_OPERATION_STATUS_FAILED => REBALANCE_OPERATION_STATUS_FAILED,
+        _ if pending == 0 && running == 0 && failed == 0 => REBALANCE_OPERATION_STATUS_COMPLETED,
+        _ if pending == 0 && running == 0 && failed > 0 => REBALANCE_OPERATION_STATUS_FAILED,
+        _ => REBALANCE_OPERATION_STATUS_RUNNING,
     };
     let error_message = if status == REBALANCE_OPERATION_STATUS_FAILED {
         Some("one or more rebalance items failed")
@@ -1271,7 +1504,10 @@ async fn refresh_rebalance_operation_status(
             failed_item_count = $4,
             cancelled_item_count = $5,
             error_message = $6,
-            completed_at = CASE WHEN $2 IN ('completed', 'failed') THEN now() ELSE completed_at END,
+            completed_at = CASE
+                WHEN $2 IN ('completed', 'failed') THEN COALESCE(completed_at, now())
+                ELSE completed_at
+            END,
             updated_at = now()
         WHERE id = $1::uuid
         RETURNING *
@@ -1283,8 +1519,9 @@ async fn refresh_rebalance_operation_status(
     .bind(failed as i32)
     .bind(cancelled as i32)
     .bind(error_message)
-    .fetch_one(db)
+    .fetch_one(tx.as_mut())
     .await?;
+    tx.commit().await?;
 
     Ok(operation)
 }
@@ -2130,6 +2367,301 @@ mod tests {
     }
 
     #[test]
+    fn rebalance_claim_eligibility_distinguishes_fresh_and_expired_running_items() {
+        let now = Utc::now();
+
+        assert!(rebalance_item_is_claim_eligible("pending", None, now));
+        assert!(!rebalance_item_is_claim_eligible(
+            "running",
+            Some(now + chrono::Duration::seconds(1)),
+            now,
+        ));
+        assert!(rebalance_item_is_claim_eligible(
+            "running",
+            Some(now - chrono::Duration::seconds(1)),
+            now,
+        ));
+        assert!(!rebalance_item_is_claim_eligible("completed", None, now));
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn rebalance_claims_pending_and_expired_items_but_skips_fresh_claims(pool: PgPool) {
+        let (operation_id, items) = seed_rebalance_operation(&pool, 3).await;
+        let fresh_token = Uuid::now_v7();
+        let fresh_owner = Uuid::now_v7();
+        let expired_token = Uuid::now_v7();
+        let expired_owner = Uuid::now_v7();
+
+        sqlx::query(
+            r#"
+            UPDATE shard_rebalance_items
+            SET status = 'running',
+                claim_token = $2::uuid,
+                claimed_by = $3::uuid,
+                claimed_until = now() + interval '1 hour'
+            WHERE operation_id = $1::uuid
+              AND sequence_no = 1
+            "#,
+        )
+        .bind(operation_id)
+        .bind(fresh_token)
+        .bind(fresh_owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            UPDATE shard_rebalance_items
+            SET status = 'running',
+                claim_token = $2::uuid,
+                claimed_by = $3::uuid,
+                claimed_until = now() - interval '1 hour'
+            WHERE operation_id = $1::uuid
+              AND sequence_no = 2
+            "#,
+        )
+        .bind(operation_id)
+        .bind(expired_token)
+        .bind(expired_owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let claimant = Uuid::now_v7();
+        let pending = claim_next_rebalance_apply_item(&pool, operation_id, claimant, 60)
+            .await
+            .unwrap()
+            .unwrap();
+        let expired = claim_next_rebalance_apply_item(&pool, operation_id, claimant, 60)
+            .await
+            .unwrap()
+            .unwrap();
+        let none = claim_next_rebalance_apply_item(&pool, operation_id, claimant, 60)
+            .await
+            .unwrap();
+
+        assert_eq!(pending.item.run_id, items[0].0);
+        assert!(!pending.reclaimed);
+        assert_eq!(expired.item.run_id, items[2].0);
+        assert!(expired.reclaimed);
+        assert!(none.is_none());
+
+        let fresh = sqlx::query_as::<_, ShardRebalanceItem>(
+            r#"
+            SELECT *
+            FROM shard_rebalance_items
+            WHERE operation_id = $1::uuid
+              AND sequence_no = 1
+            "#,
+        )
+        .bind(operation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(fresh.claim_token, Some(fresh_token));
+        assert_eq!(fresh.claimed_by, Some(fresh_owner));
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn expired_rebalance_claim_can_be_reclaimed_and_fences_stale_settlement(pool: PgPool) {
+        let (operation_id, _) = seed_rebalance_operation(&pool, 1).await;
+        let first = claim_next_rebalance_apply_item(&pool, operation_id, Uuid::now_v7(), 60)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_token = first.item.claim_token.unwrap();
+
+        sqlx::query(
+            r#"
+            UPDATE shard_rebalance_items
+            SET claimed_until = now() - interval '1 second'
+            WHERE operation_id = $1::uuid
+            "#,
+        )
+        .bind(operation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let second = claim_next_rebalance_apply_item(&pool, operation_id, Uuid::now_v7(), 60)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_token = second.item.claim_token.unwrap();
+        assert!(second.reclaimed);
+        assert_ne!(first_token, second_token);
+
+        let stale = mark_rebalance_item_completed(&pool, &first.item, first_token)
+            .await
+            .unwrap();
+        assert!(stale.is_none());
+
+        let completed = mark_rebalance_item_completed(&pool, &second.item, second_token)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, REBALANCE_ITEM_STATUS_COMPLETED);
+        assert!(completed.claim_token.is_none());
+        assert!(completed.claimed_by.is_none());
+        assert!(completed.claimed_until.is_none());
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn rebalance_cancellation_preserves_fresh_claim_and_fences_claimed_cancel(pool: PgPool) {
+        let database_url = isolated_database_url(&pool).await;
+        let database = context_with_control_pool(pool.clone(), database_url);
+        let (operation_id, _) = seed_rebalance_operation(&pool, 3).await;
+        let fresh = claim_next_rebalance_apply_item(&pool, operation_id, Uuid::now_v7(), 60)
+            .await
+            .unwrap()
+            .unwrap();
+        let expired = claim_next_rebalance_apply_item(&pool, operation_id, Uuid::now_v7(), 60)
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query(
+            r#"
+            UPDATE shard_rebalance_items
+            SET claimed_until = now() - interval '1 second'
+            WHERE operation_id = $1::uuid
+              AND run_id = $2::uuid
+              AND run_shard = $3
+            "#,
+        )
+        .bind(operation_id)
+        .bind(expired.item.run_id)
+        .bind(expired.item.run_shard)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let cancelled = cancel_shard_rebalance(&database, operation_id)
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status, REBALANCE_OPERATION_STATUS_CANCELLED);
+        assert_eq!(cancelled.cancelled_item_count, 2);
+
+        let fresh_state = sqlx::query_as::<_, ShardRebalanceItem>(
+            r#"
+            SELECT *
+            FROM shard_rebalance_items
+            WHERE operation_id = $1::uuid
+              AND run_id = $2::uuid
+              AND run_shard = $3
+            "#,
+        )
+        .bind(operation_id)
+        .bind(fresh.item.run_id)
+        .bind(fresh.item.run_shard)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(fresh_state.status, "running");
+        assert_eq!(fresh_state.claim_token, fresh.item.claim_token);
+
+        let claim_token = fresh.item.claim_token.unwrap();
+        let settled = mark_rebalance_item_cancelled(&pool, &fresh.item, claim_token)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.status, REBALANCE_ITEM_STATUS_CANCELLED);
+        let operation = refresh_rebalance_operation_status(&pool, operation_id)
+            .await
+            .unwrap();
+        assert_eq!(operation.status, REBALANCE_OPERATION_STATUS_CANCELLED);
+        assert_eq!(operation.cancelled_item_count, 3);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn concurrent_rebalance_apply_workers_move_each_item_once(pool: PgPool) {
+        let database_url = isolated_database_url(&pool).await;
+        let database = context_with_control_pool(pool.clone(), database_url);
+        let (operation_id, items) = seed_rebalance_operation(&pool, 6).await;
+        for (run_id, run_shard) in &items {
+            sqlx::query(
+                r#"
+                INSERT INTO shard_placements (
+                    run_id,
+                    run_shard,
+                    database_alias,
+                    status
+                )
+                VALUES ($1::uuid, $2, 'primary', 'active')
+                "#,
+            )
+            .bind(run_id)
+            .bind(run_shard)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let options = ShardRebalanceApplyOptions {
+            max_items: items.len(),
+            lease_seconds: 60,
+            force: false,
+        };
+        let (first, second) = tokio::join!(
+            apply_shard_rebalance(&database, operation_id, options),
+            apply_shard_rebalance(&database, operation_id, options),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let processed = first
+            .processed_items
+            .iter()
+            .chain(&second.processed_items)
+            .map(|item| (item.run_id, item.run_shard))
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            first.processed_items.len() + second.processed_items.len(),
+            items.len()
+        );
+        assert_eq!(processed.len(), items.len());
+        let operation = select_rebalance_operation(&pool, operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let item_states = sqlx::query_as::<_, (i32, String, Option<String>)>(
+            r#"
+            SELECT sequence_no, status, error_message
+            FROM shard_rebalance_items
+            WHERE operation_id = $1::uuid
+            ORDER BY sequence_no
+            "#,
+        )
+        .bind(operation_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            operation.status, REBALANCE_OPERATION_STATUS_COMPLETED,
+            "unexpected item states: {item_states:?}"
+        );
+        assert_eq!(operation.completed_item_count, items.len() as i32);
+
+        let route_versions = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT route_version
+            FROM shard_placements
+            WHERE run_id = ANY($1::uuid[])
+            ORDER BY run_id
+            "#,
+        )
+        .bind(items.iter().map(|(run_id, _)| *run_id).collect::<Vec<_>>())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(route_versions.len(), items.len());
+        assert!(route_versions.into_iter().all(|version| version == 3));
+    }
+
+    #[test]
     fn validate_run_shard_rejects_out_of_range_values() {
         assert!(validate_run_shard(0).is_ok());
         assert!(validate_run_shard(127).is_ok());
@@ -2217,6 +2749,86 @@ mod tests {
         };
         assert!(context.cell.set(pool).is_ok());
         context
+    }
+
+    async fn isolated_database_url(pool: &PgPool) -> String {
+        let database_name = sqlx::query_scalar::<_, String>("SELECT current_database()")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let mut database_url =
+            url::Url::parse(&std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap()).unwrap();
+        database_url.set_path(&database_name);
+        database_url.to_string()
+    }
+
+    async fn seed_rebalance_operation(
+        pool: &PgPool,
+        item_count: usize,
+    ) -> (Uuid, Vec<(Uuid, i16)>) {
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (
+                alias,
+                database_url_env,
+                role,
+                status
+            )
+            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'active')
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let operation_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            INSERT INTO shard_rebalance_operations (
+                id,
+                strategy,
+                source_database_alias,
+                target_database_alias,
+                planned_item_count
+            )
+            VALUES ($1::uuid, 'drain-source', 'primary', 'shard_001', $2)
+            "#,
+        )
+        .bind(operation_id)
+        .bind(item_count as i32)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let mut items = Vec::with_capacity(item_count);
+        for sequence_no in 0..item_count {
+            let run_id = Uuid::now_v7();
+            let run_shard = sequence_no as i16;
+            sqlx::query(
+                r#"
+                INSERT INTO shard_rebalance_items (
+                    operation_id,
+                    sequence_no,
+                    run_id,
+                    run_shard,
+                    source_database_alias,
+                    target_database_alias,
+                    planned_route_version
+                )
+                VALUES ($1::uuid, $2, $3::uuid, $4, 'primary', 'shard_001', 1)
+                "#,
+            )
+            .bind(operation_id)
+            .bind(sequence_no as i32)
+            .bind(run_id)
+            .bind(run_shard)
+            .execute(pool)
+            .await
+            .unwrap();
+            items.push((run_id, run_shard));
+        }
+
+        (operation_id, items)
     }
 
     async fn seed_case(pool: &PgPool, dataset_version_id: Uuid, case_id: Uuid, case_hash: &str) {

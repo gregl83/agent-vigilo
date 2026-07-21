@@ -290,16 +290,21 @@ Use rebalance operations when adding capacity or draining a placement:
 ```text
 vigilo shard rebalance plan --to shard_001 --max-items 100
 vigilo shard rebalance plan --from primary --to shard_001 --max-items 100
-vigilo shard rebalance apply <operation_id> --max-items 25
+vigilo shard rebalance apply <operation_id> --max-items 25 --lease-seconds 300
 vigilo shard rebalance verify <operation_id> --max-items 25
 vigilo shard rebalance cancel <operation_id>
 ```
 
 A rebalance plan records one item per `run_id + run_shard` in control storage.
-Apply is resumable and bounded; each item still uses the single-shard move
-workflow, including route fencing, copy verification, and active-work guards.
-Plans verify the stored `route_version` before moving an item so stale plans
-fail narrowly instead of rewriting an unexpected route.
+Apply is resumable and bounded. Each item is atomically claimed immediately
+before processing, and only pending items or running items with expired leases
+are eligible. Completion, failure, and claimed cancellation require the claim's
+opaque fencing token. Each item still uses the single-shard move workflow,
+including route fencing, copy verification, and active-work guards. Plans
+verify the stored `route_version` before moving an item so stale plans fail
+narrowly instead of rewriting an unexpected route. Claim duration defaults to
+300 seconds and can be changed with `--lease-seconds` or
+`VIGILO_REBALANCE_LEASE_SECONDS`.
 
 ## Current Scope
 
@@ -312,7 +317,7 @@ Implemented today:
   outbox publication, shard summaries, finalization, cancellation, live
   status/watch progress, results, export, route inspection, route fencing,
   placement assignment policy, explicit shard move, and persisted bulk
-  rebalance operations.
+  rebalance operations with leased concurrent apply claims.
 - Control-plane scale hardening through outbox queue indexing and structured
   backlog/timing logs for coordinator and routing hot paths.
 - Live placement admission checks that reject disabled targets and role changes
@@ -333,7 +338,7 @@ Intentionally deferred:
 - Evaluator metadata replication to execution placements.
 - Broader canonical case-data routing and replication.
 - Runtime database-secret and connection-parameter refresh.
-- Leased rebalance apply claims and fair multi-candidate finalization scanning.
+- Fair multi-candidate finalization scanning.
 
 These are product and operations contracts, not hidden formulas. Until they are
 designed explicitly, routing remains stored, inspectable, and conservative.

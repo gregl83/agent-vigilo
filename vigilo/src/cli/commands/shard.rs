@@ -25,6 +25,8 @@ use crate::{
     },
 };
 
+const REBALANCE_LEASE_SECONDS: i32 = 300;
+
 #[derive(Debug, Subcommand)]
 /// Shard placement administration operations.
 pub(crate) enum SubCommand {
@@ -174,6 +176,10 @@ pub(crate) enum RebalanceSubCommand {
         /// Maximum pending items to apply in this pass
         #[arg(long, default_value_t = 25)]
         max_items: usize,
+
+        /// Seconds before an interrupted item claim can be recovered
+        #[arg(long, env = "VIGILO_REBALANCE_LEASE_SECONDS", default_value_t = REBALANCE_LEASE_SECONDS, value_parser = clap::value_parser!(i32).range(1..=86400))]
+        lease_seconds: i32,
 
         /// Allow moving shards that still have leased chunks or running attempts
         #[arg(long, default_value_t = false)]
@@ -417,13 +423,18 @@ async fn exec_rebalance_command(
         RebalanceSubCommand::Apply {
             operation_id,
             max_items,
+            lease_seconds,
             force,
         } => {
             let operation_id = parse_operation_id(&operation_id)?;
             let outcome = shard_admin::apply_shard_rebalance(
                 database,
                 operation_id,
-                shard_admin::ShardRebalanceApplyOptions { max_items, force },
+                shard_admin::ShardRebalanceApplyOptions {
+                    max_items,
+                    lease_seconds,
+                    force,
+                },
             )
             .await?;
             info!(
@@ -757,6 +768,8 @@ mod tests {
             &operation_id,
             "--max-items",
             "3",
+            "--lease-seconds",
+            "45",
             "--force",
         ])
         .unwrap();
@@ -766,6 +779,7 @@ mod tests {
                 RebalanceSubCommand::Apply {
                     operation_id: parsed_operation_id,
                     max_items,
+                    lease_seconds,
                     force,
                 },
         } = cli.command
@@ -775,6 +789,7 @@ mod tests {
 
         assert_eq!(parsed_operation_id, operation_id);
         assert_eq!(max_items, 3);
+        assert_eq!(lease_seconds, 45);
         assert!(force);
     }
 
