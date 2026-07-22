@@ -8,10 +8,18 @@
 
 use std::collections::BTreeSet;
 
-use sqlx::PgPool;
+use sqlx::{
+    PgPool,
+    Postgres,
+    Transaction,
+};
 use uuid::Uuid;
 
 use super::run_shard_summary;
+use crate::context::database::{
+    self,
+    ExecutionRoute,
+};
 
 /// Run projection returned after a coordinator dispatches one shard window.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -56,6 +64,12 @@ pub(crate) struct DispatchRoute {
     pub(crate) run_shard: i16,
     pub(crate) database_alias: String,
     pub(crate) placement_status: String,
+    pub(crate) route_version: i64,
+}
+
+pub(crate) struct ClaimedDispatchRoute {
+    pub(crate) route: DispatchRoute,
+    pub(crate) control_tx: Transaction<'static, Postgres>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -89,20 +103,18 @@ pub(crate) struct ChunkLeaseRecoveryStats {
     pub(crate) failed: i64,
 }
 
-/// Committed lease-recovery counts plus non-transactional follow-up failures.
+/// Committed lease-recovery counts.
 #[derive(Debug)]
 pub(crate) struct ChunkLeaseRecoveryOutcome {
     pub(crate) stats: ChunkLeaseRecoveryStats,
-    pub(crate) summary_refresh_errors: Vec<anyhow::Error>,
 }
 
 /// Identifies which database boundary failed during a routed dispatch.
 ///
 /// Execution write failures are safe for the coordinator to isolate because
 /// the control cursor transaction rolls back and leaves the cursor open.
-/// Summary refresh failures happen after a successful cursor update and are
-/// identified separately. Control failures remain cycle-fatal because cursor
-/// ownership can no longer be determined reliably.
+/// Control failures remain cycle-fatal because cursor ownership can no longer
+/// be determined reliably.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RoutedDispatchError {
     #[error("dispatch invariant failed: {0}")]
@@ -111,12 +123,6 @@ pub(crate) enum RoutedDispatchError {
     Control(#[source] anyhow::Error),
     #[error("execution placement dispatch write failed: {0}")]
     ExecutionWrite(#[source] anyhow::Error),
-    #[error("execution placement shard-summary refresh failed: {source}")]
-    SummaryRefresh {
-        dispatched: DispatchedRun,
-        #[source]
-        source: anyhow::Error,
-    },
 }
 
 /// Recovers expired worker chunk leases for prepared run snapshots.
@@ -136,8 +142,10 @@ pub(crate) enum RoutedDispatchError {
 ///   limit and marks them `failed`.
 /// - `SKIP LOCKED` lets multiple coordinators run recovery without blocking
 ///   each other on the same chunk rows.
-/// - After commit, failed-shard summaries are refreshed. Those follow-up
-///   errors are returned separately so committed recovery counts are retained.
+/// - Failed-shard summaries are refreshed before commit, so clearing the final
+///   active lease and its derived summary are one source-side transition.
+/// - Recovery clears the chunk's opaque claim token, fencing a worker from
+///   allocating attempts or persisting results after reassignment.
 pub(crate) async fn recover_expired_chunk_leases(
     db: &PgPool,
     max_recoveries: i32,
@@ -174,6 +182,7 @@ pub(crate) async fn recover_expired_chunk_leases(
         recovered AS (
             UPDATE run_chunks rc
             SET status = 'pending',
+                lease_token = NULL,
                 leased_until = NULL,
                 recovery_count = expired.next_recovery_count,
                 last_recovered_at = now(),
@@ -261,6 +270,7 @@ pub(crate) async fn recover_expired_chunk_leases(
         failed AS (
             UPDATE run_chunks rc
             SET status = 'failed',
+                lease_token = NULL,
                 leased_until = NULL,
                 updated_at = now()
             FROM expired
@@ -300,24 +310,17 @@ pub(crate) async fn recover_expired_chunk_leases(
     .fetch_all(&mut *tx)
     .await?;
 
-    tx.commit().await?;
-
     let failed_shards = failed_rows.iter().copied().collect::<BTreeSet<_>>();
-    let mut summary_refresh_errors = Vec::new();
     for (run_id, run_shard) in failed_shards {
-        if let Err(error) =
-            run_shard_summary::refresh_run_shard_summary(db, run_id, run_shard).await
-        {
-            summary_refresh_errors.push(error);
-        }
+        run_shard_summary::refresh_run_shard_summary_with(&mut *tx, run_id, run_shard).await?;
     }
+    tx.commit().await?;
 
     Ok(ChunkLeaseRecoveryOutcome {
         stats: ChunkLeaseRecoveryStats {
             recovered,
             failed: i64::try_from(failed_rows.len())?,
         },
-        summary_refresh_errors,
     })
 }
 
@@ -329,17 +332,34 @@ pub(crate) async fn recover_expired_chunk_leases(
 /// then locks and advances that exact cursor on the resolved placement. Aliases
 /// that already failed in the current coordinator cycle are excluded so they
 /// cannot consume the remaining dispatch budget.
+#[cfg(test)]
 pub(crate) async fn select_next_dispatch_route(
     db: &PgPool,
     excluded_database_aliases: &[String],
 ) -> anyhow::Result<Option<DispatchRoute>> {
+    let Some(claim) = claim_next_dispatch_route(db, excluded_database_aliases).await? else {
+        return Ok(None);
+    };
+    let route = claim.route;
+    claim.control_tx.rollback().await?;
+    Ok(Some(route))
+}
+
+/// Claims the next control cursor and keeps its transaction open through the
+/// routed execution write.
+pub(crate) async fn claim_next_dispatch_route(
+    db: &PgPool,
+    excluded_database_aliases: &[String],
+) -> anyhow::Result<Option<ClaimedDispatchRoute>> {
+    let mut control_tx = db.begin().await?;
     let route = sqlx::query_as::<_, DispatchRoute>(
         r#"
         SELECT
             c.run_id,
             c.run_shard,
             sp.database_alias,
-            sp.status AS placement_status
+            sp.status AS placement_status,
+            sp.route_version
         FROM run_shard_dispatch_cursors c
         JOIN runs r
           ON r.id = c.run_id
@@ -365,13 +385,19 @@ pub(crate) async fn select_next_dispatch_route(
           )
         ORDER BY c.updated_at ASC, c.run_id ASC, c.run_shard ASC
         LIMIT 1
+        FOR UPDATE OF c SKIP LOCKED
         "#,
     )
     .bind(excluded_database_aliases)
-    .fetch_optional(db)
+    .fetch_optional(&mut *control_tx)
     .await?;
 
-    Ok(route)
+    let Some(route) = route else {
+        control_tx.rollback().await?;
+        return Ok(None);
+    };
+
+    Ok(Some(ClaimedDispatchRoute { route, control_tx }))
 }
 
 /// Counts currently dispatchable control-plane cursor rows.
@@ -416,35 +442,31 @@ pub(crate) async fn count_dispatch_cursor_backlog(db: &PgPool) -> anyhow::Result
 /// Starts a dispatchable run in control storage and returns its snapshot.
 ///
 /// The returned data is copied into execution storage by
-/// [`dispatch_routed_run_window`] before worker-visible chunk events are
+/// [`dispatch_admitted_run_window`] before worker-visible chunk events are
 /// inserted. `run.started` is a control-plane event, so it is emitted here.
+#[cfg(test)]
 pub(crate) async fn prepare_dispatch_run_snapshot(
     db: &PgPool,
     route: &DispatchRoute,
     coordinator_id: Uuid,
     lease_seconds: i32,
 ) -> anyhow::Result<Option<DispatchRunSnapshot>> {
-    let snapshot = sqlx::query_as::<_, DispatchRunSnapshot>(
+    let mut tx = db.begin().await?;
+    let snapshot =
+        prepare_dispatch_run_snapshot_with(&mut tx, route, coordinator_id, lease_seconds).await?;
+    tx.commit().await?;
+    Ok(snapshot)
+}
+
+pub(crate) async fn prepare_dispatch_run_snapshot_with(
+    tx: &mut Transaction<'_, Postgres>,
+    route: &DispatchRoute,
+    coordinator_id: Uuid,
+    lease_seconds: i32,
+) -> anyhow::Result<Option<DispatchRunSnapshot>> {
+    let started = sqlx::query_as::<_, DispatchRunSnapshot>(
         r#"
-        WITH candidate AS (
-            SELECT
-                id,
-                status AS previous_status
-            FROM runs
-            WHERE id = $1::uuid
-              AND (
-                  status = 'running'::run_status
-                  OR (
-                      status = 'pending'::run_status
-                      AND (
-                          coordinator_leased_until IS NULL
-                          OR coordinator_leased_until < now()
-                      )
-                  )
-              )
-            FOR UPDATE
-        ),
-        started_run AS (
+        WITH started_run AS (
             UPDATE runs r
             SET status = 'running'::run_status,
                 coordinator_id = $3::uuid,
@@ -453,82 +475,108 @@ pub(crate) async fn prepare_dispatch_run_snapshot(
                 started_at = COALESCE(r.started_at, now()),
                 dispatched_at = COALESCE(r.dispatched_at, now()),
                 updated_at = now()
-            FROM candidate
-            WHERE r.id = candidate.id
-              AND candidate.previous_status = 'pending'::run_status
+            WHERE r.id = $1::uuid
               AND r.status = 'pending'::run_status
+              AND (
+                  r.coordinator_leased_until IS NULL
+                  OR r.coordinator_leased_until < now()
+              )
             RETURNING r.*
-        ),
-        selected_run AS (
-            SELECT *
-            FROM started_run
-            UNION ALL
-            SELECT r.*
-            FROM runs r
-            JOIN candidate
-              ON candidate.id = r.id
-            WHERE candidate.previous_status = 'running'::run_status
-              AND r.status = 'running'::run_status
         ),
         started_event AS (
             INSERT INTO outbox_events (event_type, aggregate_type, aggregate_id, dedupe_key, payload)
             SELECT
                 'run.started',
                 'run',
-                selected_run.id,
-                format('run:%s:started', selected_run.id),
-                jsonb_build_object('run_id', selected_run.id)
-            FROM selected_run
-            JOIN candidate
-              ON candidate.id = selected_run.id
-            WHERE candidate.previous_status = 'pending'::run_status
+                started_run.id,
+                format('run:%s:started', started_run.id),
+                jsonb_build_object('run_id', started_run.id)
+            FROM started_run
             ON CONFLICT (dedupe_key) DO NOTHING
             RETURNING id
         )
         SELECT
-            selected_run.id AS run_id,
+            started_run.id AS run_id,
             $2::smallint AS run_shard,
-            selected_run.run_key,
-            selected_run.dataset_id,
-            selected_run.dataset_version_id,
-            selected_run.dataset_version,
-            selected_run.evaluation_profile_id,
-            selected_run.evaluation_profile_version,
-            selected_run.profile_version_id,
-            selected_run.profile_hash,
-            selected_run.aggregation_policy_id,
-            selected_run.aggregation_policy_version,
-            selected_run.aggregation_policy_hash,
-            selected_run.agent_provider,
-            selected_run.agent_name,
-            selected_run.agent_version,
-            selected_run.prompt_config_id,
-            selected_run.prompt_config_version,
-            selected_run.config_snapshot,
+            started_run.run_key,
+            started_run.dataset_id,
+            started_run.dataset_version_id,
+            started_run.dataset_version,
+            started_run.evaluation_profile_id,
+            started_run.evaluation_profile_version,
+            started_run.profile_version_id,
+            started_run.profile_hash,
+            started_run.aggregation_policy_id,
+            started_run.aggregation_policy_version,
+            started_run.aggregation_policy_hash,
+            started_run.agent_provider,
+            started_run.agent_name,
+            started_run.agent_version,
+            started_run.prompt_config_id,
+            started_run.prompt_config_version,
+            started_run.config_snapshot,
             (SELECT COUNT(*)::bigint FROM started_event) AS run_started_events_enqueued
-        FROM selected_run
+        FROM started_run
         "#,
     )
     .bind(route.run_id)
     .bind(route.run_shard)
     .bind(coordinator_id)
     .bind(lease_seconds)
-    .fetch_optional(db)
+    .fetch_optional(&mut **tx)
     .await?;
 
-    Ok(snapshot)
+    if started.is_some() {
+        return Ok(started);
+    }
+
+    let running = sqlx::query_as::<_, DispatchRunSnapshot>(
+        r#"
+        SELECT
+            r.id AS run_id,
+            $2::smallint AS run_shard,
+            r.run_key,
+            r.dataset_id,
+            r.dataset_version_id,
+            r.dataset_version,
+            r.evaluation_profile_id,
+            r.evaluation_profile_version,
+            r.profile_version_id,
+            r.profile_hash,
+            r.aggregation_policy_id,
+            r.aggregation_policy_version,
+            r.aggregation_policy_hash,
+            r.agent_provider,
+            r.agent_name,
+            r.agent_version,
+            r.prompt_config_id,
+            r.prompt_config_version,
+            r.config_snapshot,
+            0::bigint AS run_started_events_enqueued
+        FROM runs r
+        WHERE r.id = $1::uuid
+          AND r.status = 'running'::run_status
+        FOR SHARE
+        "#,
+    )
+    .bind(route.run_id)
+    .bind(route.run_shard)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    Ok(running)
 }
 
 /// Claims one dispatchable run shard and enqueues a bounded chunk-ready window.
 ///
-/// The caller first prepares a control-owned [`DispatchRunSnapshot`]. This
-/// function copies that snapshot into execution storage, claims one open
-/// control cursor, scans only that shard's pending execution chunks, and then
-/// releases or drains the control cursor.
+/// The caller claims one open control cursor and prepares its control-owned
+/// [`DispatchRunSnapshot`] in the same transaction. The execution write copies
+/// that snapshot, scans only that shard's pending chunks, and then releases or
+/// drains the held cursor.
 ///
 /// Query behavior:
 /// - Upserts the execution-local snapshot before worker-visible events.
-/// - Selects the exact open control cursor with `FOR UPDATE SKIP LOCKED`.
+/// - Keeps the control cursor claim through the execution write.
 /// - Selects a bounded chunk window inside one `run_id + run_shard`, emits
 ///   idempotent `run.chunk.ready` events, and advances each chunk's
 ///   `dispatched_at` cursor in the same statement.
@@ -541,40 +589,89 @@ async fn dispatch_next_run_window(
     lease_seconds: i32,
     chunk_window_size: i64,
 ) -> anyhow::Result<Option<DispatchedRun>> {
-    let Some(route) = select_next_dispatch_route(db, &[]).await? else {
+    let Some(mut claim) = claim_next_dispatch_route(db, &[]).await? else {
         return Ok(None);
     };
-    let Some(snapshot) =
-        prepare_dispatch_run_snapshot(db, &route, coordinator_id, lease_seconds).await?
+    let route = claim.route.clone();
+    let Some(snapshot) = prepare_dispatch_run_snapshot_with(
+        &mut claim.control_tx,
+        &route,
+        coordinator_id,
+        lease_seconds,
+    )
+    .await?
     else {
+        claim.control_tx.rollback().await?;
         return Ok(None);
     };
+    let execution_tx = db.begin().await?;
 
-    Ok(dispatch_routed_run_window(db, db, chunk_window_size, &route, &snapshot).await?)
+    Ok(dispatch_routed_run_window_with_transactions(
+        claim.control_tx,
+        execution_tx,
+        chunk_window_size,
+        &route,
+        &snapshot,
+    )
+    .await?)
 }
 
-/// Claims and dispatches one exact run-shard route.
-///
-/// The route is selected from control storage before the caller resolves the
-/// execution placement. This function keeps the shard-local dispatch statement
-/// constrained to that routed `run_id + run_shard`.
-pub(crate) async fn dispatch_routed_run_window(
+/// Claims and dispatches one exact run-shard through fenced write admission.
+pub(crate) async fn dispatch_admitted_run_window(
+    database: &database::Db,
+    control_tx: Transaction<'static, Postgres>,
+    execution_route: &ExecutionRoute,
+    chunk_window_size: i64,
+    route: &DispatchRoute,
+    snapshot: &DispatchRunSnapshot,
+) -> Result<Option<DispatchedRun>, RoutedDispatchError> {
+    let execution_tx = database
+        .begin_execution_admission(execution_route)
+        .await
+        .map_err(RoutedDispatchError::ExecutionWrite)?;
+
+    dispatch_routed_run_window_with_transactions(
+        control_tx,
+        execution_tx,
+        chunk_window_size,
+        route,
+        snapshot,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn dispatch_routed_run_window(
     control_db: &PgPool,
     execution_db: &PgPool,
     chunk_window_size: i64,
     route: &DispatchRoute,
     snapshot: &DispatchRunSnapshot,
 ) -> Result<Option<DispatchedRun>, RoutedDispatchError> {
-    if snapshot.run_id != route.run_id || snapshot.run_shard != route.run_shard {
-        return Err(RoutedDispatchError::Invariant(anyhow::anyhow!(
-            "dispatch snapshot route mismatch: route {} shard {}, snapshot {} shard {}",
-            route.run_id,
-            route.run_shard,
-            snapshot.run_id,
-            snapshot.run_shard
-        )));
-    }
+    let Some(control_tx) = claim_exact_dispatch_cursor(control_db, route).await? else {
+        return Ok(None);
+    };
+    let execution_tx = execution_db
+        .begin()
+        .await
+        .map_err(anyhow::Error::from)
+        .map_err(RoutedDispatchError::ExecutionWrite)?;
 
+    dispatch_routed_run_window_with_transactions(
+        control_tx,
+        execution_tx,
+        chunk_window_size,
+        route,
+        snapshot,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn claim_exact_dispatch_cursor(
+    control_db: &PgPool,
+    route: &DispatchRoute,
+) -> Result<Option<Transaction<'static, Postgres>>, RoutedDispatchError> {
     let mut control_tx = control_db
         .begin()
         .await
@@ -598,13 +695,38 @@ pub(crate) async fn dispatch_routed_run_window(
     .map_err(RoutedDispatchError::Control)?
     .is_some();
 
-    if !cursor_locked {
+    if cursor_locked {
+        Ok(Some(control_tx))
+    } else {
         control_tx
             .rollback()
             .await
             .map_err(anyhow::Error::from)
             .map_err(RoutedDispatchError::Control)?;
-        return Ok(None);
+        Ok(None)
+    }
+}
+
+/// Applies a dispatch window while the caller holds shard write admission.
+///
+/// The route is selected from control storage before the caller resolves the
+/// execution placement. This function keeps the shard-local dispatch statement
+/// constrained to that routed `run_id + run_shard`.
+async fn dispatch_routed_run_window_with_transactions(
+    mut control_tx: Transaction<'static, Postgres>,
+    mut execution_tx: Transaction<'static, Postgres>,
+    chunk_window_size: i64,
+    route: &DispatchRoute,
+    snapshot: &DispatchRunSnapshot,
+) -> Result<Option<DispatchedRun>, RoutedDispatchError> {
+    if snapshot.run_id != route.run_id || snapshot.run_shard != route.run_shard {
+        return Err(RoutedDispatchError::Invariant(anyhow::anyhow!(
+            "dispatch snapshot route mismatch: route {} shard {}, snapshot {} shard {}",
+            route.run_id,
+            route.run_shard,
+            snapshot.run_id,
+            snapshot.run_shard
+        )));
     }
 
     // Query outline:
@@ -806,10 +928,26 @@ pub(crate) async fn dispatch_routed_run_window(
     .bind(&snapshot.prompt_config_version)
     .bind(&snapshot.config_snapshot)
     .bind(snapshot.run_started_events_enqueued)
-    .fetch_optional(execution_db)
+    .fetch_optional(&mut *execution_tx)
     .await
     .map_err(anyhow::Error::from)
     .map_err(RoutedDispatchError::ExecutionWrite)?;
+
+    if let Some(dispatched) = &dispatched {
+        run_shard_summary::refresh_run_shard_summary_with(
+            &mut *execution_tx,
+            dispatched.id,
+            dispatched.run_shard,
+        )
+        .await
+        .map_err(RoutedDispatchError::ExecutionWrite)?;
+    }
+
+    execution_tx
+        .commit()
+        .await
+        .map_err(anyhow::Error::from)
+        .map_err(RoutedDispatchError::ExecutionWrite)?;
 
     if let Some(dispatched) = &dispatched {
         let next_status = if dispatched.has_remaining_chunks {
@@ -838,19 +976,6 @@ pub(crate) async fn dispatch_routed_run_window(
             .await
             .map_err(anyhow::Error::from)
             .map_err(RoutedDispatchError::Control)?;
-
-        if let Err(source) = run_shard_summary::refresh_run_shard_summary(
-            execution_db,
-            dispatched.id,
-            dispatched.run_shard,
-        )
-        .await
-        {
-            return Err(RoutedDispatchError::SummaryRefresh {
-                dispatched: dispatched.into(),
-                source,
-            });
-        }
     } else {
         control_tx
             .rollback()
@@ -1312,6 +1437,7 @@ mod tests {
             run_shard: 1,
             database_alias: "primary".to_string(),
             placement_status: "active".to_string(),
+            route_version: 1,
         };
         let snapshot = prepare_dispatch_run_snapshot(&pool, &route, Uuid::now_v7(), 60)
             .await

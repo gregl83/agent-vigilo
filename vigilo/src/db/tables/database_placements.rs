@@ -152,10 +152,11 @@ pub(crate) async fn list_active_shard_capable_database_aliases(
     Ok(aliases)
 }
 
-/// Lists active shard-capable aliases that currently own active shard rows.
+/// Lists active shard-capable aliases that currently own routed shard rows.
 ///
-/// Recovery scans run per execution placement, so aliases without active shard
-/// placements do not need a recovery pass.
+/// Recovery must include `moving` and `draining` routes so expired work can
+/// clear before movement or drainage resumes. Aliases without routed shards do
+/// not need a recovery pass.
 pub(crate) async fn list_active_shard_database_aliases(db: &PgPool) -> anyhow::Result<Vec<String>> {
     let aliases = sqlx::query_scalar::<_, String>(
         r#"
@@ -165,7 +166,6 @@ pub(crate) async fn list_active_shard_database_aliases(db: &PgPool) -> anyhow::R
           ON sp.database_alias = dp.alias
         WHERE dp.status = 'active'
           AND dp.role IN ('shard', 'control_and_shard')
-          AND sp.status = 'active'
         ORDER BY dp.alias
         "#,
     )
@@ -230,7 +230,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx placement tests"]
-    async fn list_active_shard_database_aliases_filters_to_active_routed_shards(pool: PgPool) {
+    async fn list_active_shard_database_aliases_includes_moving_routes(pool: PgPool) {
         sqlx::query(
             r#"
             INSERT INTO database_placements (alias, database_url_env, role, status)
@@ -252,7 +252,8 @@ mod tests {
                 ($1::uuid, 0, 'primary', 'active'),
                 ($1::uuid, 1, 'primary', 'moving'),
                 ($1::uuid, 2, 'shard_001', 'active'),
-                ($1::uuid, 3, 'shard_002', 'active')
+                ($1::uuid, 3, 'shard_002', 'active'),
+                ($1::uuid, 4, 'shard_003', 'moving')
             "#,
         )
         .bind(run_id)
@@ -264,7 +265,11 @@ mod tests {
 
         assert_eq!(
             aliases,
-            vec!["primary".to_string(), "shard_001".to_string()]
+            vec![
+                "primary".to_string(),
+                "shard_001".to_string(),
+                "shard_003".to_string()
+            ]
         );
     }
 

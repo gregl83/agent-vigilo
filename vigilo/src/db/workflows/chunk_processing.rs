@@ -8,7 +8,35 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::models::run_chunk::RunChunk;
+use crate::{
+    context::database::{
+        self,
+        ExecutionRoute,
+    },
+    models::run_chunk::RunChunk,
+};
+
+/// Claims a chunk through a previously resolved execution route.
+pub(crate) async fn claim_routed_chunk_for_processing(
+    database: &database::Db,
+    route: &ExecutionRoute,
+    run_id: Uuid,
+    run_shard: i16,
+    chunk_id: Uuid,
+    lease_seconds: i32,
+) -> anyhow::Result<Option<RunChunk>> {
+    let mut tx = database.begin_execution_admission(route).await?;
+    let chunk = claim_chunk_for_processing_in_transaction(
+        &mut tx,
+        run_id,
+        run_shard,
+        chunk_id,
+        lease_seconds,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(chunk)
+}
 
 /// Dataset case row materialized for worker-side execution.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, sqlx::FromRow)]
@@ -32,10 +60,10 @@ pub(crate) struct WorkerCaseBatchItem {
 ///
 /// Query behavior: one guarded `UPDATE ... RETURNING` claims ownership only if
 /// the chunk is pending or its previous lease has expired and the execution
-/// placement has a local run snapshot. The returned `leased_until` value is the
-/// worker's lease token for later completion, release, or failure.
-pub(crate) async fn claim_chunk_for_processing(
-    db: &PgPool,
+/// placement has a local run snapshot. Each claim receives an opaque token that
+/// remains stable while heartbeats extend its deadline.
+async fn claim_chunk_for_processing_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_id: Uuid,
     run_shard: i16,
     chunk_id: Uuid,
@@ -45,6 +73,7 @@ pub(crate) async fn claim_chunk_for_processing(
         r#"
 		UPDATE run_chunks
 		SET status = 'leased',
+			lease_token = gen_random_uuid(),
 			leased_until = now() + ($4::int * interval '1 second'),
 			updated_at = now()
 		WHERE run_id = $1::uuid
@@ -69,6 +98,7 @@ pub(crate) async fn claim_chunk_for_processing(
 			ordinal_start,
 			ordinal_end,
 			status,
+			lease_token,
 			leased_until,
 			created_at,
 			updated_at
@@ -78,7 +108,7 @@ pub(crate) async fn claim_chunk_for_processing(
     .bind(run_shard)
     .bind(chunk_id)
     .bind(lease_seconds)
-    .fetch_optional(db)
+    .fetch_optional(&mut **tx)
     .await?;
 
     Ok(chunk)
@@ -86,19 +116,18 @@ pub(crate) async fn claim_chunk_for_processing(
 
 /// Extends a currently owned chunk lease and returns the updated lease token.
 ///
-/// Lease ownership is represented by the `leased_until` value returned at
-/// claim/extension time. Completion and release must use the latest returned
-/// row, otherwise stale workers cannot overwrite the current owner.
+/// Lease ownership is represented by the opaque claim token. Heartbeats retain
+/// that token while advancing the deadline.
 ///
-/// Query behavior: updates the lease only when the chunk is still leased by the
-/// same timestamp token and the execution placement still has a local run
-/// snapshot. `None` means the worker lost authority and should acknowledge the
-/// stale message.
+/// Query behavior: updates an unexpired lease only for its current token and
+/// while the execution placement still has a local run snapshot. `None` means
+/// the worker lost authority and should acknowledge the stale message.
 pub(crate) async fn extend_chunk_lease(
     db: &PgPool,
     chunk: &RunChunk,
     lease_seconds: i32,
 ) -> anyhow::Result<Option<RunChunk>> {
+    let lease_token = require_chunk_lease_token(chunk)?;
     let chunk = sqlx::query_as::<_, RunChunk>(
         r#"
 		UPDATE run_chunks
@@ -108,7 +137,8 @@ pub(crate) async fn extend_chunk_lease(
           AND run_shard = $2
 		  AND id = $3::uuid
 		  AND status = 'leased'
-		  AND leased_until IS NOT DISTINCT FROM $5::timestamptz
+		  AND lease_token = $5::uuid
+		  AND leased_until >= now()
 		  AND EXISTS (
 			SELECT 1
 			FROM run_snapshots rs
@@ -124,6 +154,7 @@ pub(crate) async fn extend_chunk_lease(
 			ordinal_start,
 			ordinal_end,
 			status,
+			lease_token,
 			leased_until,
 			created_at,
 			updated_at
@@ -133,7 +164,7 @@ pub(crate) async fn extend_chunk_lease(
     .bind(chunk.run_shard)
     .bind(chunk.id)
     .bind(lease_seconds)
-    .bind(chunk.leased_until)
+    .bind(lease_token)
     .fetch_optional(db)
     .await?;
 
@@ -181,29 +212,45 @@ pub(crate) async fn load_chunk_case_batch(
 
 /// Marks a leased chunk complete if the caller still owns the same lease.
 ///
-/// Query behavior: clears the lease and moves the chunk to `completed` only if
-/// the stored lease timestamp still matches the worker's latest token. A zero
-/// row count means the worker is stale.
-pub(crate) async fn mark_chunk_completed(db: &PgPool, chunk: &RunChunk) -> anyhow::Result<u64> {
+/// Query behavior: clears an unexpired token-owned lease and refreshes the
+/// shard summary in the same transaction. A zero row count means the worker is
+/// stale.
+pub(crate) async fn mark_chunk_completed_and_refresh_summary(
+    db: &PgPool,
+    chunk: &RunChunk,
+) -> anyhow::Result<u64> {
+    let lease_token = require_chunk_lease_token(chunk)?;
+    let mut tx = db.begin().await?;
     let result = sqlx::query(
         r#"
 		UPDATE run_chunks
 		SET status = 'completed',
+			lease_token = NULL,
 			leased_until = NULL,
 			updated_at = now()
 		WHERE run_id = $1::uuid
           AND run_shard = $2
 		  AND id = $3::uuid
 		  AND status = 'leased'
-		  AND leased_until IS NOT DISTINCT FROM $4::timestamptz
+		  AND lease_token = $4::uuid
+		  AND leased_until >= now()
 		"#,
     )
     .bind(chunk.run_id)
     .bind(chunk.run_shard)
     .bind(chunk.id)
-    .bind(chunk.leased_until)
-    .execute(db)
+    .bind(lease_token)
+    .execute(&mut *tx)
     .await?;
+    if result.rows_affected() > 0 {
+        super::run_shard_summary::refresh_run_shard_summary_with(
+            &mut *tx,
+            chunk.run_id,
+            chunk.run_shard,
+        )
+        .await?;
+    }
+    tx.commit().await?;
 
     Ok(result.rows_affected())
 }
@@ -214,23 +261,26 @@ pub(crate) async fn mark_chunk_completed(db: &PgPool, chunk: &RunChunk) -> anyho
 /// the current lease token. Workers use this for recoverable processing
 /// failures and planned execution retry waits.
 pub(crate) async fn release_chunk_as_pending(db: &PgPool, chunk: &RunChunk) -> anyhow::Result<u64> {
+    let lease_token = require_chunk_lease_token(chunk)?;
     let result = sqlx::query(
         r#"
 		UPDATE run_chunks
 		SET status = 'pending',
+			lease_token = NULL,
 			leased_until = NULL,
 			updated_at = now()
 		WHERE run_id = $1::uuid
           AND run_shard = $2
 		  AND id = $3::uuid
 		  AND status = 'leased'
-		  AND leased_until IS NOT DISTINCT FROM $4::timestamptz
+		  AND lease_token = $4::uuid
+		  AND leased_until >= now()
 		"#,
     )
     .bind(chunk.run_id)
     .bind(chunk.run_shard)
     .bind(chunk.id)
-    .bind(chunk.leased_until)
+    .bind(lease_token)
     .execute(db)
     .await?;
 
@@ -239,29 +289,56 @@ pub(crate) async fn release_chunk_as_pending(db: &PgPool, chunk: &RunChunk) -> a
 
 /// Marks a leased chunk failed if the caller still owns the lease.
 ///
-/// Query behavior: clears the lease and makes the chunk terminal `failed` only
-/// for the current lease token. Workers use this when bounded message retries
-/// are exhausted.
-pub(crate) async fn mark_chunk_failed(db: &PgPool, chunk: &RunChunk) -> anyhow::Result<u64> {
+/// Query behavior: clears the lease, makes the chunk terminal `failed`, and
+/// refreshes the shard summary in one transaction. Workers use this when
+/// bounded message retries are exhausted.
+pub(crate) async fn mark_chunk_failed_and_refresh_summary(
+    db: &PgPool,
+    chunk: &RunChunk,
+) -> anyhow::Result<u64> {
+    let lease_token = require_chunk_lease_token(chunk)?;
+    let mut tx = db.begin().await?;
     let result = sqlx::query(
         r#"
 		UPDATE run_chunks
 		SET status = 'failed',
+			lease_token = NULL,
 			leased_until = NULL,
 			updated_at = now()
 		WHERE run_id = $1::uuid
           AND run_shard = $2
 		  AND id = $3::uuid
 		  AND status = 'leased'
-		  AND leased_until IS NOT DISTINCT FROM $4::timestamptz
+		  AND lease_token = $4::uuid
+		  AND leased_until >= now()
 		"#,
     )
     .bind(chunk.run_id)
     .bind(chunk.run_shard)
     .bind(chunk.id)
-    .bind(chunk.leased_until)
-    .execute(db)
+    .bind(lease_token)
+    .execute(&mut *tx)
     .await?;
+    if result.rows_affected() > 0 {
+        super::run_shard_summary::refresh_run_shard_summary_with(
+            &mut *tx,
+            chunk.run_id,
+            chunk.run_shard,
+        )
+        .await?;
+    }
+    tx.commit().await?;
 
     Ok(result.rows_affected())
+}
+
+fn require_chunk_lease_token(chunk: &RunChunk) -> anyhow::Result<Uuid> {
+    chunk.lease_token.ok_or_else(|| {
+        anyhow::anyhow!(
+            "leased chunk {} for run {} shard {} has no lease token",
+            chunk.id,
+            chunk.run_id,
+            chunk.run_shard
+        )
+    })
 }

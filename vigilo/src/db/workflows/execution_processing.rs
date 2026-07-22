@@ -26,6 +26,7 @@ use sqlx::{
     PgPool,
     Postgres,
     QueryBuilder,
+    Transaction,
 };
 use tokio::task::{
     self,
@@ -66,7 +67,10 @@ use crate::{
         evaluator_results,
         evaluators,
     },
-    models::evaluator::EvaluatorState,
+    models::{
+        evaluator::EvaluatorState,
+        run_chunk::RunChunk,
+    },
 };
 
 fn jsonb_text(value: &serde_json::Value) -> String {
@@ -704,9 +708,7 @@ fn make_test_case(case: &chunk_processing::WorkerCaseBatchItem) -> anyhow::Resul
 #[allow(clippy::too_many_arguments)]
 async fn allocate_execution_attempts_for_cases(
     db: &PgPool,
-    run_id: Uuid,
-    run_shard: i16,
-    chunk_id: Uuid,
+    chunk: &RunChunk,
     lease: &AttemptLeaseContext,
     run_profile: &RunProfile,
     cases: &[chunk_processing::WorkerCaseBatchItem],
@@ -722,6 +724,9 @@ async fn allocate_execution_attempts_for_cases(
         anyhow::bail!("attempt lease_seconds must be greater than zero");
     }
     let max_attempts = i32::try_from(run_profile.defaults.max_attempts)?;
+    let run_id = chunk.run_id;
+    let run_shard = chunk.run_shard;
+    let chunk_id = chunk.id;
 
     if cases.len() != evaluation_plans_by_case.len() {
         anyhow::bail!(
@@ -781,6 +786,7 @@ async fn allocate_execution_attempts_for_cases(
     //                   - create the new running attempt.
     // authority update  - point each execution at its new attempt.
     let mut tx = db.begin().await?;
+    lock_live_chunk_lease(&mut tx, chunk).await?;
     let mut query_builder = QueryBuilder::<Postgres>::new(
         r#"
         WITH input (
@@ -1280,6 +1286,49 @@ async fn allocate_execution_attempts_for_cases(
     tx.commit().await?;
 
     Ok(allocations)
+}
+
+async fn lock_live_chunk_lease(
+    tx: &mut Transaction<'_, Postgres>,
+    chunk: &RunChunk,
+) -> anyhow::Result<()> {
+    let lease_token = chunk.lease_token.ok_or_else(|| {
+        anyhow::anyhow!(
+            "chunk {} for run {} shard {} has no lease token",
+            chunk.id,
+            chunk.run_id,
+            chunk.run_shard
+        )
+    })?;
+    let locked = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        SELECT id
+        FROM run_chunks
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+          AND id = $3::uuid
+          AND status = 'leased'
+          AND lease_token = $4::uuid
+          AND leased_until >= now()
+        FOR UPDATE
+        "#,
+    )
+    .bind(chunk.run_id)
+    .bind(chunk.run_shard)
+    .bind(chunk.id)
+    .bind(lease_token)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    if locked.is_none() {
+        anyhow::bail!(
+            "chunk {} for run {} shard {} no longer owns a live lease",
+            chunk.id,
+            chunk.run_id,
+            chunk.run_shard
+        );
+    }
+    Ok(())
 }
 
 /// Renews live attempt leases owned by one worker for the current chunk.
@@ -2165,7 +2214,9 @@ async fn evaluate_case_execution(
 /// Persists successful evaluator evidence and execution aggregates.
 ///
 /// Query behavior:
-/// - Checks every completed record still owns the execution's current attempt.
+/// - Locks and validates the live chunk claim.
+/// - Checks every completed record still owns a live worker attempt, then locks
+///   that attempt with its current execution.
 /// - Inserts evaluator results as append-oriented evidence; uniqueness handles
 ///   redelivery by turning duplicate result rows into conflicts.
 /// - Upserts aggregates for completed attempts after evidence insertion.
@@ -2173,8 +2224,8 @@ async fn evaluate_case_execution(
 ///   so state mutation remains one authority-checked batch.
 async fn persist_completed_execution_results_batch(
     db: &PgPool,
-    run_id: Uuid,
-    run_shard: i16,
+    chunk: &RunChunk,
+    worker_id: Uuid,
     completed: &[CompletedExecutionPersistence],
 ) -> anyhow::Result<BatchPersistenceStats> {
     if completed.is_empty() {
@@ -2190,6 +2241,9 @@ async fn persist_completed_execution_results_batch(
     // The shared run-state guard preserves cancellation/finalization ordering
     // without turning the run row into an exclusive worker-side mutex.
     let mut tx = db.begin().await?;
+    lock_live_chunk_lease(&mut tx, chunk).await?;
+    let run_id = chunk.run_id;
+    let run_shard = chunk.run_shard;
 
     let mut authority_query = QueryBuilder::<Postgres>::new(
         r#"
@@ -2238,9 +2292,23 @@ async fn persist_completed_execution_results_batch(
         r#"
         JOIN input
           ON input.execution_id = executions.id
+        JOIN execution_attempts
+          ON execution_attempts.run_id = executions.run_id
+         AND execution_attempts.run_shard = executions.run_shard
+         AND execution_attempts.execution_id = executions.id
+         AND execution_attempts.id = input.attempt_id
         WHERE executions.current_attempt_id = input.attempt_id
           AND executions.current_attempt_no = input.attempt_no
-        FOR UPDATE OF executions
+          AND execution_attempts.attempt_no = input.attempt_no
+          AND execution_attempts.status = 'running'::attempt_status
+          AND execution_attempts.worker_id =
+        "#,
+    );
+    authority_query.push_bind(worker_id);
+    authority_query.push(
+        r#"::uuid
+          AND execution_attempts.leased_until >= now()
+        FOR UPDATE OF executions, execution_attempts
         )
         SELECT COUNT(*)::bigint
         FROM locked
@@ -2342,9 +2410,7 @@ async fn persist_completed_execution_results_batch(
 pub(crate) async fn process_case_batch_execution(
     context: &Context,
     db: &PgPool,
-    run_id: Uuid,
-    run_shard: i16,
-    chunk_id: Uuid,
+    chunk: &RunChunk,
     lease: &AttemptLeaseContext,
     run_profile: &RunProfile,
     evaluator_catalog: &RunEvaluatorCatalog,
@@ -2354,6 +2420,8 @@ pub(crate) async fn process_case_batch_execution(
         return Ok(Vec::new());
     }
 
+    let run_id = chunk.run_id;
+    let run_shard = chunk.run_shard;
     let setup_started = Instant::now();
     let evaluation_plans_by_case = cases
         .iter()
@@ -2362,9 +2430,7 @@ pub(crate) async fn process_case_batch_execution(
 
     let allocations = allocate_execution_attempts_for_cases(
         db,
-        run_id,
-        run_shard,
-        chunk_id,
+        chunk,
         lease,
         run_profile,
         cases,
@@ -2470,7 +2536,7 @@ pub(crate) async fn process_case_batch_execution(
 
     let persistence_started = Instant::now();
     let persistence_stats =
-        persist_completed_execution_results_batch(db, run_id, run_shard, &completed).await?;
+        persist_completed_execution_results_batch(db, chunk, lease.worker_id, &completed).await?;
     debug!(
         run_id = %run_id,
         case_count = cases.len(),
@@ -2501,11 +2567,15 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
+        AttemptLeaseContext,
+        CompletedExecutionPersistence,
         ExecutionTerminalTransition,
+        allocate_execution_attempts_for_cases,
         evaluation_plan_for_case,
         finalize_execution_terminal_transitions,
         make_test_case,
         matching_groups_for_case,
+        persist_completed_execution_results_batch,
         persisted_case_input_payload,
         persisted_evaluator_evidence,
         persisted_evaluator_manifest,
@@ -2540,6 +2610,8 @@ mod tests {
         run_id: Uuid,
         run_shard: i16,
         chunk_id: Uuid,
+        chunk: crate::models::run_chunk::RunChunk,
+        case_id: Uuid,
         execution_id: Uuid,
         attempt_id: Uuid,
         worker_id: Uuid,
@@ -2788,6 +2860,7 @@ mod tests {
                 ordinal_start,
                 ordinal_end,
                 status,
+                lease_token,
                 leased_until,
                 dispatched_at
             )
@@ -2800,6 +2873,7 @@ mod tests {
                 0,
                 1,
                 'leased',
+                gen_random_uuid(),
                 now() + ($5::int * interval '1 second'),
                 now()
             )
@@ -2811,6 +2885,25 @@ mod tests {
         .bind(dataset_version_id)
         .bind(chunk_lease_seconds)
         .execute(pool)
+        .await
+        .unwrap();
+
+        let chunk = sqlx::query_as::<_, crate::models::run_chunk::RunChunk>(
+            r#"
+            SELECT
+                id, run_id, run_shard, dataset_version_id, profile_group_id,
+                ordinal_start, ordinal_end, status, lease_token, leased_until,
+                created_at, updated_at
+            FROM run_chunks
+            WHERE run_id = $1::uuid
+              AND run_shard = $2
+              AND id = $3::uuid
+            "#,
+        )
+        .bind(run_id)
+        .bind(run_shard)
+        .bind(chunk_id)
+        .fetch_one(pool)
         .await
         .unwrap();
 
@@ -2925,6 +3018,8 @@ mod tests {
             run_id,
             run_shard,
             chunk_id,
+            chunk,
+            case_id,
             execution_id,
             attempt_id,
             worker_id,
@@ -3200,7 +3295,6 @@ mod tests {
 
         assert_eq!(outcome.stats.recovered, 1);
         assert_eq!(outcome.stats.failed, 0);
-        assert!(outcome.summary_refresh_errors.is_empty());
 
         let (chunk_status, recovery_count) = sqlx::query_as::<_, (String, i32)>(
             r#"
@@ -3257,5 +3351,111 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(requeued, 1);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn recovered_attempt_cannot_persist_late_results(pool: PgPool) {
+        let seed = seed_running_attempt(&pool, -5, -5).await;
+        run_dispatch::recover_expired_chunk_leases(&pool, 3, 10)
+            .await
+            .unwrap();
+        let completed = CompletedExecutionPersistence {
+            execution_id: seed.execution_id,
+            attempt_id: seed.attempt_id,
+            attempt_no: 1,
+            result_rows: Vec::new(),
+            overall_status: "passed".to_string(),
+            aggregate_score: Some(1.0),
+            evaluator_result_count: 0,
+            dimension_scores: json!({}),
+            blocking_failures: json!([]),
+            summary: json!({}),
+        };
+
+        let result = persist_completed_execution_results_batch(
+            &pool,
+            &seed.chunk,
+            seed.worker_id,
+            &[completed],
+        )
+        .await;
+
+        assert!(result.is_err(), "a recovered attempt no longer owns writes");
+        let aggregate_count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM execution_aggregates
+            WHERE run_id = $1::uuid
+              AND run_shard = $2
+              AND execution_id = $3::uuid
+            "#,
+        )
+        .bind(seed.run_id)
+        .bind(seed.run_shard)
+        .bind(seed.execution_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(aggregate_count, 0);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn recovered_chunk_token_cannot_allocate_a_new_attempt(pool: PgPool) {
+        let seed = seed_running_attempt(&pool, -5, -5).await;
+        run_dispatch::recover_expired_chunk_leases(&pool, 3, 10)
+            .await
+            .unwrap();
+        let mut profile = run_profile(vec![case_group(
+            "default",
+            "classification",
+            vec!["sentiment"],
+            "test/evaluator:1.0.0",
+            AggregationMethod::WeightedMean,
+        )]);
+        profile.defaults.max_attempts = 2;
+        let mut case = worker_case(None);
+        case.case_id = seed.case_id;
+        let plan = evaluation_plan_for_case(&profile, &case).unwrap();
+        let lease = AttemptLeaseContext {
+            worker_id: Uuid::now_v7(),
+            worker_host: Some("worker-b".to_string()),
+            queue_message_id: Uuid::now_v7(),
+            broker_message_id: None,
+            lease_seconds: 60,
+        };
+
+        let result = allocate_execution_attempts_for_cases(
+            &pool,
+            &seed.chunk,
+            &lease,
+            &profile,
+            &[case],
+            &[plan],
+        )
+        .await;
+
+        assert!(result.is_err(), "a recovered chunk token must be stale");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no longer owns a live lease")
+        );
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn chunk_heartbeat_preserves_claim_token(pool: PgPool) {
+        let seed = seed_running_attempt(&pool, 60, 60).await;
+        let renewed =
+            crate::db::workflows::chunk_processing::extend_chunk_lease(&pool, &seed.chunk, 120)
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(renewed.lease_token, seed.chunk.lease_token);
+        assert!(renewed.leased_until > seed.chunk.leased_until);
     }
 }

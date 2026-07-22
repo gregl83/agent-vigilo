@@ -845,6 +845,7 @@ async fn expire_chunk_lease(primary: &PgPool, run_id: Uuid) -> anyhow::Result<()
         r#"
         UPDATE run_chunks
         SET status = 'leased',
+            lease_token = gen_random_uuid(),
             leased_until = now() - interval '1 second',
             updated_at = now()
         WHERE run_id = $1::uuid

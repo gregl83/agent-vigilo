@@ -22,6 +22,8 @@ use std::{
 use moka::future::Cache;
 use sqlx::{
     PgPool,
+    Postgres,
+    Transaction,
     postgres::PgPoolOptions,
 };
 use tokio::sync::OnceCell;
@@ -59,6 +61,18 @@ pub(crate) enum ExecutionRouteError {
         run_id: Uuid,
         run_shard: i16,
         status: String,
+    },
+    #[error(
+        "stale execution route for run {run_id} shard {run_shard}; expected {expected_database_alias} version {expected_route_version}, found {actual_database_alias} status {actual_status} version {actual_route_version}"
+    )]
+    StaleExecutionRoute {
+        run_id: Uuid,
+        run_shard: i16,
+        expected_database_alias: String,
+        expected_route_version: i64,
+        actual_database_alias: String,
+        actual_status: String,
+        actual_route_version: i64,
     },
 }
 
@@ -154,6 +168,16 @@ pub(crate) struct Db {
     pub(crate) placement_pools: OnceCell<PlacementPools>,
     #[allow(dead_code)]
     pub(crate) shard_placement_cache: Cache<ShardPlacementKey, ShardPlacement>,
+}
+
+/// One active execution route resolved from authoritative control metadata.
+///
+/// Write paths retain the route fence alongside the pool so admission can be
+/// revalidated immediately before changing execution-owned state.
+#[derive(Clone)]
+pub(crate) struct ExecutionRoute {
+    pub(crate) placement: ShardPlacement,
+    pub(crate) database: PgPool,
 }
 
 impl Db {
@@ -417,6 +441,152 @@ impl Db {
         self.execution_database(&placement.database_alias).await
     }
 
+    /// Resolves an active execution route together with its current fence.
+    pub(crate) async fn execution_route(
+        &self,
+        run_id: Uuid,
+        run_shard: i16,
+    ) -> anyhow::Result<ExecutionRoute> {
+        let placement = self.resolve_execution_placement(run_id, run_shard).await?;
+        if !placement.is_dispatchable() {
+            return Err(ExecutionRouteError::NonDispatchableShardPlacement {
+                run_id,
+                run_shard,
+                status: placement.status,
+            }
+            .into());
+        }
+
+        let database = self
+            .execution_database(&placement.database_alias)
+            .await?
+            .clone();
+        Ok(ExecutionRoute {
+            placement,
+            database,
+        })
+    }
+
+    /// Acquires write admission and revalidates a previously resolved route.
+    ///
+    /// Movement takes the exclusive form of the same advisory lock. Holding
+    /// the shared lock from revalidation through the local write closes the
+    /// gap where a route could become `moving` after pool resolution.
+    pub(crate) async fn begin_execution_admission(
+        &self,
+        route: &ExecutionRoute,
+    ) -> anyhow::Result<Transaction<'static, Postgres>> {
+        let mut tx = route.database.begin().await?;
+        crate::db::shard_write_fence::lock_shared(
+            &mut tx,
+            route.placement.run_id,
+            route.placement.run_shard,
+        )
+        .await?;
+
+        let current = if route.placement.database_alias == self.control_database_alias() {
+            select_shard_placement_on_connection(
+                &mut tx,
+                route.placement.run_id,
+                route.placement.run_shard,
+            )
+            .await?
+        } else {
+            self.select_control_shard_placement(route.placement.run_id, route.placement.run_shard)
+                .await?
+        };
+
+        if !route.placement.same_route_fence(&current) {
+            let error = ExecutionRouteError::StaleExecutionRoute {
+                run_id: current.run_id,
+                run_shard: current.run_shard,
+                expected_database_alias: route.placement.database_alias.clone(),
+                expected_route_version: route.placement.route_version,
+                actual_database_alias: current.database_alias,
+                actual_status: current.status,
+                actual_route_version: current.route_version,
+            };
+            tx.rollback().await?;
+            return Err(error.into());
+        }
+
+        if !current.is_dispatchable() {
+            let error = ExecutionRouteError::NonDispatchableShardPlacement {
+                run_id: current.run_id,
+                run_shard: current.run_shard,
+                status: current.status,
+            };
+            tx.rollback().await?;
+            return Err(error.into());
+        }
+
+        Ok(tx)
+    }
+
+    /// Acquires shared admission for cleanup across routes on one placement.
+    ///
+    /// Cancellation may write routes that are already `moving`, so this checks
+    /// the exact stored fences without requiring `active`. Locks are acquired
+    /// in shard order to keep concurrent cleanup operations deterministic.
+    pub(crate) async fn begin_execution_cleanup_admission(
+        &self,
+        routes: &[ExecutionRoute],
+    ) -> anyhow::Result<Transaction<'static, Postgres>> {
+        let Some(first) = routes.first() else {
+            anyhow::bail!("execution cleanup admission requires at least one route");
+        };
+        if routes.iter().any(|route| {
+            route.placement.run_id != first.placement.run_id
+                || route.placement.database_alias != first.placement.database_alias
+        }) {
+            anyhow::bail!("execution cleanup admission routes must share one run and placement");
+        }
+
+        let mut ordered = routes.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|route| route.placement.run_shard);
+        let mut tx = first.database.begin().await?;
+        for route in &ordered {
+            crate::db::shard_write_fence::lock_shared(
+                &mut tx,
+                route.placement.run_id,
+                route.placement.run_shard,
+            )
+            .await?;
+        }
+
+        for route in ordered {
+            let current = if route.placement.database_alias == self.control_database_alias() {
+                select_shard_placement_on_connection(
+                    &mut tx,
+                    route.placement.run_id,
+                    route.placement.run_shard,
+                )
+                .await?
+            } else {
+                self.select_control_shard_placement(
+                    route.placement.run_id,
+                    route.placement.run_shard,
+                )
+                .await?
+            };
+            if !route.placement.same_route_fence(&current) {
+                let error = ExecutionRouteError::StaleExecutionRoute {
+                    run_id: current.run_id,
+                    run_shard: current.run_shard,
+                    expected_database_alias: route.placement.database_alias.clone(),
+                    expected_route_version: route.placement.route_version,
+                    actual_database_alias: current.database_alias,
+                    actual_status: current.status,
+                    actual_route_version: current.route_version,
+                };
+                tx.rollback().await?;
+                return Err(error.into());
+            }
+        }
+
+        Ok(tx)
+    }
+
     /// Returns all dispatchable execution routes for a run.
     #[allow(dead_code)]
     pub async fn execution_routes_for_run(
@@ -484,6 +654,26 @@ impl Db {
         &self,
         run_id: Uuid,
     ) -> anyhow::Result<Vec<(i16, String, PgPool)>> {
+        let routes = self
+            .execution_read_routes_with_fences_for_run(run_id)
+            .await?;
+        Ok(routes
+            .into_iter()
+            .map(|route| {
+                (
+                    route.placement.run_shard,
+                    route.placement.database_alias,
+                    route.database,
+                )
+            })
+            .collect())
+    }
+
+    /// Returns readable routes with their exact control-plane fences.
+    pub(crate) async fn execution_read_routes_with_fences_for_run(
+        &self,
+        run_id: Uuid,
+    ) -> anyhow::Result<Vec<ExecutionRoute>> {
         let db = self.control().await?;
         let placements = shard_placements::list_shard_placements_for_run(db, run_id).await?;
         let mut routed = Vec::with_capacity(placements.len());
@@ -501,7 +691,10 @@ impl Db {
                 routing_decision = "readable_execution_route",
                 "resolved readable execution route"
             );
-            routed.push((placement.run_shard, placement.database_alias, pool));
+            routed.push(ExecutionRoute {
+                placement,
+                database: pool,
+            });
         }
 
         Ok(routed)
@@ -658,6 +851,26 @@ impl Db {
     }
 }
 
+async fn select_shard_placement_on_connection(
+    tx: &mut Transaction<'_, Postgres>,
+    run_id: Uuid,
+    run_shard: i16,
+) -> anyhow::Result<ShardPlacement> {
+    sqlx::query_as::<_, ShardPlacement>(
+        r#"
+        SELECT run_id, run_shard, database_alias, status, route_version, created_at, updated_at
+        FROM shard_placements
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| ExecutionRouteError::MissingShardPlacement { run_id, run_shard }.into())
+}
+
 pub(crate) fn new_shard_placement_cache() -> Cache<ShardPlacementKey, ShardPlacement> {
     Cache::builder()
         .time_to_live(SHARD_PLACEMENT_CACHE_TTL)
@@ -766,7 +979,12 @@ fn validate_run_shard(run_shard: i16) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use sqlx::PgPool;
+    use std::time::Duration;
+
+    use sqlx::{
+        PgPool,
+        postgres::PgPoolOptions,
+    };
     use uuid::Uuid;
 
     use super::*;
@@ -970,6 +1188,97 @@ mod tests {
 
         let error = context.execution(run_id, 7).await.unwrap_err();
         assert!(error.to_string().contains("not dispatchable"));
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
+    async fn stale_execution_route_cannot_claim_after_move_begins(pool: PgPool) {
+        let context = context_with_control_pool(pool);
+        let run_id = Uuid::now_v7();
+        let chunk_id = seed_claimable_chunk(context.control().await.unwrap(), run_id, 7).await;
+        insert_shard_placement(
+            context.control().await.unwrap(),
+            run_id,
+            7,
+            DEFAULT_DATABASE_ALIAS,
+            SHARD_PLACEMENT_STATUS_ACTIVE,
+        )
+        .await;
+        let stale_route = context.execution_route(run_id, 7).await.unwrap();
+
+        crate::db::tables::shard_placements::update_shard_placement_status(
+            context.control().await.unwrap(),
+            run_id,
+            7,
+            SHARD_PLACEMENT_STATUS_MOVING,
+        )
+        .await
+        .unwrap();
+
+        let error = crate::db::workflows::chunk_processing::claim_routed_chunk_for_processing(
+            &context,
+            &stale_route,
+            run_id,
+            7,
+            chunk_id,
+            60,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<ExecutionRouteError>(),
+            Some(ExecutionRouteError::StaleExecutionRoute { .. })
+        ));
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
+    async fn routed_cancellation_waits_for_shard_move_admission(pool: PgPool) {
+        let database_name = sqlx::query_scalar::<_, String>("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let mut database_url = url::Url::parse(&std::env::var("DATABASE_URL").unwrap()).unwrap();
+        database_url.set_path(&database_name);
+        let runtime_pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(database_url.as_str())
+            .await
+            .unwrap();
+        let context = context_with_control_pool(runtime_pool);
+        let run_id = Uuid::now_v7();
+        seed_claimable_chunk(context.control().await.unwrap(), run_id, 7).await;
+        insert_shard_placement(
+            context.control().await.unwrap(),
+            run_id,
+            7,
+            DEFAULT_DATABASE_ALIAS,
+            SHARD_PLACEMENT_STATUS_ACTIVE,
+        )
+        .await;
+
+        let mut move_tx = context.control().await.unwrap().begin().await.unwrap();
+        crate::db::shard_write_fence::lock_exclusive(&mut move_tx, run_id, 7)
+            .await
+            .unwrap();
+        let cancellation = crate::db::workflows::run_cancel::cancel_run_routed(&context, run_id);
+        tokio::pin!(cancellation);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), cancellation.as_mut())
+                .await
+                .is_err(),
+            "cancellation must not mutate source rows while movement holds exclusive admission"
+        );
+
+        move_tx.rollback().await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), cancellation.as_mut())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(outcome.cancelled);
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -1208,5 +1517,99 @@ mod tests {
         .execute(db)
         .await
         .unwrap();
+    }
+
+    async fn seed_claimable_chunk(db: &PgPool, run_id: Uuid, run_shard: i16) -> Uuid {
+        let dataset_id = Uuid::now_v7();
+        let dataset_version_id = Uuid::now_v7();
+        let chunk_id = Uuid::now_v7();
+
+        sqlx::query(
+            r#"
+            INSERT INTO dataset_versions (dataset_version_id, dataset_id, dataset_version)
+            VALUES ($1::uuid, $2::uuid, 'test')
+            "#,
+        )
+        .bind(dataset_version_id)
+        .bind(dataset_id)
+        .execute(db)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO runs (
+                id, run_key,
+                dataset_id, dataset_version_id, dataset_version,
+                evaluation_profile_id, evaluation_profile_version,
+                profile_version_id, profile_hash,
+                aggregation_policy_id, aggregation_policy_version, aggregation_policy_hash,
+                agent_provider, agent_name,
+                prompt_config_id, prompt_config_version,
+                status, expected_execution_count
+            )
+            VALUES (
+                $1::uuid, $2,
+                $3::uuid, $4::uuid, 'test',
+                'profile', '1', 'profile:1', 'profile-hash',
+                'policy', '1', 'policy-hash',
+                'test', 'agent', 'prompt', '1',
+                'running'::run_status, 1
+            )
+            "#,
+        )
+        .bind(run_id)
+        .bind(format!("run-{run_id}"))
+        .bind(dataset_id)
+        .bind(dataset_version_id)
+        .execute(db)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO run_chunks (
+                id, run_id, run_shard, dataset_version_id,
+                profile_group_id, ordinal_start, ordinal_end, status
+            )
+            VALUES ($1::uuid, $2::uuid, $3, $4::uuid, 'default', 0, 1, 'pending')
+            "#,
+        )
+        .bind(chunk_id)
+        .bind(run_id)
+        .bind(run_shard)
+        .bind(dataset_version_id)
+        .execute(db)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO run_snapshots (
+                run_id, run_shard, run_key,
+                dataset_id, dataset_version_id, dataset_version,
+                evaluation_profile_id, evaluation_profile_version,
+                profile_version_id, profile_hash,
+                aggregation_policy_id, aggregation_policy_version, aggregation_policy_hash,
+                agent_provider, agent_name,
+                prompt_config_id, prompt_config_version,
+                expected_execution_count
+            )
+            VALUES (
+                $1::uuid, $2, $3,
+                $4::uuid, $5::uuid, 'test',
+                'profile', '1', 'profile:1', 'profile-hash',
+                'policy', '1', 'policy-hash',
+                'test', 'agent', 'prompt', '1', 1
+            )
+            "#,
+        )
+        .bind(run_id)
+        .bind(run_shard)
+        .bind(format!("run-{run_id}"))
+        .bind(dataset_id)
+        .bind(dataset_version_id)
+        .execute(db)
+        .await
+        .unwrap();
+
+        chunk_id
     }
 }

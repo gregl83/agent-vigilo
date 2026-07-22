@@ -3,7 +3,11 @@
 //! Shard placements are the durable routing decisions from a logical
 //! `run_id + run_shard` pair to a database placement alias.
 
-use sqlx::PgPool;
+use sqlx::{
+    Executor,
+    PgPool,
+    Postgres,
+};
 use uuid::Uuid;
 
 use crate::models::shard_placement::ShardPlacement;
@@ -13,6 +17,17 @@ pub(crate) async fn select_shard_placement(
     run_id: Uuid,
     run_shard: i16,
 ) -> anyhow::Result<Option<ShardPlacement>> {
+    select_shard_placement_with(db, run_id, run_shard).await
+}
+
+pub(crate) async fn select_shard_placement_with<'e, E>(
+    executor: E,
+    run_id: Uuid,
+    run_shard: i16,
+) -> anyhow::Result<Option<ShardPlacement>>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let placement = sqlx::query_as::<_, ShardPlacement>(
         r#"
         SELECT run_id, run_shard, database_alias, status, route_version, created_at, updated_at
@@ -23,7 +38,114 @@ pub(crate) async fn select_shard_placement(
     )
     .bind(run_id)
     .bind(run_shard)
-    .fetch_optional(db)
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(placement)
+}
+
+pub(crate) async fn mark_shard_placement_moving<'e, E>(
+    executor: E,
+    run_id: Uuid,
+    run_shard: i16,
+    expected_database_alias: &str,
+    expected_route_version: i64,
+) -> anyhow::Result<Option<ShardPlacement>>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let placement = sqlx::query_as::<_, ShardPlacement>(
+        r#"
+        UPDATE shard_placements
+        SET status = 'moving',
+            route_version = route_version + 1,
+            updated_at = now()
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+          AND database_alias = $3
+          AND status = 'active'
+          AND route_version = $4
+        RETURNING run_id, run_shard, database_alias, status, route_version, created_at, updated_at
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(expected_database_alias)
+    .bind(expected_route_version)
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(placement)
+}
+
+pub(crate) async fn activate_moved_shard_placement<'e, E>(
+    executor: E,
+    run_id: Uuid,
+    run_shard: i16,
+    expected_database_alias: &str,
+    expected_route_version: i64,
+    target_database_alias: &str,
+) -> anyhow::Result<Option<ShardPlacement>>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let placement = sqlx::query_as::<_, ShardPlacement>(
+        r#"
+        UPDATE shard_placements
+        SET database_alias = $5,
+            status = 'active',
+            route_version = route_version + 1,
+            updated_at = now()
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+          AND database_alias = $3
+          AND status = 'moving'
+          AND route_version = $4
+        RETURNING run_id, run_shard, database_alias, status, route_version, created_at, updated_at
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(expected_database_alias)
+    .bind(expected_route_version)
+    .bind(target_database_alias)
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(placement)
+}
+
+pub(crate) async fn change_empty_active_shard_placement<'e, E>(
+    executor: E,
+    run_id: Uuid,
+    run_shard: i16,
+    expected_database_alias: &str,
+    expected_route_version: i64,
+    target_database_alias: &str,
+) -> anyhow::Result<Option<ShardPlacement>>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let placement = sqlx::query_as::<_, ShardPlacement>(
+        r#"
+        UPDATE shard_placements
+        SET database_alias = $5,
+            route_version = route_version + 1,
+            updated_at = now()
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+          AND database_alias = $3
+          AND status = 'active'
+          AND route_version = $4
+        RETURNING run_id, run_shard, database_alias, status, route_version, created_at, updated_at
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(expected_database_alias)
+    .bind(expected_route_version)
+    .bind(target_database_alias)
+    .fetch_optional(executor)
     .await?;
 
     Ok(placement)
@@ -48,7 +170,7 @@ pub(crate) async fn list_shard_placements_for_run(
     Ok(placements)
 }
 
-pub(crate) async fn upsert_active_shard_placement(
+pub(crate) async fn insert_active_shard_placement(
     db: &PgPool,
     run_id: Uuid,
     run_shard: i16,
@@ -58,16 +180,6 @@ pub(crate) async fn upsert_active_shard_placement(
         r#"
         INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
         VALUES ($1::uuid, $2, $3, 'active')
-        ON CONFLICT (run_id, run_shard) DO UPDATE
-        SET database_alias = EXCLUDED.database_alias,
-            status = EXCLUDED.status,
-            route_version = CASE
-                WHEN shard_placements.database_alias IS DISTINCT FROM EXCLUDED.database_alias
-                  OR shard_placements.status IS DISTINCT FROM EXCLUDED.status
-                THEN shard_placements.route_version + 1
-                ELSE shard_placements.route_version
-            END,
-            updated_at = now()
         RETURNING run_id, run_shard, database_alias, status, route_version, created_at, updated_at
         "#,
     )

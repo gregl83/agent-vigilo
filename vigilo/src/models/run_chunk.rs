@@ -54,6 +54,8 @@ pub(crate) struct RunChunk {
     pub(crate) ordinal_end: i32,
     /// Current chunk scheduling status.
     pub(crate) status: String,
+    /// Stable ownership token for the current lease generation.
+    pub(crate) lease_token: Option<Uuid>,
     /// Worker/coordinator lease expiration, when leased.
     pub(crate) leased_until: Option<DateTime<Utc>>,
     /// Time this chunk row was inserted.

@@ -8,6 +8,7 @@ CREATE TABLE run_chunks (
     ordinal_end INTEGER NOT NULL CHECK (ordinal_end > ordinal_start),
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'leased', 'completed', 'failed', 'cancelled')),
     dispatched_at TIMESTAMPTZ,
+    lease_token UUID,
     leased_until TIMESTAMPTZ,
     recovery_count INTEGER NOT NULL DEFAULT 0 CHECK (recovery_count >= 0),
     last_recovered_at TIMESTAMPTZ,
@@ -19,6 +20,10 @@ CREATE TABLE run_chunks (
         REFERENCES runs(id, dataset_version_id)
         ON DELETE CASCADE,
 
+    CONSTRAINT chk_run_chunks_lease_state CHECK (
+        (status = 'leased' AND lease_token IS NOT NULL AND leased_until IS NOT NULL)
+        OR (status <> 'leased' AND lease_token IS NULL AND leased_until IS NULL)
+    ),
     CONSTRAINT pk_run_chunks PRIMARY KEY (run_id, run_shard, id)
 ) PARTITION BY LIST (run_shard);
 
@@ -75,6 +80,9 @@ COMMENT ON COLUMN run_chunks.status IS
 
 COMMENT ON COLUMN run_chunks.dispatched_at IS
     'Timestamp when the coordinator first made this chunk visible to workers by enqueueing a run.chunk.ready event. NULL means the chunk has not been dispatched yet.';
+
+COMMENT ON COLUMN run_chunks.lease_token IS
+    'Opaque claim-generation token. Heartbeats extend the deadline without changing this token; recovery or reassignment replaces it so stale workers cannot write.';
 
 COMMENT ON COLUMN run_chunks.leased_until IS
     'Lease expiration timestamp for worker ownership of this chunk.';

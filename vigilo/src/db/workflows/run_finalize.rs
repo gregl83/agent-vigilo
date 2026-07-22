@@ -153,7 +153,8 @@ pub(crate) async fn select_finalization_candidate_backlog(
 ///
 /// The coordinator reads shard summaries before calling this. Claiming only
 /// serializes the final control write and protects retries if the process dies
-/// after the claim but before completion.
+/// after the claim but before completion. A dispatch lifecycle share lock makes
+/// the candidate temporarily ineligible instead of blocking this coordinator.
 pub(crate) async fn claim_finalization_candidate(
     db: &PgPool,
     run_id: Uuid,
@@ -162,19 +163,26 @@ pub(crate) async fn claim_finalization_candidate(
 ) -> anyhow::Result<Option<ClaimedRunForFinalization>> {
     let claimed = sqlx::query_as::<_, ClaimedRunForFinalization>(
         r#"
+        WITH candidate AS (
+            SELECT r.id
+            FROM runs r
+            WHERE r.id = $1::uuid
+              AND r.status IN ('running'::run_status, 'finalizing'::run_status)
+              AND (
+                  r.status <> 'finalizing'::run_status
+                  OR r.coordinator_leased_until IS NULL
+                  OR r.coordinator_leased_until < now()
+              )
+            FOR UPDATE SKIP LOCKED
+        )
         UPDATE runs r
         SET status = 'finalizing'::run_status,
             coordinator_id = $2,
             coordinator_leased_until = now() + ($3::int * interval '1 second'),
             coordinator_heartbeat_at = now(),
             updated_at = now()
-        WHERE r.id = $1::uuid
-          AND r.status IN ('running'::run_status, 'finalizing'::run_status)
-          AND (
-              r.status <> 'finalizing'::run_status
-              OR r.coordinator_leased_until IS NULL
-              OR r.coordinator_leased_until < now()
-          )
+        FROM candidate
+        WHERE r.id = candidate.id
         RETURNING r.id, r.run_key
         "#,
     )
@@ -207,7 +215,8 @@ pub(crate) async fn claim_next_finalizable_run(
 /// Finalizes a claimed run from routed shard summaries.
 ///
 /// Query behavior:
-/// - Locks the claimed run row.
+/// - Locks the claimed run row and verifies the coordinator still owns an
+///   unexpired finalization lease.
 /// - Uses precomputed shard summary counters supplied by the coordinator.
 /// - Marks the run `completed`, sets the final gate status, persists the
 ///   global summary, drains leftover cursors, and emits `run.completed` in the
@@ -215,6 +224,7 @@ pub(crate) async fn claim_next_finalizable_run(
 pub(crate) async fn finalize_claimed_run_from_summaries(
     db: &PgPool,
     run_id: Uuid,
+    coordinator_id: Uuid,
     summaries: &[RunShardSummary],
 ) -> anyhow::Result<Option<FinalizedRun>> {
     if summaries.is_empty() || summaries.iter().any(|summary| !summary.is_terminal()) {
@@ -277,6 +287,8 @@ pub(crate) async fn finalize_claimed_run_from_summaries(
             FROM runs
             WHERE id = $1::uuid
               AND status = 'finalizing'::run_status
+              AND coordinator_id = $14::uuid
+              AND coordinator_leased_until >= now()
             FOR UPDATE
         ),
         finalized AS (
@@ -368,6 +380,7 @@ pub(crate) async fn finalize_claimed_run_from_summaries(
     .bind(coverage_complete)
     .bind(has_terminal_chunk_failure)
     .bind(shard_summary_count)
+    .bind(coordinator_id)
     .fetch_optional(db)
     .await?;
 
@@ -386,10 +399,12 @@ mod tests {
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx finalization tests"]
     async fn finalize_claimed_run_from_summaries_combines_terminal_shards(pool: PgPool) {
         let run_id = Uuid::now_v7();
+        let coordinator_id = Uuid::now_v7();
         let dataset_id = Uuid::now_v7();
         let dataset_version_id = Uuid::now_v7();
 
         seed_run(&pool, run_id, dataset_id, dataset_version_id, "finalizing").await;
+        set_finalization_lease(&pool, run_id, coordinator_id, "60 seconds").await;
         seed_dispatch_cursor(&pool, run_id, 3, "open").await;
 
         let mut first_summary = terminal_summary(run_id, 3, "completed");
@@ -402,10 +417,11 @@ mod tests {
 
         let summaries = vec![first_summary, second_summary];
 
-        let finalized = finalize_claimed_run_from_summaries(&pool, run_id, &summaries)
-            .await
-            .unwrap()
-            .unwrap();
+        let finalized =
+            finalize_claimed_run_from_summaries(&pool, run_id, coordinator_id, &summaries)
+                .await
+                .unwrap()
+                .unwrap();
 
         assert_eq!(finalized.id, run_id);
         assert_eq!(finalized.gate_status, "fail");
@@ -477,18 +493,21 @@ mod tests {
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx finalization tests"]
     async fn finalize_claimed_run_from_summaries_waits_for_running_summary(pool: PgPool) {
         let run_id = Uuid::now_v7();
+        let coordinator_id = Uuid::now_v7();
         let dataset_id = Uuid::now_v7();
         let dataset_version_id = Uuid::now_v7();
 
         seed_run(&pool, run_id, dataset_id, dataset_version_id, "finalizing").await;
+        set_finalization_lease(&pool, run_id, coordinator_id, "60 seconds").await;
         let mut summary = terminal_summary(run_id, 3, "running");
         summary.expected_execution_count = 2;
         summary.terminal_execution_count = 1;
         let summaries = vec![summary];
 
-        let finalized = finalize_claimed_run_from_summaries(&pool, run_id, &summaries)
-            .await
-            .unwrap();
+        let finalized =
+            finalize_claimed_run_from_summaries(&pool, run_id, coordinator_id, &summaries)
+                .await
+                .unwrap();
 
         assert!(finalized.is_none());
 
@@ -503,6 +522,39 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
+        assert_eq!(status, "finalizing");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx finalization tests"]
+    async fn stale_or_expired_finalization_owner_cannot_commit(pool: PgPool) {
+        let run_id = Uuid::now_v7();
+        let stale_coordinator_id = Uuid::now_v7();
+        let current_coordinator_id = Uuid::now_v7();
+
+        seed_run(&pool, run_id, Uuid::now_v7(), Uuid::now_v7(), "finalizing").await;
+        set_finalization_lease(&pool, run_id, current_coordinator_id, "60 seconds").await;
+        let summaries = [terminal_summary(run_id, 0, "completed")];
+
+        let finalized =
+            finalize_claimed_run_from_summaries(&pool, run_id, stale_coordinator_id, &summaries)
+                .await
+                .unwrap();
+
+        assert!(finalized.is_none());
+        set_finalization_lease(&pool, run_id, stale_coordinator_id, "-1 second").await;
+        let expired =
+            finalize_claimed_run_from_summaries(&pool, run_id, stale_coordinator_id, &summaries)
+                .await
+                .unwrap();
+        assert!(expired.is_none());
+
+        let status =
+            sqlx::query_scalar::<_, String>("SELECT status::text FROM runs WHERE id = $1::uuid")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(status, "finalizing");
     }
 
@@ -732,6 +784,28 @@ mod tests {
         .bind(run_id)
         .bind(run_shard)
         .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn set_finalization_lease(
+        pool: &PgPool,
+        run_id: Uuid,
+        coordinator_id: Uuid,
+        lease_interval: &str,
+    ) {
+        sqlx::query(
+            r#"
+            UPDATE runs
+            SET coordinator_id = $2::uuid,
+                coordinator_leased_until = now() + $3::text::interval
+            WHERE id = $1::uuid
+            "#,
+        )
+        .bind(run_id)
+        .bind(coordinator_id)
+        .bind(lease_interval)
         .execute(pool)
         .await
         .unwrap();

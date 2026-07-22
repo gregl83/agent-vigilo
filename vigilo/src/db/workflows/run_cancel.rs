@@ -13,15 +13,22 @@ use futures_util::{
     StreamExt,
     stream,
 };
-use sqlx::PgPool;
+use sqlx::{
+    PgPool,
+    Postgres,
+    Transaction,
+};
 use uuid::Uuid;
 
 use super::run_shard_summary::{
     RunShardSummary,
-    refresh_run_shard_summary,
+    refresh_run_shard_summary_with,
 };
 use crate::{
-    context::database,
+    context::database::{
+        self,
+        ExecutionRoute,
+    },
     models::run::Run,
 };
 
@@ -108,10 +115,8 @@ struct ControlCancellationState {
     already_cancelled: bool,
 }
 
-#[derive(Debug)]
 struct ExecutionCancellationTarget {
-    db: PgPool,
-    run_shards: Vec<i16>,
+    routes: Vec<ExecutionRoute>,
 }
 
 #[derive(Debug, Default)]
@@ -268,6 +273,7 @@ async fn cancel_open_chunks(
         WITH updated AS (
             UPDATE run_chunks
             SET status = 'cancelled',
+                lease_token = NULL,
                 leased_until = NULL,
                 updated_at = now()
             WHERE run_id = $1::uuid
@@ -538,7 +544,7 @@ async fn update_run_cancelled(
 }
 
 async fn select_run_execution_progress(
-    db: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
 ) -> anyhow::Result<ExecutionProgressCounts> {
     let counts = sqlx::query_as::<_, ExecutionProgressCounts>(
@@ -636,7 +642,7 @@ async fn select_run_execution_progress(
         "#,
     )
     .bind(run_id)
-    .fetch_one(db)
+    .fetch_one(&mut **tx)
     .await?;
 
     Ok(counts)
@@ -660,24 +666,44 @@ async fn select_run_shards(db: &PgPool, run_id: Uuid) -> anyhow::Result<Vec<i16>
 }
 
 async fn cancel_execution_target(
+    database: &database::Db,
     run_id: Uuid,
     target: ExecutionCancellationTarget,
 ) -> anyhow::Result<ExecutionCancellationOutcome> {
-    let mut tx = target.db.begin().await?;
-    let counts = CancellationCounts {
-        attempts_cancelled: cancel_open_attempts(&mut tx, run_id).await?,
-        executions_cancelled: cancel_open_executions(&mut tx, run_id).await?,
-        chunks_cancelled: cancel_open_chunks(&mut tx, run_id).await?,
-    };
-    tx.commit().await?;
+    let run_shards = target
+        .routes
+        .iter()
+        .map(|route| route.placement.run_shard)
+        .collect();
+    let tx = database
+        .begin_execution_cleanup_admission(&target.routes)
+        .await?;
+    cancel_execution_target_with_transaction(run_id, run_shards, tx).await
+}
 
-    let progress = select_run_execution_progress(&target.db, run_id).await?;
-    let mut summaries = Vec::with_capacity(target.run_shards.len());
-    for run_shard in target.run_shards {
-        if let Some(summary) = refresh_run_shard_summary(&target.db, run_id, run_shard).await? {
+async fn cancel_execution_target_with_transaction(
+    run_id: Uuid,
+    run_shards: Vec<i16>,
+    mut tx: Transaction<'static, Postgres>,
+) -> anyhow::Result<ExecutionCancellationOutcome> {
+    // Match worker persistence and recovery lock order: chunk before attempt.
+    // The chunk token remains visible to movement until this transaction commits.
+    let chunks_cancelled = cancel_open_chunks(&mut tx, run_id).await?;
+    let attempts_cancelled = cancel_open_attempts(&mut tx, run_id).await?;
+    let executions_cancelled = cancel_open_executions(&mut tx, run_id).await?;
+    let counts = CancellationCounts {
+        chunks_cancelled,
+        executions_cancelled,
+        attempts_cancelled,
+    };
+    let progress = select_run_execution_progress(&mut tx, run_id).await?;
+    let mut summaries = Vec::with_capacity(run_shards.len());
+    for run_shard in run_shards {
+        if let Some(summary) = refresh_run_shard_summary_with(&mut *tx, run_id, run_shard).await? {
             summaries.push(summary);
         }
     }
+    tx.commit().await?;
 
     Ok(ExecutionCancellationOutcome {
         counts,
@@ -686,16 +712,16 @@ async fn cancel_execution_target(
     })
 }
 
-fn group_execution_routes(routes: Vec<(i16, String, PgPool)>) -> Vec<ExecutionCancellationTarget> {
+fn group_execution_routes(routes: Vec<ExecutionRoute>) -> Vec<ExecutionCancellationTarget> {
     let mut grouped = BTreeMap::<String, ExecutionCancellationTarget>::new();
 
-    for (run_shard, alias, db) in routes {
+    for route in routes {
+        let alias = route.placement.database_alias.clone();
         grouped
             .entry(alias)
-            .and_modify(|target| target.run_shards.push(run_shard))
+            .and_modify(|target| target.routes.push(route.clone()))
             .or_insert_with(|| ExecutionCancellationTarget {
-                db,
-                run_shards: vec![run_shard],
+                routes: vec![route],
             });
     }
 
@@ -703,13 +729,14 @@ fn group_execution_routes(routes: Vec<(i16, String, PgPool)>) -> Vec<ExecutionCa
 }
 
 async fn cancel_execution_targets(
+    database: &database::Db,
     run_id: Uuid,
     targets: Vec<ExecutionCancellationTarget>,
 ) -> anyhow::Result<ExecutionCancellationOutcome> {
     let mut stream = stream::iter(
         targets
             .into_iter()
-            .map(|target| async move { cancel_execution_target(run_id, target).await }),
+            .map(|target| async move { cancel_execution_target(database, run_id, target).await }),
     )
     .buffer_unordered(ROUTED_CANCEL_PARALLELISM);
 
@@ -838,8 +865,10 @@ async fn enqueue_cancelled_event(
 ///   short control transaction.
 /// - Resolve execution routes and cancel each placement once, grouped by
 ///   database alias and bounded by `ROUTED_CANCEL_PARALLELISM`.
-/// - Refresh shard summaries where snapshots exist and count execution-local
-///   progress directly for shards that were never dispatched.
+/// - Hold shared movement admission while cancelling execution-local rows and
+///   refreshing their shard summaries in one transaction.
+/// - Count execution-local progress directly for shards that were never
+///   dispatched.
 /// - Finalize the control run summary and emit one idempotent control outbox
 ///   event. If fanout fails, retrying the command resumes from the already
 ///   cancelled control state and repeats idempotent execution cleanup.
@@ -852,22 +881,20 @@ pub(crate) async fn cancel_run_routed(
         return Ok(None);
     };
 
-    let routes = database.execution_read_routes_for_run(run_id).await?;
+    let routes = database
+        .execution_read_routes_with_fences_for_run(run_id)
+        .await?;
     let execution_route_count = routes.len();
     let targets = group_execution_routes(routes);
-    let execution_outcome = cancel_execution_targets(run_id, targets).await?;
+    let execution_outcome = cancel_execution_targets(database, run_id, targets).await?;
 
     finalize_control_cancellation(control_db, state, execution_outcome, execution_route_count)
         .await
         .map(Some)
 }
 
-/// Cancels a run whose control and execution rows live in one database.
-///
-/// This remains for single-pool workflow tests and local single-database use.
-/// CLI callers should use `cancel_run_routed` so execution-owned rows are
-/// cancelled in their stored placements.
-#[allow(dead_code)]
+/// Single-pool compatibility helper for workflow tests.
+#[cfg(test)]
 pub(crate) async fn cancel_run(
     db: &PgPool,
     run_id: Uuid,
@@ -877,14 +904,9 @@ pub(crate) async fn cancel_run(
     };
 
     let run_shards = select_run_shards(db, run_id).await?;
-    let execution_outcome = cancel_execution_target(
-        run_id,
-        ExecutionCancellationTarget {
-            db: db.clone(),
-            run_shards,
-        },
-    )
-    .await?;
+    let tx = db.begin().await?;
+    let execution_outcome =
+        cancel_execution_target_with_transaction(run_id, run_shards, tx).await?;
 
     finalize_control_cancellation(db, state, execution_outcome, 1)
         .await

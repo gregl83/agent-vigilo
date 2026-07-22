@@ -6,5 +6,6 @@
 //! semantics.
 
 pub(crate) mod migrations;
+pub(crate) mod shard_write_fence;
 pub(crate) mod tables;
 pub(crate) mod workflows;

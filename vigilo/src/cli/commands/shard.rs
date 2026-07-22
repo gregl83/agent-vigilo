@@ -73,7 +73,7 @@ pub(crate) enum SubCommand {
         #[arg(long, default_value_t = false)]
         verify_only: bool,
 
-        /// Allow copying while leased chunks or running attempts still exist
+        /// Compatibility flag; active work is always protected by the shard write fence
         #[arg(long, default_value_t = false)]
         force: bool,
     },
@@ -181,7 +181,7 @@ pub(crate) enum RebalanceSubCommand {
         #[arg(long, env = "VIGILO_REBALANCE_LEASE_SECONDS", default_value_t = REBALANCE_LEASE_SECONDS, value_parser = clap::value_parser!(i32).range(1..=86400))]
         lease_seconds: i32,
 
-        /// Allow moving shards that still have leased chunks or running attempts
+        /// Compatibility flag; active work is always protected by the shard write fence
         #[arg(long, default_value_t = false)]
         force: bool,
     },

@@ -4,7 +4,11 @@
 //! `run_id + run_shard` so later control-plane finalization can combine shard
 //! results without scanning all execution rows directly.
 
-use sqlx::PgPool;
+use sqlx::{
+    Executor,
+    PgPool,
+    Postgres,
+};
 use uuid::Uuid;
 
 /// Current shard-local summary for one run shard.
@@ -89,11 +93,24 @@ pub(crate) async fn select_run_shard_summary(
 /// - Marks the shard `completed` only when all expected executions are
 ///   terminal, all chunks are terminal, and no failure/missing aggregate
 ///   counters are present.
+#[cfg(test)]
 pub(crate) async fn refresh_run_shard_summary(
     db: &PgPool,
     run_id: Uuid,
     run_shard: i16,
 ) -> anyhow::Result<Option<RunShardSummary>> {
+    refresh_run_shard_summary_with(db, run_id, run_shard).await
+}
+
+/// Recomputes a summary on the caller's connection or transaction.
+pub(crate) async fn refresh_run_shard_summary_with<'e, E>(
+    executor: E,
+    run_id: Uuid,
+    run_shard: i16,
+) -> anyhow::Result<Option<RunShardSummary>>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let summary = sqlx::query_as::<_, RunShardSummary>(
         r#"
         WITH snapshot AS (
@@ -330,7 +347,7 @@ pub(crate) async fn refresh_run_shard_summary(
     )
     .bind(run_id)
     .bind(run_shard)
-    .fetch_optional(db)
+    .fetch_optional(executor)
     .await?;
 
     Ok(summary)

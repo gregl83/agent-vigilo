@@ -360,15 +360,6 @@ async fn recover_expired_chunk_leases(
                 "no expired chunk leases recovered for execution placement"
             );
         }
-
-        for error in outcome.summary_refresh_errors {
-            record_placement_failure(
-                &mut failures,
-                coordinator_id,
-                "lease_recovery_summary_refresh",
-                PlacementOperationFailure::new(alias.clone(), error),
-            );
-        }
     }
 
     for failure in batch.failed {
@@ -434,11 +425,12 @@ async fn drain_dispatch_batch(
         }
         let select_started = Instant::now();
         let excluded_aliases = failures.excluded_aliases();
-        let Some(route) =
-            run_dispatch::select_next_dispatch_route(control_db, &excluded_aliases).await?
+        let Some(mut dispatch_claim) =
+            run_dispatch::claim_next_dispatch_route(control_db, &excluded_aliases).await?
         else {
             break;
         };
+        let route = dispatch_claim.route.clone();
         let dispatch_route_select_ms = select_started.elapsed().as_millis() as u64;
         let database_alias = route.database_alias.clone();
 
@@ -453,21 +445,26 @@ async fn drain_dispatch_batch(
             "selected dispatch route"
         );
 
-        let Some(snapshot) = run_dispatch::prepare_dispatch_run_snapshot(
-            control_db,
+        let Some(snapshot) = run_dispatch::prepare_dispatch_run_snapshot_with(
+            &mut dispatch_claim.control_tx,
             &route,
             coordinator_id,
             config.lease_seconds,
         )
         .await?
         else {
+            dispatch_claim.control_tx.rollback().await?;
             continue;
         };
 
         let execution_pool_started = Instant::now();
-        let execution_db = match database.execution(route.run_id, route.run_shard).await {
-            Ok(db) => db,
+        let execution_route = match database
+            .execution_route(route.run_id, route.run_shard)
+            .await
+        {
+            Ok(route) => route,
             Err(error) => {
+                dispatch_claim.control_tx.rollback().await?;
                 record_placement_failure(
                     &mut failures,
                     coordinator_id,
@@ -477,18 +474,34 @@ async fn drain_dispatch_batch(
                 continue;
             }
         };
+        if execution_route.placement.database_alias != route.database_alias
+            || execution_route.placement.route_version != route.route_version
+        {
+            debug!(
+                run_id = %route.run_id,
+                run_shard = route.run_shard,
+                selected_database_alias = %route.database_alias,
+                selected_route_version = route.route_version,
+                current_database_alias = %execution_route.placement.database_alias,
+                current_route_version = execution_route.placement.route_version,
+                "dispatch route changed before execution pool resolution"
+            );
+            dispatch_claim.control_tx.rollback().await?;
+            continue;
+        }
         let execution_pool_resolution_ms = execution_pool_started.elapsed().as_millis() as u64;
         let dispatch_started = Instant::now();
-        let dispatch_result = run_dispatch::dispatch_routed_run_window(
-            control_db,
-            execution_db,
+        let dispatch_result = run_dispatch::dispatch_admitted_run_window(
+            database,
+            dispatch_claim.control_tx,
+            &execution_route,
             config.run_chunk_dispatch_window_size,
             &route,
             &snapshot,
         )
         .await;
-        let (run, shard_summary_refreshed) = match dispatch_result {
-            Ok(Some(run)) => (run, true),
+        let run = match dispatch_result {
+            Ok(Some(run)) => run,
             Ok(None) => continue,
             Err(run_dispatch::RoutedDispatchError::ExecutionWrite(error)) => {
                 record_placement_failure(
@@ -498,15 +511,6 @@ async fn drain_dispatch_batch(
                     PlacementOperationFailure::new(database_alias, error),
                 );
                 continue;
-            }
-            Err(run_dispatch::RoutedDispatchError::SummaryRefresh { dispatched, source }) => {
-                record_placement_failure(
-                    &mut failures,
-                    coordinator_id,
-                    "dispatch_summary_refresh",
-                    PlacementOperationFailure::new(database_alias.clone(), source),
-                );
-                (dispatched, false)
             }
             Err(error) => return Err(error.into()),
         };
@@ -532,7 +536,7 @@ async fn drain_dispatch_batch(
             chunk_events_enqueued = run.chunk_events_enqueued,
             chunks_marked_dispatched = run.chunks_marked_dispatched,
             run_started_events_enqueued = run.run_started_events_enqueued,
-            shard_summary_refreshed,
+            shard_summary_refreshed = true,
             execution_pool_resolution_ms,
             dispatch_window_ms,
             "prepared bounded dispatch shard window"
@@ -706,9 +710,13 @@ async fn drain_finalize_batch(
 
         debug!(run_id = %claimed.id, run_key = %claimed.run_key, "claimed run for finalization");
         let finalize_started = Instant::now();
-        if let Some(done) =
-            run_finalize::finalize_claimed_run_from_summaries(control_db, claimed.id, &summaries)
-                .await?
+        if let Some(done) = run_finalize::finalize_claimed_run_from_summaries(
+            control_db,
+            claimed.id,
+            coordinator_id,
+            &summaries,
+        )
+        .await?
         {
             finalized += 1;
             info!(

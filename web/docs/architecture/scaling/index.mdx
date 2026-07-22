@@ -126,11 +126,15 @@ execution placement:
 
 Coordinator dispatch is route-constrained:
 
-- Control storage selects one open `run_id + run_shard` dispatch cursor.
+- Control storage claims one open `run_id + run_shard` dispatch cursor with
+  `FOR UPDATE SKIP LOCKED` and retains that transaction through the routed
+  write. Running dispatches share the run lifecycle lock; the initial
+  pending-to-running transition is exclusive.
 - The database service resolves that shard placement to an execution pool.
 - The execution placement upserts `run_snapshots`, marks pending chunks
   dispatched, and writes `run.chunk.ready` outbox events.
-- The control cursor is released or marked drained.
+- The control cursor is released or marked drained after the execution
+  transaction commits.
 - If an execution placement operation fails, the cursor remains open and that
   database alias is excluded from the rest of the current dispatch pass.
   Healthy aliases continue within the same cycle.
@@ -147,7 +151,9 @@ Finalization fans in:
 
 - Each execution placement maintains `run_shard_summaries`.
 - The coordinator reads routed summaries for the run.
-- Control storage writes the global run outcome and emits `run.completed`.
+- Control storage claims the run without waiting behind active dispatch
+  lifecycle locks. The global outcome and `run.completed` event are written
+  only while that coordinator still owns an unexpired finalization lease.
 - A failed placement read defers that run without discarding summaries already
   read from healthy placements. The run cannot finalize until every routed
   summary is available and terminal.
@@ -156,7 +162,9 @@ Cancellation fans out:
 
 - Control storage marks the run cancelled and drains dispatch cursors first.
 - The workflow resolves the run's execution placements and cancels local
-  chunks, executions, and attempts in each placement with bounded fanout.
+  chunks, executions, and attempts in each placement with bounded fanout. Each
+  group holds shared movement admission, revalidates its route fences, and
+  refreshes shard summaries in the cancellation transaction.
 - `run.cancelled` remains a control-plane event.
 
 Status and watch reads fan in lightweight progress:
@@ -247,10 +255,24 @@ Routes are immutable while their run is `creating`; move and direct placement
 changes are rejected until creation reaches `pending` or `failed`. Rebalance
 plans omit creating runs for the same reason.
 
-The normal move marks the shard placement `moving`, rejects active leased or
-running work unless `--force` is passed, copies shard-owned rows, verifies row
-counts and checksums, then switches the route to the target alias with status
-`active`.
+The normal move takes an exclusive transaction-scoped write-admission lock on
+the source shard, revalidates its route fence, and marks the placement `moving`.
+Worker claims, dispatch writes, and routed cancellation cleanup take shared
+admission and revalidate the same alias, status, and `route_version`, so a stale
+source route cannot write after movement begins. The move then checks for active
+leased or running work, copies and verifies the shard, and compare-and-swaps the
+route to the target alias with status `active`.
+
+After claim admission commits, an opaque chunk claim token and renewable
+deadline carry worker authority. Attempt allocation and result persistence lock
+and validate that live token; result persistence also requires the current live
+worker attempt. Recovery clears the chunk token, stales the attempt, and updates
+any failed-shard summary atomically. Terminal worker settlement and cancellation
+also refresh shard summaries in the transaction that clears active work.
+
+When active work exists, the route stays `moving` while the admitted work
+drains; re-run the move afterward to resume it. `--force` remains accepted for
+CLI compatibility but cannot bypass the active-work or write-admission fence.
 
 Every route alias or status change increments `shard_placements.route_version`.
 Execution route caches are accepted only while alias, status, and
@@ -298,13 +320,16 @@ vigilo shard rebalance cancel <operation_id>
 A rebalance plan records one item per `run_id + run_shard` in control storage.
 Apply is resumable and bounded. Each item is atomically claimed immediately
 before processing, and only pending items or running items with expired leases
-are eligible. Completion, failure, and claimed cancellation require the claim's
-opaque fencing token. Each item still uses the single-shard move workflow,
-including route fencing, copy verification, and active-work guards. Plans
-verify the stored `route_version` before moving an item so stale plans fail
-narrowly instead of rewriting an unexpected route. Claim duration defaults to
-300 seconds and can be changed with `--lease-seconds` or
-`VIGILO_REBALANCE_LEASE_SECONDS`.
+are eligible. Completion, failure, claimed cancellation, and drain deferral
+require the claim's opaque fencing token. A shard with active work returns its
+item to `pending` while its route remains `moving`; a later apply resumes it at
+the expected next route version. Each item still uses the single-shard move
+workflow, including route fencing, copy verification, and active-work guards.
+Plans verify the stored `route_version` before moving an item so stale plans
+fail narrowly instead of rewriting an unexpected route. An expired apply claim
+can resume its exact source route when the route is still `moving` at the
+expected next version. Claim duration defaults to 300 seconds and can be
+changed with `--lease-seconds` or `VIGILO_REBALANCE_LEASE_SECONDS`.
 
 ## Current Scope
 

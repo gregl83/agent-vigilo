@@ -50,7 +50,6 @@ use crate::{
         workflows::{
             chunk_processing,
             execution_processing,
-            run_shard_summary,
         },
     },
     runtime::ServiceRunner,
@@ -293,7 +292,10 @@ fn worker_stream_prefetch(max_inflight_chunks: u16) -> u16 {
 fn execution_route_is_temporarily_blocked(error: &anyhow::Error) -> bool {
     matches!(
         error.downcast_ref::<ExecutionRouteError>(),
-        Some(ExecutionRouteError::NonDispatchableShardPlacement { .. })
+        Some(
+            ExecutionRouteError::NonDispatchableShardPlacement { .. }
+                | ExecutionRouteError::StaleExecutionRoute { .. }
+        )
     )
 }
 
@@ -581,9 +583,8 @@ async fn settle_retryable_chunk_failure(
             Ok(RetrySettlement::AcknowledgedStale)
         }
     } else {
-        let failed = chunk_processing::mark_chunk_failed(db, chunk).await?;
+        let failed = chunk_processing::mark_chunk_failed_and_refresh_summary(db, chunk).await?;
         if failed > 0 {
-            run_shard_summary::refresh_run_shard_summary(db, chunk.run_id, chunk.run_shard).await?;
             mq.quarantine_worker_message(
                 &message.raw,
                 &format!("worker message retry budget exhausted: {}", reason),
@@ -679,11 +680,11 @@ async fn run_worker_message(
     // chunk terminal state are execution-owned. Resolve this once at the worker
     // workflow boundary so lower helpers do not need to know topology.
     let db_service = context.db().await?;
-    let db = match db_service
-        .execution(payload.run_id, payload.run_shard)
+    let route = match db_service
+        .execution_route(payload.run_id, payload.run_shard)
         .await
     {
-        Ok(db) => db,
+        Ok(route) => route,
         Err(err) if execution_route_is_temporarily_blocked(&err) => {
             mq.delay_worker_message(
                 &message.raw,
@@ -704,19 +705,43 @@ async fn run_worker_message(
         }
         Err(err) => return Err(err),
     };
+    let db = &route.database;
 
     // --- Claim chunk ownership ---
     // Duplicate, stale, cancelled, completed, or not-yet-running chunks are
     // acknowledged because the database refused ownership.
-    let Some(mut chunk) = chunk_processing::claim_chunk_for_processing(
-        db,
+    let claim = chunk_processing::claim_routed_chunk_for_processing(
+        db_service,
+        &route,
         payload.run_id,
         payload.run_shard,
         payload.chunk_id,
         CHUNK_LEASE_SECONDS,
     )
-    .await?
-    else {
+    .await;
+    let claimed = match claim {
+        Ok(claimed) => claimed,
+        Err(err) if execution_route_is_temporarily_blocked(&err) => {
+            mq.delay_worker_message(
+                &message.raw,
+                WORKER_ROUTE_RETRY_DELAY_SECONDS,
+                &err.to_string(),
+                "execution_route_changed_before_claim",
+            )
+            .await?;
+            info!(
+                run_id = %payload.run_id,
+                run_shard = payload.run_shard,
+                chunk_id = %payload.chunk_id,
+                delay_seconds = WORKER_ROUTE_RETRY_DELAY_SECONDS,
+                error = %err,
+                "execution route changed before chunk claim; delayed worker message"
+            );
+            return Ok(WorkerCycleOutcome::Processed);
+        }
+        Err(err) => return Err(err),
+    };
+    let Some(mut chunk) = claimed else {
         mq.ack(&message.raw).await?;
         info!(
             chunk_id = %payload.chunk_id,
@@ -740,8 +765,8 @@ async fn run_worker_message(
     );
 
     // --- Load run context and extend lease ---
-    // The extended lease timestamp becomes the authority token for every later
-    // chunk settlement.
+    // The opaque claim token remains the authority for later writes while the
+    // heartbeat advances its expiration deadline.
     let run_context = evaluator_loader
         .get_or_build_run_context(chunk.run_id, chunk.run_shard, db)
         .await?;
@@ -828,9 +853,7 @@ async fn run_worker_message(
             let processed = match execution_processing::process_case_batch_execution(
                 &context,
                 db,
-                chunk.run_id,
-                chunk.run_shard,
-                chunk.id,
+                &chunk,
                 &attempt_lease,
                 &run_context.profile,
                 &run_context.evaluator_catalog,
@@ -965,7 +988,8 @@ async fn run_worker_message(
             // All executions in the chunk are terminal, so complete the chunk
             // under the same lease token.
             let chunk = heartbeat.stop().await;
-            let completed = chunk_processing::mark_chunk_completed(db, &chunk).await?;
+            let completed =
+                chunk_processing::mark_chunk_completed_and_refresh_summary(db, &chunk).await?;
             if completed == 0 {
                 mq.ack(&message.raw).await?;
                 warn!(
@@ -975,8 +999,6 @@ async fn run_worker_message(
                 );
                 return Ok(WorkerCycleOutcome::Processed);
             }
-            run_shard_summary::refresh_run_shard_summary(db, chunk.run_id, chunk.run_shard).await?;
-
             mq.ack(&message.raw).await?;
             info!(
                 run_id = %chunk.run_id,
@@ -1087,5 +1109,20 @@ mod tests {
         });
 
         assert!(!execution_route_is_temporarily_blocked(&error));
+    }
+
+    #[test]
+    fn stale_execution_route_is_temporary_worker_backpressure() {
+        let error = anyhow::Error::new(ExecutionRouteError::StaleExecutionRoute {
+            run_id: Uuid::now_v7(),
+            run_shard: 7,
+            expected_database_alias: "primary".to_string(),
+            expected_route_version: 1,
+            actual_database_alias: "primary".to_string(),
+            actual_status: "moving".to_string(),
+            actual_route_version: 2,
+        });
+
+        assert!(execution_route_is_temporarily_blocked(&error));
     }
 }
