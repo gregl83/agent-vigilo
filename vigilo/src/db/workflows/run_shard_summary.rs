@@ -1,7 +1,7 @@
 //! Shard-local run summary workflow helpers.
 //!
 //! Summaries roll chunk and execution progress up to one row per
-//! `run_id + run_shard` so later control-plane finalization can combine shard
+//! `run_id + run_shard` so later control-database finalization can combine shard
 //! results without scanning all execution rows directly.
 
 use sqlx::{

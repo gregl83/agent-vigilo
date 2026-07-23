@@ -2,9 +2,9 @@
 //!
 //! The coordinator drives run-level orchestration:
 //! - resumes durable multi-database run creation
-//! - atomically starts fully created runs and dispatches chunk-ready windows
+//! - atomically starts fully created runs and dispatches bounded chunk windows
 //! - finalizes runs whose chunks/executions are terminal
-//! - publishes outbox events from active database placements to messaging
+//! - publishes outbox event records from active database placements as messages
 //! - contains placement-scoped database failures so healthy aliases continue
 
 use std::{
@@ -55,9 +55,9 @@ mod once;
 mod start;
 
 use placement::{
-    Failure as PlacementOperationFailure,
-    FailureStats as PlacementFailureStats,
-    PlacementAware,
+    PlacementFailureStats,
+    PlacementOperationFailure,
+    PlacementPassResult,
     record_failure as record_placement_failure,
     run_operations as run_placement_operations,
 };
@@ -140,7 +140,7 @@ pub(crate) struct Command {
     #[arg(long, env = "VIGILO_CHUNK_LEASE_MAX_RECOVERIES", default_value_t = CHUNK_LEASE_MAX_RECOVERIES, value_parser = clap::value_parser!(i32).range(0..=10_000))]
     pub chunk_lease_max_recoveries: i32,
 
-    /// Maximum outbox events claimed per database placement per publish pass
+    /// Maximum outbox event records claimed per placement per publish pass
     #[arg(long, env = "VIGILO_OUTBOX_BATCH_SIZE", default_value_t = OUTBOX_BATCH_SIZE, value_parser = clap::value_parser!(i64).range(1..=1_000_000))]
     pub outbox_batch_size: i64,
 
@@ -203,9 +203,9 @@ impl Executable for Command {
 /// The cycle is intentionally ordered to keep run progression deterministic:
 /// 1. resume stale multi-database run creation
 /// 2. recover expired worker chunk leases
-/// 3. atomically start pending runs and dispatch chunk-ready windows
+/// 3. atomically start pending runs and dispatch bounded chunk windows
 /// 4. claim/finalize finalizable runs (bounded batch)
-/// 5. publish bounded batches of pending outbox events from active placements
+/// 5. publish bounded batches of pending outbox event records from active placements
 async fn run_coordinator_cycle(
     context: Context,
     coordinator_id: Uuid,
@@ -213,18 +213,18 @@ async fn run_coordinator_cycle(
 ) -> anyhow::Result<()> {
     let cycle_started = Instant::now();
     // --- Acquire cycle services ---
-    // The database service owns control and execution placement routing. The
+    // The database router owns control and execution placement routing. The
     // queue handle is acquired only after database-only recovery and dispatch.
     debug!(coordinator_id = %coordinator_id, "starting coordinator cycle pre-flight");
 
-    debug!(coordinator_id = %coordinator_id, "acquiring database context");
-    let database = context.db().await?;
-    debug!(coordinator_id = %coordinator_id, "database context ready");
+    debug!(coordinator_id = %coordinator_id, "acquiring database router");
+    let database_router = context.dbr().await?;
+    debug!(coordinator_id = %coordinator_id, "database router ready");
 
     // --- Resume incomplete run creation ---
     let creation_recovery_started = Instant::now();
     let creation_recovery = run_creation::recover_creating_runs(
-        database,
+        database_router,
         coordinator_id,
         config.lease_seconds,
         config.max_create_recovery_per_cycle,
@@ -236,22 +236,22 @@ async fn run_coordinator_cycle(
     // Recovery runs before new dispatch so dead workers do not block
     // finalization or leave ready work stranded.
     let recovery_started = Instant::now();
-    let recovery = recover_expired_chunk_leases(database, coordinator_id, config).await?;
+    let recovery = recover_expired_chunk_leases(database_router, coordinator_id, config).await?;
     let recovery_ms = recovery_started.elapsed().as_millis() as u64;
 
     // --- Dispatch runnable chunk windows ---
-    // Dispatch is drained before finalization so newly-created work gets
-    // surfaced promptly.
+    // Dispatch runs before finalization so newly-created work is surfaced
+    // promptly.
     let dispatch_started = Instant::now();
-    let dispatch = drain_dispatch_batch(database, coordinator_id, config).await?;
+    let dispatch = dispatch_ready_chunk_windows(database_router, coordinator_id, config).await?;
     let dispatch_ms = dispatch_started.elapsed().as_millis() as u64;
 
     // --- Finalize terminal runs ---
     let finalization_started = Instant::now();
-    let finalization = drain_finalize_batch(database, coordinator_id, config).await?;
+    let finalization = finalize_ready_runs(database_router, coordinator_id, config).await?;
     let finalization_ms = finalization_started.elapsed().as_millis() as u64;
 
-    // --- Publish durable outbox events ---
+    // --- Publish durable outbox event records ---
     // Failed broker publishes stay in the outbox delivery queue for retry.
     debug!(coordinator_id = %coordinator_id, "acquiring messaging context");
     let mq = context.mq().await?;
@@ -266,7 +266,7 @@ async fn run_coordinator_cycle(
     };
     let outbox_started = Instant::now();
     let publication =
-        publish_outbox_events(database, &publisher, &outbox_config, coordinator_id).await?;
+        publish_outbox_events(database_router, &publisher, &outbox_config, coordinator_id).await?;
     let outbox_publish_ms = outbox_started.elapsed().as_millis() as u64;
 
     let mut placement_failures = PlacementFailureStats::default();
@@ -275,22 +275,22 @@ async fn run_coordinator_cycle(
     placement_failures.merge(finalization.failures);
     placement_failures.merge(publication.failures);
     info!(
-        run_creations_claimed = creation_recovery.claimed,
-        run_creations_completed = creation_recovery.completed,
-        run_creations_deferred = creation_recovery.deferred,
-        run_creations_failed = creation_recovery.failed,
+        run_creations_claimed = creation_recovery.claimed_runs,
+        run_creations_completed = creation_recovery.completed_runs,
+        run_creations_deferred = creation_recovery.deferred_runs,
+        run_creations_failed = creation_recovery.failed_runs,
         creation_recovery_ms,
-        expired_chunk_leases_recovered = recovery.output.recovered,
-        expired_chunk_leases_failed = recovery.output.failed,
+        expired_chunk_leases_recovered = recovery.output.recovered_chunks,
+        expired_chunk_leases_failed = recovery.output.failed_chunks,
         recovery_ms,
         dispatch_windows_prepared = dispatch.output,
         dispatch_ms,
         runs_finalized = finalization.output,
         finalization_ms,
-        outbox_events_claimed = publication.output.claimed,
-        outbox_events_published = publication.output.published,
-        outbox_events_failed = publication.output.failed,
-        outbox_stale_claims = publication.output.stale_claims,
+        outbox_events_claimed = publication.output.claimed_events,
+        outbox_events_published = publication.output.published_events,
+        outbox_events_failed = publication.output.failed_events,
+        outbox_stale_claims = publication.output.stale_event_claims,
         outbox_publish_ms,
         skipped_placements = placement_failures.skipped_placement_count(),
         failed_placement_operations = placement_failures.failed_operation_count(),
@@ -306,17 +306,17 @@ async fn run_coordinator_cycle(
 }
 
 async fn recover_expired_chunk_leases(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     coordinator_id: Uuid,
     config: &CoordinatorRuntimeConfig,
-) -> anyhow::Result<PlacementAware<run_dispatch::ChunkLeaseRecoveryStats>> {
+) -> anyhow::Result<PlacementPassResult<run_dispatch::ChunkLeaseRecoveryStats>> {
     // --- Expired lease recovery pass ---
     // The workflow returns both recovered chunks and chunks failed after
     // exhausting recovery attempts.
     debug!(coordinator_id = %coordinator_id, "recovering expired chunk leases");
 
     let alias_list_started = Instant::now();
-    let aliases = database.active_execution_database_aliases().await?;
+    let aliases = database_router.active_execution_database_aliases().await?;
     debug!(
         coordinator_id = %coordinator_id,
         active_execution_placement_count = aliases.len(),
@@ -324,31 +324,30 @@ async fn recover_expired_chunk_leases(
         "listed active execution placements for recovery"
     );
     let batch = run_placement_operations(aliases, |alias| async move {
-        let db = database.execution_database(&alias).await?;
+        let db = database_router.execution_database(&alias).await?;
         let recovery_started = Instant::now();
-        let outcome = run_dispatch::recover_expired_chunk_leases(
+        let stats = run_dispatch::recover_expired_chunk_leases(
             db,
             config.chunk_lease_max_recoveries,
             config.chunk_lease_recovery_batch_size,
         )
         .await?;
-        Ok((outcome, recovery_started.elapsed().as_millis() as u64))
+        Ok((stats, recovery_started.elapsed().as_millis() as u64))
     })
     .await;
 
     let mut stats = run_dispatch::ChunkLeaseRecoveryStats::default();
     let mut failures = PlacementFailureStats::default();
-    for (alias, (outcome, recovery_ms)) in batch.completed {
-        let alias_stats = outcome.stats;
-        stats.recovered += alias_stats.recovered;
-        stats.failed += alias_stats.failed;
+    for (alias, (alias_stats, recovery_ms)) in batch.successes {
+        stats.recovered_chunks += alias_stats.recovered_chunks;
+        stats.failed_chunks += alias_stats.failed_chunks;
 
-        if alias_stats.recovered > 0 || alias_stats.failed > 0 {
+        if alias_stats.recovered_chunks > 0 || alias_stats.failed_chunks > 0 {
             info!(
                 coordinator_id = %coordinator_id,
                 database_alias = %alias,
-                expired_chunk_leases_recovered = alias_stats.recovered,
-                expired_chunk_leases_failed = alias_stats.failed,
+                expired_chunk_leases_recovered = alias_stats.recovered_chunks,
+                expired_chunk_leases_failed = alias_stats.failed_chunks,
                 recovery_ms,
                 "completed expired chunk lease recovery pass for execution placement"
             );
@@ -362,7 +361,7 @@ async fn recover_expired_chunk_leases(
         }
     }
 
-    for failure in batch.failed {
+    for failure in batch.failures {
         record_placement_failure(
             &mut failures,
             coordinator_id,
@@ -371,7 +370,7 @@ async fn recover_expired_chunk_leases(
         );
     }
 
-    if stats.recovered == 0 && stats.failed == 0 {
+    if stats.recovered_chunks == 0 && stats.failed_chunks == 0 {
         debug!(
             coordinator_id = %coordinator_id,
             "no expired chunk leases recovered for this cycle"
@@ -379,35 +378,38 @@ async fn recover_expired_chunk_leases(
     } else {
         info!(
             coordinator_id = %coordinator_id,
-            expired_chunk_leases_recovered = stats.recovered,
-            expired_chunk_leases_failed = stats.failed,
+            expired_chunk_leases_recovered = stats.recovered_chunks,
+            expired_chunk_leases_failed = stats.failed_chunks,
             "completed expired chunk lease recovery pass"
         );
     }
 
-    Ok(PlacementAware {
+    Ok(PlacementPassResult {
         output: stats,
         failures,
     })
 }
 
-async fn drain_dispatch_batch(
-    database: &database::Db,
+async fn dispatch_ready_chunk_windows(
+    database_router: &database::DatabaseRouter,
     coordinator_id: Uuid,
     config: &CoordinatorRuntimeConfig,
-) -> anyhow::Result<PlacementAware<usize>> {
-    // --- Dispatch drain pass ---
+) -> anyhow::Result<PlacementPassResult<usize>> {
+    // --- Dispatch pass ---
     // Repeatedly claim one dispatchable run/window until the cycle limit is
     // reached or no pending dispatch work remains.
-    debug!(coordinator_id = %coordinator_id, "draining dispatchable run-shard windows");
+    debug!(coordinator_id = %coordinator_id, "dispatching ready run-shard windows");
 
     let mut dispatched = 0usize;
     let mut dispatched_by_alias = BTreeMap::<String, usize>::new();
     let mut failures = PlacementFailureStats::default();
-    let control_db = database.control().await?;
+    let control_db = database_router.control().await?;
     // A failed alias is excluded after one attempt, so this allowance keeps
     // placement failures from reducing the successful-window budget.
-    let placement_failure_allowance = database.active_execution_database_aliases().await?.len();
+    let placement_failure_allowance = database_router
+        .active_execution_database_aliases()
+        .await?
+        .len();
     let dispatch_attempt_limit = config
         .max_dispatch_per_cycle
         .saturating_add(placement_failure_allowance);
@@ -458,7 +460,7 @@ async fn drain_dispatch_batch(
         };
 
         let execution_pool_started = Instant::now();
-        let execution_route = match database
+        let execution_route = match database_router
             .execution_route(route.run_id, route.run_shard)
             .await
         {
@@ -492,7 +494,7 @@ async fn drain_dispatch_batch(
         let execution_pool_resolution_ms = execution_pool_started.elapsed().as_millis() as u64;
         let dispatch_started = Instant::now();
         let dispatch_result = run_dispatch::dispatch_admitted_run_window(
-            database,
+            database_router,
             dispatch_claim.control_tx,
             &execution_route,
             config.run_chunk_dispatch_window_size,
@@ -533,9 +535,9 @@ async fn drain_dispatch_batch(
             run_key = %run.run_key,
             run_shard = run.run_shard,
             database_alias = %database_alias,
-            chunk_events_enqueued = run.chunk_events_enqueued,
+            chunk_ready_event_records_inserted = run.chunk_ready_event_records_inserted,
             chunks_marked_dispatched = run.chunks_marked_dispatched,
-            run_started_events_enqueued = run.run_started_events_enqueued,
+            run_started_event_records_inserted = run.run_started_event_records_inserted,
             shard_summary_refreshed = true,
             execution_pool_resolution_ms,
             dispatch_window_ms,
@@ -549,32 +551,32 @@ async fn drain_dispatch_batch(
         info!(
             coordinator_id = %coordinator_id,
             dispatch_windows_prepared = dispatched,
-            "completed coordinator dispatch drain pass"
+            "completed coordinator dispatch pass"
         );
         for (alias, alias_dispatched) in dispatched_by_alias {
             info!(
                 coordinator_id = %coordinator_id,
                 database_alias = %alias,
                 dispatch_windows_prepared = alias_dispatched,
-                "completed coordinator dispatch drain pass for execution placement"
+                "completed coordinator dispatch pass for execution placement"
             );
         }
     }
 
-    Ok(PlacementAware {
+    Ok(PlacementPassResult {
         output: dispatched,
         failures,
     })
 }
 
 async fn publish_outbox_events(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     publisher: &dyn EventPublisher,
     config: &OutboxPublisherConfig,
     coordinator_id: Uuid,
-) -> anyhow::Result<PlacementAware<OutboxPublishStats>> {
+) -> anyhow::Result<PlacementPassResult<OutboxPublishStats>> {
     let alias_list_started = Instant::now();
-    let aliases = database.active_outbox_database_aliases().await?;
+    let aliases = database_router.active_outbox_database_aliases().await?;
     debug!(
         coordinator_id = %coordinator_id,
         active_outbox_placement_count = aliases.len(),
@@ -582,7 +584,7 @@ async fn publish_outbox_events(
         "listed active outbox placements"
     );
     let batch = run_placement_operations(aliases, |alias| async move {
-        let db = database.placement(&alias).await?;
+        let db = database_router.placement(&alias).await?;
         let backlog_started = Instant::now();
         let outbox_backlog = outbox_events::count_publishable_outbox_backlog(db).await?;
         let outbox_backlog_query_ms = backlog_started.elapsed().as_millis() as u64;
@@ -600,23 +602,23 @@ async fn publish_outbox_events(
 
     let mut stats = OutboxPublishStats::default();
     for (alias, (alias_stats, outbox_backlog, outbox_backlog_query_ms, outbox_publish_ms)) in
-        batch.completed
+        batch.successes
     {
-        stats.claimed += alias_stats.claimed;
-        stats.published += alias_stats.published;
-        stats.failed += alias_stats.failed;
-        stats.stale_claims += alias_stats.stale_claims;
+        stats.claimed_events += alias_stats.claimed_events;
+        stats.published_events += alias_stats.published_events;
+        stats.failed_events += alias_stats.failed_events;
+        stats.stale_event_claims += alias_stats.stale_event_claims;
 
-        if alias_stats.claimed > 0 {
+        if alias_stats.claimed_events > 0 {
             info!(
                 coordinator_id = %coordinator_id,
                 database_alias = %alias,
                 outbox_backlog,
                 outbox_backlog_query_ms,
-                outbox_events_claimed = alias_stats.claimed,
-                outbox_events_published = alias_stats.published,
-                outbox_events_failed = alias_stats.failed,
-                outbox_stale_claims = alias_stats.stale_claims,
+                outbox_events_claimed = alias_stats.claimed_events,
+                outbox_events_published = alias_stats.published_events,
+                outbox_events_failed = alias_stats.failed_events,
+                outbox_stale_claims = alias_stats.stale_event_claims,
                 outbox_publish_ms,
                 "completed outbox publish pass for database placement"
             );
@@ -633,29 +635,29 @@ async fn publish_outbox_events(
     }
 
     let mut failures = PlacementFailureStats::default();
-    for failure in batch.failed {
+    for failure in batch.failures {
         record_placement_failure(&mut failures, coordinator_id, "outbox_publication", failure);
     }
 
-    Ok(PlacementAware {
+    Ok(PlacementPassResult {
         output: stats,
         failures,
     })
 }
 
-async fn drain_finalize_batch(
-    database: &database::Db,
+async fn finalize_ready_runs(
+    database_router: &database::DatabaseRouter,
     coordinator_id: Uuid,
     config: &CoordinatorRuntimeConfig,
-) -> anyhow::Result<PlacementAware<usize>> {
-    // --- Finalization drain pass ---
+) -> anyhow::Result<PlacementPassResult<usize>> {
+    // --- Finalization pass ---
     // Repeatedly claim one finalizable run until the cycle limit is reached or
     // no run has all chunks terminal.
-    debug!(coordinator_id = %coordinator_id, "draining finalizable runs");
+    debug!(coordinator_id = %coordinator_id, "finalizing ready runs");
 
     let mut finalized = 0usize;
     let mut failures = PlacementFailureStats::default();
-    let control_db = database.control().await?;
+    let control_db = database_router.control().await?;
     let finalization_backlog =
         run_finalize::select_finalization_candidate_backlog(control_db).await?;
     info!(
@@ -677,7 +679,8 @@ async fn drain_finalize_batch(
         let finalization_candidate_select_ms = select_started.elapsed().as_millis() as u64;
         checked_run_ids.push(run.id);
 
-        let collection = collect_run_shard_summaries(database, coordinator_id, run.id).await?;
+        let collection =
+            collect_run_shard_summaries(database_router, coordinator_id, run.id).await?;
         let placement_failure_count = collection.failures.failed_operation_count();
         failures.merge(collection.failures);
         let summaries = collection.output.summaries;
@@ -745,11 +748,11 @@ async fn drain_finalize_batch(
         info!(
             coordinator_id = %coordinator_id,
             runs_finalized = finalized,
-            "completed coordinator finalization drain pass"
+            "completed coordinator finalization pass"
         );
     }
 
-    Ok(PlacementAware {
+    Ok(PlacementPassResult {
         output: finalized,
         failures,
     })
@@ -762,11 +765,11 @@ struct RunShardSummaryCollection {
 }
 
 async fn collect_run_shard_summaries(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     coordinator_id: Uuid,
     run_id: Uuid,
-) -> anyhow::Result<PlacementAware<RunShardSummaryCollection>> {
-    let placements = database.execution_placements_for_run(run_id).await?;
+) -> anyhow::Result<PlacementPassResult<RunShardSummaryCollection>> {
+    let placements = database_router.execution_placements_for_run(run_id).await?;
     let mut placements_by_alias = BTreeMap::new();
     for placement in placements {
         placements_by_alias
@@ -779,7 +782,7 @@ async fn collect_run_shard_summaries(
     let batch = run_placement_operations(aliases, |alias| {
         let placements = placements_by_alias.get(&alias).cloned().unwrap_or_default();
         async move {
-            let db = database.execution_database(&alias).await?;
+            let db = database_router.execution_database(&alias).await?;
             let mut summaries = Vec::with_capacity(placements.len());
             let mut complete = true;
 
@@ -828,7 +831,7 @@ async fn collect_run_shard_summaries(
 
     let mut summaries = Vec::new();
     let mut complete = true;
-    for (alias, (mut alias_summaries, alias_complete)) in batch.completed {
+    for (alias, (mut alias_summaries, alias_complete)) in batch.successes {
         debug!(
             run_id = %run_id,
             database_alias = %alias,
@@ -840,7 +843,7 @@ async fn collect_run_shard_summaries(
     }
 
     let mut failures = PlacementFailureStats::default();
-    for failure in batch.failed {
+    for failure in batch.failures {
         complete = false;
         record_placement_failure(
             &mut failures,
@@ -850,7 +853,7 @@ async fn collect_run_shard_summaries(
         );
     }
 
-    Ok(PlacementAware {
+    Ok(PlacementPassResult {
         output: RunShardSummaryCollection {
             summaries,
             complete,
@@ -907,13 +910,13 @@ mod placement {
     }
 
     #[derive(Debug)]
-    pub(super) struct Failure {
+    pub(super) struct PlacementOperationFailure {
         database_alias: String,
         error: anyhow::Error,
         classification: ErrorClassification,
     }
 
-    impl Failure {
+    impl PlacementOperationFailure {
         pub(super) fn new(database_alias: String, error: anyhow::Error) -> Self {
             let classification = classify_error(&error);
             Self {
@@ -925,21 +928,21 @@ mod placement {
     }
 
     #[derive(Debug)]
-    pub(super) struct OperationBatch<T> {
-        pub(super) completed: Vec<(String, T)>,
-        pub(super) failed: Vec<Failure>,
+    pub(super) struct PlacementOperationBatch<T> {
+        pub(super) successes: Vec<(String, T)>,
+        pub(super) failures: Vec<PlacementOperationFailure>,
     }
 
     #[derive(Debug, Default)]
-    pub(super) struct FailureStats {
+    pub(super) struct PlacementFailureStats {
         skipped_database_aliases: BTreeSet<String>,
         failed_operations: usize,
         retryable_errors: usize,
         terminal_errors: usize,
     }
 
-    impl FailureStats {
-        fn record(&mut self, failure: &Failure) {
+    impl PlacementFailureStats {
+        fn record(&mut self, failure: &PlacementOperationFailure) {
             self.skipped_database_aliases
                 .insert(failure.database_alias.clone());
             self.failed_operations += 1;
@@ -980,38 +983,41 @@ mod placement {
     }
 
     #[derive(Debug)]
-    pub(super) struct PlacementAware<T> {
+    pub(super) struct PlacementPassResult<T> {
         pub(super) output: T,
-        pub(super) failures: FailureStats,
+        pub(super) failures: PlacementFailureStats,
     }
 
     /// Runs independent placement work sequentially and retains every outcome.
     pub(super) async fn run_operations<T, Operation, OperationFuture>(
         aliases: Vec<String>,
         mut operation: Operation,
-    ) -> OperationBatch<T>
+    ) -> PlacementOperationBatch<T>
     where
         Operation: FnMut(String) -> OperationFuture,
         OperationFuture: Future<Output = anyhow::Result<T>>,
     {
-        let mut completed = Vec::with_capacity(aliases.len());
-        let mut failed = Vec::new();
+        let mut successes = Vec::with_capacity(aliases.len());
+        let mut failures = Vec::new();
 
         for alias in aliases {
             match operation(alias.clone()).await {
-                Ok(output) => completed.push((alias, output)),
-                Err(error) => failed.push(Failure::new(alias, error)),
+                Ok(output) => successes.push((alias, output)),
+                Err(error) => failures.push(PlacementOperationFailure::new(alias, error)),
             }
         }
 
-        OperationBatch { completed, failed }
+        PlacementOperationBatch {
+            successes,
+            failures,
+        }
     }
 
     pub(super) fn record_failure(
-        failures: &mut FailureStats,
+        failures: &mut PlacementFailureStats,
         coordinator_id: Uuid,
         operation: &'static str,
-        failure: Failure,
+        failure: PlacementOperationFailure,
     ) {
         warn!(
             coordinator_id = %coordinator_id,
@@ -1125,30 +1131,30 @@ mod placement {
             .await;
 
             assert_eq!(
-                batch.completed,
+                batch.successes,
                 vec![
                     ("primary".to_string(), "completed:primary".to_string()),
                     ("shard_003".to_string(), "completed:shard_003".to_string()),
                 ]
             );
-            assert_eq!(batch.failed.len(), 2);
+            assert_eq!(batch.failures.len(), 2);
             assert_eq!(
-                batch.failed[0].classification,
+                batch.failures[0].classification,
                 ErrorClassification {
                     kind: ErrorKind::DatabaseUnavailable,
                     retryable: true,
                 }
             );
             assert_eq!(
-                batch.failed[1].classification,
+                batch.failures[1].classification,
                 ErrorClassification {
                     kind: ErrorKind::RouteState,
                     retryable: false,
                 }
             );
 
-            let mut stats = FailureStats::default();
-            for failure in &batch.failed {
+            let mut stats = PlacementFailureStats::default();
+            for failure in &batch.failures {
                 stats.record(failure);
             }
             assert_eq!(

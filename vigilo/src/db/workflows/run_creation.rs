@@ -1,6 +1,6 @@
 //! Durable multi-database run creation workflow.
 //!
-//! Control storage records a non-dispatchable creation plan before any remote
+//! The control database records a non-dispatchable creation plan before any remote
 //! execution database commits. Seed writes are idempotent, so a coordinator can
 //! resume the same `run_id` after a process or database failure. Dispatch
 //! cursors are created only when every selected placement is seeded.
@@ -57,10 +57,10 @@ pub(crate) struct RunCreationOutcome {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RunCreationRecoveryStats {
-    pub(crate) claimed: usize,
-    pub(crate) completed: usize,
-    pub(crate) deferred: usize,
-    pub(crate) failed: usize,
+    pub(crate) claimed_runs: usize,
+    pub(crate) completed_runs: usize,
+    pub(crate) deferred_runs: usize,
+    pub(crate) failed_runs: usize,
 }
 
 struct RunSeedMaterial<'a> {
@@ -77,7 +77,7 @@ struct OwnedRunSeedMaterial {
 
 /// Persists and immediately attempts a recoverable run creation operation.
 pub(crate) async fn create_run(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     run_id: Uuid,
     draft: &RunDraft,
     case_blobs: &[CaseBlobDraft],
@@ -87,7 +87,7 @@ pub(crate) async fn create_run(
 ) -> anyhow::Result<RunCreationOutcome> {
     let owner_id = Uuid::now_v7();
     persist_creation_plan(
-        database,
+        database_router,
         owner_id,
         run_id,
         draft,
@@ -104,7 +104,7 @@ pub(crate) async fn create_run(
         dataset_cases,
     };
     match resume_claimed_run(
-        database,
+        database_router,
         run_id,
         owner_id,
         seed,
@@ -117,7 +117,8 @@ pub(crate) async fn create_run(
             warn!(run_id = %run_id, error = %error, "run creation is durable but immediate seeding did not finish");
             Ok(RunCreationOutcome {
                 status: RUN_STATUS_CREATING.to_string(),
-                progress: select_creation_progress(database.control().await?, run_id).await?,
+                progress: select_creation_progress(database_router.control().await?, run_id)
+                    .await?,
                 error_message: Some(error.to_string()),
             })
         }
@@ -126,7 +127,7 @@ pub(crate) async fn create_run(
 
 /// Recovers a bounded set of expired `creating` runs.
 pub(crate) async fn recover_creating_runs(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     coordinator_id: Uuid,
     lease_seconds: i32,
     limit: usize,
@@ -134,25 +135,28 @@ pub(crate) async fn recover_creating_runs(
     let mut stats = RunCreationRecoveryStats::default();
 
     for _ in 0..limit {
-        let Some(run_id) =
-            claim_next_creating_run(database.control().await?, coordinator_id, lease_seconds)
-                .await?
+        let Some(run_id) = claim_next_creating_run(
+            database_router.control().await?,
+            coordinator_id,
+            lease_seconds,
+        )
+        .await?
         else {
             break;
         };
-        stats.claimed += 1;
+        stats.claimed_runs += 1;
 
-        let owned_seed = match load_seed_material(database.control().await?, run_id).await {
+        let owned_seed = match load_seed_material(database_router.control().await?, run_id).await {
             Ok(seed) => seed,
             Err(error) if run_create::is_seed_invariant_error(&error) => {
                 fail_claimed_run(
-                    database.control().await?,
+                    database_router.control().await?,
                     run_id,
                     coordinator_id,
                     &error.to_string(),
                 )
                 .await?;
-                stats.failed += 1;
+                stats.failed_runs += 1;
                 continue;
             }
             Err(error) => return Err(error),
@@ -163,23 +167,24 @@ pub(crate) async fn recover_creating_runs(
             dataset_cases: &owned_seed.dataset_cases,
         };
 
-        match resume_claimed_run(database, run_id, coordinator_id, seed, lease_seconds).await {
+        match resume_claimed_run(database_router, run_id, coordinator_id, seed, lease_seconds).await
+        {
             Ok(RunCreationOutcome { status, .. }) if status == RUN_STATUS_PENDING => {
-                stats.completed += 1;
+                stats.completed_runs += 1;
             }
             Ok(RunCreationOutcome { status, .. }) if status == RUN_STATUS_FAILED => {
-                stats.failed += 1;
+                stats.failed_runs += 1;
             }
-            Ok(_) => stats.deferred += 1,
+            Ok(_) => stats.deferred_runs += 1,
             Err(error) if run_create::is_seed_invariant_error(&error) => {
                 fail_claimed_run(
-                    database.control().await?,
+                    database_router.control().await?,
                     run_id,
                     coordinator_id,
                     &error.to_string(),
                 )
                 .await?;
-                stats.failed += 1;
+                stats.failed_runs += 1;
             }
             Err(error) => return Err(error),
         }
@@ -229,7 +234,7 @@ pub(crate) async fn select_creation_progress(
 
 #[allow(clippy::too_many_arguments)]
 async fn persist_creation_plan(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     owner_id: Uuid,
     run_id: Uuid,
     draft: &RunDraft,
@@ -239,7 +244,7 @@ async fn persist_creation_plan(
     assignments: &[RunShardPlacementAssignment],
 ) -> anyhow::Result<()> {
     let chunks_by_alias = run_create::group_chunks_by_assigned_alias(chunks, assignments)?;
-    let control_db = database.control().await?;
+    let control_db = database_router.control().await?;
     let mut tx = control_db.begin().await?;
 
     run_create::bulk_insert_case_blobs(&mut tx, case_blobs).await?;
@@ -257,7 +262,7 @@ async fn persist_creation_plan(
     insert_creation_placements(&mut tx, run_id, &chunks_by_alias).await?;
     insert_creation_chunks(&mut tx, run_id, &chunks_by_alias).await?;
 
-    if let Some(control_chunks) = chunks_by_alias.get(database.control_database_alias()) {
+    if let Some(control_chunks) = chunks_by_alias.get(database_router.control_database_alias()) {
         run_create::bulk_insert_run_chunks(
             &mut tx,
             run_id,
@@ -265,7 +270,8 @@ async fn persist_creation_plan(
             control_chunks,
         )
         .await?;
-        mark_control_placement_seeded(&mut tx, run_id, database.control_database_alias()).await?;
+        mark_control_placement_seeded(&mut tx, run_id, database_router.control_database_alias())
+            .await?;
     }
 
     let claimed = sqlx::query(
@@ -366,13 +372,13 @@ async fn mark_control_placement_seeded(
 }
 
 async fn resume_claimed_run(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     run_id: Uuid,
     owner_id: Uuid,
     seed: RunSeedMaterial<'_>,
     lease_seconds: i32,
 ) -> anyhow::Result<RunCreationOutcome> {
-    let control_db = database.control().await?;
+    let control_db = database_router.control().await?;
     let pending_aliases = select_pending_placements(control_db, run_id, owner_id).await?;
 
     for database_alias in pending_aliases {
@@ -394,7 +400,7 @@ async fn resume_claimed_run(
             Err(error) => return Err(error),
         };
         let seed_result = seed_execution_placement(
-            database,
+            database_router,
             run_id,
             &database_alias,
             seed.draft,
@@ -530,7 +536,7 @@ async fn start_placement_attempt(
 
 #[allow(clippy::too_many_arguments)]
 async fn seed_execution_placement(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     run_id: Uuid,
     database_alias: &str,
     draft: &RunDraft,
@@ -538,7 +544,7 @@ async fn seed_execution_placement(
     dataset_cases: &[DatasetVersionCaseDraft],
     chunks: &[RunChunkDraft],
 ) -> anyhow::Result<()> {
-    let db = database.execution_database(database_alias).await?;
+    let db = database_router.execution_database(database_alias).await?;
     let mut tx = db.begin().await?;
     run_create::bulk_insert_case_blobs(&mut tx, case_blobs).await?;
     run_create::upsert_dataset_version(

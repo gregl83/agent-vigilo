@@ -247,8 +247,8 @@ async fn exec_database_command(
     context: Context,
     command: DatabaseSubCommand,
 ) -> anyhow::Result<()> {
-    let database = context.db().await?;
-    let control_db = database.control().await?;
+    let database_router = context.dbr().await?;
+    let control_db = database_router.control().await?;
     let out = context.out().await?;
 
     match command {
@@ -291,10 +291,10 @@ async fn exec_move_command(
     force: bool,
 ) -> anyhow::Result<()> {
     let run_id = parse_run_id(&run_id)?;
-    let database = context.db().await?;
+    let database_router = context.dbr().await?;
     let out = context.out().await?;
     let outcome = shard_admin::move_shard_placement(
-        database,
+        database_router,
         run_id,
         run_shard,
         &alias,
@@ -324,9 +324,9 @@ async fn exec_route_command(
     run_shard: i16,
 ) -> anyhow::Result<()> {
     let run_id = parse_run_id(&run_id)?;
-    let database = context.db().await?;
+    let database_router = context.dbr().await?;
     let out = context.out().await?;
-    let route = shard_admin::inspect_shard_route(database, run_id, run_shard).await?;
+    let route = shard_admin::inspect_shard_route(database_router, run_id, run_shard).await?;
 
     info!(
         run_id = %run_id,
@@ -344,8 +344,8 @@ async fn exec_placement_command(
     context: Context,
     command: PlacementSubCommand,
 ) -> anyhow::Result<()> {
-    let database = context.db().await?;
-    let control_db = database.control().await?;
+    let database_router = context.dbr().await?;
+    let control_db = database_router.control().await?;
     let out = context.out().await?;
 
     match command {
@@ -374,7 +374,8 @@ async fn exec_placement_command(
         } => {
             let run_id = parse_run_id(&run_id)?;
             let outcome =
-                shard_admin::set_shard_placement(database, run_id, run_shard, &alias).await?;
+                shard_admin::set_shard_placement(database_router, run_id, run_shard, &alias)
+                    .await?;
             info!(
                 run_id = %run_id,
                 run_shard,
@@ -392,7 +393,7 @@ async fn exec_rebalance_command(
     context: Context,
     command: RebalanceSubCommand,
 ) -> anyhow::Result<()> {
-    let database = context.db().await?;
+    let database_router = context.dbr().await?;
     let out = context.out().await?;
 
     match command {
@@ -403,7 +404,7 @@ async fn exec_rebalance_command(
             dry_run,
         } => {
             let outcome = shard_admin::plan_shard_rebalance(
-                database,
+                database_router,
                 shard_admin::ShardRebalancePlanOptions {
                     source_database_alias: from,
                     target_database_alias: target,
@@ -428,7 +429,7 @@ async fn exec_rebalance_command(
         } => {
             let operation_id = parse_operation_id(&operation_id)?;
             let outcome = shard_admin::apply_shard_rebalance(
-                database,
+                database_router,
                 operation_id,
                 shard_admin::ShardRebalanceApplyOptions {
                     max_items,
@@ -451,7 +452,8 @@ async fn exec_rebalance_command(
         } => {
             let operation_id = parse_operation_id(&operation_id)?;
             let outcome =
-                shard_admin::verify_shard_rebalance(database, operation_id, max_items).await?;
+                shard_admin::verify_shard_rebalance(database_router, operation_id, max_items)
+                    .await?;
             info!(
                 operation_id = %outcome.operation.id,
                 verified_item_count = outcome.items.len(),
@@ -461,7 +463,8 @@ async fn exec_rebalance_command(
         }
         RebalanceSubCommand::Cancel { operation_id } => {
             let operation_id = parse_operation_id(&operation_id)?;
-            let operation = shard_admin::cancel_shard_rebalance(database, operation_id).await?;
+            let operation =
+                shard_admin::cancel_shard_rebalance(database_router, operation_id).await?;
             info!(
                 operation_id = %operation.id,
                 operation_status = %operation.status,

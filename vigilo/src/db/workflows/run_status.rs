@@ -108,10 +108,10 @@ pub(crate) fn combine_run_shard_progress(summaries: &[RunShardSummary]) -> RunPr
 
 /// Reads a control-only creation projection or routed shard-summary progress.
 pub(crate) async fn select_run_status(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     run_id: Uuid,
 ) -> anyhow::Result<Option<RunStatusProjection>> {
-    let control_db = database.control().await?;
+    let control_db = database_router.control().await?;
     let Some(run) = runs::select_run_by_id(control_db, run_id).await? else {
         return Ok(None);
     };
@@ -132,7 +132,9 @@ pub(crate) async fn select_run_status(
         }
     }
 
-    let routes = database.execution_read_routes_for_run(run_id).await?;
+    let routes = database_router
+        .execution_read_routes_for_run(run_id)
+        .await?;
     let mut summaries = Vec::with_capacity(routes.len());
 
     for (run_shard, _, db) in &routes {
@@ -164,7 +166,7 @@ mod tests {
 
     use super::*;
     use crate::context::database::{
-        Db,
+        DatabaseRouter,
         PlacementConfig,
         new_shard_placement_cache,
     };
@@ -255,9 +257,12 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let database = context_with_control_pool(pool);
+        let database_router = database_router_with_control_pool(pool);
 
-        let status = select_run_status(&database, run_id).await.unwrap().unwrap();
+        let status = select_run_status(&database_router, run_id)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(status.execution_route_count, 0);
         assert_eq!(
@@ -269,17 +274,17 @@ mod tests {
         );
     }
 
-    fn context_with_control_pool(pool: sqlx::PgPool) -> Db {
-        let database = Db {
+    fn database_router_with_control_pool(pool: sqlx::PgPool) -> DatabaseRouter {
+        let database_router = DatabaseRouter {
             uri: "postgres://injected-control-pool".to_string(),
             max_connections: 5,
             placement_config: PlacementConfig::default_single_database(),
-            cell: OnceCell::new(),
+            control_pool: OnceCell::new(),
             placement_pools: OnceCell::new(),
             shard_placement_cache: new_shard_placement_cache(),
         };
-        assert!(database.cell.set(pool).is_ok());
-        database
+        assert!(database_router.control_pool.set(pool).is_ok());
+        database_router
     }
 
     fn summary(

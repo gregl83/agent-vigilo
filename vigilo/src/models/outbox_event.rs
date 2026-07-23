@@ -1,6 +1,7 @@
 //! Outbox event persistence models.
 //!
-//! Outbox events are durable messages written inside database transactions.
+//! Outbox events are durable records written inside database transactions and
+//! later published as broker messages.
 //! Active delivery state is stored in a separate hot queue table so publication
 //! can be retried without scanning the historical event ledger.
 

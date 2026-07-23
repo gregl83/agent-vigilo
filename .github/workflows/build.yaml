@@ -24,10 +24,11 @@ jobs:
     needs:
       - rustfmt
       - clippy
-      - test
+      - unit-tests
+      - database-integration-tests
+      - migration-tests
+      - end-to-end-tests
       - coverage
-      - migrations
-      - multi-database-integration
       - evaluator-wasm
       - web
     steps:
@@ -53,8 +54,8 @@ jobs:
           components: clippy
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-  test:
-    name: Test (${{ matrix.os }})
+  unit-tests:
+    name: Unit and Contract Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -66,31 +67,38 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --workspace --locked --verbose
+      - name: Run service-free tests
+        run: cargo test --workspace --locked --lib --bins --verbose
 
-  coverage:
-    name: Coverage
+  database-integration-tests:
+    name: Database Integration Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:password@localhost:5432/postgres
+      RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Generate Rust coverage report
-        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          files: lcov.info
-          flags: rust
-          name: rust-workspace
-          fail_ci_if_error: true
-          token: ${{ secrets.CODECOV_TOKEN }}
+      - name: Run PostgreSQL-backed SQLx tests
+        run: cargo test -p vigilo --locked --bin vigilo -- --ignored --nocapture --test-threads=4
 
-  migrations:
-    name: Migrations
+  migration-tests:
+    name: Migration Tests
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -112,13 +120,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo run --quiet -p vigilo --locked -- setup --skip-evaluators
+      - name: Apply migrations to a fresh database
+        run: cargo run --quiet -p vigilo --locked -- setup --skip-evaluators
         env:
           RUSTFLAGS: -Awarnings
 
-  multi-database-integration:
-    name: Multi-Database Integration
+  end-to-end-tests:
+    name: End-to-End Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     services:
       postgres-primary:
         image: postgres:16-alpine
@@ -168,11 +178,35 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-wasip2
-      - run: cargo build -p sentiment-basic-en --target wasm32-wasip2 --release --locked
-      - run: cargo test -p vigilo --locked --test multi_database_routing -- --nocapture
-      - run: cargo test -p vigilo --locked --test multi_database_e2e -- --nocapture
+      - name: Build the end-to-end evaluator
+        run: cargo build -p sentiment-basic-en --target wasm32-wasip2 --release --locked
+      - name: Run routing integration tests
+        run: cargo test -p vigilo --locked --test multi_database_routing -- --nocapture
+      - name: Run distributed runtime tests
+        run: cargo test -p vigilo --locked --test multi_database_e2e -- --nocapture
         env:
           VIGILO_E2E_MULTI_DATABASE: "1"
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate service-free Rust coverage report
+        run: cargo llvm-cov --workspace --locked --lib --bins --lcov --output-path lcov.info
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          flags: rust
+          name: rust-workspace
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   evaluator-wasm:
     name: Evaluator Wasm

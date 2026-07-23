@@ -15,7 +15,7 @@ pub(super) async fn exec(
 ) -> anyhow::Result<()> {
     info!("testing evaluator {}", evaluator);
 
-    let db = context.db().await?.control().await?;
+    let db = context.dbr().await?.control().await?;
     let out = context.out().await?;
     let wasm = context.wasm().await?;
     let evaluator = parse_fully_qualified_evaluator(&evaluator)?;

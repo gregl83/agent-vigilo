@@ -187,7 +187,7 @@ impl Executable for Command {
         match self.command {
             Some(subcommand) => subcommand.exec(context).await,
             None => {
-                let db = context.db().await?.control().await?;
+                let db = context.dbr().await?.control().await?;
                 let evaluators = evaluators::list_evaluators(db, DEFAULT_NAMESPACE).await?;
 
                 if evaluators.is_empty() {

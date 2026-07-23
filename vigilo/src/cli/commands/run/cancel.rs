@@ -38,9 +38,9 @@ pub(super) fn run_cancel_payload(outcome: &run_cancel::CancelRunOutcome) -> Valu
 
 pub(super) async fn exec(context: Context, run_id: String) -> anyhow::Result<()> {
     let run_id = parse_run_id(&run_id)?;
-    let database = context.db().await?;
+    let database_router = context.dbr().await?;
     let out = context.out().await?;
-    let outcome = run_cancel::cancel_run_routed(database, run_id)
+    let outcome = run_cancel::cancel_run_routed(database_router, run_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("run '{}' was not found", run_id))?;
 

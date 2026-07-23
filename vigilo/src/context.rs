@@ -1,7 +1,7 @@
 //! Lazily initialized process context.
 //!
 //! Commands receive a cloned [`Context`] and request services on demand:
-//! database service, HTTP client, message queue client, output buffer,
+//! database router, HTTP client, message queue client, output buffer,
 //! evaluator registry cache, and Wasm runtime. Service modules in `context::*`
 //! should remain thin initialization boundaries; domain behavior belongs in
 //! runtime, db, mq, or command modules.
@@ -16,7 +16,7 @@ pub(crate) mod registry;
 pub(crate) mod wasm;
 
 struct ContextInner {
-    pub db: database::Context,
+    pub dbr: database::Context,
     pub http: http::Context,
     pub mq: messaging::Context,
     pub out: output::Context,
@@ -29,18 +29,18 @@ pub(crate) struct Context(Arc<ContextInner>);
 
 impl Context {
     pub fn new(
-        db_uri: String,
-        db_max_connections: u32,
+        database_uri: String,
+        database_max_connections: u32,
         placement_config: database::PlacementConfig,
         mq_uri: String,
         wasm_config: wasm::Config,
         output_format: output::OutputFormat,
     ) -> Self {
         Self(Arc::new(ContextInner {
-            db: database::Context {
+            dbr: database::Context {
                 config: database::Config {
-                    uri: db_uri,
-                    max_connections: db_max_connections,
+                    uri: database_uri,
+                    max_connections: database_max_connections,
                     placement_config,
                 },
                 cell: Default::default(),
@@ -66,8 +66,8 @@ impl Context {
         }))
     }
 
-    pub(crate) async fn db(&self) -> anyhow::Result<&database::Db> {
-        self.0.db.get().await
+    pub(crate) async fn dbr(&self) -> anyhow::Result<&database::DatabaseRouter> {
+        self.0.dbr.get().await
     }
 
     pub async fn http(&self) -> anyhow::Result<&reqwest::Client> {

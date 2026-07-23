@@ -2,7 +2,7 @@
 //!
 //! Database placements are the routing catalog for future multi-database
 //! deployments. The default deployment seeds one `primary` placement that uses
-//! `DATABASE_URL` for both control-plane and shard-local data.
+//! `DATABASE_URL` for both control-database and shard-local data.
 
 use chrono::{
     DateTime,

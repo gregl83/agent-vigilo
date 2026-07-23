@@ -18,14 +18,14 @@ use crate::{
 
 /// Claims a chunk through a previously resolved execution route.
 pub(crate) async fn claim_routed_chunk_for_processing(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     route: &ExecutionRoute,
     run_id: Uuid,
     run_shard: i16,
     chunk_id: Uuid,
     lease_seconds: i32,
 ) -> anyhow::Result<Option<RunChunk>> {
-    let mut tx = database.begin_execution_admission(route).await?;
+    let mut tx = database_router.begin_execution_admission(route).await?;
     let chunk = claim_chunk_for_processing_in_transaction(
         &mut tx,
         run_id,

@@ -1,7 +1,7 @@
 //! Routed run result summary helpers.
 //!
 //! Result summaries are assembled from shard-local `run_shard_summaries` so
-//! control storage does not scan execution-owned tables.
+//! the control database does not scan execution-owned tables.
 
 use uuid::Uuid;
 
@@ -29,10 +29,12 @@ pub(crate) struct RunResultsSummary {
 
 /// Reads and combines shard-local result summaries for a run.
 pub(crate) async fn select_run_results_summary(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     run_id: Uuid,
 ) -> anyhow::Result<RunResultsSummary> {
-    let routes = database.execution_read_routes_for_run(run_id).await?;
+    let routes = database_router
+        .execution_read_routes_for_run(run_id)
+        .await?;
     let mut summaries = Vec::with_capacity(routes.len());
 
     for (run_shard, _, db) in routes {

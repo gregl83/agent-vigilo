@@ -67,7 +67,7 @@ pub(crate) struct RunShardPlacementAssignment {
 /// The returned assignments are persisted to `shard_placements`; runtime
 /// routing reads those stored rows instead of recomputing this policy.
 pub(crate) async fn assign_run_shard_placements(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     chunks: &[RunChunkDraft],
 ) -> anyhow::Result<Vec<RunShardPlacementAssignment>> {
     let run_shards = chunks
@@ -75,18 +75,24 @@ pub(crate) async fn assign_run_shard_placements(
         .map(|chunk| chunk.run_shard)
         .collect::<BTreeSet<_>>();
 
-    let aliases = match database.shard_assignment_policy() {
+    let aliases = match database_router.shard_assignment_policy() {
         ShardAssignmentPolicy::SingleDefault => {
-            vec![database.default_execution_database_alias().to_string()]
+            vec![
+                database_router
+                    .default_execution_database_alias()
+                    .to_string(),
+            ]
         }
         ShardAssignmentPolicy::SpreadActive => {
-            let mut aliases = database.active_shard_capable_database_aliases().await?;
+            let mut aliases = database_router
+                .active_shard_capable_database_aliases()
+                .await?;
             if aliases.is_empty() {
                 anyhow::bail!("no active shard-capable database placements are configured");
             }
             if let Some(default_idx) = aliases
                 .iter()
-                .position(|alias| alias == database.default_execution_database_alias())
+                .position(|alias| alias == database_router.default_execution_database_alias())
             {
                 aliases.swap(0, default_idx);
             }
@@ -507,7 +513,7 @@ pub(crate) async fn insert_run_create(
 
 /// Inserts pending chunk rows for the run.
 ///
-/// Chunk-ready outbox events are created by dispatch windows after the run is
+/// Chunk-ready outbox event records are created by dispatch after the run is
 /// marked running.
 ///
 /// Query behavior: bulk inserts run-local chunk ranges in bounded batches. A

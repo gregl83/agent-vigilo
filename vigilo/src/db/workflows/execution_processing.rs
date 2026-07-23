@@ -474,7 +474,7 @@ pub(crate) async fn get_or_load_component(
     let component = cache
         .try_get_with(evaluator_ref_owned.clone(), async move {
             let identity = parse_fully_qualified_evaluator(&evaluator_ref_for_closure)?;
-            let db = context.db().await?.control().await?;
+            let db = context.dbr().await?.control().await?;
             let evaluator_record = evaluators::select_evaluator(
                 db,
                 &identity.namespace,
@@ -3293,8 +3293,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome.stats.recovered, 1);
-        assert_eq!(outcome.stats.failed, 0);
+        assert_eq!(outcome.recovered_chunks, 1);
+        assert_eq!(outcome.failed_chunks, 0);
 
         let (chunk_status, recovery_count) = sqlx::query_as::<_, (String, i32)>(
             r#"

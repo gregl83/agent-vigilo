@@ -1,7 +1,7 @@
 //! Shard placement persistence models.
 //!
 //! Shard placements map one `run_id + run_shard` pair to a configured database
-//! placement alias. They are control-plane routing metadata, not evaluator
+//! placement alias. They are control-database routing metadata, not evaluator
 //! execution contracts.
 
 use chrono::{

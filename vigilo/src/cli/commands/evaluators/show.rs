@@ -9,7 +9,7 @@ use super::*;
 pub(super) async fn exec(context: Context, evaluator: String) -> anyhow::Result<()> {
     info!("fetching evaluator {}", evaluator);
 
-    let db = context.db().await?.control().await?;
+    let db = context.dbr().await?.control().await?;
     let out = context.out().await?;
     let evaluator = parse_fully_qualified_evaluator(&evaluator)?;
 

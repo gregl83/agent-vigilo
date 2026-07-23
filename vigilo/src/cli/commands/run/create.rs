@@ -23,9 +23,11 @@ pub(super) async fn exec(
     // --- Load command inputs ---
     // Acquire output/database handles and parse profile/dataset payloads before
     // any durable writes are attempted.
-    let database = context.db().await?;
-    let default_execution_database_alias = database.default_execution_database_alias().to_string();
-    let db = database.control().await?;
+    let database_router = context.dbr().await?;
+    let default_execution_database_alias = database_router
+        .default_execution_database_alias()
+        .to_string();
+    let db = database_router.control().await?;
     let out = context.out().await?;
 
     let parsed = load_run_inputs(profile, profile_file, dataset, dataset_file)?;
@@ -123,13 +125,14 @@ pub(super) async fn exec(
     // Commit the control creation plan before seeding execution placements.
     // Dispatch cursors appear only when every placement is seeded, so no
     // queue-visible work can escape a partial creation.
-    let shard_assignments = run_create::assign_run_shard_placements(database, &chunks).await?;
+    let shard_assignments =
+        run_create::assign_run_shard_placements(database_router, &chunks).await?;
     let shard_assignment_aliases = shard_assignments
         .iter()
         .map(|assignment| assignment.database_alias.clone())
         .collect::<std::collections::BTreeSet<_>>();
     let creation = run_creation::create_run(
-        database,
+        database_router,
         run_id,
         &run_draft,
         &case_blobs,
@@ -156,7 +159,7 @@ pub(super) async fn exec(
             "case_count": dataset_cases.len(),
             "chunk_count": chunks.len(),
             "chunk_size": chunk_size,
-            "shard_assignment_policy": database.shard_assignment_policy().as_str(),
+            "shard_assignment_policy": database_router.shard_assignment_policy().as_str(),
             "default_execution_database_alias": default_execution_database_alias,
             "execution_database_aliases": shard_assignment_aliases,
             "shard_placement_count": shard_assignments.len(),

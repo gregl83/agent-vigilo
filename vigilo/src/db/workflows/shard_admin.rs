@@ -364,17 +364,17 @@ pub(crate) async fn select_shard_placement(
 
 /// Inspects the persisted route for one run shard.
 ///
-/// This reads only control-plane metadata. It reports whether the current
+/// This reads only control-database metadata. It reports whether the current
 /// process can resolve the placement URL env var, but never returns the URL
 /// value.
 pub(crate) async fn inspect_shard_route(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     run_id: Uuid,
     run_shard: i16,
 ) -> anyhow::Result<ShardRouteInspection> {
     validate_run_shard(run_shard)?;
 
-    let control_db = database.control().await?;
+    let control_db = database_router.control().await?;
     let placement = shard_placements::select_shard_placement(control_db, run_id, run_shard)
         .await?
         .ok_or_else(|| {
@@ -414,7 +414,7 @@ pub(crate) async fn inspect_shard_route(
         route_version: placement.route_version,
         database_role: database_placement.role,
         database_status: database_placement.status,
-        database_url_env_resolved: database
+        database_url_env_resolved: database_router
             .database_url_env_is_resolved(&database_placement.database_url_env),
         database_url_env: database_placement.database_url_env,
         dispatchable,
@@ -424,7 +424,7 @@ pub(crate) async fn inspect_shard_route(
 }
 
 pub(crate) async fn set_shard_placement(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     run_id: Uuid,
     run_shard: i16,
     database_alias: &str,
@@ -432,7 +432,7 @@ pub(crate) async fn set_shard_placement(
     validate_run_shard(run_shard)?;
     validate_non_empty(database_alias, "database alias")?;
 
-    let control_db = database.control().await?;
+    let control_db = database_router.control().await?;
     ensure_run_creation_is_inactive(control_db, run_id).await?;
     let target = database_placements::select_database_placement(control_db, database_alias)
         .await?
@@ -477,7 +477,8 @@ pub(crate) async fn set_shard_placement(
     let placement = match &existing {
         Some(existing) if existing.database_alias == database_alias => existing.clone(),
         Some(existing) => {
-            change_empty_shard_placement(database, control_db, existing, database_alias).await?
+            change_empty_shard_placement(database_router, control_db, existing, database_alias)
+                .await?
         }
         None => {
             shard_placements::insert_active_shard_placement(
@@ -489,7 +490,7 @@ pub(crate) async fn set_shard_placement(
             .await?
         }
     };
-    database
+    database_router
         .invalidate_execution_placement(run_id, run_shard)
         .await;
 
@@ -501,15 +502,15 @@ pub(crate) async fn set_shard_placement(
 }
 
 async fn change_empty_shard_placement(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     control_db: &PgPool,
     expected: &ShardPlacement,
     target_database_alias: &str,
 ) -> anyhow::Result<ShardPlacement> {
-    let source_db = database
+    let source_db = database_router
         .execution_database(&expected.database_alias)
         .await?;
-    let source_is_control = expected.database_alias == database.control_database_alias();
+    let source_is_control = expected.database_alias == database_router.control_database_alias();
     let mut source_tx = source_db.begin().await?;
     crate::db::shard_write_fence::lock_exclusive(
         &mut source_tx,
@@ -590,7 +591,7 @@ async fn change_empty_shard_placement(
 /// `move_shard_placement` for each item, so copy, verification, and route
 /// fencing remain centralized in the single-shard move workflow.
 pub(crate) async fn plan_shard_rebalance(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     options: ShardRebalancePlanOptions,
 ) -> anyhow::Result<ShardRebalancePlanOutcome> {
     validate_non_empty(&options.target_database_alias, "target database alias")?;
@@ -598,7 +599,7 @@ pub(crate) async fn plan_shard_rebalance(
         anyhow::bail!("max_items must be greater than zero");
     }
 
-    let control_db = database.control().await?;
+    let control_db = database_router.control().await?;
     validate_target_placement(control_db, &options.target_database_alias).await?;
     if let Some(source_alias) = &options.source_database_alias {
         validate_source_placement(control_db, source_alias).await?;
@@ -607,7 +608,7 @@ pub(crate) async fn plan_shard_rebalance(
         }
     }
 
-    let active_aliases = database
+    let active_aliases = database_router
         .active_shard_capable_database_aliases()
         .await?
         .into_iter()
@@ -667,7 +668,7 @@ pub(crate) async fn plan_shard_rebalance(
 /// shard is still draining is released back to pending. All settlement writes
 /// are fenced by the opaque token returned with the claim.
 pub(crate) async fn apply_shard_rebalance(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     operation_id: Uuid,
     options: ShardRebalanceApplyOptions,
 ) -> anyhow::Result<ShardRebalanceApplyOutcome> {
@@ -678,7 +679,7 @@ pub(crate) async fn apply_shard_rebalance(
         anyhow::bail!("lease_seconds must be greater than zero");
     }
 
-    let control_db = database.control().await?;
+    let control_db = database_router.control().await?;
     let operation = select_rebalance_operation(control_db, operation_id)
         .await?
         .ok_or_else(|| {
@@ -758,7 +759,7 @@ pub(crate) async fn apply_shard_rebalance(
             continue;
         }
 
-        let result = apply_rebalance_item(database, &item, options.force).await;
+        let result = apply_rebalance_item(database_router, &item, options.force).await;
         match result {
             Ok(()) => {
                 let settled = mark_rebalance_item_completed(control_db, &item, claim_token).await?;
@@ -838,7 +839,7 @@ pub(crate) async fn apply_shard_rebalance(
 }
 
 pub(crate) async fn verify_shard_rebalance(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     operation_id: Uuid,
     max_items: usize,
 ) -> anyhow::Result<ShardRebalanceVerifyOutcome> {
@@ -846,7 +847,7 @@ pub(crate) async fn verify_shard_rebalance(
         anyhow::bail!("max_items must be greater than zero");
     }
 
-    let control_db = database.control().await?;
+    let control_db = database_router.control().await?;
     let operation = select_rebalance_operation(control_db, operation_id)
         .await?
         .ok_or_else(|| {
@@ -862,10 +863,10 @@ pub(crate) async fn verify_shard_rebalance(
     let mut verified_items = Vec::with_capacity(items.len());
 
     for item in items {
-        let source_db = database
+        let source_db = database_router
             .execution_database(&item.source_database_alias)
             .await?;
-        let target_db = database
+        let target_db = database_router
             .execution_database(&item.target_database_alias)
             .await?;
         let reports = verify_move_tables(
@@ -891,10 +892,10 @@ pub(crate) async fn verify_shard_rebalance(
 }
 
 pub(crate) async fn cancel_shard_rebalance(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     operation_id: Uuid,
 ) -> anyhow::Result<ShardRebalanceOperation> {
-    let control_db = database.control().await?;
+    let control_db = database_router.control().await?;
     let mut tx = control_db.begin().await?;
     let operation = sqlx::query_as::<_, ShardRebalanceOperation>(
         r#"
@@ -981,7 +982,7 @@ pub(crate) async fn cancel_shard_rebalance(
 /// or copy while a lease/attempt is active. Re-running the move resumes a
 /// route left `moving` by a drain or interrupted copy.
 pub(crate) async fn move_shard_placement(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     run_id: Uuid,
     run_shard: i16,
     target_database_alias: &str,
@@ -994,7 +995,7 @@ pub(crate) async fn move_shard_placement(
         anyhow::bail!("--dry-run and --verify-only cannot be used together");
     }
 
-    let control_db = database.control().await?;
+    let control_db = database_router.control().await?;
     ensure_run_creation_is_inactive(control_db, run_id).await?;
     let current = shard_placements::select_shard_placement(control_db, run_id, run_shard)
         .await?
@@ -1017,8 +1018,12 @@ pub(crate) async fn move_shard_placement(
         );
     }
 
-    let source_db = database.execution_database(&current.database_alias).await?;
-    let target_db = database.execution_database(target_database_alias).await?;
+    let source_db = database_router
+        .execution_database(&current.database_alias)
+        .await?;
+    let target_db = database_router
+        .execution_database(target_database_alias)
+        .await?;
     let mut copied_rows_by_table = std::collections::BTreeMap::<&'static str, u64>::new();
 
     if options.dry_run || options.verify_only {
@@ -1060,7 +1065,7 @@ pub(crate) async fn move_shard_placement(
     }
 
     let source_database_alias = current.database_alias.clone();
-    let source_is_control = source_database_alias == database.control_database_alias();
+    let source_is_control = source_database_alias == database_router.control_database_alias();
     let mut source_tx = source_db.begin().await?;
     crate::db::shard_write_fence::lock_exclusive(&mut source_tx, run_id, run_shard).await?;
 
@@ -1163,7 +1168,7 @@ pub(crate) async fn move_shard_placement(
     } else {
         current
     };
-    database
+    database_router
         .invalidate_execution_placement(run_id, run_shard)
         .await;
 
@@ -1236,7 +1241,7 @@ pub(crate) async fn move_shard_placement(
         )
     })?;
     source_tx.commit().await?;
-    database
+    database_router
         .invalidate_execution_placement(run_id, run_shard)
         .await;
 
@@ -1705,11 +1710,11 @@ fn record_rebalance_item_settlement(
 }
 
 async fn apply_rebalance_item(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     item: &ShardRebalanceItem,
     force: bool,
 ) -> anyhow::Result<()> {
-    let control_db = database.control().await?;
+    let control_db = database_router.control().await?;
     let current = shard_placements::select_shard_placement(control_db, item.run_id, item.run_shard)
         .await?
         .ok_or_else(|| {
@@ -1747,7 +1752,7 @@ async fn apply_rebalance_item(
     }
 
     move_shard_placement(
-        database,
+        database_router,
         item.run_id,
         item.run_shard,
         &item.target_database_alias,
@@ -2356,7 +2361,7 @@ mod tests {
     use super::*;
     use crate::{
         context::database::{
-            Db,
+            DatabaseRouter,
             PlacementConfig,
             new_shard_placement_cache,
         },
@@ -2401,7 +2406,7 @@ mod tests {
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
     async fn inspect_shard_route_reports_dispatchable_primary_route(pool: PgPool) {
         let database_url = std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap();
-        let database = context_with_control_pool(pool.clone(), database_url);
+        let database_router = database_router_with_control_pool(pool.clone(), database_url);
         let run_id = Uuid::now_v7();
 
         sqlx::query(
@@ -2415,7 +2420,9 @@ mod tests {
         .await
         .unwrap();
 
-        let route = inspect_shard_route(&database, run_id, 4).await.unwrap();
+        let route = inspect_shard_route(&database_router, run_id, 4)
+            .await
+            .unwrap();
 
         assert_eq!(route.database_alias, "primary");
         assert_eq!(route.database_role, "control_and_shard");
@@ -2430,7 +2437,7 @@ mod tests {
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
     async fn inspect_shard_route_reports_moving_route_as_read_only(pool: PgPool) {
         let database_url = std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap();
-        let database = context_with_control_pool(pool.clone(), database_url);
+        let database_router = database_router_with_control_pool(pool.clone(), database_url);
         let run_id = Uuid::now_v7();
 
         sqlx::query(
@@ -2444,7 +2451,9 @@ mod tests {
         .await
         .unwrap();
 
-        let route = inspect_shard_route(&database, run_id, 4).await.unwrap();
+        let route = inspect_shard_route(&database_router, run_id, 4)
+            .await
+            .unwrap();
 
         assert!(!route.dispatchable);
         assert!(route.readable);
@@ -2455,7 +2464,7 @@ mod tests {
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
     async fn inspect_shard_route_reports_disabled_placement_as_blocked(pool: PgPool) {
         let database_url = std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap();
-        let database = context_with_control_pool(pool.clone(), database_url);
+        let database_router = database_router_with_control_pool(pool.clone(), database_url);
         let run_id = Uuid::now_v7();
 
         sqlx::query(
@@ -2478,7 +2487,9 @@ mod tests {
         .await
         .unwrap();
 
-        let route = inspect_shard_route(&database, run_id, 4).await.unwrap();
+        let route = inspect_shard_route(&database_router, run_id, 4)
+            .await
+            .unwrap();
 
         assert_eq!(route.database_alias, "shard_disabled");
         assert_eq!(route.database_status, "disabled");
@@ -2492,7 +2503,7 @@ mod tests {
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
     async fn creating_run_rejects_route_changes(pool: PgPool) {
         let database_url = std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap();
-        let database = context_with_control_pool(pool.clone(), database_url);
+        let database_router = database_router_with_control_pool(pool.clone(), database_url);
         let run_id = Uuid::now_v7();
 
         sqlx::query(
@@ -2521,11 +2532,11 @@ mod tests {
         .await
         .unwrap();
 
-        let set_error = set_shard_placement(&database, run_id, 3, "shard_001")
+        let set_error = set_shard_placement(&database_router, run_id, 3, "shard_001")
             .await
             .unwrap_err();
         let move_error = move_shard_placement(
-            &database,
+            &database_router,
             run_id,
             3,
             "shard_001",
@@ -2546,7 +2557,7 @@ mod tests {
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
     async fn move_shard_placement_switches_alias_after_verification(pool: PgPool) {
         let database_url = isolated_database_url(&pool).await;
-        let database = context_with_control_pool(pool.clone(), database_url);
+        let database_router = database_router_with_control_pool(pool.clone(), database_url);
         let run_id = Uuid::now_v7();
         let dataset_id = Uuid::now_v7();
         let dataset_version_id = Uuid::now_v7();
@@ -2597,7 +2608,7 @@ mod tests {
         .unwrap();
 
         let outcome = move_shard_placement(
-            &database,
+            &database_router,
             run_id,
             3,
             "shard_001",
@@ -2621,7 +2632,7 @@ mod tests {
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
     async fn force_cannot_move_a_shard_with_active_work(pool: PgPool) {
         let database_url = isolated_database_url(&pool).await;
-        let database = context_with_control_pool(pool.clone(), database_url);
+        let database_router = database_router_with_control_pool(pool.clone(), database_url);
         let run_id = Uuid::now_v7();
         let dataset_id = Uuid::now_v7();
         let dataset_version_id = Uuid::now_v7();
@@ -2667,7 +2678,7 @@ mod tests {
         .unwrap();
 
         let error = move_shard_placement(
-            &database,
+            &database_router,
             run_id,
             3,
             "shard_001",
@@ -2694,7 +2705,7 @@ mod tests {
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
     async fn rebalance_defers_a_moving_shard_until_active_work_drains(pool: PgPool) {
         let database_url = isolated_database_url(&pool).await;
-        let database = context_with_control_pool(pool.clone(), database_url);
+        let database_router = database_router_with_control_pool(pool.clone(), database_url);
         let (operation_id, items) = seed_rebalance_operation(&pool, 1).await;
         let (run_id, run_shard) = items[0];
         let dataset_id = Uuid::now_v7();
@@ -2734,7 +2745,7 @@ mod tests {
         .unwrap();
 
         let outcome = apply_shard_rebalance(
-            &database,
+            &database_router,
             operation_id,
             ShardRebalanceApplyOptions {
                 max_items: 1,
@@ -3009,7 +3020,7 @@ mod tests {
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
     async fn rebalance_cancellation_preserves_fresh_claim_and_fences_claimed_cancel(pool: PgPool) {
         let database_url = isolated_database_url(&pool).await;
-        let database = context_with_control_pool(pool.clone(), database_url);
+        let database_router = database_router_with_control_pool(pool.clone(), database_url);
         let (operation_id, _) = seed_rebalance_operation(&pool, 3).await;
         let fresh = claim_next_rebalance_apply_item(&pool, operation_id, Uuid::now_v7(), 60)
             .await
@@ -3035,7 +3046,7 @@ mod tests {
         .await
         .unwrap();
 
-        let cancelled = cancel_shard_rebalance(&database, operation_id)
+        let cancelled = cancel_shard_rebalance(&database_router, operation_id)
             .await
             .unwrap();
         assert_eq!(cancelled.status, REBALANCE_OPERATION_STATUS_CANCELLED);
@@ -3076,7 +3087,7 @@ mod tests {
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
     async fn concurrent_rebalance_apply_workers_move_each_item_once(pool: PgPool) {
         let database_url = isolated_database_url(&pool).await;
-        let database = context_with_control_pool(pool.clone(), database_url);
+        let database_router = database_router_with_control_pool(pool.clone(), database_url);
         let (operation_id, items) = seed_rebalance_operation(&pool, 6).await;
         for (run_id, run_shard) in &items {
             sqlx::query(
@@ -3103,8 +3114,8 @@ mod tests {
             force: false,
         };
         let (first, second) = tokio::join!(
-            apply_shard_rebalance(&database, operation_id, options),
-            apply_shard_rebalance(&database, operation_id, options),
+            apply_shard_rebalance(&database_router, operation_id, options),
+            apply_shard_rebalance(&database_router, operation_id, options),
         );
         let first = first.unwrap();
         let second = second.unwrap();
@@ -3235,17 +3246,17 @@ mod tests {
         }
     }
 
-    fn context_with_control_pool(pool: PgPool, uri: String) -> Db {
-        let context = Db {
+    fn database_router_with_control_pool(pool: PgPool, uri: String) -> DatabaseRouter {
+        let database_router = DatabaseRouter {
             uri,
             max_connections: 5,
             placement_config: PlacementConfig::default_single_database(),
-            cell: OnceCell::new(),
+            control_pool: OnceCell::new(),
             placement_pools: OnceCell::new(),
             shard_placement_cache: new_shard_placement_cache(),
         };
-        assert!(context.cell.set(pool).is_ok());
-        context
+        assert!(database_router.control_pool.set(pool).is_ok());
+        database_router
     }
 
     async fn isolated_database_url(pool: &PgPool) -> String {

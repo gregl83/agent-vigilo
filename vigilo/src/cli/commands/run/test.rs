@@ -18,7 +18,7 @@ pub(super) async fn exec(
     dataset: Option<String>,
     dataset_file: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let db = context.db().await?.control().await?;
+    let db = context.dbr().await?.control().await?;
     let out = context.out().await?;
     let parsed = load_run_inputs(profile, profile_file, dataset, dataset_file)?;
     let executability = run_profile_validation::validate_profile_executability(

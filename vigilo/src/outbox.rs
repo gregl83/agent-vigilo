@@ -1,9 +1,9 @@
 //! Durable outbox publication.
 //!
-//! Database workflows insert events into the local `outbox_events` table in
-//! the same transaction as state changes. Control-plane workflows write to the
-//! control placement; execution workflows write to the execution placement that
-//! owns the changed rows.
+//! Database workflows insert event records into the local `outbox_events` table
+//! in the same transaction as state changes. Control-database workflows write
+//! to the control placement; execution workflows write to the execution
+//! placement that owns the changed rows.
 //!
 //! The coordinator calls this module once per active database placement after
 //! each orchestration pass to claim a bounded batch of delivery rows, publish
@@ -56,14 +56,14 @@ impl Default for OutboxPublisherConfig {
 
 /// Counts produced by a single publish pass.
 ///
-/// `claimed` is the number of events leased from the database. `published` and
-/// `failed` describe the outcomes for those claimed events.
+/// `claimed_events` is the number of events leased from the database. The
+/// remaining fields describe the outcomes for those claimed events.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct OutboxPublishStats {
-    pub(crate) claimed: usize,
-    pub(crate) published: usize,
-    pub(crate) failed: usize,
-    pub(crate) stale_claims: usize,
+    pub(crate) claimed_events: usize,
+    pub(crate) published_events: usize,
+    pub(crate) failed_events: usize,
+    pub(crate) stale_event_claims: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -73,7 +73,7 @@ enum OutboxPublishOutcome {
     StaleClaim,
 }
 
-/// Transport boundary for publishing outbox events.
+/// Transport boundary for publishing outbox event records as broker messages.
 ///
 /// Keeping this as a trait lets the coordinator publish to RabbitMQ in
 /// production while tests or future transports can supply a different
@@ -164,7 +164,7 @@ async fn publish_claimed_event(
 
 /// Claims and publishes a bounded batch of pending outbox delivery rows.
 ///
-/// Each claimed event is published independently. Successful publishes are
+/// Each claimed event record is published independently. Successful publishes are
 /// marked `published` in the ledger and removed from the delivery queue;
 /// failures are logged and rescheduled so a later coordinator pass can retry
 /// them.
@@ -178,7 +178,7 @@ pub(crate) async fn publish_pending_events(
             .await?;
 
     let mut stats = OutboxPublishStats {
-        claimed: claimed_events.len(),
+        claimed_events: claimed_events.len(),
         ..OutboxPublishStats::default()
     };
 
@@ -206,13 +206,13 @@ pub(crate) async fn publish_pending_events(
 
         match result? {
             OutboxPublishOutcome::Published => {
-                stats.published += 1;
+                stats.published_events += 1;
             }
             OutboxPublishOutcome::Failed => {
-                stats.failed += 1;
+                stats.failed_events += 1;
             }
             OutboxPublishOutcome::StaleClaim => {
-                stats.stale_claims += 1;
+                stats.stale_event_claims += 1;
             }
         }
     }

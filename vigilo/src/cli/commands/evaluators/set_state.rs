@@ -14,7 +14,7 @@ pub(super) async fn exec(
 ) -> anyhow::Result<()> {
     info!("setting evaluator state {} -> {:?}", evaluator, state);
 
-    let db = context.db().await?.control().await?;
+    let db = context.dbr().await?.control().await?;
     let evaluator = parse_fully_qualified_evaluator(&evaluator)?;
 
     // todo - handle failure reason (e.g. removed -> active failure)

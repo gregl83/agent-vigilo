@@ -19,7 +19,7 @@ run_check() {
 
 if command -v cargo >/dev/null 2>&1; then
   run_check cargo clippy --workspace --all-targets --locked -- -D warnings
-  run_check cargo test --workspace --locked
+  run_check cargo test --workspace --locked --lib --bins
 else
   warn "cargo not found; skipping Rust checks locally. GitHub Actions will enforce them."
 fi

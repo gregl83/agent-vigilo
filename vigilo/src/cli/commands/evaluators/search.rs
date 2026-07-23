@@ -18,7 +18,7 @@ pub(super) async fn exec(
         query.clone().unwrap_or_default(),
     );
 
-    let db = context.db().await?.control().await?;
+    let db = context.dbr().await?.control().await?;
     let out = context.out().await?;
     let evaluators =
         evaluators::search_evaluator_summaries(db, &namespace, query.as_deref(), limit).await?;

@@ -5,7 +5,7 @@
 //! requeue queue messages based on outcome. Chunk-local worker persistence uses
 //! the execution database selected by `run_id + run_shard`; run profile
 //! snapshots are read from that execution placement, while evaluator registry
-//! metadata remains a control-plane read.
+//! metadata remains a control-database read.
 
 use std::{
     sync::Arc,
@@ -421,7 +421,7 @@ impl EvaluatorLoaderService {
                         anyhow::anyhow!("run '{}' profile is invalid: {}", run_id, err)
                     })?;
                 let evaluator_refs = execution_processing::evaluator_refs_from_profile(&profile)?;
-                let db = context.db().await?.control().await?;
+                let db = context.dbr().await?.control().await?;
                 let evaluator_catalog =
                     execution_processing::build_run_evaluator_catalog(db, &profile).await?;
 
@@ -675,12 +675,12 @@ async fn run_worker_message(
         "parsed chunk-ready message payload"
     );
 
-    // --- Resolve execution storage ---
+    // --- Resolve execution database ---
     // Chunk leases, case batches, attempts, evaluator results, aggregates, and
     // chunk terminal state are execution-owned. Resolve this once at the worker
     // workflow boundary so lower helpers do not need to know topology.
-    let db_service = context.db().await?;
-    let route = match db_service
+    let database_router = context.dbr().await?;
+    let route = match database_router
         .execution_route(payload.run_id, payload.run_shard)
         .await
     {
@@ -705,13 +705,13 @@ async fn run_worker_message(
         }
         Err(err) => return Err(err),
     };
-    let db = &route.database;
+    let db = &route.pool;
 
     // --- Claim chunk ownership ---
     // Duplicate, stale, cancelled, completed, or not-yet-running chunks are
     // acknowledged because the database refused ownership.
     let claim = chunk_processing::claim_routed_chunk_for_processing(
-        db_service,
+        database_router,
         &route,
         payload.run_id,
         payload.run_shard,

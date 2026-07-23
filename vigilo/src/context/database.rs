@@ -1,15 +1,16 @@
-//! Lazy PostgreSQL pool and placement configuration context.
+//! Lazy PostgreSQL pool router and placement configuration context.
 //!
-//! Commands call this module through [`crate::context::Context::db`] when they
-//! first need database access. This context initializes the database service
-//! once, then the service lazily initializes its control pool and per-placement
-//! pools. Connection parameters remain fixed for the process lifetime, while
-//! placement status and role are read from control storage before new work is
-//! admitted. Environment variables only provide secret connection values.
+//! Commands call this module through
+//! [`crate::context::Context::dbr`] when they first need database
+//! access. This context initializes the database router once, then the router
+//! lazily initializes its control pool and per-placement pools. Connection
+//! parameters remain fixed for the process lifetime, while placement status
+//! and role are read from the control database before new work is admitted.
+//! Environment variables only provide secret connection values.
 //!
-//! Keep topology choices behind DB workflow boundaries. Thin command dispatch,
+//! Keep topology choices behind database workflow boundaries. Thin command dispatch,
 //! generic runtime code, and arbitrary domain callers should prefer workflows
-//! over directly choosing control storage or execution storage.
+//! over directly choosing the control or execution database.
 
 use std::{
     collections::HashMap,
@@ -148,22 +149,25 @@ pub(crate) struct Config {
 
 pub(crate) struct Context {
     pub(crate) config: Config,
-    pub(crate) cell: OnceCell<Db>,
+    pub(crate) cell: OnceCell<DatabaseRouter>,
 }
 
 impl Context {
-    pub(crate) async fn get(&self) -> anyhow::Result<&Db> {
+    pub(crate) async fn get(&self) -> anyhow::Result<&DatabaseRouter> {
         self.cell
-            .get_or_try_init(|| async { Ok::<Db, anyhow::Error>(Db::new(self.config.clone())) })
+            .get_or_try_init(|| async {
+                Ok::<DatabaseRouter, anyhow::Error>(DatabaseRouter::new(self.config.clone()))
+            })
             .await
     }
 }
 
-pub(crate) struct Db {
+/// Resolves control and execution database pools from placement metadata.
+pub(crate) struct DatabaseRouter {
     pub(crate) uri: String,
     pub(crate) max_connections: u32,
     pub(crate) placement_config: PlacementConfig,
-    pub(crate) cell: OnceCell<PgPool>,
+    pub(crate) control_pool: OnceCell<PgPool>,
     #[allow(dead_code)]
     pub(crate) placement_pools: OnceCell<PlacementPools>,
     #[allow(dead_code)]
@@ -177,28 +181,28 @@ pub(crate) struct Db {
 #[derive(Clone)]
 pub(crate) struct ExecutionRoute {
     pub(crate) placement: ShardPlacement,
-    pub(crate) database: PgPool,
+    pub(crate) pool: PgPool,
 }
 
-impl Db {
+impl DatabaseRouter {
     fn new(config: Config) -> Self {
         Self {
             uri: config.uri,
             max_connections: config.max_connections,
             placement_config: config.placement_config,
-            cell: OnceCell::new(),
+            control_pool: OnceCell::new(),
             placement_pools: OnceCell::new(),
             shard_placement_cache: new_shard_placement_cache(),
         }
     }
 
-    /// Returns the control-plane database pool.
+    /// Returns the control database pool.
     ///
-    /// The pool is initialized on first use, not when the database service is
-    /// retrieved from [`crate::context::Context::db`].
+    /// The pool is initialized on first use, not when the database router is
+    /// retrieved from [`crate::context::Context::dbr`].
     pub async fn control(&self) -> anyhow::Result<&PgPool> {
         let started = Instant::now();
-        self.cell
+        self.control_pool
             .get_or_try_init(|| async {
                 debug!("initializing postgres database connection");
 
@@ -254,7 +258,7 @@ impl Db {
     ///
     /// This is an infrastructure hook for router/admin workflows. Most callers
     /// should use a domain workflow or [`Self::execution`] instead of naming a
-    /// placement directly. Status is read from control storage on every call;
+    /// placement directly. Status is read from the control database on every call;
     /// connection parameters and pools remain fixed for the process lifetime.
     #[allow(dead_code)]
     pub async fn placement(&self, alias: &str) -> anyhow::Result<&PgPool> {
@@ -408,7 +412,7 @@ impl Db {
     /// Returns the execution-owned database pool for a run shard.
     ///
     /// Routing is based on persisted `shard_placements` data. Callers that do
-    /// not own execution storage should use a workflow that hides this choice.
+    /// not own execution data should use a workflow that hides this choice.
     #[allow(dead_code)]
     pub async fn execution(&self, run_id: Uuid, run_shard: i16) -> anyhow::Result<&PgPool> {
         let placement = self.resolve_execution_placement(run_id, run_shard).await?;
@@ -457,14 +461,11 @@ impl Db {
             .into());
         }
 
-        let database = self
+        let pool = self
             .execution_database(&placement.database_alias)
             .await?
             .clone();
-        Ok(ExecutionRoute {
-            placement,
-            database,
-        })
+        Ok(ExecutionRoute { placement, pool })
     }
 
     /// Acquires write admission and revalidates a previously resolved route.
@@ -476,7 +477,7 @@ impl Db {
         &self,
         route: &ExecutionRoute,
     ) -> anyhow::Result<Transaction<'static, Postgres>> {
-        let mut tx = route.database.begin().await?;
+        let mut tx = route.pool.begin().await?;
         crate::db::shard_write_fence::lock_shared(
             &mut tx,
             route.placement.run_id,
@@ -544,7 +545,7 @@ impl Db {
 
         let mut ordered = routes.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|route| route.placement.run_shard);
-        let mut tx = first.database.begin().await?;
+        let mut tx = first.pool.begin().await?;
         for route in &ordered {
             crate::db::shard_write_fence::lock_shared(
                 &mut tx,
@@ -663,13 +664,13 @@ impl Db {
                 (
                     route.placement.run_shard,
                     route.placement.database_alias,
-                    route.database,
+                    route.pool,
                 )
             })
             .collect())
     }
 
-    /// Returns readable routes with their exact control-plane fences.
+    /// Returns readable routes with their exact control-database fences.
     pub(crate) async fn execution_read_routes_with_fences_for_run(
         &self,
         run_id: Uuid,
@@ -691,10 +692,7 @@ impl Db {
                 routing_decision = "readable_execution_route",
                 "resolved readable execution route"
             );
-            routed.push(ExecutionRoute {
-                placement,
-                database: pool,
-            });
+            routed.push(ExecutionRoute { placement, pool });
         }
 
         Ok(routed)
@@ -811,7 +809,7 @@ impl Db {
                         PlacementPool {
                             database_url_env: placement.database_url_env,
                             database_url,
-                            cell: OnceCell::new(),
+                            pool: OnceCell::new(),
                         },
                     );
                 }
@@ -888,13 +886,13 @@ pub(crate) struct PlacementPool {
     #[allow(dead_code)]
     database_url: String,
     #[allow(dead_code)]
-    cell: OnceCell<PgPool>,
+    pool: OnceCell<PgPool>,
 }
 
 impl PlacementPool {
     #[allow(dead_code)]
     async fn get(&self, alias: &str, max_connections: u32) -> anyhow::Result<&PgPool> {
-        self.cell
+        self.pool
             .get_or_try_init(|| async {
                 debug!(database_alias = %alias, "initializing postgres placement connection");
 
@@ -1094,7 +1092,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn database_context_get_returns_one_service_without_opening_pool() {
+    async fn database_context_get_returns_one_router_without_opening_pool() {
         let context = Context {
             config: Config {
                 uri: "postgres://lazy-control-pool".to_string(),
@@ -1104,21 +1102,21 @@ mod tests {
             cell: OnceCell::new(),
         };
 
-        let first = context.get().await.unwrap() as *const Db;
-        let second = context.get().await.unwrap() as *const Db;
+        let first = context.get().await.unwrap() as *const DatabaseRouter;
+        let second = context.get().await.unwrap() as *const DatabaseRouter;
 
         assert_eq!(first, second);
-        assert!(context.cell.get().unwrap().cell.get().is_none());
+        assert!(context.cell.get().unwrap().control_pool.get().is_none());
     }
 
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
     async fn execution_routes_active_primary_placement_to_control_pool(pool: PgPool) {
-        let context = context_with_control_pool(pool);
+        let database_router = database_router_with_control_pool(pool);
         let run_id = Uuid::now_v7();
 
         insert_shard_placement(
-            context.control().await.unwrap(),
+            database_router.control().await.unwrap(),
             run_id,
             42,
             DEFAULT_DATABASE_ALIAS,
@@ -1126,11 +1124,14 @@ mod tests {
         )
         .await;
 
-        let control = context.control().await.unwrap() as *const PgPool;
-        let routed = context.execution(run_id, 42).await.unwrap() as *const PgPool;
+        let control = database_router.control().await.unwrap() as *const PgPool;
+        let routed = database_router.execution(run_id, 42).await.unwrap() as *const PgPool;
         assert_eq!(control, routed);
 
-        let placement = context.execution_placement(run_id, 42).await.unwrap();
+        let placement = database_router
+            .execution_placement(run_id, 42)
+            .await
+            .unwrap();
         assert_eq!(placement.database_alias, DEFAULT_DATABASE_ALIAS);
         assert_eq!(placement.status, SHARD_PLACEMENT_STATUS_ACTIVE);
     }
@@ -1138,11 +1139,11 @@ mod tests {
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
     async fn execution_rejects_moving_placement(pool: PgPool) {
-        let context = context_with_control_pool(pool);
+        let database_router = database_router_with_control_pool(pool);
         let run_id = Uuid::now_v7();
 
         insert_shard_placement(
-            context.control().await.unwrap(),
+            database_router.control().await.unwrap(),
             run_id,
             7,
             DEFAULT_DATABASE_ALIAS,
@@ -1150,18 +1151,18 @@ mod tests {
         )
         .await;
 
-        let error = context.execution(run_id, 7).await.unwrap_err();
+        let error = database_router.execution(run_id, 7).await.unwrap_err();
         assert!(error.to_string().contains("not dispatchable"));
     }
 
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
     async fn execution_placement_refreshes_stale_cached_route_version(pool: PgPool) {
-        let context = context_with_control_pool(pool);
+        let database_router = database_router_with_control_pool(pool);
         let run_id = Uuid::now_v7();
 
         insert_shard_placement(
-            context.control().await.unwrap(),
+            database_router.control().await.unwrap(),
             run_id,
             7,
             DEFAULT_DATABASE_ALIAS,
@@ -1169,12 +1170,15 @@ mod tests {
         )
         .await;
 
-        let initial = context.execution_placement(run_id, 7).await.unwrap();
+        let initial = database_router
+            .execution_placement(run_id, 7)
+            .await
+            .unwrap();
         assert_eq!(initial.status, SHARD_PLACEMENT_STATUS_ACTIVE);
         assert_eq!(initial.route_version, 1);
 
         crate::db::tables::shard_placements::update_shard_placement_status(
-            context.control().await.unwrap(),
+            database_router.control().await.unwrap(),
             run_id,
             7,
             SHARD_PLACEMENT_STATUS_MOVING,
@@ -1182,32 +1186,36 @@ mod tests {
         .await
         .unwrap();
 
-        let refreshed = context.execution_placement(run_id, 7).await.unwrap();
+        let refreshed = database_router
+            .execution_placement(run_id, 7)
+            .await
+            .unwrap();
         assert_eq!(refreshed.status, SHARD_PLACEMENT_STATUS_MOVING);
         assert_eq!(refreshed.route_version, 2);
 
-        let error = context.execution(run_id, 7).await.unwrap_err();
+        let error = database_router.execution(run_id, 7).await.unwrap_err();
         assert!(error.to_string().contains("not dispatchable"));
     }
 
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
     async fn stale_execution_route_cannot_claim_after_move_begins(pool: PgPool) {
-        let context = context_with_control_pool(pool);
+        let database_router = database_router_with_control_pool(pool);
         let run_id = Uuid::now_v7();
-        let chunk_id = seed_claimable_chunk(context.control().await.unwrap(), run_id, 7).await;
+        let chunk_id =
+            seed_claimable_chunk(database_router.control().await.unwrap(), run_id, 7).await;
         insert_shard_placement(
-            context.control().await.unwrap(),
+            database_router.control().await.unwrap(),
             run_id,
             7,
             DEFAULT_DATABASE_ALIAS,
             SHARD_PLACEMENT_STATUS_ACTIVE,
         )
         .await;
-        let stale_route = context.execution_route(run_id, 7).await.unwrap();
+        let stale_route = database_router.execution_route(run_id, 7).await.unwrap();
 
         crate::db::tables::shard_placements::update_shard_placement_status(
-            context.control().await.unwrap(),
+            database_router.control().await.unwrap(),
             run_id,
             7,
             SHARD_PLACEMENT_STATUS_MOVING,
@@ -1216,7 +1224,7 @@ mod tests {
         .unwrap();
 
         let error = crate::db::workflows::chunk_processing::claim_routed_chunk_for_processing(
-            &context,
+            &database_router,
             &stale_route,
             run_id,
             7,
@@ -1246,11 +1254,11 @@ mod tests {
             .connect(database_url.as_str())
             .await
             .unwrap();
-        let context = context_with_control_pool(runtime_pool);
+        let database_router = database_router_with_control_pool(runtime_pool);
         let run_id = Uuid::now_v7();
-        seed_claimable_chunk(context.control().await.unwrap(), run_id, 7).await;
+        seed_claimable_chunk(database_router.control().await.unwrap(), run_id, 7).await;
         insert_shard_placement(
-            context.control().await.unwrap(),
+            database_router.control().await.unwrap(),
             run_id,
             7,
             DEFAULT_DATABASE_ALIAS,
@@ -1258,11 +1266,18 @@ mod tests {
         )
         .await;
 
-        let mut move_tx = context.control().await.unwrap().begin().await.unwrap();
+        let mut move_tx = database_router
+            .control()
+            .await
+            .unwrap()
+            .begin()
+            .await
+            .unwrap();
         crate::db::shard_write_fence::lock_exclusive(&mut move_tx, run_id, 7)
             .await
             .unwrap();
-        let cancellation = crate::db::workflows::run_cancel::cancel_run_routed(&context, run_id);
+        let cancellation =
+            crate::db::workflows::run_cancel::cancel_run_routed(&database_router, run_id);
         tokio::pin!(cancellation);
 
         assert!(
@@ -1284,10 +1299,13 @@ mod tests {
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
     async fn execution_placement_requires_stored_shard_placement(pool: PgPool) {
-        let context = context_with_control_pool(pool);
+        let database_router = database_router_with_control_pool(pool);
         let run_id = Uuid::now_v7();
 
-        let error = context.execution_placement(run_id, 3).await.unwrap_err();
+        let error = database_router
+            .execution_placement(run_id, 3)
+            .await
+            .unwrap_err();
 
         assert!(error.to_string().contains("missing shard placement"));
         assert!(
@@ -1300,11 +1318,11 @@ mod tests {
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
     async fn execution_routes_for_run_returns_routed_primary_pools(pool: PgPool) {
-        let context = context_with_control_pool(pool);
+        let database_router = database_router_with_control_pool(pool);
         let run_id = Uuid::now_v7();
 
         insert_shard_placement(
-            context.control().await.unwrap(),
+            database_router.control().await.unwrap(),
             run_id,
             2,
             DEFAULT_DATABASE_ALIAS,
@@ -1312,7 +1330,7 @@ mod tests {
         )
         .await;
         insert_shard_placement(
-            context.control().await.unwrap(),
+            database_router.control().await.unwrap(),
             run_id,
             9,
             DEFAULT_DATABASE_ALIAS,
@@ -1320,7 +1338,10 @@ mod tests {
         )
         .await;
 
-        let routed = context.execution_routes_for_run(run_id).await.unwrap();
+        let routed = database_router
+            .execution_routes_for_run(run_id)
+            .await
+            .unwrap();
 
         assert_eq!(routed.len(), 2);
         assert_eq!(routed[0].0, 2);
@@ -1332,11 +1353,11 @@ mod tests {
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
     async fn execution_read_routes_for_run_include_moving_placements(pool: PgPool) {
-        let context = context_with_control_pool(pool);
+        let database_router = database_router_with_control_pool(pool);
         let run_id = Uuid::now_v7();
 
         insert_shard_placement(
-            context.control().await.unwrap(),
+            database_router.control().await.unwrap(),
             run_id,
             7,
             DEFAULT_DATABASE_ALIAS,
@@ -1344,10 +1365,16 @@ mod tests {
         )
         .await;
 
-        let dispatch_error = context.execution_routes_for_run(run_id).await.unwrap_err();
+        let dispatch_error = database_router
+            .execution_routes_for_run(run_id)
+            .await
+            .unwrap_err();
         assert!(dispatch_error.to_string().contains("not dispatchable"));
 
-        let readable = context.execution_read_routes_for_run(run_id).await.unwrap();
+        let readable = database_router
+            .execution_read_routes_for_run(run_id)
+            .await
+            .unwrap();
         assert_eq!(readable.len(), 1);
         assert_eq!(readable[0].0, 7);
         assert_eq!(readable[0].1, DEFAULT_DATABASE_ALIAS);
@@ -1356,10 +1383,13 @@ mod tests {
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
     async fn placement_rejects_alias_disabled_after_pool_initialization(pool: PgPool) {
-        let context = context_with_control_pool(pool);
+        let database_router = database_router_with_control_pool(pool);
 
-        context.placement(DEFAULT_DATABASE_ALIAS).await.unwrap();
-        assert!(context.placement_pools.get().is_some());
+        database_router
+            .placement(DEFAULT_DATABASE_ALIAS)
+            .await
+            .unwrap();
+        assert!(database_router.placement_pools.get().is_some());
 
         sqlx::query(
             r#"
@@ -1369,30 +1399,33 @@ mod tests {
             "#,
         )
         .bind(DEFAULT_DATABASE_ALIAS)
-        .execute(context.control().await.unwrap())
+        .execute(database_router.control().await.unwrap())
         .await
         .unwrap();
 
-        let error = context.placement(DEFAULT_DATABASE_ALIAS).await.unwrap_err();
+        let error = database_router
+            .placement(DEFAULT_DATABASE_ALIAS)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("status disabled"));
-        assert!(context.placement_pools.get().is_some());
+        assert!(database_router.placement_pools.get().is_some());
     }
 
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
     async fn execution_rejects_live_non_shard_role(pool: PgPool) {
-        let context = context_with_control_pool(pool);
+        let database_router = database_router_with_control_pool(pool);
         let run_id = Uuid::now_v7();
 
         insert_shard_placement(
-            context.control().await.unwrap(),
+            database_router.control().await.unwrap(),
             run_id,
             7,
             DEFAULT_DATABASE_ALIAS,
             SHARD_PLACEMENT_STATUS_ACTIVE,
         )
         .await;
-        context.execution(run_id, 7).await.unwrap();
+        database_router.execution(run_id, 7).await.unwrap();
 
         sqlx::query(
             r#"
@@ -1402,12 +1435,15 @@ mod tests {
             "#,
         )
         .bind(DEFAULT_DATABASE_ALIAS)
-        .execute(context.control().await.unwrap())
+        .execute(database_router.control().await.unwrap())
         .await
         .unwrap();
 
-        context.placement(DEFAULT_DATABASE_ALIAS).await.unwrap();
-        let error = context.execution(run_id, 7).await.unwrap_err();
+        database_router
+            .placement(DEFAULT_DATABASE_ALIAS)
+            .await
+            .unwrap();
+        let error = database_router.execution(run_id, 7).await.unwrap_err();
         assert!(error.to_string().contains("role control"));
         assert!(error.to_string().contains("not shard-capable"));
     }
@@ -1415,8 +1451,11 @@ mod tests {
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
     async fn placement_requires_restart_for_alias_added_after_pool_initialization(pool: PgPool) {
-        let context = context_with_control_pool(pool);
-        context.placement(DEFAULT_DATABASE_ALIAS).await.unwrap();
+        let database_router = database_router_with_control_pool(pool);
+        database_router
+            .placement(DEFAULT_DATABASE_ALIAS)
+            .await
+            .unwrap();
 
         sqlx::query(
             r#"
@@ -1424,11 +1463,11 @@ mod tests {
             VALUES ('shard_late', 'VIGILO_TEST_LATE_SHARD_URL', 'shard', 'active')
             "#,
         )
-        .execute(context.control().await.unwrap())
+        .execute(database_router.control().await.unwrap())
         .await
         .unwrap();
 
-        let error = context.placement("shard_late").await.unwrap_err();
+        let error = database_router.placement("shard_late").await.unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1440,8 +1479,11 @@ mod tests {
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
     async fn placement_requires_restart_after_connection_metadata_changes(pool: PgPool) {
-        let context = context_with_control_pool(pool);
-        context.placement(DEFAULT_DATABASE_ALIAS).await.unwrap();
+        let database_router = database_router_with_control_pool(pool);
+        database_router
+            .placement(DEFAULT_DATABASE_ALIAS)
+            .await
+            .unwrap();
 
         sqlx::query(
             r#"
@@ -1452,11 +1494,14 @@ mod tests {
             "#,
         )
         .bind(DEFAULT_DATABASE_ALIAS)
-        .execute(context.control().await.unwrap())
+        .execute(database_router.control().await.unwrap())
         .await
         .unwrap();
 
-        let error = context.placement(DEFAULT_DATABASE_ALIAS).await.unwrap_err();
+        let error = database_router
+            .placement(DEFAULT_DATABASE_ALIAS)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("changed database_url_env"));
         assert!(error.to_string().contains("restart Vigilo"));
     }
@@ -1464,7 +1509,7 @@ mod tests {
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
     async fn active_placement_with_missing_env_var_fails_clearly(pool: PgPool) {
-        let context = context_with_control_pool(pool);
+        let database_router = database_router_with_control_pool(pool);
 
         sqlx::query(
             r#"
@@ -1472,11 +1517,11 @@ mod tests {
             VALUES ('shard_001', 'VIGILO_TEST_MISSING_SHARD_URL', 'shard', 'active')
             "#,
         )
-        .execute(context.control().await.unwrap())
+        .execute(database_router.control().await.unwrap())
         .await
         .unwrap();
 
-        let error = context.placement("shard_001").await.unwrap_err();
+        let error = database_router.placement("shard_001").await.unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1484,17 +1529,17 @@ mod tests {
         );
     }
 
-    fn context_with_control_pool(pool: PgPool) -> Db {
-        let context = Db {
+    fn database_router_with_control_pool(pool: PgPool) -> DatabaseRouter {
+        let database_router = DatabaseRouter {
             uri: "postgres://injected-control-pool".to_string(),
             max_connections: 5,
             placement_config: PlacementConfig::default_single_database(),
-            cell: OnceCell::new(),
+            control_pool: OnceCell::new(),
             placement_pools: OnceCell::new(),
             shard_placement_cache: new_shard_placement_cache(),
         };
-        assert!(context.cell.set(pool).is_ok());
-        context
+        assert!(database_router.control_pool.set(pool).is_ok());
+        database_router
     }
 
     async fn insert_shard_placement(

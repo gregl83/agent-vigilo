@@ -163,9 +163,9 @@ async fn publish_evaluator_draft(
     context: &Context,
     draft: EvaluatorDraft,
 ) -> anyhow::Result<PublishEvaluatorOutcome> {
-    // Evaluator registry rows are control-plane metadata. Keep this storage
+    // Evaluator registry rows are control-database metadata. Keep this lookup
     // choice inside the evaluator publishing workflow.
-    let db = context.db().await?.control().await?;
+    let db = context.dbr().await?.control().await?;
 
     if let Some(existing) =
         evaluator_table::select_evaluator(db, &draft.namespace, &draft.name, &draft.version).await?

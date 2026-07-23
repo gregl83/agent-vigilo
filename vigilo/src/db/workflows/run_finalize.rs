@@ -29,7 +29,7 @@ pub(crate) struct FinalizedRun {
     pub(crate) errored_execution_count: i32,
 }
 
-/// Control-plane finalization backlog gauge.
+/// Control-database finalization backlog gauge.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct FinalizationCandidateBacklog {
     pub(crate) candidate_count: i64,
@@ -105,7 +105,7 @@ pub(crate) async fn mark_finalization_candidate_checked(
     Ok(result.rows_affected() == 1)
 }
 
-/// Measures control-plane runs that are eligible for finalization consideration.
+/// Measures control-database runs that are eligible for finalization consideration.
 ///
 /// This intentionally checks only control-owned dispatch cursor state. The
 /// coordinator still reads routed shard summaries before claiming and
@@ -149,7 +149,7 @@ pub(crate) async fn select_finalization_candidate_backlog(
     Ok(backlog)
 }
 
-/// Claims a finalization candidate in control storage.
+/// Claims a finalization candidate in the control database.
 ///
 /// The coordinator reads shard summaries before calling this. Claiming only
 /// serializes the final control write and protects retries if the process dies
@@ -195,7 +195,7 @@ pub(crate) async fn claim_finalization_candidate(
     Ok(claimed)
 }
 
-/// Claims the next control candidate without reading execution storage.
+/// Claims the next control candidate without reading execution databases.
 ///
 /// Retained for existing workflow tests; production finalization uses
 /// [`select_next_finalization_candidate`] plus routed shard summary reads.

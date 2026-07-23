@@ -53,7 +53,36 @@ chmod +x scripts/hooks/pre-commit scripts/hooks/pre-push
 git config core.hooksPath scripts/hooks
 ```
 
-The pre-commit hook runs nightly rustfmt only. The pre-push hook runs clippy, Rust tests, and the web typecheck. Migration smoke checks, evaluator Wasm builds, and the web production build run in CI.
+### Test Tiers
+
+| Tier | Scope | Required services | GitHub Actions job |
+| --- | --- | --- | --- |
+| Unit and contract | Service-free Rust behavior across the workspace | None | `Unit and Contract Tests` |
+| Database integration | SQL, migrations, transactions, advisory locks, leases, and concurrency | One PostgreSQL server; `DATABASE_URL` must use a role that can create test databases | `Database Integration Tests` |
+| Migration | Greenfield schema application through the CLI setup path | One fresh PostgreSQL database | `Migration Tests` |
+| End-to-end | Routing and the real distributed runtime across process and protocol boundaries | Two PostgreSQL servers, RabbitMQ, evaluator Wasm, and the test HTTP agent | `End-to-End Tests` |
+
+Run the service-free tier with:
+
+```bash
+cargo test --workspace --locked --lib --bins
+```
+
+After setting `DATABASE_URL`, run every PostgreSQL-backed SQLx test with:
+
+```bash
+cargo test -p vigilo --locked --bin vigilo -- --ignored --nocapture --test-threads=4
+```
+
+Within the `vigilo` binary target, `#[ignore]` is reserved for this database
+integration tier so the command remains complete.
+
+The end-to-end tier runs `multi_database_routing` and `multi_database_e2e`
+separately because they require the complete distributed dependency set. The
+workflow builds the evaluator Wasm and supplies the required database,
+messaging, and opt-in environment variables.
+
+The pre-commit hook runs nightly rustfmt only. The pre-push hook runs clippy, the service-free Rust tier, and the web typecheck. Database integration, migration, end-to-end, evaluator Wasm, and web production build checks run as separate required CI jobs.
 
 Coverage is generated in CI with `cargo llvm-cov` and uploaded to Codecov from the `Coverage` job. Configure the repository secret `CODECOV_TOKEN` in GitHub Actions for authenticated uploads.
 

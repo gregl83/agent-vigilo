@@ -8,10 +8,10 @@
 use super::*;
 
 async fn select_existing_run_for_watch(
-    database: &crate::context::database::Db,
+    database_router: &crate::context::database::DatabaseRouter,
     run_id: Uuid,
 ) -> anyhow::Result<run_status_workflow::RunStatusProjection> {
-    run_status_workflow::select_run_status(database, run_id)
+    run_status_workflow::select_run_status(database_router, run_id)
         .await?
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -29,12 +29,12 @@ pub(super) async fn exec(
     fail_on_gate: bool,
 ) -> anyhow::Result<()> {
     let run_id = parse_run_id(&run_id)?;
-    let database = context.db().await?;
+    let database_router = context.dbr().await?;
     let out = context.out().await?;
     let interval = Duration::from_secs(interval_seconds);
     let deadline = timeout_seconds.map(|seconds| Instant::now() + Duration::from_secs(seconds));
     let mut last_snapshot = None;
-    let mut status = select_existing_run_for_watch(database, run_id).await?;
+    let mut status = select_existing_run_for_watch(database_router, run_id).await?;
 
     loop {
         let terminal = is_terminal_run_status(&status.run.status);
@@ -73,6 +73,6 @@ pub(super) async fn exec(
         };
 
         sleep(sleep_for).await;
-        status = select_existing_run_for_watch(database, run_id).await?;
+        status = select_existing_run_for_watch(database_router, run_id).await?;
     }
 }

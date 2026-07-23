@@ -666,7 +666,7 @@ async fn select_run_shards(db: &PgPool, run_id: Uuid) -> anyhow::Result<Vec<i16>
 }
 
 async fn cancel_execution_target(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     run_id: Uuid,
     target: ExecutionCancellationTarget,
 ) -> anyhow::Result<ExecutionCancellationOutcome> {
@@ -675,7 +675,7 @@ async fn cancel_execution_target(
         .iter()
         .map(|route| route.placement.run_shard)
         .collect();
-    let tx = database
+    let tx = database_router
         .begin_execution_cleanup_admission(&target.routes)
         .await?;
     cancel_execution_target_with_transaction(run_id, run_shards, tx).await
@@ -729,15 +729,13 @@ fn group_execution_routes(routes: Vec<ExecutionRoute>) -> Vec<ExecutionCancellat
 }
 
 async fn cancel_execution_targets(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     run_id: Uuid,
     targets: Vec<ExecutionCancellationTarget>,
 ) -> anyhow::Result<ExecutionCancellationOutcome> {
-    let mut stream = stream::iter(
-        targets
-            .into_iter()
-            .map(|target| async move { cancel_execution_target(database, run_id, target).await }),
-    )
+    let mut stream = stream::iter(targets.into_iter().map(|target| async move {
+        cancel_execution_target(database_router, run_id, target).await
+    }))
     .buffer_unordered(ROUTED_CANCEL_PARALLELISM);
 
     let mut combined = ExecutionCancellationOutcome::default();
@@ -855,7 +853,7 @@ async fn enqueue_cancelled_event(
     Ok(count)
 }
 
-/// Cancels a pending/running/finalizing run through routed execution storage.
+/// Cancels a pending/running/finalizing run through routed execution databases.
 ///
 /// Returns `Ok(None)` when the run does not exist. Repeated cancellation of an
 /// already-cancelled run is idempotent; completed or failed runs are rejected.
@@ -873,20 +871,20 @@ async fn enqueue_cancelled_event(
 ///   event. If fanout fails, retrying the command resumes from the already
 ///   cancelled control state and repeats idempotent execution cleanup.
 pub(crate) async fn cancel_run_routed(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     run_id: Uuid,
 ) -> anyhow::Result<Option<CancelRunOutcome>> {
-    let control_db = database.control().await?;
+    let control_db = database_router.control().await?;
     let Some(state) = mark_control_cancellation_requested(control_db, run_id).await? else {
         return Ok(None);
     };
 
-    let routes = database
+    let routes = database_router
         .execution_read_routes_with_fences_for_run(run_id)
         .await?;
     let execution_route_count = routes.len();
     let targets = group_execution_routes(routes);
-    let execution_outcome = cancel_execution_targets(database, run_id, targets).await?;
+    let execution_outcome = cancel_execution_targets(database_router, run_id, targets).await?;
 
     finalize_control_cancellation(control_db, state, execution_outcome, execution_route_count)
         .await

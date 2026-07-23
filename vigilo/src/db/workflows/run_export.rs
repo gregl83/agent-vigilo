@@ -43,10 +43,10 @@ impl RunExportRoute {
 }
 
 pub(crate) async fn select_run_export_routes(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     run_id: Uuid,
 ) -> anyhow::Result<Vec<RunExportRoute>> {
-    let routes = database
+    let routes = database_router
         .execution_read_routes_for_run(run_id)
         .await?
         .into_iter()

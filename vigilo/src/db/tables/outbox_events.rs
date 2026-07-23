@@ -85,7 +85,7 @@ pub(crate) async fn select_outbox_event_by_id(
     Ok(event)
 }
 
-/// Lists outbox events with a given ledger status.
+/// Lists outbox event records with a given ledger status.
 pub(crate) async fn list_outbox_events_by_status(
     db: &PgPool,
     status: &str,

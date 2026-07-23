@@ -132,13 +132,13 @@ pub(super) async fn exec(
     }
 
     let run_id = parse_run_id(&run_id)?;
-    let database = context.db().await?;
-    let db = database.control().await?;
+    let database_router = context.dbr().await?;
+    let db = database_router.control().await?;
     let out = context.out().await?;
 
     let run = select_existing_run(db, run_id).await?;
-    let summary = run_results_workflow::select_run_results_summary(database, run_id).await?;
-    let routes = run_export_workflow::select_run_export_routes(database, run_id).await?;
+    let summary = run_results_workflow::select_run_results_summary(database_router, run_id).await?;
+    let routes = run_export_workflow::select_run_export_routes(database_router, run_id).await?;
 
     match format {
         RunExportFormat::Json => {

@@ -1,10 +1,10 @@
 //! Run dispatch workflow helpers.
 //!
-//! Coordinators use this module to start pending runs in control storage,
-//! prepare execution-local run snapshots, and enqueue bounded windows of outbox
-//! events that make chunks visible to workers. Dispatch cursors stay in control
-//! storage and serialize route claims while execution storage owns chunk scans
-//! and chunk-ready outbox events.
+//! Coordinators use this module to start pending runs in the control database,
+//! prepare execution-local run snapshots, and insert one outbox event record per
+//! chunk in a bounded dispatch window. Dispatch cursors stay in the control
+//! database and serialize route claims while execution databases own chunk
+//! scans and chunk-ready outbox event records.
 
 use std::collections::BTreeSet;
 
@@ -27,12 +27,12 @@ pub(crate) struct DispatchedRun {
     pub(crate) id: Uuid,
     pub(crate) run_key: String,
     pub(crate) run_shard: i16,
-    pub(crate) chunk_events_enqueued: i64,
+    pub(crate) chunk_ready_event_records_inserted: i64,
     pub(crate) chunks_marked_dispatched: i64,
-    pub(crate) run_started_events_enqueued: i64,
+    pub(crate) run_started_event_records_inserted: i64,
 }
 
-/// Immutable run context copied from control storage before execution dispatch.
+/// Immutable run context copied from the control database before execution dispatch.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct DispatchRunSnapshot {
     pub(crate) run_id: Uuid,
@@ -54,10 +54,10 @@ pub(crate) struct DispatchRunSnapshot {
     pub(crate) prompt_config_id: String,
     pub(crate) prompt_config_version: String,
     pub(crate) config_snapshot: serde_json::Value,
-    pub(crate) run_started_events_enqueued: i64,
+    pub(crate) run_started_event_records_inserted: i64,
 }
 
-/// Control-plane route selected for one dispatch attempt.
+/// Control-database route selected for one dispatch attempt.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct DispatchRoute {
     pub(crate) run_id: Uuid,
@@ -77,9 +77,9 @@ struct DispatchedRunWindow {
     id: Uuid,
     run_key: String,
     run_shard: i16,
-    chunk_events_enqueued: i64,
+    chunk_ready_event_records_inserted: i64,
     chunks_marked_dispatched: i64,
-    run_started_events_enqueued: i64,
+    run_started_event_records_inserted: i64,
     has_remaining_chunks: bool,
 }
 
@@ -89,9 +89,9 @@ impl From<&DispatchedRunWindow> for DispatchedRun {
             id: dispatched.id,
             run_key: dispatched.run_key.clone(),
             run_shard: dispatched.run_shard,
-            chunk_events_enqueued: dispatched.chunk_events_enqueued,
+            chunk_ready_event_records_inserted: dispatched.chunk_ready_event_records_inserted,
             chunks_marked_dispatched: dispatched.chunks_marked_dispatched,
-            run_started_events_enqueued: dispatched.run_started_events_enqueued,
+            run_started_event_records_inserted: dispatched.run_started_event_records_inserted,
         }
     }
 }
@@ -99,14 +99,8 @@ impl From<&DispatchedRunWindow> for DispatchedRun {
 /// Counts returned after one expired chunk lease recovery pass.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ChunkLeaseRecoveryStats {
-    pub(crate) recovered: i64,
-    pub(crate) failed: i64,
-}
-
-/// Committed lease-recovery counts.
-#[derive(Debug)]
-pub(crate) struct ChunkLeaseRecoveryOutcome {
-    pub(crate) stats: ChunkLeaseRecoveryStats,
+    pub(crate) recovered_chunks: i64,
+    pub(crate) failed_chunks: i64,
 }
 
 /// Identifies which database boundary failed during a routed dispatch.
@@ -119,7 +113,7 @@ pub(crate) struct ChunkLeaseRecoveryOutcome {
 pub(crate) enum RoutedDispatchError {
     #[error("dispatch invariant failed: {0}")]
     Invariant(#[source] anyhow::Error),
-    #[error("control-plane dispatch operation failed: {0}")]
+    #[error("control database dispatch operation failed: {0}")]
     Control(#[source] anyhow::Error),
     #[error("execution placement dispatch write failed: {0}")]
     ExecutionWrite(#[source] anyhow::Error),
@@ -128,7 +122,7 @@ pub(crate) enum RoutedDispatchError {
 /// Recovers expired worker chunk leases for prepared run snapshots.
 ///
 /// Recovered chunks are moved back to `pending` and receive a fresh
-/// `run.chunk.ready` event with a recovery-scoped dedupe key. Chunks that have
+/// `run.chunk.ready` outbox record with a recovery-scoped dedupe key. Chunks that have
 /// already reached the recovery limit are marked failed so finalization can
 /// terminate the run instead of leaving it blocked by a dead lease forever.
 ///
@@ -137,7 +131,7 @@ pub(crate) enum RoutedDispatchError {
 ///   consistent lease snapshot.
 /// - First query locks a bounded oldest-expired set below `max_recoveries`,
 ///   resets those chunks to `pending`, increments recovery metadata, and emits
-///   idempotent recovery-scoped chunk-ready events.
+///   idempotent recovery-scoped chunk-ready outbox records.
 /// - Second query locks a bounded oldest-expired set already at the recovery
 ///   limit and marks them `failed`.
 /// - `SKIP LOCKED` lets multiple coordinators run recovery without blocking
@@ -150,7 +144,7 @@ pub(crate) async fn recover_expired_chunk_leases(
     db: &PgPool,
     max_recoveries: i32,
     batch_size: i64,
-) -> anyhow::Result<ChunkLeaseRecoveryOutcome> {
+) -> anyhow::Result<ChunkLeaseRecoveryStats> {
     let mut tx = db.begin().await?;
 
     // Query outline:
@@ -159,7 +153,7 @@ pub(crate) async fn recover_expired_chunk_leases(
     // recovered       - clear lease, increment recovery_count, return rows.
     // stale_recovered_attempts
     //                 - mark current running attempts stale before requeue.
-    // recovery_events - publish a fresh, recovery-scoped chunk-ready event.
+    // recovery_events - insert a fresh, recovery-scoped chunk-ready outbox record.
     let recovered = sqlx::query_scalar::<_, i64>(
         r#"
         WITH expired AS (
@@ -316,15 +310,13 @@ pub(crate) async fn recover_expired_chunk_leases(
     }
     tx.commit().await?;
 
-    Ok(ChunkLeaseRecoveryOutcome {
-        stats: ChunkLeaseRecoveryStats {
-            recovered,
-            failed: i64::try_from(failed_rows.len())?,
-        },
+    Ok(ChunkLeaseRecoveryStats {
+        recovered_chunks: recovered,
+        failed_chunks: i64::try_from(failed_rows.len())?,
     })
 }
 
-/// Selects the next control-plane dispatch route.
+/// Selects the next control-database dispatch route.
 ///
 /// This query does not claim execution rows. It chooses one open
 /// `(run_id, run_shard)` cursor whose shard placement is active and whose
@@ -400,7 +392,7 @@ pub(crate) async fn claim_next_dispatch_route(
     Ok(Some(ClaimedDispatchRoute { route, control_tx }))
 }
 
-/// Counts currently dispatchable control-plane cursor rows.
+/// Counts currently dispatchable control-database cursor rows.
 ///
 /// This mirrors [`select_next_dispatch_route`] without ordering or row return
 /// data. Coordinator structured logs use it as a backlog gauge for scale
@@ -439,11 +431,11 @@ pub(crate) async fn count_dispatch_cursor_backlog(db: &PgPool) -> anyhow::Result
     Ok(count)
 }
 
-/// Starts a dispatchable run in control storage and returns its snapshot.
+/// Starts a dispatchable run in the control database and returns its snapshot.
 ///
-/// The returned data is copied into execution storage by
+/// The returned data is copied into the execution database by
 /// [`dispatch_admitted_run_window`] before worker-visible chunk events are
-/// inserted. `run.started` is a control-plane event, so it is emitted here.
+/// inserted. `run.started` is a control-database outbox record, so it is inserted here.
 #[cfg(test)]
 pub(crate) async fn prepare_dispatch_run_snapshot(
     db: &PgPool,
@@ -515,7 +507,7 @@ pub(crate) async fn prepare_dispatch_run_snapshot_with(
             started_run.prompt_config_id,
             started_run.prompt_config_version,
             started_run.config_snapshot,
-            (SELECT COUNT(*)::bigint FROM started_event) AS run_started_events_enqueued
+            (SELECT COUNT(*)::bigint FROM started_event) AS run_started_event_records_inserted
         FROM started_run
         "#,
     )
@@ -552,7 +544,7 @@ pub(crate) async fn prepare_dispatch_run_snapshot_with(
             r.prompt_config_id,
             r.prompt_config_version,
             r.config_snapshot,
-            0::bigint AS run_started_events_enqueued
+            0::bigint AS run_started_event_records_inserted
         FROM runs r
         WHERE r.id = $1::uuid
           AND r.status = 'running'::run_status
@@ -567,7 +559,7 @@ pub(crate) async fn prepare_dispatch_run_snapshot_with(
     Ok(running)
 }
 
-/// Claims one dispatchable run shard and enqueues a bounded chunk-ready window.
+/// Claims one dispatch cursor and processes a bounded chunk window for its shard.
 ///
 /// The caller claims one open control cursor and prepares its control-owned
 /// [`DispatchRunSnapshot`] in the same transaction. The execution write copies
@@ -618,14 +610,14 @@ async fn dispatch_next_run_window(
 
 /// Claims and dispatches one exact run-shard through fenced write admission.
 pub(crate) async fn dispatch_admitted_run_window(
-    database: &database::Db,
+    database_router: &database::DatabaseRouter,
     control_tx: Transaction<'static, Postgres>,
     execution_route: &ExecutionRoute,
     chunk_window_size: i64,
     route: &DispatchRoute,
     snapshot: &DispatchRunSnapshot,
 ) -> Result<Option<DispatchedRun>, RoutedDispatchError> {
-    let execution_tx = database
+    let execution_tx = database_router
         .begin_execution_admission(execution_route)
         .await
         .map_err(RoutedDispatchError::ExecutionWrite)?;
@@ -709,7 +701,7 @@ async fn claim_exact_dispatch_cursor(
 
 /// Applies a dispatch window while the caller holds shard write admission.
 ///
-/// The route is selected from control storage before the caller resolves the
+/// The route is selected from the control database before the caller resolves the
 /// execution placement. This function keeps the shard-local dispatch statement
 /// constrained to that routed `run_id + run_shard`.
 async fn dispatch_routed_run_window_with_transactions(
@@ -900,9 +892,9 @@ async fn dispatch_routed_run_window_with_transactions(
             claimed.id,
             claimed.run_key,
             claimed.run_shard,
-            (SELECT COUNT(*)::bigint FROM chunk_events) AS chunk_events_enqueued,
+            (SELECT COUNT(*)::bigint FROM chunk_events) AS chunk_ready_event_records_inserted,
             (SELECT COUNT(*)::bigint FROM marked_chunks) AS chunks_marked_dispatched,
-            $21::bigint AS run_started_events_enqueued,
+            $21::bigint AS run_started_event_records_inserted,
             remaining_chunks.has_remaining AS has_remaining_chunks
         FROM claimed, remaining_chunks
         "#,
@@ -927,7 +919,7 @@ async fn dispatch_routed_run_window_with_transactions(
     .bind(&snapshot.prompt_config_id)
     .bind(&snapshot.prompt_config_version)
     .bind(&snapshot.config_snapshot)
-    .bind(snapshot.run_started_events_enqueued)
+    .bind(snapshot.run_started_event_records_inserted)
     .fetch_optional(&mut *execution_tx)
     .await
     .map_err(anyhow::Error::from)
@@ -1575,7 +1567,7 @@ mod tests {
         assert_eq!(dispatched.id, run_id);
         assert_eq!(dispatched.run_shard, 0);
         assert_eq!(dispatched.chunks_marked_dispatched, 1);
-        assert_eq!(dispatched.run_started_events_enqueued, 0);
+        assert_eq!(dispatched.run_started_event_records_inserted, 0);
 
         tx.rollback().await.unwrap();
     }

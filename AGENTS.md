@@ -31,11 +31,22 @@ This repository supports AI-assisted development, but generated changes must fol
 
 ## Pre-PR Checks
 
+- Keep the test-tier names, scopes, and commands aligned with
+  [README.md](README.md#test-tiers).
+- Reserve `#[ignore]` in the `vigilo` binary test target for the PostgreSQL-backed
+  database integration tier. Other opt-in service tests belong in an explicitly
+  named integration target and CI tier.
 - Before opening or updating a PR that touches Rust code, CI, migrations, evaluator crates, or workflow files, run:
   - `cargo +nightly fmt --all -- --check`
   - `cargo clippy --workspace --all-targets --locked -- -D warnings`
-  - `cargo test --workspace --locked`
+  - `cargo test --workspace --locked --lib --bins`
+- If database workflows, SQL, locking, leases, or sharding behavior changed, run
+  the database integration tier against PostgreSQL:
+  - `cargo test -p vigilo --locked --bin vigilo -- --ignored --nocapture --test-threads=4`
 - If migrations changed, run the setup/migration path against a fresh local PostgreSQL database.
+- If distributed routing or runtime behavior changed, run the end-to-end tier
+  when its two PostgreSQL servers, RabbitMQ, evaluator Wasm, and test HTTP agent
+  are available.
 - If web docs changed, run `npm --prefix web run typecheck` and `npm --prefix web run build`.
 - If local tooling is unavailable, say so explicitly and treat GitHub Actions as the first verification pass.
 - Optional repository hooks can be installed with `chmod +x scripts/hooks/pre-commit scripts/hooks/pre-push` and `git config core.hooksPath scripts/hooks`.
