@@ -20,10 +20,24 @@ State diagrams for the database-backed lifecycle boundaries in Agent Vigilo.
 
 These views focus on:
 
-- lifecycle states stored in the DB
+- lifecycle states stored in PostgreSQL
 - guarded transitions owned by CLI, coordinator, and worker processes
 - leases, compatible row locks, idempotent events, and no-op branches
 - terminal outcomes that feed run status, gate status, and exportable evidence
+
+## Terms On This Page
+
+| Term | Meaning here |
+| --- | --- |
+| State | Persisted lifecycle value used to decide which transitions are valid. |
+| Transition | Guarded database change from one state to another. |
+| Claim | Successful transition that gives a process temporary authority over work. |
+| Lease | Time-bounded claim authority that can be recovered after expiry. |
+| Fencing token | Value checked on mutation to reject an owner or route that is no longer current. |
+| Idempotent operation | Operation that can be repeated without duplicating its logical effect. |
+| No-op | Valid path that changes nothing because another process already advanced the state. |
+
+See the [Glossary](/docs/glossary) for the distinction between row locks, admission locks, leases, and fencing tokens.
 
 ## Overview
 
@@ -43,3 +57,4 @@ These views focus on:
 - [System structure](/docs/architecture/structure/)
 - [Runtime architecture](/docs/architecture/flow)
 - [Reliability](/docs/architecture/failure-modes)
+- [Glossary](/docs/glossary)

@@ -21,7 +21,11 @@ How `vigilo coordinator start` runs configurable coordinator cycles continuously
 until shutdown or service failure. Each cycle resumes a bounded number of
 expired `creating` runs before chunk lease recovery and normal dispatch.
 
-Dispatch claims one open `run_id + run_shard` cursor per window, and dispatch and recovery events include each chunk's `run_shard` in the `run.chunk.ready` payload so workers can claim chunk-local work without an extra routing lookup.
+Dispatch claims one open `run_id + run_shard` cursor per window. Dispatch and
+recovery insert one `run.chunk.ready` outbox event record per chunk, including
+the chunk's `run_shard` in the payload. Publication preserves that payload in
+the broker message so workers can claim chunk-local work without an extra
+routing lookup.
 
 ## Execution Flow
 
@@ -39,3 +43,4 @@ Dispatch claims one open `run_id + run_shard` cursor per window, and dispatch an
 - [Run watch flow](/docs/architecture/flows/run/watch/)
 - [Coordinator component](/docs/architecture/structure/components/coordinator/)
 - [Container view](/docs/architecture/structure/containers/agent-vigilo/)
+- [Glossary](/docs/glossary)

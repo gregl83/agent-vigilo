@@ -16,9 +16,9 @@ flowchart TD
     RecoverCreation[Resume expired creating runs]
     Recover[Recover expired chunk leases]
     RecoveryIsolated[Count placement failure and continue aliases]
-    Dispatch[Drain dispatchable run-shard windows]
+    Dispatch[Dispatch ready run-shard windows]
     DispatchIsolated[Leave cursor open and exclude failed alias]
-    Finalize[Drain finalizable runs]
+    Finalize[Finalize ready runs]
     FinalizeIsolated[Defer run and continue cycle]
     Messaging{Messaging context available?}
     Outbox[Claim delivery queue batch and publish with bounded concurrency]

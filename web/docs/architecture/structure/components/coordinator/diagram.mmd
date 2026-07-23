@@ -11,7 +11,7 @@ config:
 flowchart TD
     %% actors
     Vigilo["fa:fa-terminal <br/> <b>Vigilo CLI</b> <br/> <small>[Container: Rust]</small> <br/> <small>Starts the coordinator loop or one-shot cycle.</small>"]:::component
-    Worker["fa:fa-gear <br/> <b>Worker</b> <br/> <small>[Container: Rust]</small> <br/> <small>Consumes chunk-ready events and persists execution outcomes.</small>"]:::component
+    Worker["fa:fa-gear <br/> <b>Worker</b> <br/> <small>[Container: Rust]</small> <br/> <small>Consumes chunk-ready broker messages and persists execution outcomes.</small>"]:::component
 
     %% components
     CommandFacade["fa:fa-compass <br/> <b>Coordinator Command Facade</b> <br/> <small>[Component: Rust / Clap]</small> <br/> <small>Selects start or once mode, loads throughput knobs, and creates a coordinator identity.</small>"]:::component
@@ -21,11 +21,11 @@ flowchart TD
     CycleOrchestrator["fa:fa-arrows-spin <br/> <b>Coordinator Cycle Orchestrator</b> <br/> <small>[Component: Rust]</small> <br/> <small>Runs creation recovery, lease recovery, dispatch, finalization, outbox publication, and timing logs in deterministic order.</small>"]:::component
     CreationRecovery["fa:fa-database <br/> <b>Run Creation Recovery</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Claims stale creating runs, resumes idempotent placement seeds, and activates fully seeded runs.</small>"]:::component
     LeaseRecovery["fa:fa-life-ring <br/> <b>Chunk Lease Recovery</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Recovers expired chunk leases or marks poison chunks failed after the recovery limit.</small>"]:::component
-    DispatchDrainer["fa:fa-list-check <br/> <b>Dispatch Batch Drainer</b> <br/> <small>[Component: Rust]</small> <br/> <small>Bounds chunk-window dispatch work and logs cursor backlog per coordinator cycle.</small>"]:::component
-    DispatchWorkflow["fa:fa-share-nodes <br/> <b>Run Dispatch Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Claims control cursors, prepares execution snapshots, and inserts bounded run.chunk.ready windows.</small>"]:::component
+    DispatchPass["fa:fa-list-check <br/> <b>Dispatch Pass</b> <br/> <small>[Component: Rust]</small> <br/> <small>Bounds chunk-window dispatch work and logs cursor backlog per coordinator cycle.</small>"]:::component
+    DispatchWorkflow["fa:fa-share-nodes <br/> <b>Run Dispatch Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Claims a control cursor, prepares an execution snapshot, and inserts one run.chunk.ready outbox record per selected chunk.</small>"]:::component
 
-    FinalizeDrainer["fa:fa-flag-checkered <br/> <b>Finalization Batch Drainer</b> <br/> <small>[Component: Rust]</small> <br/> <small>Bounds finalizable-run work and logs candidate backlog per coordinator cycle.</small>"]:::component
-    FinalizeWorkflow["fa:fa-calculator <br/> <b>Run Finalization Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Reads routed shard summaries, sets global gate status, and inserts run.completed events.</small>"]:::component
+    FinalizationPass["fa:fa-flag-checkered <br/> <b>Finalization Pass</b> <br/> <small>[Component: Rust]</small> <br/> <small>Bounds finalizable-run work and logs candidate backlog per coordinator cycle.</small>"]:::component
+    FinalizeWorkflow["fa:fa-calculator <br/> <b>Run Finalization Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Reads routed shard summaries, sets global gate status, and inserts a run.completed outbox record.</small>"]:::component
 
     OutboxPublisher["fa:fa-paper-plane <br/> <b>Outbox Publisher</b> <br/> <small>[Component: Rust / Tokio]</small> <br/> <small>Claims delivery batches, logs per-placement backlog, publishes with bounded concurrency, and deletes completed rows.</small>"]:::component
     EventPublisher["fa:fa-plug <br/> <b>Event Publisher Boundary</b> <br/> <small>[Component: Rust Trait]</small> <br/> <small>Separates durable outbox handling from the broker transport.</small>"]:::component
@@ -39,9 +39,9 @@ flowchart TD
         CycleOrchestrator
         CreationRecovery
         LeaseRecovery
-        DispatchDrainer
+        DispatchPass
         DispatchWorkflow
-        FinalizeDrainer
+        FinalizationPass
         FinalizeWorkflow
         OutboxPublisher
         EventPublisher
@@ -50,8 +50,8 @@ flowchart TD
     style CoordinatorRuntime stroke-dasharray: 5 5,fill:none,stroke:#1168bd,stroke-width:2px
 
     %% external containers
-    Database[("<b>Database Placements</b> <br/> <small>[Container: PostgreSQL]</small> <br/> <small>Store creation plans, control cursors, routed execution rows, shard summaries, local outbox events, and delivery queues.</small>")]:::component
-    Queue[("<b>Queue</b> <br/> <small>[Container: RabbitMQ]</small> <br/> <small>Durably stores routed run lifecycle and chunk-ready events.</small>")]:::component
+    Database[("<b>Database Placements</b> <br/> <small>[Container: PostgreSQL]</small> <br/> <small>Store creation plans, control cursors, routed execution rows, shard summaries, local outbox records, and delivery queues.</small>")]:::component
+    Queue[("<b>Queue</b> <br/> <small>[Container: RabbitMQ]</small> <br/> <small>Durably stores routed run lifecycle and chunk-ready broker messages.</small>")]:::component
 
     %% edges
     Vigilo -->|"Runs coordinator start or once through"| CommandFacade
@@ -69,20 +69,20 @@ flowchart TD
     CycleOrchestrator -->|"Then recovers"| LeaseRecovery
     LeaseRecovery -->|"Resets expired leases, inserts recovery events, or fails exhausted chunks in <br> <small>[SQL/TCP]</small>"| Database
 
-    CycleOrchestrator -->|"Then dispatches with"| DispatchDrainer
-    DispatchDrainer -->|"Claims one dispatchable run window with"| DispatchWorkflow
-    DispatchWorkflow -->|"Claims one control cursor, then updates execution-local chunks, snapshots, outbox events, and delivery rows in <br> <small>[SQL/TCP]</small>"| Database
+    CycleOrchestrator -->|"Then dispatches with"| DispatchPass
+    DispatchPass -->|"Claims one dispatchable chunk window with"| DispatchWorkflow
+    DispatchWorkflow -->|"Claims one control cursor, then updates execution-local chunks, snapshots, outbox records, and delivery rows in <br> <small>[SQL/TCP]</small>"| Database
 
-    CycleOrchestrator -->|"Then finalizes"| FinalizeDrainer
-    FinalizeDrainer -->|"Claims and finalizes one terminal run at a time with"| FinalizeWorkflow
+    CycleOrchestrator -->|"Then finalizes"| FinalizationPass
+    FinalizationPass -->|"Claims and finalizes one terminal run at a time with"| FinalizeWorkflow
     FinalizeWorkflow -->|"Reads routed shard summaries and updates the control run summary in <br> <small>[SQL/TCP]</small>"| Database
 
     CycleOrchestrator -->|"Finally publishes with"| OutboxPublisher
     OutboxPublisher -->|"Claims delivery rows, marks ledgers, deletes completed rows, and reschedules retries in <br> <small>[SQL/TCP]</small>"| Database
-    OutboxPublisher -->|"Publishes claimed events concurrently through"| EventPublisher
+    OutboxPublisher -->|"Publishes claimed event records concurrently through"| EventPublisher
     EventPublisher -->|"Uses AMQP transport"| MqPublisher
-    MqPublisher -->|"Publishes persistent routed run events to <br> <small>[JSON/AMQP]</small>"| Queue
-    Queue -->|"Streams run.chunk.ready events to"| Worker
+    MqPublisher -->|"Publishes persistent routed run messages to <br> <small>[JSON/AMQP]</small>"| Queue
+    Queue -->|"Delivers run.chunk.ready messages to"| Worker
 
     %% links
     click Vigilo "/docs/architecture/structure/components/vigilo/"

@@ -20,6 +20,20 @@ Use this profile with:
 vigilo run test --profile-file <profile.yaml> --dataset-file <dataset.yaml>
 ```
 
+## Terms On This Page
+
+| Term | Meaning here |
+| --- | --- |
+| Run profile | Versioned configuration for the target agent, evaluators, scoring, persistence, and gate behavior. |
+| Case group | Rule that selects evaluator bindings and aggregation policy for matching dataset cases. |
+| Evaluator binding | Profile entry that assigns an evaluator to a dimension, weight, blocking policy, and config. |
+| Finding | One normalized result emitted by an evaluator invocation. |
+| Dimension score | Score calculated for one profile-owned aggregation bucket. |
+| Aggregate score | Weighted total of an execution's dimension scores. |
+| Gate status | Run-level policy result; it is distinct from operational run status. |
+
+See the [Glossary](/docs/glossary) for related evaluation and runtime terms.
+
 ## Result Calculation
 
 ```text
@@ -293,5 +307,6 @@ See the repository example profile:
 
 ## Related
 
-- Dataset format: `web/docs/configuration/dataset-format.mdx`
-- Example project: `example/README.md`
+- [Dataset format](./dataset-format)
+- [Glossary](/docs/glossary)
+- Repository example: `example/README.md`

@@ -23,7 +23,7 @@ sequenceDiagram
     else Run is completed or failed
         Vigilo-->>User: Cancellation error
     else Run is already cancelled
-        Vigilo->>ControlDB: Drain dispatch cursors
+        Vigilo->>ControlDB: Mark dispatch cursors drained
         Vigilo->>ControlDB: Resolve readable execution routes
         ControlDB-->>Vigilo: Route list
         Vigilo->>ExecDB: Idempotently cancel local work by placement
@@ -31,7 +31,7 @@ sequenceDiagram
         Vigilo->>ControlDB: Refresh cancellation summary and event
         Vigilo-->>User: Success response
     else Run is pending, running, or finalizing
-        Vigilo->>ControlDB: Drain dispatch cursors
+        Vigilo->>ControlDB: Mark dispatch cursors drained
         Vigilo->>ControlDB: Resolve readable execution routes
         ControlDB-->>Vigilo: Route list
         Vigilo->>ExecDB: Cancel attempts, executions, and chunks

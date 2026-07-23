@@ -27,7 +27,7 @@ sequenceDiagram
             Vigilo->>Vigilo: Cancel consumer loop and wait for service stop
             Vigilo-->>User: Success response
         else Delivery received
-            Queue-->>Vigilo: Chunk-ready message
+            Queue-->>Vigilo: Chunk-ready broker message
             Vigilo->>Vigilo: Deserialize message payload
             Vigilo->>ControlDB: Resolve execution route
             ControlDB-->>Vigilo: Database alias and placement status

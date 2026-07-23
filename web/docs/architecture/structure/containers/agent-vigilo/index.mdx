@@ -14,15 +14,36 @@ import containerDiagram from './diagram.mmd';
 
 # Agent Vigilo Containers
 
-Briefly: what this diagram shows and where this boundary starts/stops.
+This view shows the deployable runtime boundaries: the CLI, coordinator,
+workers, PostgreSQL database placements, RabbitMQ, and the external agent target
+being evaluated.
+
+## Terms On This Page
+
+| Term | Meaning here |
+| --- | --- |
+| Container | Independently runnable process or infrastructure service in this deployment view. |
+| Coordinator | Runtime process that advances orchestration and publishes outbox event records. |
+| Worker | Runtime process that claims chunks and executes case evaluations. |
+| Database placement | One PostgreSQL target that can serve control, execution, or both roles. |
+| Broker | RabbitMQ service that delivers published messages between coordinators and workers. |
+| Agent target | External HTTP service whose behavior is being evaluated. |
+
+See the [Glossary](/docs/glossary) for data ownership and messaging terms.
 
 <Mermaid value={containerDiagram} />
 
 ## Notes
 
-- Key responsibility of this view
-- Important boundary or dependency
-- Anything intentionally omitted
+- The CLI, coordinator, and worker are modes of the same Rust application but
+  run as separate processes in distributed deployments.
+- Database placements hold durable authority. RabbitMQ carries at-least-once
+  broker deliveries but does not replace database claims or leases.
+- The coordinator inserts outbox event records in PostgreSQL and publishes them
+  as broker messages. Workers claim the chunks named by those messages before
+  doing work.
+- The external agent target is outside the Vigilo trust and persistence
+  boundary. WASM evaluators execute inside worker processes.
 
 ## Related
 

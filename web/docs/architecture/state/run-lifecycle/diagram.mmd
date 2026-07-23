@@ -16,8 +16,8 @@ flowchart TD
     DispatchGuard{Pending or running with open shard cursor?}
     DispatchLock[Claim one run-shard dispatch cursor]
     Running[Run running]
-    DispatchEvents[Insert run.started if new and shard chunk-ready window]
-    DispatchCursor[Mark selected chunks dispatched and release or drain cursor]
+    DispatchEvents[Insert run.started once and one chunk-ready outbox record per selected chunk]
+    DispatchCursor[Mark selected chunks dispatched and release or mark cursor drained]
 
     FinalizeGuard{Running or finalizing with no open chunks?}
     Finalizing[Run finalizing]

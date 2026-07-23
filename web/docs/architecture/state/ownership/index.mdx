@@ -2,10 +2,10 @@
 title: State Ownership
 sidebar_label: Ownership
 sidebar_position: 5
-description: State ownership diagram for Agent Vigilo CLI, coordinator, worker, and DB guard responsibilities.
+description: State ownership diagram for Agent Vigilo CLI, coordinator, worker, and database guard responsibilities.
 keywords:
   - Agent Vigilo state ownership
-  - DB guard responsibilities
+  - database guard responsibilities
   - coordinator worker ownership
   - evaluation state guards
   - durable workflow ownership
@@ -20,6 +20,20 @@ Which process owns each state transition and which database guard prevents confl
 
 <Mermaid value={ownershipDiagram} />
 
+## Terms On This Page
+
+| Term | Meaning here |
+| --- | --- |
+| Owner | Process that currently has the guarded authority to perform a state transition. |
+| Claim | Database transition that grants temporary authority over one work item. |
+| Lease | Claim with an expiry time; expiry permits recovery but does not by itself validate a stale write. |
+| Claim token | Opaque fencing value that must still match when a claim is renewed or settled. |
+| Row lock | PostgreSQL-enforced lock on selected rows for the duration of a transaction. |
+| Admission lock | Cooperative transaction-scoped advisory lock shared by normal shard writers and held exclusively by shard movement. |
+| Route fence | Expected database alias, placement status, and `route_version` checked before a routed write. |
+
+The [Glossary](/docs/glossary) provides the complete ownership and concurrency definitions.
+
 ## Notes
 
 - The create command owns input validation and the first durable `creating`
@@ -27,7 +41,7 @@ Which process owns each state transition and which database guard prevents confl
 - Coordinators own expired run-creation recovery, expired chunk lease recovery,
   run dispatch, run finalization, and outbox publishing.
 - Workers own chunk leases, attempt leases, execution attempt allocation, retry scheduling, and execution/attempt terminal transitions. Chunk-local worker state is addressed by `run_id + run_shard + chunk_id`.
-- DB guards are the authority boundary: creation and coordinator leases,
+- Database guards are the authority boundary: creation and coordinator leases,
   idempotent seed checks, shared run-state locks, chunk and attempt leases,
   conflict keys, current-attempt checks, worker ownership checks, and outbox
   delivery claim tokens prevent stale writes.
@@ -39,3 +53,4 @@ Which process owns each state transition and which database guard prevents confl
 - [Execution lifecycle](/docs/architecture/state/execution-lifecycle/)
 - [Outbox lifecycle](/docs/architecture/state/outbox-lifecycle/)
 - [Scale-out and shard migration](/docs/architecture/scaling)
+- [Glossary](/docs/glossary)

@@ -17,6 +17,18 @@ This guide walks through building and publishing a Rust evaluator crate to the A
 
 Need a build-first walkthrough before publishing? See [Creating Evaluators](./creating-evaluators.mdx), including the dedicated "Using Codex" section.
 
+## Terms On This Page
+
+| Term | Meaning here |
+| --- | --- |
+| Evaluator artifact | Compiled WASI Preview 2 WebAssembly component. |
+| Registry | Durable catalog of evaluator identity, metadata, contract, and artifact content. |
+| Evaluator identifier | Immutable `<namespace>/<name>:<version>` identity used by run profiles. |
+| Build profile | Named `Vigilo.toml` artifact path such as `dev` or `release`; it is not a run profile. |
+| Publish | Validate and insert a versioned evaluator artifact into the registry. |
+
+See the [Glossary](/docs/glossary) for evaluation terms used after publication.
+
 ---
 
 ## Prerequisites

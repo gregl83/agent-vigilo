@@ -11,7 +11,7 @@ config:
 flowchart TD
     %% actors
     Vigilo["fa:fa-terminal <br/> <b>Vigilo CLI</b> <br/> <small>[Container: Rust]</small> <br/> <small>Starts the worker loop or one-shot cycle.</small>"]:::component
-    Coordinator["fa:fa-compass <br/> <b>Coordinator</b> <br/> <small>[Container: Rust]</small> <br/> <small>Publishes bounded run.chunk.ready windows.</small>"]:::component
+    Coordinator["fa:fa-compass <br/> <b>Coordinator</b> <br/> <small>[Container: Rust]</small> <br/> <small>Publishes run.chunk.ready broker messages from durable outbox records.</small>"]:::component
 
     %% components
     CommandFacade["fa:fa-gear <br/> <b>Worker Command Facade</b> <br/> <small>[Component: Rust / Clap]</small> <br/> <small>Selects start or once mode and builds the evaluator loader.</small>"]:::component
@@ -57,13 +57,13 @@ flowchart TD
 
     %% external containers
     Database[("<b>Database Placements</b> <br/> <small>[Container: PostgreSQL]</small> <br/> <small>Store control evaluator metadata plus routed execution chunks, attempts, results, and aggregates.</small>")]:::component
-    Queue[("<b>Queue</b> <br/> <small>[Container: RabbitMQ]</small> <br/> <small>Delivers run.chunk.ready events to workers.</small>")]:::component
+    Queue[("<b>Queue</b> <br/> <small>[Container: RabbitMQ]</small> <br/> <small>Delivers run.chunk.ready broker messages to workers.</small>")]:::component
     TargetAgent["fa:fa-brain <br/> <b>Agent / AI Provider</b> <br/> <small>[External System]</small> <br/> <small>The model, agent wrapper, or HTTP endpoint being evaluated.</small>"]:::external
 
     %% edges
     Vigilo -->|"Runs worker start or once through"| CommandFacade
     CommandFacade -->|"Starts continuous mode with"| ServiceLoop
-    CommandFacade -->|"Runs one bounded drain pass through"| WorkerConsumer
+    CommandFacade -->|"Runs one bounded receive pass through"| WorkerConsumer
     ServiceLoop -->|"Maintains delivery stream with"| WorkerConsumer
 
     CommandFacade -->|"Creates shared access through"| RuntimeContext
@@ -73,7 +73,7 @@ flowchart TD
     EvaluatorLoader -->|"Uses registry cache and Wasm runtime from"| RuntimeContext
     EvaluatorExecutor -->|"Uses Wasm runtime from"| RuntimeContext
 
-    Coordinator -->|"Publishes chunk-ready windows to <br> <small>[JSON/AMQP]</small>"| Queue
+    Coordinator -->|"Publishes chunk-ready broker messages to <br> <small>[JSON/AMQP]</small>"| Queue
     RuntimeContext -->|"Opens messaging access to <br> <small>[AMQP]</small>"| Queue
     RuntimeContext -->|"Opens database access to <br> <small>[SQL/TCP]</small>"| Database
 

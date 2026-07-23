@@ -16,6 +16,19 @@ keywords:
 
 This guide is the recommended path for creating a single evaluator crate that can be built to WASM and executed by Agent Vigilo.
 
+## Terms On This Page
+
+| Term | Meaning here |
+| --- | --- |
+| Evaluator | Versioned WASM component that accepts canonical `input` and returns canonical `output`. |
+| WIT | WebAssembly Interface Type contract in `wit/evaluator.wit`. |
+| World | WIT boundary that groups the evaluator's imported and exported interfaces. |
+| WASI Preview 2 | Component-target runtime interface selected by `wasm32-wasip2`. |
+| Finding | One normalized observation returned in `output.results`. |
+| Evaluator identifier | Published identity in `<namespace>/<name>:<version>` format. |
+
+See the [Glossary](/docs/glossary) for result and runtime terms.
+
 ## What You Build
 
 A minimal evaluator crate should:

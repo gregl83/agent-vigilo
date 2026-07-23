@@ -20,6 +20,19 @@ Step-by-step views of how Vigilo commands move through runtime decisions and per
 
 For lifecycle and database guard views, see [State Management](/docs/architecture/state/).
 
+## Terms On This Page
+
+| Term | Meaning here |
+| --- | --- |
+| Command flow | Decisions and side effects produced by one CLI command. |
+| Coordinator cycle | One ordered iteration of recovery, dispatch, finalization, and publication work. |
+| Coordinator pass | One bounded stage within a coordinator cycle. |
+| Worker delivery | One broker delivery that identifies a chunk for a worker to claim. |
+| Outbox event record | Durable database record created with the state change it describes. |
+| Broker message | RabbitMQ message published from an outbox event record. |
+
+See the [Glossary](/docs/glossary) for ownership and routing terms used in the diagrams.
+
 ## Overview
 
 <Mermaid value={overviewDiagram} />

@@ -8,7 +8,7 @@ keywords:
   - coordinator once flow
   - evaluation orchestration cycle
   - dispatch run chunk windows
-  - publish outbox events
+  - outbox publication
 ---
 
 import Mermaid from '@theme/Mermaid';
@@ -20,8 +20,8 @@ import decisionFlowDiagram from './decision-flow.mmd';
 How `vigilo coordinator once` executes one configurable bounded orchestration
 cycle and exits. It first resumes expired `creating` runs, then performs chunk
 lease recovery, dispatch, finalization, and outbox publication. Dispatch work is
-claimed by `run_id + run_shard` cursor so each chunk-ready window is
-partition-local.
+claimed through a `run_id + run_shard` cursor, and each operation selects a
+partition-local chunk window before inserting one outbox event record per chunk.
 
 ## Execution Flow
 
@@ -40,3 +40,4 @@ partition-local.
 - [Run watch flow](/docs/architecture/flows/run/watch/)
 - [Coordinator component](/docs/architecture/structure/components/coordinator/)
 - [Container view](/docs/architecture/structure/containers/agent-vigilo/)
+- [Glossary](/docs/glossary)

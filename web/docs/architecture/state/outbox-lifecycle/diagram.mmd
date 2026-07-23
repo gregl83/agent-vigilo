@@ -8,7 +8,7 @@ config:
 ---
 flowchart TD
     StateChange[State change transaction]
-    Ledger[Outbox event ledger row]
+    Ledger[Outbox event record]
     Delivery[Delivery queue row]
     Dedupe{Dedupe key exists?}
     Ready{Delivery row available now?}

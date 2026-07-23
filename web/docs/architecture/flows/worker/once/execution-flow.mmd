@@ -19,7 +19,7 @@ sequenceDiagram
     activate Vigilo
     Vigilo->>Vigilo: Build evaluator loader
     Vigilo->>Queue: Consume one worker message
-    Queue-->>Vigilo: Chunk-ready message or no work
+    Queue-->>Vigilo: Chunk-ready broker message or no work
 
     alt No worker message
         Vigilo-->>User: Success response

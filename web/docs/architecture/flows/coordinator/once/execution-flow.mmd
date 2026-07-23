@@ -42,10 +42,10 @@ sequenceDiagram
         Vigilo->>ControlDB: Count dispatchable cursor backlog
         Vigilo->>ControlDB: Select and lock open run-shard cursor
         ControlDB-->>Vigilo: Dispatch route or no work
-        Vigilo->>ExecutionDB: Upsert run snapshot and enqueue chunk-ready window
+        Vigilo->>ExecutionDB: Upsert run snapshot and insert one chunk-ready outbox record per selected chunk
         alt Execution placement write succeeds
             ExecutionDB-->>Vigilo: Dispatch shard window result
-            Vigilo->>ControlDB: Release or drain dispatch cursor
+            Vigilo->>ControlDB: Release or mark dispatch cursor drained
         else Execution placement fails
             ExecutionDB-->>Vigilo: Database error
             Note over Vigilo,ControlDB: Cursor stays open

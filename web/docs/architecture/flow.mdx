@@ -23,28 +23,29 @@ This document describes how Agent Vigilo processes an evaluation run from start 
 At a high level, the system follows a fan-out / fan-in pattern:
 
 1. **Run** is created
-2. **Executions** are generated from a dataset cases
-3. Workers process executions via **attempts**
-4. Evaluators produce append-only results
-5. Execution aggregates are computed
-6. **Run** is finalized
-7. Completion event is published
+2. Dataset cases are grouped into shard-local **chunks**
+3. The coordinator dispatches chunks through outbox event records and RabbitMQ
+4. Workers process case **executions** through **attempts**
+5. Evaluators produce append-only findings
+6. Execution aggregates are computed
+7. The **run** is finalized
+8. Its completion event record is published as a broker message
 
 ---
 
 ## Core Concepts
 
-### Run
-A run represents a batch evaluation of a versioned agent target against a dataset and evaluation profile.
+| Term | Meaning here |
+| --- | --- |
+| Run | Durable evaluation of one dataset version with one run profile and agent target. |
+| Chunk | Bounded range of dataset cases processed under one worker claim. |
+| Execution | Durable evaluation of one dataset case against the agent target. |
+| Attempt | One worker effort to complete an execution; retries create later attempts. |
+| Evaluator finding | Append-only normalized observation emitted by an evaluator invocation. |
+| Outbox event record | Durable database row inserted in the same transaction as a state change. |
+| Broker message | RabbitMQ message published from an outbox event record. |
 
-### Execution
-An execution represents one dataset case evaluated against the target system.
-
-### Attempt
-An attempt represents a single worker’s effort to process an execution. Multiple attempts may exist due to retries or failures.
-
-### Evaluator Result
-An append-only evidence row representing one finding emitted by an evaluator invocation.
+See the [Glossary](/docs/glossary) for routing, ownership, and scoring terms.
 
 ---
 
@@ -78,7 +79,11 @@ run_chunk.run_shard = 0..127
 
 ### 2. Execution Dispatch
 
-The coordinator emits `run.chunk.ready` messages with `run_id`, `run_shard`, and `chunk_id`. Workers claim chunks and allocate due executions for the chunk:
+The coordinator selects a bounded chunk dispatch window from one run shard and
+inserts one `run.chunk.ready` outbox event record per selected chunk. The outbox
+publisher turns those records into RabbitMQ messages carrying `run_id`,
+`run_shard`, and `chunk_id`. Workers consume the broker messages, claim the
+identified chunks, and allocate due executions:
 
 ```text
 run_chunk.status = leased
@@ -169,7 +174,7 @@ execution.status = retry_scheduled
 execution.retry_after = now() + bounded exponential backoff
 ```
 
-The worker finishes the current chunk pass, summarizes the chunk's execution state from the database, and releases the chunk back to `pending` when any cases are still waiting for retry. The chunk-ready message is delayed until the next retry window instead of being treated as a worker failure.
+The worker finishes the current chunk pass, summarizes the chunk's execution state from the database, and releases the chunk back to `pending` when any cases are still waiting for retry. The chunk-ready broker message is delayed until the next retry window instead of being treated as a worker failure.
 
 When the message returns, the worker reloads the chunk cases and the execution allocation query decides which cases should run:
 
@@ -196,7 +201,7 @@ Retries are bounded by `defaults.max_attempts`. When the current attempt number 
 
 ### 7. Run Finalization
 
-Before finalization, the coordinator recovers expired chunk leases for running runs. Recoverable chunks are reset to `pending`, their current running attempts are marked `stale`, and they receive a recovery-scoped `run.chunk.ready` event. Chunks that exceed the recovery limit are marked `failed`.
+Before finalization, the coordinator recovers expired chunk leases for running runs. Recoverable chunks are reset to `pending`, their current running attempts are marked `stale`, and they receive a recovery-scoped `run.chunk.ready` outbox event record. Chunks that exceed the recovery limit are marked `failed`.
 
 The coordinator checks:
 
@@ -223,7 +228,7 @@ run.gate_status = pass | fail
 
 ### 8. Event Publication (Outbox Pattern)
 
-A run-completed event is inserted into the durable outbox ledger:
+A `run.completed` outbox event record is inserted into the durable outbox ledger:
 
 ```text
 outbox_events.status = pending
@@ -235,7 +240,8 @@ The database creates a matching hot delivery row in the same transaction:
 outbox_delivery_queue.available_at = now()
 ```
 
-A publisher process claims delivery rows, publishes the joined event payload to RabbitMQ, and waits for broker confirmation:
+The coordinator's outbox publisher claims delivery rows, publishes each joined
+event payload as a RabbitMQ message, and waits for broker confirmation:
 
 ```text
 delivery row claimed -> confirmed publish -> delete delivery row
@@ -292,7 +298,7 @@ Evaluator findings are never updated, only inserted. This provides:
 
 ### 3. Idempotent finalization
 
-Multiple workers may attempt to finalize a run.
+Multiple coordinators may attempt to finalize a run.
 
 The system ensures:
 

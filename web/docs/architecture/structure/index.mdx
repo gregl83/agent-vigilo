@@ -101,10 +101,10 @@ Agent Vigilo is structured as a distributed AI evaluation system. Runs are creat
 ## Current Runtime Shape
 
 - **CLI runtime** parses commands, initializes shared context, applies migrations, publishes evaluators, creates runs, starts services, and renders JSON or TOON output.
-- **Coordinator** recovers expired chunk leases, marks abandoned running attempts stale, claims coordinator leases, dispatches runnable chunks, finalizes completed runs, and publishes state-change events from the outbox delivery queue.
-- **Worker** consumes `run.chunk.ready` messages, claims chunk leases, allocates due attempts with worker and message ownership, renews chunk and attempt leases, delays retry-scheduled chunks until `retry_after`, invokes target agents, runs evaluator bindings, persists results, and settles RabbitMQ deliveries.
+- **Coordinator** recovers expired chunk leases, marks abandoned running attempts stale, claims coordinator-owned work, dispatches bounded chunk windows, finalizes completed runs, and publishes outbox event records as broker messages.
+- **Worker** consumes `run.chunk.ready` broker messages, claims chunk leases, allocates due attempts with worker and message ownership, renews chunk and attempt leases, delays retry-scheduled chunks until `retry_after`, invokes target agents, runs evaluator bindings, persists results, and settles RabbitMQ deliveries.
 - **PostgreSQL placements** hold control metadata and routed execution data: evaluators, datasets, runs, shard-partitioned chunks, attempts, evaluator results, execution aggregates, coordinator leases, outbox ledger rows, and hot delivery rows.
-- **RabbitMQ** distributes worker-ready chunk messages and receives confirmed durable event publications from the outbox publisher.
+- **RabbitMQ** distributes chunk-ready broker messages published from durable outbox event records.
 - **Wasmtime** executes versioned WASI Preview 2 evaluator components with per-invocation store limits and a process-wide active-evaluation semaphore.
 
 ## Reliability Boundaries
@@ -141,6 +141,7 @@ Runtime behavior and state transitions are documented outside the structure sect
 - [Vigilo.toml evaluator manifest](/docs/configuration/vigilo-toml)
 - [Creating evaluators](/docs/guides/creating-evaluators)
 - [Publishing evaluators](/docs/guides/publishing)
+- [Glossary](/docs/glossary)
 
 ## Reading Order
 

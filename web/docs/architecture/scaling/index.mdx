@@ -2,7 +2,7 @@
 title: Scaling
 sidebar_label: Scaling
 sidebar_position: 0
-description: How Agent Vigilo uses logical run shards, placement metadata, and routed execution storage to scale PostgreSQL-backed evaluation runs.
+description: How Agent Vigilo uses logical run shards, placement metadata, and routed execution databases to scale PostgreSQL-backed evaluation runs.
 keywords:
   - Agent Vigilo scale out
   - evaluation shard migration
@@ -19,6 +19,50 @@ to additional PostgreSQL placements without changing coordinator or worker code.
 
 The design principle is simple: **control metadata decides where work lives;
 workers and coordinators follow the stored route.**
+
+## Routing At A Glance
+
+```text
+control database
+  -> shard placement (run_id + run_shard -> database alias + route_version)
+  -> DatabaseRouter
+  -> execution database pool
+  -> shard-local chunks, executions, results, summaries, and outbox records
+```
+
+- The system has 128 possible logical shard numbers, but a run uses only the
+  shards assigned to its chunks.
+- Each used run shard has one shard-placement row and, after creation, one
+  dispatch cursor.
+- One dispatch operation claims one cursor, selects a bounded chunk window from
+  that run shard, and inserts one `run.chunk.ready` outbox event record per
+  selected chunk.
+- `run.started` is inserted at most once per run in the control database; it is
+  not inserted once per shard.
+- Many run shards can route to the same database alias. A coordinator pass can
+  therefore report counts for several aliases while each routed operation still
+  targets one database at a time.
+
+The run shard itself is not leased by normal dispatch. The coordinator claims
+the shard's dispatch cursor while it prepares one window. Rebalance is a
+separate workflow that claims one persisted rebalance item for a targeted run
+shard before invoking the single-shard move operation.
+
+## Terms On This Page
+
+| Term | Meaning here |
+| --- | --- |
+| Run shard | Stable logical segment identified by `run_id + run_shard`. |
+| Database placement | Catalog entry for one PostgreSQL target, named by a database alias. |
+| Shard placement | Authoritative mapping from one used run shard to a database alias, status, and route version. |
+| Database router | Process-local resolver that turns stored placement metadata into a PostgreSQL pool. |
+| Execution route | Resolved shard placement plus its current execution database pool. |
+| Route version | Per-shard-placement generation incremented when its alias or status changes. |
+| Dispatch cursor | Control-database progress row claimed while preparing the next window for one run shard. |
+| Chunk dispatch window | Bounded set of pending chunks selected from one run shard in one dispatch operation. |
+| Admission lock | Cooperative advisory lock shared by normal shard writers and held exclusively by shard movement. |
+
+See the [Glossary](/docs/glossary) for full definitions and cardinality.
 
 ## Default Posture
 
@@ -39,19 +83,19 @@ role = control_and_shard
 status = active
 ```
 
-All logical shards route to `primary` until another shard-capable placement is
+All used run shards route to `primary` until another shard-capable placement is
 added and selected for new or moved run shards.
 
-## Control And Execution Storage
+## Control And Execution Databases
 
 Agent Vigilo separates database responsibility from database location.
 
-- **Control storage** owns evaluator registry rows, global run metadata,
+- The **control database** owns evaluator registry rows, global run metadata,
   placement catalog rows, recoverable run-creation plans, dispatch cursors,
   coordinator leases, and global run lifecycle updates.
-- **Execution storage** owns high-volume run work: chunks, run snapshots,
+- An **execution database** owns high-volume run work: chunks, run snapshots,
   executions, attempts, aggregates, evaluator results, shard summaries, and
-  chunk-ready outbox events.
+  chunk-ready outbox event records.
 - **Database placements** name PostgreSQL targets such as `primary` or
   `shard_001`.
 - **Shard placements** map one `run_id + run_shard` pair to a database
@@ -61,7 +105,7 @@ There is one active control-capable placement. Additional placements can have
 role `shard` and store execution data. Environment variables hold connection
 secrets; the placement catalog in PostgreSQL is the routing authority.
 
-Placement status and role are checked in control storage before Vigilo admits
+Placement status and role are checked in the control database before Vigilo admits
 new database work. Disabling a placement therefore blocks new pool lookups
 even when that process already has a pool for the alias. Work that already
 acquired the pool may finish.
@@ -102,14 +146,14 @@ does not recalculate `run_shard`; it changes stored placement rows.
 Run creation persists a recoverable control plan before it writes to any remote
 execution placement:
 
-- Control storage receives the canonical dataset metadata, a non-dispatchable
+- The control database receives the canonical dataset metadata, a non-dispatchable
   `creating` run, shard placements, one creation-ledger row per selected
   database, and the exact temporary chunk plan.
 - The shard assignment policy chooses the execution placement for each used
   `run_shard` and persists the result in `shard_placements`.
 - Each selected execution placement receives local prerequisites and only its
   pending chunks in one idempotent transaction. A committed seed can therefore
-  be applied again safely if the process fails before control storage records
+  be applied again safely if the process fails before the control database records
   that placement as seeded.
 - After every placement is seeded, one control transaction creates dispatch
   cursors, changes the run to `pending`, and removes the temporary chunk plan.
@@ -126,14 +170,14 @@ execution placement:
 
 Coordinator dispatch is route-constrained:
 
-- Control storage claims one open `run_id + run_shard` dispatch cursor with
+- The control database claims one open `run_id + run_shard` dispatch cursor with
   `FOR UPDATE SKIP LOCKED` and retains that transaction through the routed
   write. Running dispatches share the run lifecycle lock; the initial
   pending-to-running transition is exclusive.
-- The database service resolves that shard placement to an execution pool.
-- The execution placement upserts `run_snapshots`, marks pending chunks
-  dispatched, and writes `run.chunk.ready` outbox events.
-- The control cursor is released or marked drained after the execution
+- The database router resolves that shard placement to an execution database pool.
+- The execution database upserts `run_snapshots`, marks pending chunks
+  dispatched, and inserts `run.chunk.ready` outbox event records.
+- The control cursor is released or marked `drained` after the execution
   transaction commits.
 - If an execution placement operation fails, the cursor remains open and that
   database alias is excluded from the rest of the current dispatch pass.
@@ -145,13 +189,13 @@ Workers stay chunk-local:
 - The worker resolves the execution route once, then claims chunks, loads the
   local run snapshot and case data, persists attempts/results/aggregates, and
   refreshes the shard summary in that execution placement.
-- Evaluator registry metadata remains a control-plane read.
+- Evaluator registry metadata remains a control-database read.
 
 Finalization fans in:
 
 - Each execution placement maintains `run_shard_summaries`.
 - The coordinator reads routed summaries for the run.
-- Control storage claims the run without waiting behind active dispatch
+- The control database claims the run without waiting behind active dispatch
   lifecycle locks. The global outcome and `run.completed` event are written
   only while that coordinator still owns an unexpired finalization lease.
 - A failed placement read defers that run without discarding summaries already
@@ -160,30 +204,31 @@ Finalization fans in:
 
 Cancellation fans out:
 
-- Control storage marks the run cancelled and drains dispatch cursors first.
+- The control database marks the run cancelled and marks its dispatch cursors
+  `drained` first.
 - The workflow resolves the run's execution placements and cancels local
   chunks, executions, and attempts in each placement with bounded fanout. Each
   group holds shared movement admission, revalidates its route fences, and
   refreshes shard summaries in the cancellation transaction.
-- `run.cancelled` remains a control-plane event.
+- `run.cancelled` remains a control-database outbox event record.
 
 Status and watch reads fan in lightweight progress:
 
 - The control run row remains the authoritative lifecycle record.
 - While a run is `creating`, reads report placement counts, attempts, and the
-  latest creation error from control storage without contacting unseeded
+  latest creation error from the control database without contacting unseeded
   execution databases.
 - Live progress is read from routed `run_shard_summaries` when available.
 - Payloads include `data.live_progress` and progress-source metadata so callers
   can distinguish control-only state from execution-shard progress.
 
-Outbox publication is local to the database where the state changed. Control
-events publish from the control outbox. Execution events publish from the
-execution placement that owns the changed rows. Lease recovery and outbox
+Outbox records are local to the database where the state changed. Control event
+records publish from the control database. Execution event records publish from
+the execution database that owns the changed rows. Lease recovery and outbox
 publication iterate placements independently; a failed alias is logged and
 skipped while healthy aliases finish the pass.
 
-## Control-Plane Scale
+## Control Database Scale
 
 The control database stays singular and authoritative. It is expected to scale
 vertically first, while execution rows spread across shard-capable placements.
@@ -255,13 +300,19 @@ Routes are immutable while their run is `creating`; move and direct placement
 changes are rejected until creation reaches `pending` or `failed`. Rebalance
 plans omit creating runs for the same reason.
 
-The normal move takes an exclusive transaction-scoped write-admission lock on
-the source shard, revalidates its route fence, and marks the placement `moving`.
-Worker claims, dispatch writes, and routed cancellation cleanup take shared
-admission and revalidate the same alias, status, and `route_version`, so a stale
-source route cannot write after movement begins. The move then checks for active
-leased or running work, copies and verifies the shard, and compare-and-swaps the
-route to the target alias with status `active`.
+The normal move takes the exclusive form of a transaction-scoped PostgreSQL
+advisory admission lock for the source shard, revalidates its route fence, and
+marks the placement `moving`. Worker claims, dispatch writes, and routed
+cancellation cleanup take the shared form of the same lock and revalidate the
+alias, status, and `route_version`. The lock is cooperative: every protected
+writer must explicitly acquire it. PostgreSQL does not infer which rows belong
+to the shard.
+
+The route fence is the expected alias, placement status, and `route_version`.
+After movement changes any of those values, a writer holding an older route is
+rejected before it changes shard-owned rows. With the fence established, the
+move checks for active leased or running work, copies and verifies the shard,
+and compare-and-swaps the route to the target alias with status `active`.
 
 After claim admission commits, an opaque chunk claim token and renewable
 deadline carry worker authority. Attempt allocation and result persistence lock
@@ -270,8 +321,8 @@ worker attempt. Recovery clears the chunk token, stales the attempt, and updates
 any failed-shard summary atomically. Terminal worker settlement and cancellation
 also refresh shard summaries in the transaction that clears active work.
 
-When active work exists, the route stays `moving` while the admitted work
-drains; re-run the move afterward to resume it. `--force` remains accepted for
+When active work exists, the route stays `moving` while already admitted work
+finishes; re-run the move afterward to resume it. `--force` remains accepted for
 CLI compatibility but cannot bypass the active-work or write-admission fence.
 
 Every route alias or status change increments `shard_placements.route_version`.
@@ -301,7 +352,7 @@ dataset_version_cases
 runs
 ```
 
-`run_shard_dispatch_cursors` stays in control storage and is never copied
+`run_shard_dispatch_cursors` stays in the control database and is never copied
 between execution placements. Source cleanup is intentionally outside the move
 command so teams can apply their own backup and retention policy.
 
@@ -317,14 +368,18 @@ vigilo shard rebalance verify <operation_id> --max-items 25
 vigilo shard rebalance cancel <operation_id>
 ```
 
-A rebalance plan records one item per `run_id + run_shard` in control storage.
-Apply is resumable and bounded. Each item is atomically claimed immediately
-before processing, and only pending items or running items with expired leases
-are eligible. Completion, failure, claimed cancellation, and drain deferral
-require the claim's opaque fencing token. A shard with active work returns its
-item to `pending` while its route remains `moving`; a later apply resumes it at
-the expected next route version. Each item still uses the single-shard move
-workflow, including route fencing, copy verification, and active-work guards.
+A rebalance plan records one item per targeted `run_id + run_shard` in the
+control database.
+Apply is resumable and bounded. The `rebalance apply` process atomically claims
+one item immediately before processing it, completes that item's single-shard
+move, and then selects another item. Multiple apply processes can work on the
+same plan because their item claims do not overlap. Only pending items or
+running items with expired leases are eligible. Completion, failure, claimed
+cancellation, and active-work deferral require the claim's opaque fencing
+token. A shard with active work returns its item to `pending` while its route
+remains `moving`; a later apply resumes it at the expected next route version.
+Each item still uses the single-shard move workflow, including route fencing,
+copy verification, and active-work guards.
 Plans verify the stored `route_version` before moving an item so stale plans
 fail narrowly instead of rewriting an unexpected route. An expired apply claim
 can resume its exact source route when the route is still `moving` at the
@@ -343,7 +398,7 @@ Implemented today:
   status/watch progress, results, export, route inspection, route fencing,
   placement assignment policy, explicit shard move, and persisted bulk
   rebalance operations with leased concurrent apply claims.
-- Control-plane scale hardening through outbox queue indexing and structured
+- Control-database scale hardening through outbox queue indexing and structured
   backlog/timing logs for coordinator and routing hot paths.
 - Live placement admission checks that reject disabled targets and role changes
   without discarding reusable connection pools.

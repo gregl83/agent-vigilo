@@ -43,7 +43,7 @@ sequenceDiagram
                 Vigilo->>ExecutionDB: Dispatch routed chunk window
                 alt Execution placement succeeds
                     ExecutionDB-->>Vigilo: Dispatch shard window result
-                    Vigilo->>ControlDB: Release or drain cursor
+                    Vigilo->>ControlDB: Release or mark cursor drained
                 else Execution placement fails
                     Note over Vigilo,ControlDB: Cursor stays open
                     Vigilo->>Vigilo: Count failure and exclude alias for this pass

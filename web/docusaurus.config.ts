@@ -127,6 +127,11 @@ const config: Config = {
           label: 'Guides',
         },
         {
+          to: '/docs/glossary',
+          label: 'Glossary',
+          position: 'left',
+        },
+        {
           href: 'https://github.com/gregl83/agent-vigilo',
           label: 'GitHub',
           position: 'right',
@@ -146,6 +151,10 @@ const config: Config = {
             {
               label: 'Architecture',
               to: '/docs/architecture/structure/context/',
+            },
+            {
+              label: 'Glossary',
+              to: '/docs/glossary',
             },
           ],
         },

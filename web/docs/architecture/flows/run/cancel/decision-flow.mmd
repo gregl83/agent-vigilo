@@ -13,7 +13,7 @@ flowchart TD
     RequestCancel[Mark control cancellation requested]
     Found{Run exists?}
     Status{Run status?}
-    Drain[Drain control dispatch cursors]
+    Drain[Mark control dispatch cursors drained]
     Routes[Resolve execution routes]
     CancelWork[Cancel execution-local work by placement]
     Summary[Refresh routed cancellation summary]

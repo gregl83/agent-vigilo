@@ -21,7 +21,7 @@ flowchart TD
     Dispatch[Dispatch chunk windows]
     RecoverLeases[Recover expired chunk leases]
     Finalize[Finalize terminal runs]
-    Publish[Publish outbox events]
+    Publish[Publish outbox records as broker messages]
 
     ChunkClaim[Claim and release chunks]
     Execute[Allocate attempts, schedule retries, and persist results]

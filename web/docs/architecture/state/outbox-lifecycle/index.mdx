@@ -18,17 +18,30 @@ import outboxLifecycleDiagram from './diagram.mmd';
 
 How durable outbox ledger rows and hot delivery rows make state-change events publishable, retryable, and idempotent.
 
+## Terms On This Page
+
+| Term | Meaning here |
+| --- | --- |
+| Outbox event record | Durable `outbox_events` row inserted with a state change. |
+| Delivery row | Temporary `outbox_delivery_queue` work item used to publish an event record. |
+| Publish claim | Time-bounded ownership of a delivery row, fenced by `claim_token`. |
+| Broker message | RabbitMQ message produced from an outbox event record. |
+| Dedupe key | Stable logical event identity, also used as the AMQP message id. |
+| At-least-once delivery | Contract that permits broker redelivery and requires idempotent consumers. |
+
+See the [Glossary](/docs/glossary) for messaging and ownership terms.
+
 <Mermaid value={outboxLifecycleDiagram} />
 
 ## Notes
 
-- State workflows insert durable events into `outbox_events` in the same database operation as the state change.
-- An insert trigger creates one `outbox_delivery_queue` row for each new event; this is the hot queue scanned by coordinators.
+- State workflows insert durable event records into `outbox_events` in the same database transaction as the state change.
+- An insert trigger creates one `outbox_delivery_queue` row for each new event record; this is the hot queue scanned by coordinators.
 - The publisher claims delivery rows with `available_at <= now()` and `FOR UPDATE SKIP LOCKED`, using the sharded delivery queue index for the hot claim path.
 - A claim assigns a `claim_token`, sets `claimed_until`, and moves the delivery row `available_at` into the future as a publish lease.
 - Claimed batches are published with bounded concurrency controlled by the coordinator outbox publish parallelism setting.
 - RabbitMQ publication declares durable queues and bindings before publish, uses persistent messages, sets the outbox `dedupe_key` as the AMQP message id, publishes with mandatory routing, and waits for publisher confirmation.
-- Successful publishes mark the ledger event `published` and delete the delivery row only when the delivery row still has the same `claim_token`; failed publishes clear the claim and return the delivery row to retry with a delay and error message.
+- Successful publishes mark the ledger event record `published` and delete the delivery row only when the delivery row still has the same `claim_token`; failed publishes clear the claim and return the delivery row to retry with a delay and error message.
 - Broker delivery is at-least-once. Exactly-once effects are managed by idempotency guards: outbox `dedupe_key`, fenced publisher claims, chunk-claim checks, current-attempt and live-attempt-lease authority checks, and evaluator-result uniqueness.
 
 ## Related

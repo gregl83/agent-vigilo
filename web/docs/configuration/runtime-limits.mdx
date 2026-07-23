@@ -12,9 +12,22 @@ keywords:
 
 These process-level settings bound evaluator execution resource use. They can be supplied as CLI flags or environment variables.
 
+## Terms On This Page
+
+| Term | Meaning here |
+| --- | --- |
+| In-flight chunk | Chunk-ready broker delivery currently being processed by one worker process. |
+| Prefetch | RabbitMQ limit on unacknowledged deliveries reserved by one consumer. |
+| Chunk parallelism | Number of case executions processed concurrently inside one claimed chunk. |
+| Wasm store | Fresh Wasmtime execution state created for one evaluator invocation. |
+| Fuel | Deterministic Wasmtime instruction budget for one evaluator invocation. |
+| Evaluator semaphore | Process-local cap on concurrently active Wasm evaluator invocations. |
+
+See the [Glossary](/docs/glossary) for chunk, attempt, and broker-message terms.
+
 ## Worker Chunk Concurrency
 
-`vigilo worker start` processes chunk-ready messages with bounded per-process concurrency. The default keeps one chunk in flight per worker process, which matches the safest local/dev posture and scales horizontally by running more workers. Larger deployments can raise the limit to improve process utilization when chunks are uneven, agent calls are I/O-bound, or retry waits create tail latency.
+`vigilo worker start` processes chunk-ready broker messages with bounded per-process concurrency. The default keeps one chunk in flight per worker process, which matches the safest local/dev posture and scales horizontally by running more workers. Larger deployments can raise the limit to improve process utilization when chunks are uneven, agent calls are I/O-bound, or retry waits create tail latency.
 
 | Flag | Environment | Default | Purpose |
 | --- | --- | ---: | --- |

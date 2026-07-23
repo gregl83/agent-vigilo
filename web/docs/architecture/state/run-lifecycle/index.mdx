@@ -28,7 +28,7 @@ How `runs.status` and `runs.gate_status` move through creation, dispatch, finali
 - Coordinators claim expired creation leases before dispatch work and resume
   pending placement seeds with the original `run_id`. Persisted-data conflicts
   fail creation without opening dispatch cursors.
-- Coordinator dispatch claims an open `run_id + run_shard` cursor, marks a new `pending` run as `running`, and then enqueues a bounded shard-local chunk-ready window.
+- Coordinator dispatch claims an open `run_id + run_shard` cursor, marks a new `pending` run as `running`, selects a bounded shard-local chunk window, and inserts one `run.chunk.ready` outbox event record per selected chunk.
 - Before dispatch and finalization, the coordinator recovers expired worker chunk leases or marks exhausted chunks failed.
 - Finalization only claims runs whose chunks are all terminal and whose finalization lease is open; `pending` or `leased` chunks keep the run out of finalization, including chunks waiting for execution retry windows.
 - Cancellation applies to `pending`, `running`, and `finalizing` runs. A

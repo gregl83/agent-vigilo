@@ -20,6 +20,20 @@ Use this dataset with:
 vigilo run test --profile-file <profile.yaml> --dataset-file <dataset.yaml>
 ```
 
+## Terms On This Page
+
+| Term | Meaning here |
+| --- | --- |
+| Dataset | Versioned collection of evaluation cases. |
+| Case | Immutable input, optional expected output, and routing metadata. |
+| Input | Data sent to the configured agent target. |
+| Expected output | Optional oracle data available to evaluators, not sent to the target agent. |
+| Task type | Case label used by automatic run-profile matching. |
+| Case group | Optional explicit selection of a run-profile case group. |
+| Tags | Case labels used by `tags_any` and `tags_all` matching rules. |
+
+See the [Glossary](/docs/glossary) for related evaluation and runtime terms.
+
 ## File Format
 
 The CLI accepts YAML or JSON.
@@ -90,5 +104,6 @@ See the repository sample dataset:
 
 ## Related
 
-- Run profile configuration: `web/docs/configuration/run-profile.mdx`
-- Example project: `example/README.md`
+- [Run profile configuration](./run-profile)
+- [Glossary](/docs/glossary)
+- Repository example: `example/README.md`

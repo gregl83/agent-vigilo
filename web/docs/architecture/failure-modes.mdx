@@ -25,11 +25,11 @@ run `failed` without making it dispatchable.
 
 ## Worker crash
 
-Chunk messages are delivered at least once. A worker holds the RabbitMQ delivery unacked while it owns the chunk lease, and it renews both the chunk lease and the running attempt leases while processing. If the worker exits before acknowledgement, RabbitMQ may redeliver the message and the next worker must win the database chunk claim by `run_id + run_shard + chunk_id` before doing work. The coordinator also scans expired chunk leases, marks current running attempts stale, requeues recoverable chunks with recovery-scoped `run.chunk.ready` events, and marks chunks failed after the recovery limit.
+Chunk-ready broker messages are delivered at least once. A worker holds the RabbitMQ delivery unacked while it owns the chunk lease, and it renews both the chunk lease and the running attempt leases while processing. If the worker exits before acknowledgement, RabbitMQ may redeliver the message and the next worker must win the database chunk claim by `run_id + run_shard + chunk_id` before doing work. The coordinator also scans expired chunk leases, marks current running attempts stale, requeues recoverable chunks with recovery-scoped `run.chunk.ready` outbox event records, and marks chunks failed after the recovery limit.
 
 ## Duplicate delivery
 
-Duplicate broker deliveries are allowed. Exactly-once effects are managed in the database: chunks can only be claimed from an open or expired lease, recovered chunk-ready events carry unique recovery dedupe keys, executions only accept terminal transitions from the current attempt id, attempt number, worker id, and live attempt lease, and evaluator findings are unique per run, attempt, evaluator, and finding index.
+Duplicate broker deliveries are allowed. Exactly-once effects are managed in the database: chunks can only be claimed from an open or expired lease, recovered chunk-ready outbox event records carry unique recovery dedupe keys, executions only accept terminal transitions from the current attempt id, attempt number, worker id, and live attempt lease, and evaluator findings are unique per run, attempt, evaluator, and finding index.
 
 ## Outbox publisher crash
 
@@ -45,7 +45,13 @@ Worker persistence batches are guarded by current-attempt and live-attempt-lease
 
 ## Execution retry waits
 
-Failed case attempts that still have retry budget are stored as `retry_scheduled` with a bounded `retry_after` timestamp. Workers do not keep spinning on those rows: they release the chunk, delay the chunk-ready message until the next retry window, and re-check the database before creating another attempt. `defaults.max_attempts` closes the execution retry loop; actual worker processing failures still use the bounded RabbitMQ failure retry budget and then quarantine or fail the chunk.
+Failed case attempts that still have retry budget are stored as `retry_scheduled` with a bounded `retry_after` timestamp. Workers do not keep spinning on those rows: they release the chunk, delay the chunk-ready broker message until the next retry window, and re-check the database before creating another attempt. `defaults.max_attempts` closes the execution retry loop; actual worker processing failures still use the bounded RabbitMQ failure retry budget and then quarantine or fail the chunk.
+
+## Related
+
+- [State ownership](/docs/architecture/state/ownership/)
+- [Outbox lifecycle](/docs/architecture/state/outbox-lifecycle/)
+- [Glossary](/docs/glossary)
 
 ## Evaluator resource exhaustion
 

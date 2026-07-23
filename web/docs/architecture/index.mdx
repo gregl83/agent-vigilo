@@ -14,6 +14,19 @@ keywords:
 
 Agent Vigilo is a distributed AI evaluation runtime built around durable state, explicit worker/coordinator ownership, isolated WASM evaluators, and retry-safe event publication.
 
+## Terms On This Page
+
+| Term | Meaning here |
+| --- | --- |
+| CLI | User and automation entry point for evaluator, run, shard, coordinator, and worker commands. |
+| Coordinator | Process that advances durable orchestration, recovery, dispatch, finalization, and outbox publication. |
+| Worker | Process that claims chunks, invokes the agent target and evaluators, and persists results. |
+| Control database | PostgreSQL role that owns global run and routing state. |
+| Execution database | PostgreSQL role that owns shard-local execution work and results. |
+| Broker | RabbitMQ transport that delivers published chunk-ready broker messages to workers. |
+
+See the [Glossary](/docs/glossary) for the complete vocabulary and term cardinality.
+
 ## Core Views
 
 <div className="row">
@@ -43,7 +56,7 @@ Agent Vigilo is a distributed AI evaluation runtime built around durable state, 
     <div className="card">
       <div className="card__body">
         <h3>State Management</h3>
-        <p>Database-backed lifecycle diagrams for runs, chunks, attempts, executions, outbox events, and ownership guards.</p>
+        <p>Database-backed lifecycle diagrams for runs, chunks, attempts, executions, outbox event records, and ownership guards.</p>
       </div>
       <div className="card__footer">
         <a className="button button--primary button--block" href="/docs/architecture/state/">Open State</a>
@@ -104,3 +117,4 @@ Agent Vigilo is a distributed AI evaluation runtime built around durable state, 
 4. [Command Flows](./flows/)
 5. [Failure Modes](./failure-modes)
 6. [Scaling](./scaling)
+7. [Glossary](/docs/glossary)

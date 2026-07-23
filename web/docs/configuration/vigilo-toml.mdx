@@ -14,6 +14,18 @@ keywords:
 
 `Vigilo.toml` tells `vigilo` how to prepare and publish an evaluator WebAssembly component. It lives beside the evaluator crate `Cargo.toml`.
 
+## Terms On This Page
+
+| Term | Meaning here |
+| --- | --- |
+| Package manifest | `Cargo.toml` file that supplies evaluator crate identity and version. |
+| Evaluator manifest | `Vigilo.toml` file that supplies artifact paths, WIT expectations, and publish metadata. |
+| WIT contract | Interface definition that the compiled evaluator component must implement. |
+| Build profile | Named artifact selection such as `dev` or `release`; distinct from an evaluation run profile. |
+| Evaluator identifier | Published `<namespace>/<name>:<version>` registry identity. |
+
+See the [Glossary](/docs/glossary) for evaluator and run terminology.
+
 ---
 
 ## File Location
@@ -187,3 +199,4 @@ vigilo evaluators publish ./evaluators/my-evaluator --release
 - [Creating Evaluators](../guides/creating-evaluators.mdx)
 - [Run Profile Configuration](./run-profile.mdx)
 - [Dataset Format](./dataset-format.mdx)
+- [Glossary](/docs/glossary)
