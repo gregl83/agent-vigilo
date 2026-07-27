@@ -205,7 +205,7 @@ impl Executable for Command {
 /// 2. recover expired worker chunk leases
 /// 3. atomically start pending runs and dispatch bounded chunk windows
 /// 4. claim/finalize finalizable runs (bounded batch)
-/// 5. publish bounded batches of pending outbox event records from active placements
+/// 5. publish bounded batches of pending outbox records from serviceable placements
 async fn run_coordinator_cycle(
     context: Context,
     coordinator_id: Uuid,
@@ -316,10 +316,12 @@ async fn recover_expired_chunk_leases(
     debug!(coordinator_id = %coordinator_id, "recovering expired chunk leases");
 
     let alias_list_started = Instant::now();
-    let aliases = database_router.active_execution_database_aliases().await?;
+    let aliases = database_router
+        .serviceable_execution_database_aliases()
+        .await?;
     debug!(
         coordinator_id = %coordinator_id,
-        active_execution_placement_count = aliases.len(),
+        serviceable_execution_placement_count = aliases.len(),
         active_execution_alias_list_ms = alias_list_started.elapsed().as_millis() as u64,
         "listed active execution placements for recovery"
     );
@@ -407,7 +409,7 @@ async fn dispatch_ready_chunk_windows(
     // A failed alias is excluded after one attempt, so this allowance keeps
     // placement failures from reducing the successful-window budget.
     let placement_failure_allowance = database_router
-        .active_execution_database_aliases()
+        .serviceable_execution_database_aliases()
         .await?
         .len();
     let dispatch_attempt_limit = config
@@ -576,10 +578,12 @@ async fn publish_outbox_events(
     coordinator_id: Uuid,
 ) -> anyhow::Result<PlacementPassResult<OutboxPublishStats>> {
     let alias_list_started = Instant::now();
-    let aliases = database_router.active_outbox_database_aliases().await?;
+    let aliases = database_router
+        .serviceable_outbox_database_aliases()
+        .await?;
     debug!(
         coordinator_id = %coordinator_id,
-        active_outbox_placement_count = aliases.len(),
+        serviceable_outbox_placement_count = aliases.len(),
         active_outbox_alias_list_ms = alias_list_started.elapsed().as_millis() as u64,
         "listed active outbox placements"
     );

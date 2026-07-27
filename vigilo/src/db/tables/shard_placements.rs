@@ -170,12 +170,15 @@ pub(crate) async fn list_shard_placements_for_run(
     Ok(placements)
 }
 
-pub(crate) async fn insert_active_shard_placement(
-    db: &PgPool,
+pub(crate) async fn insert_active_shard_placement<'e, E>(
+    executor: E,
     run_id: Uuid,
     run_shard: i16,
     database_alias: &str,
-) -> anyhow::Result<ShardPlacement> {
+) -> anyhow::Result<ShardPlacement>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let placement = sqlx::query_as::<_, ShardPlacement>(
         r#"
         INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
@@ -186,7 +189,7 @@ pub(crate) async fn insert_active_shard_placement(
     .bind(run_id)
     .bind(run_shard)
     .bind(database_alias)
-    .fetch_one(db)
+    .fetch_one(executor)
     .await?;
 
     Ok(placement)

@@ -362,7 +362,7 @@ pub(crate) async fn claim_next_dispatch_route(
           ON dp.alias = sp.database_alias
         WHERE c.status = 'open'
           AND sp.status = 'active'
-          AND dp.status = 'active'
+          AND dp.status IN ('active', 'draining')
           AND dp.role IN ('shard', 'control_and_shard')
           AND NOT (sp.database_alias = ANY($1::text[]))
           AND (
@@ -411,7 +411,7 @@ pub(crate) async fn count_dispatch_cursor_backlog(db: &PgPool) -> anyhow::Result
           ON dp.alias = sp.database_alias
         WHERE c.status = 'open'
           AND sp.status = 'active'
-          AND dp.status = 'active'
+          AND dp.status IN ('active', 'draining')
           AND dp.role IN ('shard', 'control_and_shard')
           AND (
               r.status = 'running'::run_status
@@ -1402,6 +1402,42 @@ mod tests {
             .unwrap();
 
         assert!(route.is_none());
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+    async fn select_next_dispatch_route_includes_draining_database_owner(pool: PgPool) {
+        let run_id = seed_pending_run(&pool, &[(0, 1)]).await;
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'draining')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            UPDATE shard_placements
+            SET database_alias = 'shard_001',
+                updated_at = now()
+            WHERE run_id = $1::uuid
+              AND run_shard = 0
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let route = select_next_dispatch_route(&pool, &[])
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(route.database_alias, "shard_001");
+        assert_eq!(count_dispatch_cursor_backlog(&pool).await.unwrap(), 1);
     }
 
     #[sqlx::test(migrations = "../migrations")]

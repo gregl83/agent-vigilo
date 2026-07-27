@@ -22,12 +22,15 @@ workers and coordinators follow the stored route.**
 
 ## Routing At A Glance
 
-```text
-control database
-  -> shard placement (run_id + run_shard -> database alias + route_version)
-  -> DatabaseRouter
-  -> execution database pool
-  -> shard-local chunks, executions, results, summaries, and outbox records
+```mermaid
+flowchart LR
+    control[("Control database")]
+    route["Shard placement<br/>run_id + run_shard<br/>alias + route_version"]
+    router["DatabaseRouter"]
+    target[("Execution database")]
+    data["Chunks, executions, results,<br/>summaries, and outbox"]
+
+    control --> route --> router --> target --> data
 ```
 
 - The system has 128 possible logical shard numbers, but a run uses only the
@@ -105,10 +108,11 @@ There is one active control-capable placement. Additional placements can have
 role `shard` and store execution data. Environment variables hold connection
 secrets; the placement catalog in PostgreSQL is the routing authority.
 
-Placement status and role are checked in the control database before Vigilo admits
-new database work. Disabling a placement therefore blocks new pool lookups
-even when that process already has a pool for the alias. Work that already
-acquired the pool may finish.
+Placement status and role are checked in the control database before Vigilo
+admits work. An `active` placement accepts new shard ownership. A `draining`
+placement rejects new ownership but remains serviceable for shards it already
+owns, including dispatch, workers, recovery, reads, outbox publication, and
+movement away from the placement. A `disabled` placement is not serviceable.
 
 Connection parameters are process-lifetime configuration. Adding an alias,
 changing `database_url_env`, changing its URL value, or rotating credentials
@@ -272,6 +276,52 @@ VIGILO_SHARD_ASSIGNMENT_POLICY=spread-active
 deterministically assigns used logical shards across active shard-capable
 placements and stores each assignment in `shard_placements`.
 
+### Placement lifecycle
+
+Database-placement status controls whether a physical PostgreSQL target can
+receive or serve shard ownership. It does not move any shard rows itself.
+
+```mermaid
+stateDiagram-v2
+    state "Active<br/>accepts and serves ownership" as active
+    state "Draining<br/>serves existing ownership only" as draining
+    state "Disabled<br/>serves no runtime work" as disabled
+
+    [*] --> active: databases add
+    active --> draining: databases drain
+    draining --> disabled: databases disable
+```
+
+| Database status | New run shard | Placement set or move target | Existing owned shard |
+| --- | --- | --- | --- |
+| `active` | Allowed | Allowed | Served |
+| `draining` | Rejected | Rejected | Served |
+| `disabled` | Rejected | Rejected | Blocked |
+
+New-ownership writes take a shared row lock on the target placement through
+route commit. Drain and disable take an exclusive row lock on the same catalog
+row. This serializes a concurrent route assignment with the lifecycle change:
+the assignment commits before drain, or it observes `draining` and fails.
+
+To evacuate a shard-only placement:
+
+```text
+# First deploy an active default/target alias to every relevant process.
+vigilo shard databases drain shard_001
+vigilo shard rebalance plan --from shard_001 --to shard_002 --max-items 100
+vigilo shard rebalance apply <operation_id> --max-items 25
+vigilo shard rebalance verify <operation_id> --max-items 25
+vigilo shard databases disable shard_001
+```
+
+`databases drain` is idempotent and refuses the control-capable placement.
+After it succeeds, existing routes continue normally while rebalance evacuates
+them. `databases disable` requires the placement to be draining and have zero
+owned shard routes, zero creating-run references, zero unfinished rebalance
+items, and zero pending outbox deliveries. It is also idempotent. Keep the
+placement database and its URL environment variable available until disable
+succeeds.
+
 Inspect routing metadata:
 
 ```text
@@ -385,6 +435,9 @@ fail narrowly instead of rewriting an unexpected route. An expired apply claim
 can resume its exact source route when the route is still `moving` at the
 expected next version. Claim duration defaults to 300 seconds and can be
 changed with `--lease-seconds` or `VIGILO_REBALANCE_LEASE_SECONDS`.
+Drain-source planning includes shards owned by an `active` or `draining`
+source. Every target is revalidated as `active` when the route is activated,
+so a target that begins draining during a copy cannot receive the shard.
 
 ## Current Scope
 
@@ -393,6 +446,8 @@ Implemented today:
 - Single-database default with a seeded `primary` placement.
 - 128 logical shards and partitioned execution tables.
 - Stored database and shard placement catalogs.
+- Active, draining, and disabled database-placement lifecycle with atomic
+  new-ownership admission and guarded disable.
 - Recoverable routed run creation, dispatch, worker processing, lease recovery,
   outbox publication, shard summaries, finalization, cancellation, live
   status/watch progress, results, export, route inspection, route fencing,

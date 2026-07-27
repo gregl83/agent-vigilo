@@ -4,7 +4,11 @@
 //! targets. Runtime configuration supplies secret URL values by resolving each
 //! row's `database_url_env`.
 
-use sqlx::PgPool;
+use sqlx::{
+    PgPool,
+    Postgres,
+    Transaction,
+};
 
 use crate::models::database_placement::DatabasePlacement;
 
@@ -44,6 +48,24 @@ pub(crate) async fn list_active_database_placements(
     Ok(placements)
 }
 
+/// Lists placements that may serve existing runtime ownership.
+pub(crate) async fn list_serviceable_database_placements(
+    db: &PgPool,
+) -> anyhow::Result<Vec<DatabasePlacement>> {
+    let placements = sqlx::query_as::<_, DatabasePlacement>(
+        r#"
+        SELECT alias, database_url_env, role, status, created_at, updated_at
+        FROM database_placements
+        WHERE status IN ('active', 'draining')
+        ORDER BY alias
+        "#,
+    )
+    .fetch_all(db)
+    .await?;
+
+    Ok(placements)
+}
+
 /// Reads one database placement directly from the authoritative control table.
 ///
 /// Runtime admission uses this query for live status and role checks. Connection
@@ -61,6 +83,46 @@ pub(crate) async fn select_database_placement(
     )
     .bind(alias)
     .fetch_optional(db)
+    .await?;
+
+    Ok(placement)
+}
+
+/// Locks one placement against a concurrent lifecycle transition.
+pub(crate) async fn select_database_placement_for_update(
+    tx: &mut Transaction<'_, Postgres>,
+    alias: &str,
+) -> anyhow::Result<Option<DatabasePlacement>> {
+    let placement = sqlx::query_as::<_, DatabasePlacement>(
+        r#"
+        SELECT alias, database_url_env, role, status, created_at, updated_at
+        FROM database_placements
+        WHERE alias = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(alias)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    Ok(placement)
+}
+
+/// Takes a shared lifecycle lock while a caller assigns new ownership.
+pub(crate) async fn select_database_placement_for_share(
+    tx: &mut Transaction<'_, Postgres>,
+    alias: &str,
+) -> anyhow::Result<Option<DatabasePlacement>> {
+    let placement = sqlx::query_as::<_, DatabasePlacement>(
+        r#"
+        SELECT alias, database_url_env, role, status, created_at, updated_at
+        FROM database_placements
+        WHERE alias = $1
+        FOR SHARE
+        "#,
+    )
+    .bind(alias)
+    .fetch_optional(&mut **tx)
     .await?;
 
     Ok(placement)
@@ -90,21 +152,23 @@ pub(crate) async fn insert_database_placement(
     Ok(placement)
 }
 
-pub(crate) async fn disable_database_placement(
-    db: &PgPool,
+pub(crate) async fn update_database_placement_status(
+    tx: &mut Transaction<'_, Postgres>,
     alias: &str,
+    status: &str,
 ) -> anyhow::Result<Option<DatabasePlacement>> {
     let placement = sqlx::query_as::<_, DatabasePlacement>(
         r#"
         UPDATE database_placements
-        SET status = 'disabled',
+        SET status = $2,
             updated_at = now()
         WHERE alias = $1
         RETURNING alias, database_url_env, role, status, created_at, updated_at
         "#,
     )
     .bind(alias)
-    .fetch_optional(db)
+    .bind(status)
+    .fetch_optional(&mut **tx)
     .await?;
 
     Ok(placement)
@@ -120,6 +184,22 @@ pub(crate) async fn list_active_database_aliases(db: &PgPool) -> anyhow::Result<
         SELECT alias
         FROM database_placements
         WHERE status = 'active'
+        ORDER BY alias
+        "#,
+    )
+    .fetch_all(db)
+    .await?;
+
+    Ok(aliases)
+}
+
+/// Lists aliases that may finish existing work, including draining targets.
+pub(crate) async fn list_serviceable_database_aliases(db: &PgPool) -> anyhow::Result<Vec<String>> {
+    let aliases = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT alias
+        FROM database_placements
+        WHERE status IN ('active', 'draining')
         ORDER BY alias
         "#,
     )
@@ -152,19 +232,21 @@ pub(crate) async fn list_active_shard_capable_database_aliases(
     Ok(aliases)
 }
 
-/// Lists active shard-capable aliases that currently own routed shard rows.
+/// Lists serviceable shard-capable aliases that own routed shard rows.
 ///
 /// Recovery must include `moving` and `draining` routes so expired work can
 /// clear before movement or drainage resumes. Aliases without routed shards do
 /// not need a recovery pass.
-pub(crate) async fn list_active_shard_database_aliases(db: &PgPool) -> anyhow::Result<Vec<String>> {
+pub(crate) async fn list_serviceable_shard_database_aliases(
+    db: &PgPool,
+) -> anyhow::Result<Vec<String>> {
     let aliases = sqlx::query_scalar::<_, String>(
         r#"
         SELECT DISTINCT dp.alias
         FROM database_placements dp
         JOIN shard_placements sp
           ON sp.database_alias = dp.alias
-        WHERE dp.status = 'active'
+        WHERE dp.status IN ('active', 'draining')
           AND dp.role IN ('shard', 'control_and_shard')
         ORDER BY dp.alias
         "#,
@@ -177,9 +259,8 @@ pub(crate) async fn list_active_shard_database_aliases(db: &PgPool) -> anyhow::R
 
 /// Counts shard placement rows that route to a disabled database placement.
 ///
-/// The foreign key prevents missing aliases, but it intentionally permits
-/// disabling a database placement while historical rows still point at it. The
-/// router must reject those rows for normal dispatch.
+/// Disabled targets cannot own routes. Draining targets remain valid owners
+/// while their routes are evacuated.
 pub(crate) async fn count_shard_placements_on_disabled_databases(
     db: &PgPool,
 ) -> anyhow::Result<i64> {
@@ -189,7 +270,7 @@ pub(crate) async fn count_shard_placements_on_disabled_databases(
         FROM shard_placements sp
         JOIN database_placements dp
           ON dp.alias = sp.database_alias
-        WHERE dp.status <> 'active'
+        WHERE dp.status = 'disabled'
         "#,
     )
     .fetch_one(db)
@@ -213,7 +294,8 @@ mod tests {
             INSERT INTO database_placements (alias, database_url_env, role, status)
             VALUES
                 ('shard_001', 'VIGILO_SHARD_001_DATABASE_URL', 'shard', 'active'),
-                ('shard_002', 'VIGILO_SHARD_002_DATABASE_URL', 'shard', 'disabled')
+                ('shard_002', 'VIGILO_SHARD_002_DATABASE_URL', 'shard', 'disabled'),
+                ('shard_003', 'VIGILO_SHARD_003_DATABASE_URL', 'shard', 'draining')
             "#,
         )
         .execute(&pool)
@@ -230,14 +312,42 @@ mod tests {
 
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx placement tests"]
-    async fn list_active_shard_database_aliases_includes_moving_routes(pool: PgPool) {
+    async fn list_serviceable_database_aliases_includes_draining(pool: PgPool) {
         sqlx::query(
             r#"
             INSERT INTO database_placements (alias, database_url_env, role, status)
             VALUES
                 ('shard_001', 'VIGILO_SHARD_001_DATABASE_URL', 'shard', 'active'),
                 ('shard_002', 'VIGILO_SHARD_002_DATABASE_URL', 'shard', 'disabled'),
-                ('shard_003', 'VIGILO_SHARD_003_DATABASE_URL', 'shard', 'active')
+                ('shard_003', 'VIGILO_SHARD_003_DATABASE_URL', 'shard', 'draining')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let aliases = list_serviceable_database_aliases(&pool).await.unwrap();
+
+        assert_eq!(
+            aliases,
+            vec![
+                "primary".to_string(),
+                "shard_001".to_string(),
+                "shard_003".to_string()
+            ]
+        );
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx placement tests"]
+    async fn list_serviceable_shard_database_aliases_includes_draining_owners(pool: PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES
+                ('shard_001', 'VIGILO_SHARD_001_DATABASE_URL', 'shard', 'active'),
+                ('shard_002', 'VIGILO_SHARD_002_DATABASE_URL', 'shard', 'disabled'),
+                ('shard_003', 'VIGILO_SHARD_003_DATABASE_URL', 'shard', 'draining')
             "#,
         )
         .execute(&pool)
@@ -261,7 +371,9 @@ mod tests {
         .await
         .unwrap();
 
-        let aliases = list_active_shard_database_aliases(&pool).await.unwrap();
+        let aliases = list_serviceable_shard_database_aliases(&pool)
+            .await
+            .unwrap();
 
         assert_eq!(
             aliases,

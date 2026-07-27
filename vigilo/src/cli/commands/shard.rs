@@ -106,7 +106,15 @@ pub(crate) enum DatabaseSubCommand {
     },
 
     /// Disable a non-control database placement
+    ///
+    /// The placement must already be draining and own no shard routes.
     Disable {
+        /// Stable placement alias
+        alias: String,
+    },
+
+    /// Stop assigning new shards while existing owned shards keep running
+    Drain {
         /// Stable placement alias
         alias: String,
     },
@@ -272,9 +280,15 @@ async fn exec_database_command(
             out.write_value(&database_added_payload(&placement, !defer_env_validation))?;
         }
         DatabaseSubCommand::Disable { alias } => {
-            let placement = shard_admin::disable_database_placement(control_db, &alias).await?;
+            let placement =
+                shard_admin::disable_database_placement(database_router, &alias).await?;
             info!(database_alias = %placement.alias, "disabled database placement");
             out.write_value(&database_disabled_payload(&placement))?;
+        }
+        DatabaseSubCommand::Drain { alias } => {
+            let placement = shard_admin::drain_database_placement(database_router, &alias).await?;
+            info!(database_alias = %placement.alias, "started draining database placement");
+            out.write_value(&database_draining_payload(&placement))?;
         }
     }
 
@@ -519,6 +533,17 @@ fn database_disabled_payload(placement: &DatabasePlacement) -> Value {
     })
 }
 
+fn database_draining_payload(placement: &DatabasePlacement) -> Value {
+    json!({
+        "data": {
+            "database_placement": placement,
+        },
+        "meta": {
+            "draining": placement.status == "draining",
+        }
+    })
+}
+
 fn placement_list_payload(run_id: Uuid, placements: &[ShardPlacement]) -> Value {
     json!({
         "data": {
@@ -655,6 +680,7 @@ mod tests {
         database_placement::{
             DATABASE_PLACEMENT_ROLE_SHARD,
             DATABASE_PLACEMENT_STATUS_ACTIVE,
+            DATABASE_PLACEMENT_STATUS_DRAINING,
         },
         shard_placement::SHARD_PLACEMENT_STATUS_ACTIVE,
     };
@@ -797,6 +823,20 @@ mod tests {
     }
 
     #[test]
+    fn database_drain_command_matches_lifecycle_shape() {
+        let cli = TestCli::try_parse_from(["vigilo", "databases", "drain", "shard_001"]).unwrap();
+
+        let SubCommand::Databases {
+            command: DatabaseSubCommand::Drain { alias },
+        } = cli.command
+        else {
+            panic!("expected database drain command");
+        };
+
+        assert_eq!(alias, "shard_001");
+    }
+
+    #[test]
     fn database_list_payload_reports_count() {
         let placement = DatabasePlacement {
             alias: "shard_001".to_string(),
@@ -813,6 +853,26 @@ mod tests {
         assert_eq!(
             payload["data"]["database_placements"][0]["alias"],
             json!("shard_001")
+        );
+    }
+
+    #[test]
+    fn database_draining_payload_reports_lifecycle_state() {
+        let placement = DatabasePlacement {
+            alias: "shard_001".to_string(),
+            database_url_env: "VIGILO_SHARD_001_DATABASE_URL".to_string(),
+            role: DATABASE_PLACEMENT_ROLE_SHARD.to_string(),
+            status: DATABASE_PLACEMENT_STATUS_DRAINING.to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let payload = database_draining_payload(&placement);
+
+        assert_eq!(payload["meta"]["draining"], json!(true));
+        assert_eq!(
+            payload["data"]["database_placement"]["status"],
+            json!("draining")
         );
     }
 

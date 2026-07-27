@@ -654,6 +654,7 @@ async fn validate_active_shard_capable_placement(
         SELECT role, status
         FROM database_placements
         WHERE alias = $1
+        FOR SHARE
         "#,
     )
     .bind(database_alias)

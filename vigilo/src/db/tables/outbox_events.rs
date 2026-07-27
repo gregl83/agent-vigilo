@@ -37,6 +37,15 @@ const OUTBOX_EVENT_SELECT: &str = r#"
       ON q.event_id = e.id
 "#;
 
+/// Counts events that still require broker publication or retry.
+pub(crate) async fn count_pending_outbox_deliveries(db: &PgPool) -> anyhow::Result<i64> {
+    let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::bigint FROM outbox_delivery_queue")
+        .fetch_one(db)
+        .await?;
+
+    Ok(count)
+}
+
 /// Inserts one durable outbox event.
 ///
 /// The database trigger creates the matching `outbox_delivery_queue` row inside

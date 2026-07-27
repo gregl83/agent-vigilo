@@ -20,6 +20,7 @@ pub(crate) const DATABASE_PLACEMENT_ROLE_CONTROL: &str = "control";
 pub(crate) const DATABASE_PLACEMENT_ROLE_SHARD: &str = "shard";
 pub(crate) const DATABASE_PLACEMENT_ROLE_CONTROL_AND_SHARD: &str = "control_and_shard";
 pub(crate) const DATABASE_PLACEMENT_STATUS_ACTIVE: &str = "active";
+pub(crate) const DATABASE_PLACEMENT_STATUS_DRAINING: &str = "draining";
 pub(crate) const DATABASE_PLACEMENT_STATUS_DISABLED: &str = "disabled";
 
 /// Persisted database placement row.
@@ -31,7 +32,7 @@ pub(crate) struct DatabasePlacement {
     pub(crate) database_url_env: String,
     /// Placement role: control, shard, or control_and_shard.
     pub(crate) role: String,
-    /// Placement status: active or disabled.
+    /// Placement status: active, draining, or disabled.
     pub(crate) status: String,
     /// Time this placement row was inserted.
     pub(crate) created_at: DateTime<Utc>,
@@ -52,5 +53,52 @@ impl DatabasePlacement {
             self.role.as_str(),
             DATABASE_PLACEMENT_ROLE_SHARD | DATABASE_PLACEMENT_ROLE_CONTROL_AND_SHARD
         )
+    }
+
+    /// Whether this target may receive a new run shard or move activation.
+    pub(crate) fn accepts_new_shards(&self) -> bool {
+        self.status == DATABASE_PLACEMENT_STATUS_ACTIVE
+    }
+
+    /// Whether this target may serve ownership assigned before a drain began.
+    pub(crate) fn can_serve_owned_shards(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            DATABASE_PLACEMENT_STATUS_ACTIVE | DATABASE_PLACEMENT_STATUS_DRAINING
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+
+    use super::*;
+
+    fn shard_placement(status: &str) -> DatabasePlacement {
+        DatabasePlacement {
+            alias: "shard_001".to_string(),
+            database_url_env: "VIGILO_SHARD_001_DATABASE_URL".to_string(),
+            role: DATABASE_PLACEMENT_ROLE_SHARD.to_string(),
+            status: status.to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn draining_placement_serves_existing_ownership_but_rejects_new_ownership() {
+        let placement = shard_placement(DATABASE_PLACEMENT_STATUS_DRAINING);
+
+        assert!(placement.can_serve_owned_shards());
+        assert!(!placement.accepts_new_shards());
+    }
+
+    #[test]
+    fn disabled_placement_serves_no_shard_ownership() {
+        let placement = shard_placement(DATABASE_PLACEMENT_STATUS_DISABLED);
+
+        assert!(!placement.can_serve_owned_shards());
+        assert!(!placement.accepts_new_shards());
     }
 }

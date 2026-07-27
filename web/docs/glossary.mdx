@@ -62,6 +62,8 @@ same time.
 | Execution database | A PostgreSQL role that owns shard-local chunks, snapshots, executions, attempts, results, summaries, and chunk-ready outbox records. | One or more shard-capable database placements. The control database may also serve this role. |
 | Database alias | A stable name such as `primary` or `shard_001` used instead of a connection URL. | One alias per database placement. |
 | Database placement | A catalog entry that maps a database alias to a secret environment-variable name, role, and status. | One row per configured PostgreSQL target. |
+| Database placement status | Admission lifecycle for a configured target: `active` accepts and serves shard ownership, `draining` serves existing ownership but accepts none, and `disabled` serves no runtime work. | One status per database placement. |
+| Placement drain | Guarded transition that stops new shard ownership before existing routes are moved away and the database placement is disabled. It does not move rows by itself. | One shard-only database placement at a time; shard moves or rebalance perform evacuation. |
 | Database router | The process-local `DatabaseRouter` that reads placement metadata and resolves control or execution pools. It does not choose a new shard assignment. | One lazily initialized router per Vigilo process. |
 | Shard placement | The authoritative mapping from `run_id + run_shard` to a database alias, status, and route version. | One row per used run shard. |
 | Execution route | A resolved shard placement plus the PostgreSQL pool for its current database alias. | Resolved for one `run_id + run_shard`. |

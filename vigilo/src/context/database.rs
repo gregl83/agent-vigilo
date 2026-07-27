@@ -174,7 +174,7 @@ pub(crate) struct DatabaseRouter {
     pub(crate) shard_placement_cache: Cache<ShardPlacementKey, ShardPlacement>,
 }
 
-/// One active execution route resolved from authoritative control metadata.
+/// One serviceable execution route resolved from authoritative control metadata.
 ///
 /// Write paths retain the route fence alongside the pool so admission can be
 /// revalidated immediately before changing execution-owned state.
@@ -244,36 +244,49 @@ impl DatabaseRouter {
         database_placements::list_active_shard_capable_database_aliases(db).await
     }
 
-    pub(crate) async fn active_execution_database_aliases(&self) -> anyhow::Result<Vec<String>> {
+    pub(crate) async fn serviceable_execution_database_aliases(
+        &self,
+    ) -> anyhow::Result<Vec<String>> {
         let db = self.control().await?;
-        database_placements::list_active_shard_database_aliases(db).await
+        database_placements::list_serviceable_shard_database_aliases(db).await
     }
 
-    pub(crate) async fn active_outbox_database_aliases(&self) -> anyhow::Result<Vec<String>> {
+    pub(crate) async fn serviceable_outbox_database_aliases(&self) -> anyhow::Result<Vec<String>> {
         let db = self.control().await?;
-        database_placements::list_active_database_aliases(db).await
+        database_placements::list_serviceable_database_aliases(db).await
     }
 
-    /// Returns a pool for an explicit active placement alias.
+    /// Returns a pool for a placement that may finish existing work.
     ///
     /// This is an infrastructure hook for router/admin workflows. Most callers
     /// should use a domain workflow or [`Self::execution`] instead of naming a
-    /// placement directly. Status is read from the control database on every call;
-    /// connection parameters and pools remain fixed for the process lifetime.
+    /// placement directly. Active and draining placements are serviceable.
+    /// Status is read from the control database on every call; connection
+    /// parameters and pools remain fixed for the process lifetime.
     #[allow(dead_code)]
     pub async fn placement(&self, alias: &str) -> anyhow::Result<&PgPool> {
         let started = Instant::now();
         let alias = normalize_alias(alias.to_string(), "database alias")?;
-        let placement = self.require_active_placement(&alias).await?;
+        let placement = self.require_serviceable_placement(&alias).await?;
 
         self.resolve_placement_pool(&placement, started).await
     }
 
-    /// Returns a pool for an active shard-capable database placement.
+    /// Returns a pool for a shard-capable owner of existing execution data.
     ///
-    /// Execution workflows use this entry point so a live role change prevents
-    /// new shard work even when a connection pool for the alias already exists.
+    /// Active and draining targets remain available because draining must not
+    /// strand routed work, recovery, creation replay, or source-side movement.
     pub(crate) async fn execution_database(&self, alias: &str) -> anyhow::Result<&PgPool> {
+        let started = Instant::now();
+        let alias = normalize_alias(alias.to_string(), "database alias")?;
+        let placement = self.require_serviceable_placement(&alias).await?;
+        require_shard_capable_placement(&placement)?;
+
+        self.resolve_placement_pool(&placement, started).await
+    }
+
+    /// Returns a pool for a target that may receive new shard ownership.
+    pub(crate) async fn execution_target_database(&self, alias: &str) -> anyhow::Result<&PgPool> {
         let started = Instant::now();
         let alias = normalize_alias(alias.to_string(), "database alias")?;
         let placement = self.require_active_placement(&alias).await?;
@@ -717,10 +730,10 @@ impl DatabaseRouter {
 
     pub(crate) async fn validate_placement_config(&self) -> anyhow::Result<()> {
         let db = self.control().await?;
-        let placements = database_placements::list_active_database_placements(db).await?;
+        let placements = database_placements::list_serviceable_database_placements(db).await?;
 
         if placements.is_empty() {
-            anyhow::bail!("database_placements has no active placements");
+            anyhow::bail!("database_placements has no active or draining placements");
         }
 
         for placement in &placements {
@@ -729,7 +742,10 @@ impl DatabaseRouter {
 
         let control_placements = placements
             .iter()
-            .filter(|placement| placement.is_control_capable())
+            .filter(|placement| {
+                placement.status == DATABASE_PLACEMENT_STATUS_ACTIVE
+                    && placement.is_control_capable()
+            })
             .collect::<Vec<_>>();
 
         let [active_control] = control_placements.as_slice() else {
@@ -777,7 +793,7 @@ impl DatabaseRouter {
 
         std::env::var(database_url_env).map_err(|_| {
             anyhow::anyhow!(
-                "active database placement references unset env var {}",
+                "serviceable database placement references unset env var {}",
                 database_url_env
             )
         })
@@ -792,10 +808,11 @@ impl DatabaseRouter {
         self.placement_pools
             .get_or_try_init(|| async {
                 let db = self.control().await?;
-                let placements = database_placements::list_active_database_placements(db).await?;
+                let placements =
+                    database_placements::list_serviceable_database_placements(db).await?;
 
                 if placements.is_empty() {
-                    anyhow::bail!("database_placements has no active placements");
+                    anyhow::bail!("database_placements has no active or draining placements");
                 }
 
                 let mut pools_by_alias = HashMap::with_capacity(placements.len());
@@ -827,7 +844,27 @@ impl DatabaseRouter {
 
         if placement.status != DATABASE_PLACEMENT_STATUS_ACTIVE {
             anyhow::bail!(
-                "database placement alias {} has status {}, which is not active",
+                "database placement alias {} has status {}, which cannot receive new shard ownership",
+                alias,
+                placement.status
+            );
+        }
+
+        Ok(placement)
+    }
+
+    async fn require_serviceable_placement(
+        &self,
+        alias: &str,
+    ) -> anyhow::Result<DatabasePlacement> {
+        let db = self.control().await?;
+        let placement = database_placements::select_database_placement(db, alias)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("database placement alias {} was not found", alias))?;
+
+        if !placement.can_serve_owned_shards() {
+            anyhow::bail!(
+                "database placement alias {} has status {}, which cannot serve existing shard ownership",
                 alias,
                 placement.status
             );
@@ -842,7 +879,7 @@ impl DatabaseRouter {
         placement: &ShardPlacement,
     ) -> anyhow::Result<()> {
         let database_placement = self
-            .require_active_placement(&placement.database_alias)
+            .require_serviceable_placement(&placement.database_alias)
             .await?;
 
         require_shard_capable_placement(&database_placement)
@@ -932,11 +969,20 @@ fn validate_shard_capable_alias(
 ) -> anyhow::Result<()> {
     let Some(placement) = placements_by_alias.get(alias) else {
         anyhow::bail!(
-            "{}={} does not match an active database placement",
+            "{}={} does not match an active or draining database placement",
             config_name,
             alias
         );
     };
+
+    if !placement.accepts_new_shards() {
+        anyhow::bail!(
+            "{}={} points to placement status {}, which cannot receive new shard ownership",
+            config_name,
+            alias,
+            placement.status
+        );
+    }
 
     if !placement.is_shard_capable() {
         anyhow::bail!(
@@ -1134,6 +1180,42 @@ mod tests {
             .unwrap();
         assert_eq!(placement.database_alias, DEFAULT_DATABASE_ALIAS);
         assert_eq!(placement.status, SHARD_PLACEMENT_STATUS_ACTIVE);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
+    async fn draining_placement_serves_owned_routes_but_rejects_new_ownership(pool: PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'draining')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let database_router = database_router_with_control_pool(pool);
+        let run_id = Uuid::now_v7();
+        insert_shard_placement(
+            database_router.control().await.unwrap(),
+            run_id,
+            42,
+            "shard_001",
+            SHARD_PLACEMENT_STATUS_ACTIVE,
+        )
+        .await;
+
+        database_router.execution(run_id, 42).await.unwrap();
+
+        let error = database_router
+            .execution_target_database("shard_001")
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot receive new shard ownership")
+        );
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -1525,7 +1607,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("active database placement references unset env var")
+                .contains("serviceable database placement references unset env var")
         );
     }
 
