@@ -1194,7 +1194,8 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let database_router = database_router_with_control_pool(pool);
+        let database_url = isolated_database_url(&pool).await;
+        let database_router = database_router_with_control_pool_and_uri(pool, database_url);
         let run_id = Uuid::now_v7();
         insert_shard_placement(
             database_router.control().await.unwrap(),
@@ -1612,8 +1613,15 @@ mod tests {
     }
 
     fn database_router_with_control_pool(pool: PgPool) -> DatabaseRouter {
+        database_router_with_control_pool_and_uri(
+            pool,
+            "postgres://injected-control-pool".to_string(),
+        )
+    }
+
+    fn database_router_with_control_pool_and_uri(pool: PgPool, uri: String) -> DatabaseRouter {
         let database_router = DatabaseRouter {
-            uri: "postgres://injected-control-pool".to_string(),
+            uri,
             max_connections: 5,
             placement_config: PlacementConfig::default_single_database(),
             control_pool: OnceCell::new(),
@@ -1622,6 +1630,17 @@ mod tests {
         };
         assert!(database_router.control_pool.set(pool).is_ok());
         database_router
+    }
+
+    async fn isolated_database_url(pool: &PgPool) -> String {
+        let database_name = sqlx::query_scalar::<_, String>("SELECT current_database()")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let mut database_url =
+            url::Url::parse(&std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap()).unwrap();
+        database_url.set_path(&database_name);
+        database_url.to_string()
     }
 
     async fn insert_shard_placement(

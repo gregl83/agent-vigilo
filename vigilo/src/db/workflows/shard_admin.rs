@@ -2056,7 +2056,7 @@ async fn validate_new_ownership_target(
 
     if !target.accepts_new_shards() {
         anyhow::bail!(
-            "database placement alias {} has status {}, which cannot receive shard placements or new shard ownership",
+            "database placement alias {} has status {}, which cannot receive new shard ownership",
             target.alias,
             target.status
         );
@@ -2638,10 +2638,7 @@ mod tests {
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
     async fn disable_database_placement_rejects_active_control(pool: PgPool) {
-        let database_router = database_router_with_control_pool(
-            pool,
-            std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap(),
-        );
+        let database_router = database_router_with_isolated_control_pool(pool).await;
         let error = disable_database_placement(&database_router, DEFAULT_DATABASE_ALIAS)
             .await
             .unwrap_err();
@@ -2674,10 +2671,7 @@ mod tests {
         .await
         .unwrap();
 
-        let database_router = database_router_with_control_pool(
-            pool.clone(),
-            std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap(),
-        );
+        let database_router = database_router_with_isolated_control_pool(pool.clone()).await;
         let placement = drain_database_placement(&database_router, "shard_001")
             .await
             .unwrap();
@@ -2699,17 +2693,14 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("cannot receive shard placements")
+                .contains("cannot receive new shard ownership")
         );
     }
 
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
     async fn disable_requires_draining_placement_without_owned_routes(pool: PgPool) {
-        let database_router = database_router_with_control_pool(
-            pool.clone(),
-            std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap(),
-        );
+        let database_router = database_router_with_isolated_control_pool(pool.clone()).await;
         sqlx::query(
             r#"
             INSERT INTO database_placements (alias, database_url_env, role, status)
@@ -2783,10 +2774,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let database_router = database_router_with_control_pool(
-            pool.clone(),
-            std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap(),
-        );
+        let database_router = database_router_with_isolated_control_pool(pool.clone()).await;
         drain_database_placement(&database_router, "shard_001")
             .await
             .unwrap();
@@ -2798,7 +2786,8 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("cannot receive new shard ownership")
+                .contains("cannot receive new shard ownership"),
+            "{error:#}"
         );
 
         let route = shard_placements::select_shard_placement(&pool, run_id, 3)
@@ -2879,7 +2868,8 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("cannot receive new shard ownership")
+                .contains("cannot receive new shard ownership"),
+            "{error:#}"
         );
 
         let route = shard_placements::select_shard_placement(&pool, run_id, 3)
@@ -2919,10 +2909,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let database_router = database_router_with_control_pool(
-            pool,
-            std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap(),
-        );
+        let database_router = database_router_with_isolated_control_pool(pool).await;
 
         let error = disable_database_placement(&database_router, "shard_001")
             .await
@@ -2954,10 +2941,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let database_router = database_router_with_control_pool(
-            pool,
-            std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap(),
-        );
+        let database_router = database_router_with_isolated_control_pool(pool).await;
 
         let route = inspect_shard_route(&database_router, run_id, 4)
             .await
@@ -2972,8 +2956,7 @@ mod tests {
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
     async fn inspect_shard_route_reports_dispatchable_primary_route(pool: PgPool) {
-        let database_url = std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap();
-        let database_router = database_router_with_control_pool(pool.clone(), database_url);
+        let database_router = database_router_with_isolated_control_pool(pool.clone()).await;
         let run_id = Uuid::now_v7();
 
         sqlx::query(
@@ -3003,8 +2986,7 @@ mod tests {
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
     async fn inspect_shard_route_reports_moving_route_as_read_only(pool: PgPool) {
-        let database_url = std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap();
-        let database_router = database_router_with_control_pool(pool.clone(), database_url);
+        let database_router = database_router_with_isolated_control_pool(pool.clone()).await;
         let run_id = Uuid::now_v7();
 
         sqlx::query(
@@ -3030,8 +3012,7 @@ mod tests {
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
     async fn inspect_shard_route_reports_disabled_placement_as_blocked(pool: PgPool) {
-        let database_url = std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap();
-        let database_router = database_router_with_control_pool(pool.clone(), database_url);
+        let database_router = database_router_with_isolated_control_pool(pool.clone()).await;
         let run_id = Uuid::now_v7();
 
         sqlx::query(
@@ -3069,8 +3050,7 @@ mod tests {
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
     async fn creating_run_rejects_route_changes(pool: PgPool) {
-        let database_url = std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap();
-        let database_router = database_router_with_control_pool(pool.clone(), database_url);
+        let database_router = database_router_with_isolated_control_pool(pool.clone()).await;
         let run_id = Uuid::now_v7();
 
         sqlx::query(
@@ -3811,6 +3791,11 @@ mod tests {
             source_database_alias: source_database_alias.to_string(),
             route_version,
         }
+    }
+
+    async fn database_router_with_isolated_control_pool(pool: PgPool) -> DatabaseRouter {
+        let database_url = isolated_database_url(&pool).await;
+        database_router_with_control_pool(pool, database_url)
     }
 
     fn database_router_with_control_pool(pool: PgPool, uri: String) -> DatabaseRouter {
