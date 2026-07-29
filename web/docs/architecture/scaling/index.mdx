@@ -332,9 +332,9 @@ vigilo shard route <run_id> <run_shard>
 ```
 
 `vigilo shard route` reports the database alias, placement statuses,
-`route_version`, `database_url_env`, env-var availability, and whether the
-route is `dispatchable`, `read_only`, or `blocked`. It never prints the
-database URL.
+`move_target_database_alias`, `route_version`, `database_url_env`, env-var
+availability, and whether the route is `dispatchable`, `read_only`, or
+`blocked`. It never prints the database URL.
 
 ## Moving A Run Shard
 
@@ -352,17 +352,39 @@ plans omit creating runs for the same reason.
 
 The normal move takes the exclusive form of a transaction-scoped PostgreSQL
 advisory admission lock for the source shard, revalidates its route fence, and
-marks the placement `moving`. Worker claims, dispatch writes, and routed
-cancellation cleanup take the shared form of the same lock and revalidate the
-alias, status, and `route_version`. The lock is cooperative: every protected
-writer must explicitly acquire it. PostgreSQL does not infer which rows belong
-to the shard.
+persists the destination while changing the shard placement from `active` to
+`draining`. New dispatch and worker claims stop, while cleanup for work admitted
+before the transition can finish. Once leased chunks and running attempts reach
+zero, the workflow changes the route to `moving`. At that point all source
+writes, including cancellation cleanup, are frozen while the target is
+reconciled and copied. PostgreSQL enforces that draining and moving routes have
+a target distinct from their current owner, and that active routes have no
+pending target.
+
+```mermaid
+stateDiagram-v2
+    [*] --> active
+    active --> draining: persist target and stop new work
+    draining --> draining: admitted work remains
+    draining --> moving: active work reaches zero
+    moving --> active: reset, copy, verify, and activate target
+```
+
+Worker claims, dispatch writes, and routed cancellation cleanup take the shared
+form of the same advisory lock and revalidate the alias, status, and
+`route_version`. The lock is cooperative: every protected writer must
+explicitly acquire it. PostgreSQL does not infer which rows belong to the
+shard.
 
 The route fence is the expected alias, placement status, and `route_version`.
 After movement changes any of those values, a writer holding an older route is
 rejected before it changes shard-owned rows. With the fence established, the
-move checks for active leased or running work, copies and verifies the shard,
-and compare-and-swaps the route to the target alias with status `active`.
+move checks for active leased or running work. After the shard is frozen, it
+deletes rows for the exact `run_id + run_shard` from the target in reverse
+foreign-key order, copies the source rows in bounded batches, verifies ordered
+streaming BLAKE3 fingerprints and row counts, and compare-and-swaps the route to
+the target alias with status `active`. Shared prerequisite rows are upserted and
+are not deleted because other target shards may reference them.
 
 After claim admission commits, an opaque chunk claim token and renewable
 deadline carry worker authority. Attempt allocation and result persistence lock
@@ -371,9 +393,14 @@ worker attempt. Recovery clears the chunk token, stales the attempt, and updates
 any failed-shard summary atomically. Terminal worker settlement and cancellation
 also refresh shard summaries in the transaction that clears active work.
 
-When active work exists, the route stays `moving` while already admitted work
-finishes; re-run the move afterward to resume it. `--force` remains accepted for
-CLI compatibility but cannot bypass the active-work or write-admission fence.
+When active work exists, the route stays `draining`; re-run the move after that
+work finishes. An interrupted `draining` or `moving` move can be retried only
+with its persisted target alias. A `moving` retry resets the target shard rows
+and repeats the bounded copy, making stale retained target data harmless when a
+shard later moves back to a database. Repeating a move after fenced activation
+returns a verified no-op, which makes a lost command response safe to retry.
+`--force` remains accepted for CLI compatibility but cannot bypass the
+active-work or write-admission fence.
 
 Every route alias or status change increments `shard_placements.route_version`.
 Execution route caches are accepted only while alias, status, and
@@ -427,13 +454,14 @@ same plan because their item claims do not overlap. Only pending items or
 running items with expired leases are eligible. Completion, failure, claimed
 cancellation, and active-work deferral require the claim's opaque fencing
 token. A shard with active work returns its item to `pending` while its route
-remains `moving`; a later apply resumes it at the expected next route version.
+remains `draining`; a later apply resumes it at the expected next route version.
 Each item still uses the single-shard move workflow, including route fencing,
-copy verification, and active-work guards.
+target reconciliation, bounded copy verification, and active-work guards.
 Plans verify the stored `route_version` before moving an item so stale plans
 fail narrowly instead of rewriting an unexpected route. An expired apply claim
-can resume its exact source route when the route is still `moving` at the
-expected next version. Claim duration defaults to 300 seconds and can be
+can resume its exact source route when it is `draining` at the next route
+version or `moving` two route versions later, provided its persisted target
+still matches the plan. Claim duration defaults to 300 seconds and can be
 changed with `--lease-seconds` or `VIGILO_REBALANCE_LEASE_SECONDS`.
 Drain-source planning includes shards owned by an `active` or `draining`
 source. Every target is revalidated as `active` when the route is activated,

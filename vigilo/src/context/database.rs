@@ -42,7 +42,10 @@ use crate::{
             DEFAULT_DATABASE_URL_ENV,
             DatabasePlacement,
         },
-        shard_placement::ShardPlacement,
+        shard_placement::{
+            SHARD_PLACEMENT_STATUS_MOVING,
+            ShardPlacement,
+        },
     },
 };
 
@@ -539,9 +542,9 @@ impl DatabaseRouter {
 
     /// Acquires shared admission for cleanup across routes on one placement.
     ///
-    /// Cancellation may write routes that are already `moving`, so this checks
-    /// the exact stored fences without requiring `active`. Locks are acquired
-    /// in shard order to keep concurrent cleanup operations deterministic.
+    /// Cancellation may finish cleanup while a route is `draining`, but
+    /// `moving` is fully frozen for target reconciliation and copying. Locks
+    /// are acquired in shard order to keep concurrent cleanup deterministic.
     pub(crate) async fn begin_execution_cleanup_admission(
         &self,
         routes: &[ExecutionRoute],
@@ -592,6 +595,15 @@ impl DatabaseRouter {
                     actual_database_alias: current.database_alias,
                     actual_status: current.status,
                     actual_route_version: current.route_version,
+                };
+                tx.rollback().await?;
+                return Err(error.into());
+            }
+            if current.status == SHARD_PLACEMENT_STATUS_MOVING {
+                let error = ExecutionRouteError::NonDispatchableShardPlacement {
+                    run_id: current.run_id,
+                    run_shard: current.run_shard,
+                    status: current.status,
                 };
                 tx.rollback().await?;
                 return Err(error.into());
@@ -893,7 +905,8 @@ async fn select_shard_placement_on_connection(
 ) -> anyhow::Result<ShardPlacement> {
     sqlx::query_as::<_, ShardPlacement>(
         r#"
-        SELECT run_id, run_shard, database_alias, status, route_version, created_at, updated_at
+        SELECT run_id, run_shard, database_alias, status, move_target_database_alias,
+               route_version, created_at, updated_at
         FROM shard_placements
         WHERE run_id = $1::uuid
           AND run_shard = $2
@@ -1230,9 +1243,13 @@ mod tests {
             run_id,
             7,
             DEFAULT_DATABASE_ALIAS,
-            SHARD_PLACEMENT_STATUS_MOVING,
+            SHARD_PLACEMENT_STATUS_ACTIVE,
         )
         .await;
+        let draining =
+            mark_test_shard_placement_draining(database_router.control().await.unwrap(), run_id, 7)
+                .await;
+        mark_test_shard_placement_moving(database_router.control().await.unwrap(), &draining).await;
 
         let error = database_router.execution(run_id, 7).await.unwrap_err();
         assert!(error.to_string().contains("not dispatchable"));
@@ -1260,21 +1277,17 @@ mod tests {
         assert_eq!(initial.status, SHARD_PLACEMENT_STATUS_ACTIVE);
         assert_eq!(initial.route_version, 1);
 
-        crate::db::tables::shard_placements::update_shard_placement_status(
-            database_router.control().await.unwrap(),
-            run_id,
-            7,
-            SHARD_PLACEMENT_STATUS_MOVING,
-        )
-        .await
-        .unwrap();
+        let draining =
+            mark_test_shard_placement_draining(database_router.control().await.unwrap(), run_id, 7)
+                .await;
+        mark_test_shard_placement_moving(database_router.control().await.unwrap(), &draining).await;
 
         let refreshed = database_router
             .execution_placement(run_id, 7)
             .await
             .unwrap();
         assert_eq!(refreshed.status, SHARD_PLACEMENT_STATUS_MOVING);
-        assert_eq!(refreshed.route_version, 2);
+        assert_eq!(refreshed.route_version, 3);
 
         let error = database_router.execution(run_id, 7).await.unwrap_err();
         assert!(error.to_string().contains("not dispatchable"));
@@ -1297,14 +1310,10 @@ mod tests {
         .await;
         let stale_route = database_router.execution_route(run_id, 7).await.unwrap();
 
-        crate::db::tables::shard_placements::update_shard_placement_status(
-            database_router.control().await.unwrap(),
-            run_id,
-            7,
-            SHARD_PLACEMENT_STATUS_MOVING,
-        )
-        .await
-        .unwrap();
+        let draining =
+            mark_test_shard_placement_draining(database_router.control().await.unwrap(), run_id, 7)
+                .await;
+        mark_test_shard_placement_moving(database_router.control().await.unwrap(), &draining).await;
 
         let error = crate::db::workflows::chunk_processing::claim_routed_chunk_for_processing(
             &database_router,
@@ -1381,6 +1390,53 @@ mod tests {
 
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
+    async fn cleanup_admission_allows_draining_but_rejects_moving(pool: PgPool) {
+        let database_router = database_router_with_control_pool(pool);
+        let run_id = Uuid::now_v7();
+        seed_claimable_chunk(database_router.control().await.unwrap(), run_id, 7).await;
+        insert_shard_placement(
+            database_router.control().await.unwrap(),
+            run_id,
+            7,
+            DEFAULT_DATABASE_ALIAS,
+            SHARD_PLACEMENT_STATUS_ACTIVE,
+        )
+        .await;
+        let draining =
+            mark_test_shard_placement_draining(database_router.control().await.unwrap(), run_id, 7)
+                .await;
+
+        let draining_routes = database_router
+            .execution_read_routes_with_fences_for_run(run_id)
+            .await
+            .unwrap();
+        database_router
+            .begin_execution_cleanup_admission(&draining_routes)
+            .await
+            .unwrap()
+            .rollback()
+            .await
+            .unwrap();
+
+        mark_test_shard_placement_moving(database_router.control().await.unwrap(), &draining).await;
+        let moving_routes = database_router
+            .execution_read_routes_with_fences_for_run(run_id)
+            .await
+            .unwrap();
+        let error = database_router
+            .begin_execution_cleanup_admission(&moving_routes)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<ExecutionRouteError>(),
+            Some(ExecutionRouteError::NonDispatchableShardPlacement { status, .. })
+                if status == SHARD_PLACEMENT_STATUS_MOVING
+        ));
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
     async fn execution_placement_requires_stored_shard_placement(pool: PgPool) {
         let database_router = database_router_with_control_pool(pool);
         let run_id = Uuid::now_v7();
@@ -1444,9 +1500,13 @@ mod tests {
             run_id,
             7,
             DEFAULT_DATABASE_ALIAS,
-            SHARD_PLACEMENT_STATUS_MOVING,
+            SHARD_PLACEMENT_STATUS_ACTIVE,
         )
         .await;
+        let draining =
+            mark_test_shard_placement_draining(database_router.control().await.unwrap(), run_id, 7)
+                .await;
+        mark_test_shard_placement_moving(database_router.control().await.unwrap(), &draining).await;
 
         let dispatch_error = database_router
             .execution_routes_for_run(run_id)
@@ -1663,6 +1723,56 @@ mod tests {
         .execute(db)
         .await
         .unwrap();
+    }
+
+    async fn mark_test_shard_placement_draining(
+        db: &PgPool,
+        run_id: Uuid,
+        run_shard: i16,
+    ) -> ShardPlacement {
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'active')
+            ON CONFLICT (alias) DO NOTHING
+            "#,
+        )
+        .execute(db)
+        .await
+        .unwrap();
+
+        let current = shard_placements::select_shard_placement(db, run_id, run_shard)
+            .await
+            .unwrap()
+            .unwrap();
+        shard_placements::mark_shard_placement_draining(
+            db,
+            run_id,
+            run_shard,
+            &current.database_alias,
+            current.route_version,
+            "shard_001",
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    async fn mark_test_shard_placement_moving(
+        db: &PgPool,
+        draining: &ShardPlacement,
+    ) -> ShardPlacement {
+        shard_placements::mark_shard_placement_moving(
+            db,
+            draining.run_id,
+            draining.run_shard,
+            &draining.database_alias,
+            draining.route_version,
+            draining.move_target_database_alias.as_deref().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
     }
 
     async fn seed_claimable_chunk(db: &PgPool, run_id: Uuid, run_shard: i16) -> Uuid {

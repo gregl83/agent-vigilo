@@ -11,6 +11,7 @@ use chrono::{
     DateTime,
     Utc,
 };
+use futures_util::TryStreamExt;
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::{
@@ -44,6 +45,7 @@ use crate::{
         run_chunk::RUN_SHARD_COUNT,
         shard_placement::{
             SHARD_PLACEMENT_STATUS_ACTIVE,
+            SHARD_PLACEMENT_STATUS_DRAINING,
             SHARD_PLACEMENT_STATUS_MOVING,
             ShardPlacement,
         },
@@ -89,6 +91,7 @@ pub(crate) struct ShardRouteInspection {
     pub(crate) run_shard: i16,
     pub(crate) database_alias: String,
     pub(crate) shard_placement_status: String,
+    pub(crate) move_target_database_alias: Option<String>,
     pub(crate) route_version: i64,
     pub(crate) database_role: String,
     pub(crate) database_status: String,
@@ -225,7 +228,7 @@ struct StaleRebalancePlanError {
 
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "run {run_id} shard {run_shard} has {active_work_count} leased/running row(s); the route remains moving until work drains, and --force cannot bypass the shard write fence"
+    "run {run_id} shard {run_shard} has {active_work_count} leased/running row(s); the route remains draining until work finishes, and --force cannot bypass the shard write fence"
 )]
 struct ShardMoveDrainPending {
     run_id: Uuid,
@@ -269,6 +272,7 @@ const SHARD_TABLES: &[ShardTable] = &[
         name: "run_shard_summaries",
     },
 ];
+const SHARD_MOVE_COPY_BATCH_SIZE: usize = 1_000;
 
 const REBALANCE_STRATEGY_DRAIN_SOURCE: &str = "drain-source";
 const REBALANCE_STRATEGY_FILL_TARGET: &str = "fill-target";
@@ -549,6 +553,7 @@ pub(crate) async fn inspect_shard_route(
         run_shard,
         database_alias: placement.database_alias,
         shard_placement_status: placement.status,
+        move_target_database_alias: placement.move_target_database_alias,
         route_version: placement.route_version,
         database_role: database_placement.role,
         database_status: database_placement.status,
@@ -1103,12 +1108,12 @@ pub(crate) async fn cancel_shard_rebalance(
     refresh_rebalance_operation_status(control_db, operation_id).await
 }
 
-/// Moves one shard while holding exclusive source-side write admission.
+/// Drains, freezes, reconciles, and moves one shard under write admission.
 ///
-/// The route becomes `moving` before active work is counted. Existing work is
-/// allowed to drain, but neither `force` nor a stale route can admit new work
-/// or copy while a lease/attempt is active. Re-running the move resumes a
-/// route left `moving` by a drain or interrupted copy.
+/// `draining` rejects new work while admitted leases and attempts finish.
+/// `moving` freezes every source mutation before stale target rows are removed
+/// and replaced. The intended target is persisted across both states so a
+/// retry cannot redirect an in-progress move.
 pub(crate) async fn move_shard_placement(
     database_router: &database::DatabaseRouter,
     run_id: Uuid,
@@ -1135,13 +1140,21 @@ pub(crate) async fn move_shard_placement(
             )
         })?;
 
+    let retrying_completed_move = !options.dry_run
+        && !options.verify_only
+        && current.database_alias == target_database_alias
+        && current.status == SHARD_PLACEMENT_STATUS_ACTIVE;
+
     if options.verify_only {
         validate_source_placement(control_db, target_database_alias).await?;
-    } else {
+    } else if !retrying_completed_move {
         validate_target_placement(control_db, target_database_alias).await?;
     }
 
-    if current.database_alias == target_database_alias && !options.verify_only {
+    if current.database_alias == target_database_alias
+        && !options.verify_only
+        && !retrying_completed_move
+    {
         anyhow::bail!(
             "run {} shard {} already routes to database placement {}",
             run_id,
@@ -1153,7 +1166,7 @@ pub(crate) async fn move_shard_placement(
     let source_db = database_router
         .execution_database(&current.database_alias)
         .await?;
-    let target_db = if options.verify_only {
+    let target_db = if options.verify_only || retrying_completed_move {
         database_router
             .execution_database(target_database_alias)
             .await?
@@ -1192,7 +1205,9 @@ pub(crate) async fn move_shard_placement(
 
     if !matches!(
         current.status.as_str(),
-        SHARD_PLACEMENT_STATUS_ACTIVE | SHARD_PLACEMENT_STATUS_MOVING
+        SHARD_PLACEMENT_STATUS_ACTIVE
+            | SHARD_PLACEMENT_STATUS_DRAINING
+            | SHARD_PLACEMENT_STATUS_MOVING
     ) {
         anyhow::bail!(
             "run {} shard {} has placement status {}, which cannot be moved",
@@ -1235,7 +1250,7 @@ pub(crate) async fn move_shard_placement(
             &copied_rows_by_table,
         )
         .await?;
-        if active_work_count > 0 || !reports.iter().all(|report| report.verified) {
+        if !reports.iter().all(|report| report.verified) {
             anyhow::bail!(
                 "run {} shard {} reached target {} while the completed move could not be verified",
                 run_id,
@@ -1263,7 +1278,9 @@ pub(crate) async fn move_shard_placement(
     if current.database_alias != source_database_alias
         || !matches!(
             current.status.as_str(),
-            SHARD_PLACEMENT_STATUS_ACTIVE | SHARD_PLACEMENT_STATUS_MOVING
+            SHARD_PLACEMENT_STATUS_ACTIVE
+                | SHARD_PLACEMENT_STATUS_DRAINING
+                | SHARD_PLACEMENT_STATUS_MOVING
         )
     {
         anyhow::bail!(
@@ -1276,29 +1293,46 @@ pub(crate) async fn move_shard_placement(
         );
     }
 
-    let moving = if current.status == SHARD_PLACEMENT_STATUS_ACTIVE {
+    if current.status != SHARD_PLACEMENT_STATUS_ACTIVE
+        && current.move_target_database_alias.as_deref() != Some(target_database_alias)
+    {
+        anyhow::bail!(
+            "run {} shard {} is already {} toward database placement {}; retry with the persisted target",
+            run_id,
+            run_shard,
+            current.status,
+            current
+                .move_target_database_alias
+                .as_deref()
+                .unwrap_or("<missing>")
+        );
+    }
+
+    let draining = if current.status == SHARD_PLACEMENT_STATUS_ACTIVE {
         let placement = if source_is_control {
-            shard_placements::mark_shard_placement_moving(
+            shard_placements::mark_shard_placement_draining(
                 &mut *source_tx,
                 run_id,
                 run_shard,
                 &source_database_alias,
                 current.route_version,
+                target_database_alias,
             )
             .await?
         } else {
-            shard_placements::mark_shard_placement_moving(
+            shard_placements::mark_shard_placement_draining(
                 control_db,
                 run_id,
                 run_shard,
                 &source_database_alias,
                 current.route_version,
+                target_database_alias,
             )
             .await?
         };
         placement.ok_or_else(|| {
             anyhow::anyhow!(
-                "run {} shard {} route changed before it could be marked moving",
+                "run {} shard {} route changed before it could be marked draining",
                 run_id,
                 run_shard
             )
@@ -1322,15 +1356,56 @@ pub(crate) async fn move_shard_placement(
         .into());
     }
 
+    let moving = if draining.status == SHARD_PLACEMENT_STATUS_DRAINING {
+        let placement = if source_is_control {
+            shard_placements::mark_shard_placement_moving(
+                &mut *source_tx,
+                run_id,
+                run_shard,
+                &source_database_alias,
+                draining.route_version,
+                target_database_alias,
+            )
+            .await?
+        } else {
+            shard_placements::mark_shard_placement_moving(
+                control_db,
+                run_id,
+                run_shard,
+                &source_database_alias,
+                draining.route_version,
+                target_database_alias,
+            )
+            .await?
+        };
+        placement.ok_or_else(|| {
+            anyhow::anyhow!(
+                "run {} shard {} route changed before it could be frozen for copying",
+                run_id,
+                run_shard
+            )
+        })?
+    } else {
+        draining
+    };
+    database_router
+        .invalidate_execution_placement(run_id, run_shard)
+        .await;
+
+    if !databases_share_identity(&mut source_tx, target_db).await? {
+        reset_target_shard_rows(target_db, run_id, run_shard).await?;
+    }
+
     for table in PREREQUISITE_TABLES {
-        let rows = select_prerequisite_rows_with(&mut *source_tx, table, run_id).await?;
-        let copied = copy_json_rows(target_db, table, rows).await?;
+        let copied =
+            copy_prerequisite_rows_in_batches(&mut source_tx, target_db, table, run_id).await?;
         copied_rows_by_table.insert(table, copied);
     }
 
     for table in SHARD_TABLES {
-        let rows = select_shard_rows_with(&mut *source_tx, table.name, run_id, run_shard).await?;
-        let copied = copy_json_rows(target_db, table.name, rows).await?;
+        let copied =
+            copy_shard_rows_in_batches(&mut source_tx, target_db, table.name, run_id, run_shard)
+                .await?;
         copied_rows_by_table.insert(table.name, copied);
     }
 
@@ -1872,11 +1947,16 @@ async fn apply_rebalance_item(
     let planned_route_is_current = current.database_alias == item.source_database_alias
         && current.status == SHARD_PLACEMENT_STATUS_ACTIVE
         && current.route_version == item.planned_route_version;
-    let interrupted_move_is_resumable = current.database_alias == item.source_database_alias
-        && current.status == SHARD_PLACEMENT_STATUS_MOVING
+    let draining_move_is_resumable = current.database_alias == item.source_database_alias
+        && current.status == SHARD_PLACEMENT_STATUS_DRAINING
+        && current.move_target_database_alias.as_deref() == Some(&item.target_database_alias)
         && item.planned_route_version.checked_add(1) == Some(current.route_version);
+    let copying_move_is_resumable = current.database_alias == item.source_database_alias
+        && current.status == SHARD_PLACEMENT_STATUS_MOVING
+        && current.move_target_database_alias.as_deref() == Some(&item.target_database_alias)
+        && item.planned_route_version.checked_add(2) == Some(current.route_version);
 
-    if !planned_route_is_current && !interrupted_move_is_resumable {
+    if !planned_route_is_current && !draining_move_is_resumable && !copying_move_is_resumable {
         return Err(StaleRebalancePlanError {
             run_id: item.run_id,
             run_shard: item.run_shard,
@@ -2198,14 +2278,64 @@ where
     Ok(count)
 }
 
-async fn select_prerequisite_rows_with<'e, E>(
-    executor: E,
+async fn databases_share_identity(
+    source: &mut Transaction<'_, Postgres>,
+    target: &PgPool,
+) -> anyhow::Result<bool> {
+    type DatabaseIdentity = (String, Option<String>, Option<i32>, DateTime<Utc>);
+
+    let sql = r#"
+        SELECT
+            current_database(),
+            inet_server_addr()::text,
+            inet_server_port(),
+            pg_postmaster_start_time()
+    "#;
+    let source_identity = sqlx::query_as::<_, DatabaseIdentity>(sql)
+        .fetch_one(&mut **source)
+        .await?;
+    let target_identity = sqlx::query_as::<_, DatabaseIdentity>(sql)
+        .fetch_one(target)
+        .await?;
+
+    Ok(source_identity == target_identity)
+}
+
+/// Removes only the target's non-authoritative rows for one run shard.
+///
+/// Source ownership remains unchanged while this commits. Deletes run in
+/// reverse dependency order and take target-side exclusive admission so stale
+/// routed transactions cannot race the reset.
+async fn reset_target_shard_rows(
+    target: &PgPool,
+    run_id: Uuid,
+    run_shard: i16,
+) -> anyhow::Result<()> {
+    let mut tx = target.begin().await?;
+    crate::db::shard_write_fence::lock_exclusive(&mut tx, run_id, run_shard).await?;
+
+    for table in SHARD_TABLES.iter().rev() {
+        let sql = format!(
+            "DELETE FROM {} WHERE run_id = $1::uuid AND run_shard = $2",
+            table.name
+        );
+        sqlx::query(&sql)
+            .bind(run_id)
+            .bind(run_shard)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn copy_prerequisite_rows_in_batches(
+    source: &mut Transaction<'_, Postgres>,
+    target: &PgPool,
     table: &str,
     run_id: Uuid,
-) -> anyhow::Result<Vec<Value>>
-where
-    E: Executor<'e, Database = Postgres>,
-{
+) -> anyhow::Result<u64> {
     let sql = match table {
         "case_blobs" => {
             r#"
@@ -2251,23 +2381,33 @@ where
         _ => anyhow::bail!("unsupported prerequisite table {}", table),
     };
 
-    let rows = sqlx::query_scalar::<_, Value>(sql)
+    let mut rows = sqlx::query_scalar::<_, Value>(sql)
         .bind(run_id)
-        .fetch_all(executor)
-        .await?;
+        .fetch(&mut **source);
+    let mut batch = Vec::with_capacity(SHARD_MOVE_COPY_BATCH_SIZE);
+    let mut copied = 0;
 
-    Ok(rows)
+    while let Some(row) = rows.try_next().await? {
+        batch.push(row);
+        if batch.len() == SHARD_MOVE_COPY_BATCH_SIZE {
+            copied += copy_json_rows(target, table, std::mem::take(&mut batch)).await?;
+            batch = Vec::with_capacity(SHARD_MOVE_COPY_BATCH_SIZE);
+        }
+    }
+    if !batch.is_empty() {
+        copied += copy_json_rows(target, table, batch).await?;
+    }
+
+    Ok(copied)
 }
 
-async fn select_shard_rows_with<'e, E>(
-    executor: E,
+async fn copy_shard_rows_in_batches(
+    source: &mut Transaction<'_, Postgres>,
+    target: &PgPool,
     table: &str,
     run_id: Uuid,
     run_shard: i16,
-) -> anyhow::Result<Vec<Value>>
-where
-    E: Executor<'e, Database = Postgres>,
-{
+) -> anyhow::Result<u64> {
     let sql = format!(
         r#"
         SELECT to_jsonb(t) AS row
@@ -2277,13 +2417,25 @@ where
         "#
     );
 
-    let rows = sqlx::query_scalar::<_, Value>(&sql)
+    let mut rows = sqlx::query_scalar::<_, Value>(&sql)
         .bind(run_id)
         .bind(run_shard)
-        .fetch_all(executor)
-        .await?;
+        .fetch(&mut **source);
+    let mut batch = Vec::with_capacity(SHARD_MOVE_COPY_BATCH_SIZE);
+    let mut copied = 0;
 
-    Ok(rows)
+    while let Some(row) = rows.try_next().await? {
+        batch.push(row);
+        if batch.len() == SHARD_MOVE_COPY_BATCH_SIZE {
+            copied += copy_json_rows(target, table, std::mem::take(&mut batch)).await?;
+            batch = Vec::with_capacity(SHARD_MOVE_COPY_BATCH_SIZE);
+        }
+    }
+    if !batch.is_empty() {
+        copied += copy_json_rows(target, table, batch).await?;
+    }
+
+    Ok(copied)
 }
 
 async fn copy_json_rows(db: &PgPool, table: &str, rows: Vec<Value>) -> anyhow::Result<u64> {
@@ -2432,91 +2584,73 @@ where
     let sql = match table {
         "case_blobs" => {
             r#"
-            SELECT
-                COUNT(*)::bigint AS row_count,
-                COALESCE(md5(string_agg(row_json, E'\n' ORDER BY row_json)), '') AS checksum
-            FROM (
-                SELECT (to_jsonb(cb) - 'created_at')::text AS row_json
-                FROM case_blobs cb
-                WHERE EXISTS (
-                    SELECT 1
-                    FROM runs r
-                    JOIN dataset_version_cases cvc
-                      ON cvc.dataset_version_id = r.dataset_version_id
-                    WHERE r.id = $1::uuid
-                      AND cvc.case_hash = cb.case_hash
-                )
-            ) rows
+            SELECT (to_jsonb(cb) - 'created_at')::text AS row_json
+            FROM case_blobs cb
+            WHERE EXISTS (
+                SELECT 1
+                FROM runs r
+                JOIN dataset_version_cases cvc
+                  ON cvc.dataset_version_id = r.dataset_version_id
+                WHERE r.id = $1::uuid
+                  AND cvc.case_hash = cb.case_hash
+            )
+            ORDER BY row_json
             "#
         }
         "dataset_versions" => {
             r#"
-            SELECT
-                COUNT(*)::bigint AS row_count,
-                COALESCE(md5(string_agg(row_json, E'\n' ORDER BY row_json)), '') AS checksum
-            FROM (
-                SELECT (to_jsonb(dv) - 'created_at' - 'updated_at')::text AS row_json
-                FROM dataset_versions dv
-                JOIN runs r
-                  ON r.dataset_version_id = dv.dataset_version_id
-                WHERE r.id = $1::uuid
-            ) rows
+            SELECT (to_jsonb(dv) - 'created_at' - 'updated_at')::text AS row_json
+            FROM dataset_versions dv
+            JOIN runs r
+              ON r.dataset_version_id = dv.dataset_version_id
+            WHERE r.id = $1::uuid
+            ORDER BY row_json
             "#
         }
         "dataset_version_cases" => {
             r#"
-            SELECT
-                COUNT(*)::bigint AS row_count,
-                COALESCE(md5(string_agg(row_json, E'\n' ORDER BY row_json)), '') AS checksum
-            FROM (
-                SELECT (to_jsonb(cvc) - 'created_at' - 'updated_at')::text AS row_json
-                FROM dataset_version_cases cvc
-                JOIN runs r
-                  ON r.dataset_version_id = cvc.dataset_version_id
-                WHERE r.id = $1::uuid
-            ) rows
+            SELECT (to_jsonb(cvc) - 'created_at' - 'updated_at')::text AS row_json
+            FROM dataset_version_cases cvc
+            JOIN runs r
+              ON r.dataset_version_id = cvc.dataset_version_id
+            WHERE r.id = $1::uuid
+            ORDER BY row_json
             "#
         }
         "runs" => {
             r#"
-            SELECT
-                COUNT(*)::bigint AS row_count,
-                COALESCE(md5(string_agg(row_json, E'\n' ORDER BY row_json)), '') AS checksum
-            FROM (
-                SELECT (
-                    to_jsonb(r)
-                    - 'status'
-                    - 'gate_status'
-                    - 'coordinator_id'
-                    - 'coordinator_leased_until'
-                    - 'coordinator_heartbeat_at'
-                    - 'terminal_execution_count'
-                    - 'passed_execution_count'
-                    - 'failed_execution_count'
-                    - 'errored_execution_count'
-                    - 'summary'
-                    - 'error_message'
-                    - 'created_at'
-                    - 'started_at'
-                    - 'dispatched_at'
-                    - 'finalized_at'
-                    - 'completed_at'
-                    - 'updated_at'
-                )::text AS row_json
-                FROM runs r
-                WHERE r.id = $1::uuid
-            ) rows
+            SELECT (
+                to_jsonb(r)
+                - 'status'
+                - 'gate_status'
+                - 'coordinator_id'
+                - 'coordinator_leased_until'
+                - 'coordinator_heartbeat_at'
+                - 'terminal_execution_count'
+                - 'passed_execution_count'
+                - 'failed_execution_count'
+                - 'errored_execution_count'
+                - 'summary'
+                - 'error_message'
+                - 'created_at'
+                - 'started_at'
+                - 'dispatched_at'
+                - 'finalized_at'
+                - 'completed_at'
+                - 'updated_at'
+            )::text AS row_json
+            FROM runs r
+            WHERE r.id = $1::uuid
+            ORDER BY row_json
             "#
         }
         _ => anyhow::bail!("unsupported prerequisite table {}", table),
     };
 
-    let fingerprint = sqlx::query_as::<_, TableFingerprint>(sql)
+    let rows = sqlx::query_scalar::<_, String>(sql)
         .bind(run_id)
-        .fetch_one(executor)
-        .await?;
-
-    Ok(fingerprint)
+        .fetch(executor);
+    fingerprint_ordered_rows(rows).await
 }
 
 async fn table_fingerprint(
@@ -2539,25 +2673,38 @@ where
 {
     let sql = format!(
         r#"
-        SELECT
-            COUNT(*)::bigint AS row_count,
-            COALESCE(md5(string_agg(row_json, E'\n' ORDER BY row_json)), '') AS checksum
-        FROM (
-            SELECT to_jsonb(t)::text AS row_json
-            FROM {table} t
-            WHERE run_id = $1::uuid
-              AND run_shard = $2
-        ) rows
+        SELECT to_jsonb(t)::text AS row_json
+        FROM {table} t
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+        ORDER BY row_json
         "#
     );
 
-    let fingerprint = sqlx::query_as::<_, TableFingerprint>(&sql)
+    let rows = sqlx::query_scalar::<_, String>(&sql)
         .bind(run_id)
         .bind(run_shard)
-        .fetch_one(executor)
-        .await?;
+        .fetch(executor);
+    fingerprint_ordered_rows(rows).await
+}
 
-    Ok(fingerprint)
+async fn fingerprint_ordered_rows<'a>(
+    mut rows: impl futures_util::TryStream<Ok = String, Error = sqlx::Error> + Unpin + 'a,
+) -> anyhow::Result<TableFingerprint> {
+    let mut hasher = blake3::Hasher::new();
+    let mut row_count = 0_i64;
+
+    while let Some(row) = rows.try_next().await? {
+        let bytes = row.as_bytes();
+        hasher.update(&(bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+        row_count += 1;
+    }
+
+    Ok(TableFingerprint {
+        row_count,
+        checksum: hasher.finalize().to_hex().to_string(),
+    })
 }
 
 fn validate_run_shard(run_shard: i16) -> anyhow::Result<()> {
@@ -2765,9 +2912,10 @@ mod tests {
                 run_shard,
                 database_alias,
                 status,
+                move_target_database_alias,
                 route_version
             )
-            VALUES ($1::uuid, 3, 'primary', 'moving', 2)
+            VALUES ($1::uuid, 3, 'primary', 'moving', 'shard_001', 3)
             "#,
         )
         .bind(run_id)
@@ -2780,7 +2928,7 @@ mod tests {
             .unwrap();
 
         let error =
-            activate_moved_shard_placement_on_target(&pool, run_id, 3, "primary", 2, "shard_001")
+            activate_moved_shard_placement_on_target(&pool, run_id, 3, "primary", 3, "shard_001")
                 .await
                 .unwrap_err();
         assert!(
@@ -2796,7 +2944,7 @@ mod tests {
             .unwrap();
         assert_eq!(route.database_alias, "primary");
         assert_eq!(route.status, SHARD_PLACEMENT_STATUS_MOVING);
-        assert_eq!(route.route_version, 2);
+        assert_eq!(route.route_version, 3);
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -2819,9 +2967,10 @@ mod tests {
                 run_shard,
                 database_alias,
                 status,
+                move_target_database_alias,
                 route_version
             )
-            VALUES ($1::uuid, 3, 'primary', 'moving', 2)
+            VALUES ($1::uuid, 3, 'primary', 'moving', 'shard_001', 3)
             "#,
         )
         .bind(run_id)
@@ -2842,7 +2991,7 @@ mod tests {
                 run_id,
                 3,
                 "primary",
-                2,
+                3,
                 "shard_001",
             )
             .await
@@ -2878,7 +3027,7 @@ mod tests {
             .unwrap();
         assert_eq!(route.database_alias, "primary");
         assert_eq!(route.status, SHARD_PLACEMENT_STATUS_MOVING);
-        assert_eq!(route.route_version, 2);
+        assert_eq!(route.route_version, 3);
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -2991,8 +3140,23 @@ mod tests {
 
         sqlx::query(
             r#"
-            INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
-            VALUES ($1::uuid, 4, 'primary', 'moving')
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'active')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO shard_placements (
+                run_id,
+                run_shard,
+                database_alias,
+                status,
+                move_target_database_alias
+            )
+            VALUES ($1::uuid, 4, 'primary', 'moving', 'shard_001')
             "#,
         )
         .bind(run_id)
@@ -3172,7 +3336,27 @@ mod tests {
         assert!(outcome.tables.iter().all(|table| table.verified));
         assert_eq!(outcome.placement.database_alias, "shard_001");
         assert_eq!(outcome.placement.status, SHARD_PLACEMENT_STATUS_ACTIVE);
-        assert_eq!(outcome.placement.route_version, 3);
+        assert!(outcome.placement.move_target_database_alias.is_none());
+        assert_eq!(outcome.placement.route_version, 4);
+
+        let retried = move_shard_placement(
+            &database_router,
+            run_id,
+            3,
+            "shard_001",
+            ShardMoveOptions {
+                dry_run: false,
+                verify_only: false,
+                force: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!retried.moved);
+        assert!(retried.tables.iter().all(|table| table.verified));
+        assert_eq!(retried.placement.database_alias, "shard_001");
+        assert_eq!(retried.placement.route_version, 4);
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -3187,7 +3371,9 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO database_placements (alias, database_url_env, role, status)
-            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'active')
+            VALUES
+                ('shard_001', 'DATABASE_URL', 'shard', 'active'),
+                ('shard_002', 'DATABASE_URL', 'shard', 'active')
             "#,
         )
         .execute(&pool)
@@ -3244,13 +3430,36 @@ mod tests {
 
         assert!(error.to_string().contains("--force cannot bypass"));
         assert_eq!(placement.database_alias, "primary");
-        assert_eq!(placement.status, SHARD_PLACEMENT_STATUS_MOVING);
+        assert_eq!(placement.status, SHARD_PLACEMENT_STATUS_DRAINING);
+        assert_eq!(
+            placement.move_target_database_alias.as_deref(),
+            Some("shard_001")
+        );
         assert_eq!(placement.route_version, 2);
+
+        let redirect_error = move_shard_placement(
+            &database_router,
+            run_id,
+            3,
+            "shard_002",
+            ShardMoveOptions {
+                dry_run: false,
+                verify_only: false,
+                force: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            redirect_error
+                .to_string()
+                .contains("retry with the persisted target")
+        );
     }
 
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
-    async fn rebalance_defers_a_moving_shard_until_active_work_drains(pool: PgPool) {
+    async fn rebalance_defers_a_draining_shard_until_active_work_drains(pool: PgPool) {
         let database_url = isolated_database_url(&pool).await;
         let database_router = database_router_with_control_pool(pool.clone(), database_url);
         let (operation_id, items) = seed_rebalance_operation(&pool, 1).await;
@@ -3309,7 +3518,11 @@ mod tests {
 
         assert_eq!(outcome.operation.status, REBALANCE_OPERATION_STATUS_RUNNING);
         assert_eq!(outcome.processed_items[0].status, "pending");
-        assert_eq!(placement.status, SHARD_PLACEMENT_STATUS_MOVING);
+        assert_eq!(placement.status, SHARD_PLACEMENT_STATUS_DRAINING);
+        assert_eq!(
+            placement.move_target_database_alias.as_deref(),
+            Some("shard_001")
+        );
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -3713,7 +3926,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(route_versions.len(), items.len());
-        assert!(route_versions.into_iter().all(|version| version == 3));
+        assert!(route_versions.into_iter().all(|version| version == 4));
     }
 
     #[test]

@@ -118,6 +118,30 @@ async fn multi_database_routing_flow() -> anyhow::Result<()> {
             .as_i64()
             .is_some_and(|version| version > 1)
     );
+    set_run_shard_chunk_status(&shard, default_run_id, 0, "completed").await?;
+
+    let moved_default_back_payload = run_vigilo(
+        &config,
+        PRIMARY_ALIAS,
+        [
+            "shard",
+            "move",
+            &default_run_id.to_string(),
+            "0",
+            "--alias",
+            PRIMARY_ALIAS,
+        ],
+    )?;
+    assert_eq!(moved_default_back_payload["meta"]["moved"], true);
+    assert_eq!(
+        shard_placement_alias(&primary, default_run_id, 0).await?,
+        PRIMARY_ALIAS
+    );
+    assert_eq!(
+        run_shard_chunk_status(&primary, default_run_id, 0).await?,
+        "completed",
+        "moving back replaces the target's retained stale shard rows"
+    );
 
     let routed_run_id = create_run(&config, SHARD_ALIAS, 101).await?;
     assert_eq!(run_chunk_count(&primary, routed_run_id).await?, 0);
@@ -590,6 +614,50 @@ async fn run_shard_chunk_count(db: &PgPool, run_id: Uuid, run_shard: i16) -> any
     Ok(sqlx::query_scalar::<_, i64>(
         r#"
         SELECT COUNT(*)::bigint
+        FROM run_chunks
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .fetch_one(db)
+    .await?)
+}
+
+async fn set_run_shard_chunk_status(
+    db: &PgPool,
+    run_id: Uuid,
+    run_shard: i16,
+    status: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE run_chunks
+        SET status = $3,
+            lease_token = NULL,
+            leased_until = NULL,
+            updated_at = now()
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(status)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn run_shard_chunk_status(
+    db: &PgPool,
+    run_id: Uuid,
+    run_shard: i16,
+) -> anyhow::Result<String> {
+    Ok(sqlx::query_scalar(
+        r#"
+        SELECT status
         FROM run_chunks
         WHERE run_id = $1::uuid
           AND run_shard = $2

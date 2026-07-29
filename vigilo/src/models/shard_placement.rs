@@ -27,7 +27,7 @@ pub(crate) struct ShardPlacementDraft {
     pub(crate) run_shard: i16,
     /// Database placement alias for this run shard.
     pub(crate) database_alias: String,
-    /// Placement lifecycle: active, moving, or draining.
+    /// Placement lifecycle: active, draining, or moving.
     pub(crate) status: String,
 }
 
@@ -40,8 +40,10 @@ pub(crate) struct ShardPlacement {
     pub(crate) run_shard: i16,
     /// Database placement alias for this run shard.
     pub(crate) database_alias: String,
-    /// Placement lifecycle: active, moving, or draining.
+    /// Placement lifecycle: active, draining, or moving.
     pub(crate) status: String,
+    /// Distinct destination required while a shard is draining or moving.
+    pub(crate) move_target_database_alias: Option<String>,
     /// Monotonic route fencing token.
     pub(crate) route_version: i64,
     /// Time this placement row was inserted.

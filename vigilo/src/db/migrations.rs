@@ -149,11 +149,22 @@ mod tests {
     async fn shard_placements_enforce_alias_status_and_shard_range(pool: PgPool) {
         let run_id = Uuid::now_v7();
 
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_001', 'VIGILO_SHARD_001_DATABASE_URL', 'shard', 'active')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
         let placement = sqlx::query_as::<_, ShardPlacement>(
             r#"
             INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
             VALUES ($1::uuid, 42, 'primary', 'active')
-            RETURNING run_id, run_shard, database_alias, status, route_version, created_at, updated_at
+            RETURNING run_id, run_shard, database_alias, status, move_target_database_alias,
+                      route_version, created_at, updated_at
             "#,
         )
         .bind(run_id)
@@ -199,5 +210,67 @@ mod tests {
         .execute(&pool)
         .await;
         assert!(invalid_status.is_err());
+
+        let active_with_target = sqlx::query(
+            r#"
+            INSERT INTO shard_placements (
+                run_id,
+                run_shard,
+                database_alias,
+                status,
+                move_target_database_alias
+            )
+            VALUES ($1::uuid, 3, 'primary', 'active', 'shard_001')
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .execute(&pool)
+        .await;
+        assert!(active_with_target.is_err());
+
+        let moving_without_target = sqlx::query(
+            r#"
+            INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
+            VALUES ($1::uuid, 4, 'primary', 'moving')
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .execute(&pool)
+        .await;
+        assert!(moving_without_target.is_err());
+
+        let move_target_matches_owner = sqlx::query(
+            r#"
+            INSERT INTO shard_placements (
+                run_id,
+                run_shard,
+                database_alias,
+                status,
+                move_target_database_alias
+            )
+            VALUES ($1::uuid, 5, 'primary', 'draining', 'primary')
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .execute(&pool)
+        .await;
+        assert!(move_target_matches_owner.is_err());
+
+        sqlx::query(
+            r#"
+            INSERT INTO shard_placements (
+                run_id,
+                run_shard,
+                database_alias,
+                status,
+                move_target_database_alias
+            )
+            VALUES ($1::uuid, 6, 'primary', 'draining', 'shard_001')
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .execute(&pool)
+        .await
+        .unwrap();
     }
 }
