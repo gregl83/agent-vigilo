@@ -1,7 +1,7 @@
 //! Contracts used at the run-configuration and dataset input boundary.
 //!
 //! These types define the canonical profile and dataset payloads consumed by
-//! `vigilo run test`. They are intentionally transport-focused contracts used
+//! `vigilo run validate`. They are intentionally transport-focused contracts used
 //! for parsing and validation before orchestration/runtime execution logic.
 
 use std::collections::BTreeMap;
@@ -21,7 +21,7 @@ fn default_post_method() -> String {
     "POST".to_string()
 }
 
-/// Run profile used by `vigilo run test`.
+/// Run profile used by `vigilo run validate`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RunProfile {
     /// Stable profile identifier (for example, `mixed_agent_release`).
@@ -249,7 +249,7 @@ pub(crate) enum AggregationMethod {
     WeightedMean,
 }
 
-/// Dataset envelope used by `vigilo run test`.
+/// Dataset envelope used by `vigilo run validate`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RunDataset {
     /// Stable dataset identifier.

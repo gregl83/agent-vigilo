@@ -161,8 +161,8 @@ Common profiles:
 | Profile | Publish selection |
 |---------|-------------------|
 | `dev` | default when no profile flag is provided |
-| `release` | selected by `vigilo evaluators publish <path> --release` |
-| custom | selected by `vigilo evaluators publish <path> --profile <name>` |
+| `release` | selected by `vigilo evaluator publish <path> --release` |
+| custom | selected by `vigilo evaluator publish <path> --profile <name>` |
 
 ---
 
@@ -188,7 +188,7 @@ Rebuild the selected profile before publishing:
 
 ```bash
 cargo build --manifest-path evaluators/my-evaluator/Cargo.toml --target wasm32-wasip2 --release
-vigilo evaluators publish ./evaluators/my-evaluator --release
+vigilo evaluator publish ./evaluators/my-evaluator --release
 ```
 
 ---

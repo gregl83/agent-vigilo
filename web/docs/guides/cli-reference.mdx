@@ -1,0 +1,72 @@
+---
+title: CLI Reference
+sidebar_position: 4
+description: Canonical Agent Vigilo command hierarchy and routing administration workflow.
+keywords:
+  - Agent Vigilo CLI
+  - Vigilo commands
+  - database drain
+  - run shard move
+  - shard rebalance
+---
+
+# CLI Reference
+
+The CLI uses singular resource groups. Database commands manage global
+execution placements, shard commands live under their owning run, and
+rebalance commands operate across runs.
+
+```text
+vigilo
+|-- setup
+|-- evaluator
+|   |-- list
+|   |-- publish <path>
+|   |-- show <evaluator>
+|   |-- search [query]
+|   |-- test <evaluator>
+|   `-- set-state <evaluator> <state>
+|-- run
+|   |-- create
+|   |-- validate
+|   |-- watch <run_id>
+|   |-- status <run_id>
+|   |-- cancel <run_id>
+|   |-- results <run_id>
+|   |-- export <run_id>
+|   `-- shard
+|       |-- list <run_id>
+|       |-- show <run_id> <run_shard>
+|       |-- assign <run_id> <run_shard> --to <database>
+|       |-- move <run_id> <run_shard> --to <database>
+|       `-- abort-move <run_id> <run_shard> --from <source> --to <target>
+|-- database
+|   |-- list
+|   |-- register <alias> --database-url-env <ENV>
+|   |-- drain <alias>
+|   `-- disable <alias>
+|-- rebalance
+|   |-- plan [--from <source>] --to <target>
+|   |-- apply <operation_id>
+|   |-- verify <operation_id>
+|   `-- cancel <operation_id>
+|-- coordinator
+|   |-- start
+|   `-- once
+`-- worker
+    |-- start
+    `-- once
+```
+
+Use `run shard assign` only for an empty or new shard. Use `run shard move`
+when the shard owns data. Draining a database stops new ownership but does not
+move existing shards; use `rebalance` to evacuate them before disabling it.
+
+The former plural evaluator command, `run test`, and `shard ...` hierarchy
+remain accepted as compatibility paths but are omitted from canonical help.
+
+## Related
+
+- [Getting started](./getting-started)
+- [Scale-out and shard migration](/docs/architecture/scaling/)
+- [Publishing evaluators](./publishing)

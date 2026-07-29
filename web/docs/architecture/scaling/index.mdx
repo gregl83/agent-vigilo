@@ -256,7 +256,7 @@ the placement:
 
 ```text
 VIGILO_SHARD_001_DATABASE_URL=postgres://...
-vigilo shard databases add shard_001 --database-url-env VIGILO_SHARD_001_DATABASE_URL
+vigilo database register shard_001 --database-url-env VIGILO_SHARD_001_DATABASE_URL
 ```
 
 Set the default for future run shards:
@@ -287,12 +287,12 @@ stateDiagram-v2
     state "Draining<br/>serves existing ownership only" as draining
     state "Disabled<br/>serves no runtime work" as disabled
 
-    [*] --> active: databases add
-    active --> draining: databases drain
-    draining --> disabled: databases disable
+    [*] --> active: database register
+    active --> draining: database drain
+    draining --> disabled: database disable
 ```
 
-| Database status | New run shard | Placement set or move target | Existing owned shard |
+| Database status | New run shard | Assignment or move target | Existing owned shard |
 | --- | --- | --- | --- |
 | `active` | Allowed | Allowed | Served |
 | `draining` | Rejected | Rejected | Served |
@@ -307,16 +307,16 @@ To evacuate a shard-only placement:
 
 ```text
 # First deploy an active default/target alias to every relevant process.
-vigilo shard databases drain shard_001
-vigilo shard rebalance plan --from shard_001 --to shard_002 --max-items 100
-vigilo shard rebalance apply <operation_id> --max-items 25
-vigilo shard rebalance verify <operation_id> --max-items 25
-vigilo shard databases disable shard_001
+vigilo database drain shard_001
+vigilo rebalance plan --from shard_001 --to shard_002 --max-items 100
+vigilo rebalance apply <operation_id> --max-items 25
+vigilo rebalance verify <operation_id> --max-items 25
+vigilo database disable shard_001
 ```
 
-`databases drain` is idempotent and refuses the control-capable placement.
+`database drain` is idempotent and refuses the control-capable placement.
 After it succeeds, existing routes continue normally while rebalance evacuates
-them. `databases disable` requires the placement to be draining and have zero
+them. `database disable` requires the placement to be draining and have zero
 owned shard routes, zero creating-run references, zero unfinished rebalance
 items, and zero pending outbox deliveries. It is also idempotent. Keep the
 placement database and its URL environment variable available until disable
@@ -325,13 +325,12 @@ succeeds.
 Inspect routing metadata:
 
 ```text
-vigilo shard databases list
-vigilo shard placements list <run_id>
-vigilo shard placements show <run_id> <run_shard>
-vigilo shard route <run_id> <run_shard>
+vigilo database list
+vigilo run shard list <run_id>
+vigilo run shard show <run_id> <run_shard>
 ```
 
-`vigilo shard route` reports the database alias, placement statuses,
+`vigilo run shard show` reports the database alias, placement statuses,
 `move_target_database_alias`, `route_version`, `database_url_env`, env-var
 availability, and whether the route is `dispatchable`, `read_only`, or
 `blocked`. It never prints the database URL.
@@ -341,9 +340,9 @@ availability, and whether the route is `dispatchable`, `read_only`, or
 Use shard move for a specific `run_id + run_shard`:
 
 ```text
-vigilo shard move <run_id> <run_shard> --alias <alias> --dry-run
-vigilo shard move <run_id> <run_shard> --alias <alias>
-vigilo shard move <run_id> <run_shard> --alias <alias> --verify-only
+vigilo run shard move <run_id> <run_shard> --to <alias> --dry-run
+vigilo run shard move <run_id> <run_shard> --to <alias>
+vigilo run shard move <run_id> <run_shard> --to <alias> --verify-only
 ```
 
 Routes are immutable while their run is `creating`; move and direct placement
@@ -438,11 +437,11 @@ command so teams can apply their own backup and retention policy.
 Use rebalance operations when adding capacity or draining a placement:
 
 ```text
-vigilo shard rebalance plan --to shard_001 --max-items 100
-vigilo shard rebalance plan --from primary --to shard_001 --max-items 100
-vigilo shard rebalance apply <operation_id> --max-items 25 --lease-seconds 300
-vigilo shard rebalance verify <operation_id> --max-items 25
-vigilo shard rebalance cancel <operation_id>
+vigilo rebalance plan --to shard_001 --max-items 100
+vigilo rebalance plan --from primary --to shard_001 --max-items 100
+vigilo rebalance apply <operation_id> --max-items 25 --lease-seconds 300
+vigilo rebalance verify <operation_id> --max-items 25
+vigilo rebalance cancel <operation_id>
 ```
 
 A rebalance plan records one item per targeted `run_id + run_shard` in the

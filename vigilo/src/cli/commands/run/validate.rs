@@ -7,7 +7,7 @@
 
 use super::*;
 
-/// Implements `vigilo run test`.
+/// Implements `vigilo run validate`.
 ///
 /// This command performs schema + executability validation and echoes parsed
 /// contracts for local inspection without creating persistence records.

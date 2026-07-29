@@ -85,13 +85,13 @@ cargo build --manifest-path evaluators/my-evaluator/Cargo.toml --target wasm32-w
 Publish the release artifact:
 
 ```bash
-vigilo evaluators publish ./evaluators/my-evaluator --release
+vigilo evaluator publish ./evaluators/my-evaluator --release
 ```
 
 Run a focused evaluator test against the published version using the sample input:
 
 ```bash
-vigilo evaluators test 'vigilo/my-evaluator:0.1.0' --input-file evaluators/my-evaluator/example-input.json
+vigilo evaluator test 'vigilo/my-evaluator:0.1.0' --input-file evaluators/my-evaluator/example-input.json
 ```
 
 If you hit an interface conversion error, check that the published evaluator version matches the current WIT contract expected by the host.
@@ -101,7 +101,7 @@ If you hit an interface conversion error, check that the published evaluator ver
 After validating behavior locally:
 
 ```bash
-vigilo evaluators publish ./evaluators/my-evaluator --release
+vigilo evaluator publish ./evaluators/my-evaluator --release
 ```
 
 For complete publish workflow details, see [Publishing Evaluators](./publishing.mdx).
@@ -120,8 +120,8 @@ Recommended prompt constraints:
 Recommended validation checklist:
 
 1. Confirm the generated evaluator builds for `wasm32-wasip2`.
-2. Confirm `vigilo evaluators publish ... --release` publishes or skips the expected version.
-3. Confirm `vigilo evaluators test ... --input-file ...` succeeds.
+2. Confirm `vigilo evaluator publish ... --release` publishes or skips the expected version.
+3. Confirm `vigilo evaluator test ... --input-file ...` succeeds.
 4. Confirm identifiers and output fields use the canonical naming (`input`/`output`).
 5. Bump evaluator version and republish after any contract-shape or behavior change.
 

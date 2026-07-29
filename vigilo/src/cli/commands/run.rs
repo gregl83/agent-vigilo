@@ -32,6 +32,7 @@ use uuid::Uuid;
 use super::{
     Executable,
     args::parsers::parse_filepath,
+    shard,
 };
 use crate::{
     context::Context,
@@ -77,7 +78,7 @@ mod create;
 mod export;
 mod results;
 mod status;
-mod test;
+mod validate;
 mod watch;
 
 const DEFAULT_CHUNK_SIZE: usize = 100;
@@ -553,8 +554,9 @@ pub(crate) enum SubCommand {
         dataset_file: Option<PathBuf>,
     },
 
-    /// Parse and validate run profile + dataset inputs
-    Test {
+    /// Parse and validate run profile and dataset inputs
+    #[command(alias = "test")]
+    Validate {
         /// Run profile YAML/JSON inline string
         #[arg(
             long,
@@ -643,6 +645,9 @@ pub(crate) enum SubCommand {
         #[arg(long, default_value_t = EXPORT_EXECUTION_BATCH_SIZE, value_parser = clap::value_parser!(i64).range(1..=MAX_EXPORT_BATCH_SIZE))]
         batch_size: i64,
     },
+
+    /// Manage shards owned by a run
+    Shard(shard::RunShardCommand),
 }
 
 #[derive(Debug, Args)]
@@ -703,17 +708,18 @@ impl Executable for Command {
                 )
                 .await
             }
-            Some(SubCommand::Test {
+            Some(SubCommand::Validate {
                 profile,
                 profile_file,
                 dataset,
                 dataset_file,
             }) => {
-                info!("parsing run test profile and dataset inputs");
-                test::exec(context, profile, profile_file, dataset, dataset_file).await
+                info!("validating run profile and dataset inputs");
+                validate::exec(context, profile, profile_file, dataset, dataset_file).await
             }
+            Some(SubCommand::Shard(command)) => command.exec(context).await,
             None => anyhow::bail!(
-                "missing run subcommand; use `vigilo run test --profile-file <file> --dataset-file <file>`"
+                "missing run subcommand; use `vigilo run validate --profile-file <file> --dataset-file <file>`"
             ),
         }
     }

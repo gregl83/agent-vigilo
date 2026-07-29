@@ -63,6 +63,9 @@ fn get_manifest_profile(release: bool, profile: Option<String>) -> String {
 #[derive(Debug, Subcommand)]
 /// Evaluator command operations.
 pub(crate) enum SubCommand {
+    /// List evaluator versions in the default namespace
+    List,
+
     /// Publish evaluator version
     Publish {
         /// Path to evaluator crate
@@ -145,6 +148,7 @@ impl Executable for SubCommand {
     /// Executes one evaluator operation against runtime + persistence context.
     async fn exec(self, context: Context) -> anyhow::Result<()> {
         match self {
+            SubCommand::List => list(context).await,
             SubCommand::Publish {
                 evaluator_path,
                 release,
@@ -170,11 +174,40 @@ impl Executable for SubCommand {
     }
 }
 
+async fn list(context: Context) -> anyhow::Result<()> {
+    let db = context.dbr().await?.control().await?;
+    let evaluators = evaluators::list_evaluators(db, DEFAULT_NAMESPACE).await?;
+
+    if evaluators.is_empty() {
+        warn!("no evaluators found");
+    } else {
+        for evaluator in evaluators {
+            info!(
+                "{}/{}:{} state={:?}",
+                evaluator.namespace, evaluator.name, evaluator.version, evaluator.state,
+            );
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Args)]
-/// Arguments for `vigilo evaluators`.
-///
-/// If no subcommand is provided, the command lists evaluator versions in the
-/// default namespace.
+/// Arguments for `vigilo evaluator`.
+pub(crate) struct CanonicalCommand {
+    #[command(subcommand)]
+    pub command: SubCommand,
+}
+
+#[async_trait]
+impl Executable for CanonicalCommand {
+    async fn exec(self, context: Context) -> anyhow::Result<()> {
+        self.command.exec(context).await
+    }
+}
+
+#[derive(Debug, Args)]
+/// Deprecated `vigilo evaluators` compatibility command.
 pub(crate) struct Command {
     #[command(subcommand)]
     pub command: Option<SubCommand>,
@@ -182,27 +215,11 @@ pub(crate) struct Command {
 
 #[async_trait]
 impl Executable for Command {
-    /// Dispatches evaluator subcommands or falls back to list behavior.
     async fn exec(self, context: Context) -> anyhow::Result<()> {
+        warn!("`vigilo evaluators` is deprecated; use `vigilo evaluator`");
         match self.command {
             Some(subcommand) => subcommand.exec(context).await,
-            None => {
-                let db = context.dbr().await?.control().await?;
-                let evaluators = evaluators::list_evaluators(db, DEFAULT_NAMESPACE).await?;
-
-                if evaluators.is_empty() {
-                    warn!("no evaluators found");
-                } else {
-                    for evaluator in evaluators {
-                        info!(
-                            "{}/{}:{} state={:?}",
-                            evaluator.namespace, evaluator.name, evaluator.version, evaluator.state,
-                        );
-                    }
-                }
-
-                Ok(())
-            }
+            None => list(context).await,
         }
     }
 }

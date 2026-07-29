@@ -101,13 +101,13 @@ If your package uses a custom target directory, keep the configured profile path
 Publish the release artifact:
 
 ```bash
-vigilo evaluators publish ./evaluators/my-evaluator --release
+vigilo evaluator publish ./evaluators/my-evaluator --release
 ```
 
 Publish a non-release profile by name:
 
 ```bash
-vigilo evaluators publish ./evaluators/my-evaluator --profile dev
+vigilo evaluator publish ./evaluators/my-evaluator --profile dev
 ```
 
 If neither `--release` nor `--profile` is provided, `vigilo` uses the `dev` profile from `Vigilo.toml`.
@@ -116,7 +116,7 @@ If neither `--release` nor `--profile` is provided, `vigilo` uses the `dev` prof
 
 ## What Happens at Publish Time
 
-When you run `vigilo evaluators publish`, the following steps occur:
+When you run `vigilo evaluator publish`, the following steps occur:
 
 1. `Vigilo.toml` is read from the evaluator directory.
 2. The selected `[profile.<name>]` resolves the compiled wasm artifact path.
@@ -156,7 +156,7 @@ If a stale build is detected, rebuild and publish again:
 
 ```bash
 cargo build --manifest-path evaluators/my-evaluator/Cargo.toml --target wasm32-wasip2 --release
-vigilo evaluators publish ./evaluators/my-evaluator --release
+vigilo evaluator publish ./evaluators/my-evaluator --release
 ```
 
 ---
@@ -183,14 +183,14 @@ Build and publish each:
 cargo build --manifest-path evaluators/core/Cargo.toml --target wasm32-wasip2 --release
 cargo build --manifest-path evaluators/sentiment/Cargo.toml --target wasm32-wasip2 --release
 
-vigilo evaluators publish ./evaluators/core --release
-vigilo evaluators publish ./evaluators/sentiment --release
+vigilo evaluator publish ./evaluators/core --release
+vigilo evaluator publish ./evaluators/sentiment --release
 ```
 
 For a small workspace, publish all evaluator directories with:
 
 ```bash
-for dir in evaluators/*/; do vigilo evaluators publish "$dir" --release; done
+for dir in evaluators/*/; do vigilo evaluator publish "$dir" --release; done
 ```
 
 ---
@@ -220,17 +220,17 @@ jobs:
         run: cargo build --manifest-path evaluators/my-evaluator/Cargo.toml --target wasm32-wasip2 --release
 
       - name: Publish evaluator
-        run: vigilo evaluators publish ./evaluators/my-evaluator --release
+        run: vigilo evaluator publish ./evaluators/my-evaluator --release
 ```
 
 ---
 
 ## Reference
 
-### `vigilo evaluators publish`
+### `vigilo evaluator publish`
 
 ```text
-vigilo evaluators publish <evaluator-path> [--release | --profile <PROFILE>]
+vigilo evaluator publish <evaluator-path> [--release | --profile <PROFILE>]
 ```
 
 Arguments:
@@ -245,7 +245,7 @@ Options:
 ### Related Commands
 
 ```bash
-vigilo evaluators test 'vigilo/my-evaluator:0.1.0' --input-file evaluators/my-evaluator/example-input.json
-vigilo evaluators show 'vigilo/my-evaluator:0.1.0'
-vigilo evaluators search --namespace vigilo my-evaluator
+vigilo evaluator test 'vigilo/my-evaluator:0.1.0' --input-file evaluators/my-evaluator/example-input.json
+vigilo evaluator show 'vigilo/my-evaluator:0.1.0'
+vigilo evaluator search --namespace vigilo my-evaluator
 ```

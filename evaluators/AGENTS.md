@@ -23,7 +23,7 @@ This file applies to evaluator crates under `evaluators/`.
 ## Build and Test Expectations
 
 - Build target: `wasm32-wasip2`.
-- Validate with `vigilo evaluators test` using `--input` or `--input-file`.
+- Validate with `vigilo evaluator test` using `--input` or `--input-file`.
 - If contract shape changes, bump evaluator version before republishing.
 
 ## Rustfmt and Toolchain

@@ -29,14 +29,14 @@ The profile uses the bundled evaluator `vigilo/sentiment-basic-en:0.1.0`. Build 
 
 ```bash
 cargo build --manifest-path evaluators/sentiment-basic-en/Cargo.toml --target wasm32-wasip2 --release
-DATABASE_URL='postgres://postgres:password@localhost:5432/agent_vigilo' cargo run -p vigilo -- evaluators publish evaluators/sentiment-basic-en --release
+DATABASE_URL='postgres://postgres:password@localhost:5432/agent_vigilo' cargo run -p vigilo -- evaluator publish evaluators/sentiment-basic-en --release
 ```
 
 ## Run
 
 ```bash
 docker compose -f infra/dev/docker-compose.yml up -d
-DATABASE_URL='postgres://postgres:password@localhost:5432/agent_vigilo' cargo run -p vigilo -- run test --profile-file example/profile.yaml --dataset-file example/dataset.yaml
+DATABASE_URL='postgres://postgres:password@localhost:5432/agent_vigilo' cargo run -p vigilo -- run validate --profile-file example/profile.yaml --dataset-file example/dataset.yaml
 ```
 
 Notes:

@@ -1,7 +1,8 @@
-//! Shard placement administration commands.
+//! Database placement, run-shard, and rebalance administration commands.
 //!
-//! These commands inspect placement metadata, update empty shard routes, and
-//! run, recover, or abort explicit moves for routes that already own data.
+//! The public CLI exposes these resources at their ownership boundaries:
+//! databases are global, run shards belong to runs, and rebalances span runs.
+//! Legacy `vigilo shard ...` paths translate into the same handlers.
 
 use async_trait::async_trait;
 use clap::{
@@ -12,7 +13,10 @@ use serde_json::{
     Value,
     json,
 };
-use tracing::info;
+use tracing::{
+    info,
+    warn,
+};
 use uuid::Uuid;
 
 use super::Executable;
@@ -92,7 +96,7 @@ pub(crate) enum SubCommand {
         source: String,
 
         /// Expected target database placement alias
-        #[arg(long, alias = "to")]
+        #[arg(long = "to", alias = "target")]
         target: String,
     },
 
@@ -109,8 +113,9 @@ pub(crate) enum DatabaseSubCommand {
     /// List database placements
     List,
 
-    /// Add an active shard database placement
-    Add {
+    /// Register an active shard database placement
+    #[command(alias = "add")]
+    Register {
         /// Stable placement alias
         alias: String,
 
@@ -123,16 +128,16 @@ pub(crate) enum DatabaseSubCommand {
         defer_env_validation: bool,
     },
 
-    /// Disable a non-control database placement
-    ///
-    /// The placement must be draining, own no routes, and be no move target.
-    Disable {
+    /// Stop new ownership unless an in-flight move targets this placement
+    Drain {
         /// Stable placement alias
         alias: String,
     },
 
-    /// Stop new ownership unless an in-flight move targets this placement
-    Drain {
+    /// Disable a non-control database placement
+    ///
+    /// The placement must be draining, own no routes, and be no move target.
+    Disable {
         /// Stable placement alias
         alias: String,
     },
@@ -182,7 +187,7 @@ pub(crate) enum RebalanceSubCommand {
         from: Option<String>,
 
         /// Target database placement alias
-        #[arg(long, alias = "to")]
+        #[arg(long = "to", alias = "target")]
         target: String,
 
         /// Maximum items to include in this plan
@@ -230,7 +235,115 @@ pub(crate) enum RebalanceSubCommand {
 }
 
 #[derive(Debug, Args)]
-/// Arguments for `vigilo shard`.
+/// Global database placement administration.
+#[command(
+    after_help = "Tip: draining stops new ownership but does not move existing shards. Use `vigilo rebalance` to evacuate the database before disabling it."
+)]
+pub(crate) struct DatabaseCommand {
+    #[command(subcommand)]
+    pub(crate) command: DatabaseSubCommand,
+}
+
+#[derive(Debug, Subcommand)]
+/// Operations on shards owned by one run.
+pub(crate) enum RunShardSubCommand {
+    /// List shard assignments for a run
+    List {
+        /// Run UUID
+        run_id: String,
+    },
+
+    /// Show the resolved route for one run shard
+    Show {
+        /// Run UUID
+        run_id: String,
+
+        /// Logical run shard
+        #[arg(value_parser = clap::value_parser!(i16).range(0..=127))]
+        run_shard: i16,
+    },
+
+    /// Assign an empty or new run shard to a database
+    Assign {
+        /// Run UUID
+        run_id: String,
+
+        /// Logical run shard
+        #[arg(value_parser = clap::value_parser!(i16).range(0..=127))]
+        run_shard: i16,
+
+        /// Target database placement alias
+        #[arg(long = "to")]
+        target: String,
+    },
+
+    /// Move one run shard to another database
+    Move {
+        /// Run UUID
+        run_id: String,
+
+        /// Logical run shard
+        #[arg(value_parser = clap::value_parser!(i16).range(0..=127))]
+        run_shard: i16,
+
+        /// Target database placement alias
+        #[arg(long = "to", alias = "alias")]
+        target: String,
+
+        /// Validate and report the move plan without writing data
+        #[arg(long, default_value_t = false, conflicts_with = "verify_only")]
+        dry_run: bool,
+
+        /// Verify source and target shard rows without copying or switching placement
+        #[arg(long, default_value_t = false)]
+        verify_only: bool,
+
+        /// Compatibility flag; active work is always protected by the shard write fence
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+
+    /// Restore an in-progress move to its source database
+    AbortMove {
+        /// Run UUID
+        run_id: String,
+
+        /// Logical run shard
+        #[arg(value_parser = clap::value_parser!(i16).range(0..=127))]
+        run_shard: i16,
+
+        /// Expected source database placement alias
+        #[arg(long = "from", alias = "source")]
+        source: String,
+
+        /// Expected target database placement alias
+        #[arg(long = "to", alias = "target")]
+        target: String,
+    },
+}
+
+#[derive(Debug, Args)]
+/// Run-shard routing administration.
+#[command(
+    after_help = "Tip: use `assign` only for an empty or new shard; use `move` when the shard owns data."
+)]
+pub(crate) struct RunShardCommand {
+    #[command(subcommand)]
+    pub(crate) command: RunShardSubCommand,
+}
+
+#[derive(Debug, Args)]
+/// Cross-run shard rebalance administration.
+#[command(
+    after_help = "Tip: use plan, apply, and verify to evacuate a draining database before disabling it."
+)]
+pub(crate) struct RebalanceCommand {
+    #[command(subcommand)]
+    pub(crate) command: RebalanceSubCommand,
+}
+
+#[derive(Debug, Args)]
+/// Deprecated `vigilo shard` compatibility commands.
 pub(crate) struct Command {
     #[command(subcommand)]
     pub command: SubCommand,
@@ -239,6 +352,10 @@ pub(crate) struct Command {
 #[async_trait]
 impl Executable for Command {
     async fn exec(self, context: Context) -> anyhow::Result<()> {
+        warn!(
+            "the `vigilo shard` command group is deprecated; use `vigilo database`, \
+             `vigilo run shard`, or `vigilo rebalance`"
+        );
         match self.command {
             SubCommand::Databases { command } => exec_database_command(context, command).await,
             SubCommand::Move {
@@ -275,6 +392,62 @@ impl Executable for Command {
     }
 }
 
+#[async_trait]
+impl Executable for DatabaseCommand {
+    async fn exec(self, context: Context) -> anyhow::Result<()> {
+        exec_database_command(context, self.command).await
+    }
+}
+
+#[async_trait]
+impl Executable for RunShardCommand {
+    async fn exec(self, context: Context) -> anyhow::Result<()> {
+        match self.command {
+            RunShardSubCommand::List { run_id } => exec_shard_list_command(context, run_id).await,
+            RunShardSubCommand::Show { run_id, run_shard } => {
+                exec_route_command(context, run_id, run_shard).await
+            }
+            RunShardSubCommand::Assign {
+                run_id,
+                run_shard,
+                target,
+            } => exec_shard_assign_command(context, run_id, run_shard, target).await,
+            RunShardSubCommand::Move {
+                run_id,
+                run_shard,
+                target,
+                dry_run,
+                verify_only,
+                force,
+            } => {
+                exec_move_command(
+                    context,
+                    run_id,
+                    run_shard,
+                    target,
+                    dry_run,
+                    verify_only,
+                    force,
+                )
+                .await
+            }
+            RunShardSubCommand::AbortMove {
+                run_id,
+                run_shard,
+                source,
+                target,
+            } => exec_move_abort_command(context, run_id, run_shard, source, target).await,
+        }
+    }
+}
+
+#[async_trait]
+impl Executable for RebalanceCommand {
+    async fn exec(self, context: Context) -> anyhow::Result<()> {
+        exec_rebalance_command(context, self.command).await
+    }
+}
+
 async fn exec_database_command(
     context: Context,
     command: DatabaseSubCommand,
@@ -288,7 +461,7 @@ async fn exec_database_command(
             let placements = shard_admin::list_database_placements(control_db).await?;
             out.write_value(&database_list_payload(&placements))?;
         }
-        DatabaseSubCommand::Add {
+        DatabaseSubCommand::Register {
             alias,
             database_url_env,
             defer_env_validation,
@@ -300,8 +473,11 @@ async fn exec_database_command(
                 defer_env_validation,
             )
             .await?;
-            info!(database_alias = %placement.alias, "added shard database placement");
-            out.write_value(&database_added_payload(&placement, !defer_env_validation))?;
+            info!(database_alias = %placement.alias, "registered shard database placement");
+            out.write_value(&database_registered_payload(
+                &placement,
+                !defer_env_validation,
+            ))?;
         }
         DatabaseSubCommand::Disable { alias } => {
             let placement =
@@ -403,22 +579,53 @@ async fn exec_route_command(
     Ok(())
 }
 
+async fn exec_shard_list_command(context: Context, run_id: String) -> anyhow::Result<()> {
+    let run_id = parse_run_id(&run_id)?;
+    let database_router = context.dbr().await?;
+    let control_db = database_router.control().await?;
+    let out = context.out().await?;
+    let placements = shard_admin::list_shard_placements(control_db, run_id).await?;
+    out.write_value(&placement_list_payload(run_id, &placements))?;
+    Ok(())
+}
+
+async fn exec_shard_assign_command(
+    context: Context,
+    run_id: String,
+    run_shard: i16,
+    target: String,
+) -> anyhow::Result<()> {
+    let run_id = parse_run_id(&run_id)?;
+    let database_router = context.dbr().await?;
+    let out = context.out().await?;
+    let outcome =
+        shard_admin::set_shard_placement(database_router, run_id, run_shard, &target).await?;
+    info!(
+        run_id = %run_id,
+        run_shard,
+        database_alias = %outcome.placement.database_alias,
+        "assigned run shard"
+    );
+    out.write_value(&shard_assignment_payload(&outcome))?;
+    Ok(())
+}
+
 async fn exec_placement_command(
     context: Context,
     command: PlacementSubCommand,
 ) -> anyhow::Result<()> {
-    let database_router = context.dbr().await?;
-    let control_db = database_router.control().await?;
-    let out = context.out().await?;
-
     match command {
-        PlacementSubCommand::List { run_id } => {
-            let run_id = parse_run_id(&run_id)?;
-            let placements = shard_admin::list_shard_placements(control_db, run_id).await?;
-            out.write_value(&placement_list_payload(run_id, &placements))?;
-        }
+        PlacementSubCommand::List { run_id } => exec_shard_list_command(context, run_id).await,
+        PlacementSubCommand::Set {
+            run_id,
+            run_shard,
+            alias,
+        } => exec_shard_assign_command(context, run_id, run_shard, alias).await,
         PlacementSubCommand::Show { run_id, run_shard } => {
             let run_id = parse_run_id(&run_id)?;
+            let database_router = context.dbr().await?;
+            let control_db = database_router.control().await?;
+            let out = context.out().await?;
             let placement = shard_admin::select_shard_placement(control_db, run_id, run_shard)
                 .await?
                 .ok_or_else(|| {
@@ -429,27 +636,9 @@ async fn exec_placement_command(
                     )
                 })?;
             out.write_value(&placement_show_payload(&placement))?;
-        }
-        PlacementSubCommand::Set {
-            run_id,
-            run_shard,
-            alias,
-        } => {
-            let run_id = parse_run_id(&run_id)?;
-            let outcome =
-                shard_admin::set_shard_placement(database_router, run_id, run_shard, &alias)
-                    .await?;
-            info!(
-                run_id = %run_id,
-                run_shard,
-                database_alias = %outcome.placement.database_alias,
-                "set shard placement"
-            );
-            out.write_value(&placement_set_payload(&outcome))?;
+            Ok(())
         }
     }
-
-    Ok(())
 }
 
 async fn exec_rebalance_command(
@@ -559,7 +748,7 @@ fn database_list_payload(placements: &[DatabasePlacement]) -> Value {
     })
 }
 
-fn database_added_payload(placement: &DatabasePlacement, env_validated: bool) -> Value {
+fn database_registered_payload(placement: &DatabasePlacement, env_validated: bool) -> Value {
     json!({
         "data": {
             "database_placement": placement,
@@ -613,7 +802,7 @@ fn placement_show_payload(placement: &ShardPlacement) -> Value {
     })
 }
 
-fn placement_set_payload(outcome: &shard_admin::ShardPlacementSetOutcome) -> Value {
+fn shard_assignment_payload(outcome: &shard_admin::ShardPlacementSetOutcome) -> Value {
     json!({
         "data": {
             "shard_placement": outcome.placement,
@@ -754,6 +943,90 @@ mod tests {
     struct TestCli {
         #[command(subcommand)]
         command: SubCommand,
+    }
+
+    #[derive(Debug, Parser)]
+    struct RunShardTestCli {
+        #[command(subcommand)]
+        command: RunShardSubCommand,
+    }
+
+    #[derive(Debug, Parser)]
+    struct DatabaseTestCli {
+        #[command(subcommand)]
+        command: DatabaseSubCommand,
+    }
+
+    #[derive(Debug, Parser)]
+    struct RebalanceTestCli {
+        #[command(subcommand)]
+        command: RebalanceSubCommand,
+    }
+
+    #[test]
+    fn canonical_run_shard_commands_use_directional_flags() {
+        let run_id = Uuid::now_v7().to_string();
+        let move_cli =
+            RunShardTestCli::try_parse_from(["vigilo", "move", &run_id, "4", "--to", "shard_001"])
+                .unwrap();
+        let abort_cli = RunShardTestCli::try_parse_from([
+            "vigilo",
+            "abort-move",
+            &run_id,
+            "4",
+            "--from",
+            "primary",
+            "--to",
+            "shard_001",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            move_cli.command,
+            RunShardSubCommand::Move { target, .. } if target == "shard_001"
+        ));
+        assert!(matches!(
+            abort_cli.command,
+            RunShardSubCommand::AbortMove {
+                source,
+                target,
+                ..
+            } if source == "primary" && target == "shard_001"
+        ));
+    }
+
+    #[test]
+    fn canonical_database_and_rebalance_commands_use_resource_terms() {
+        let database_cli = DatabaseTestCli::try_parse_from([
+            "vigilo",
+            "register",
+            "shard_001",
+            "--database-url-env",
+            "VIGILO_SHARD_001_DATABASE_URL",
+        ])
+        .unwrap();
+        let rebalance_cli = RebalanceTestCli::try_parse_from([
+            "vigilo",
+            "plan",
+            "--from",
+            "primary",
+            "--to",
+            "shard_001",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            database_cli.command,
+            DatabaseSubCommand::Register { alias, .. } if alias == "shard_001"
+        ));
+        assert!(matches!(
+            rebalance_cli.command,
+            RebalanceSubCommand::Plan {
+                from,
+                target,
+                ..
+            } if from.as_deref() == Some("primary") && target == "shard_001"
+        ));
     }
 
     #[test]
@@ -973,7 +1246,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_set_payload_reports_previous_alias() {
+    fn shard_assignment_payload_reports_previous_alias() {
         let run_id = Uuid::now_v7();
         let placement = ShardPlacement {
             run_id,
@@ -991,7 +1264,7 @@ mod tests {
             changed: true,
         };
 
-        let payload = placement_set_payload(&outcome);
+        let payload = shard_assignment_payload(&outcome);
 
         assert_eq!(payload["meta"]["changed"], json!(true));
         assert_eq!(

@@ -49,5 +49,5 @@ cargo build --manifest-path evaluators/sentiment-basic-en/Cargo.toml --target wa
 ## Test
 
 ```bash
-vigilo evaluators test 'vigilo/sentiment-basic-en:0.1.0' --input-file evaluators/sentiment-basic-en/example-input.json
+vigilo evaluator test 'vigilo/sentiment-basic-en:0.1.0' --input-file evaluators/sentiment-basic-en/example-input.json
 ```

@@ -33,6 +33,7 @@ A run can fail operationally because work did not complete, or complete with a f
 ## Start Here
 
 - [Getting started](https://agentvigilo.com/docs/guides/getting-started): run your first evaluation.
+- [CLI reference](https://agentvigilo.com/docs/guides/cli-reference): canonical commands for evaluators, runs, databases, and rebalancing.
 - [Architecture overview](https://agentvigilo.com/docs/architecture/structure/): containers, components, flows, and state diagrams.
 - [Scale-out and shard migration](https://agentvigilo.com/docs/architecture/scaling): 128 logical run shards and expansion guidance.
 - [Worker runtime](https://agentvigilo.com/docs/architecture/structure/components/worker/): chunk claiming, evaluator execution, and result persistence.

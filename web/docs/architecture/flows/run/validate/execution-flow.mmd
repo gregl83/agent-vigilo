@@ -11,7 +11,7 @@ sequenceDiagram
     participant Vigilo
     participant ControlDB as Control DB
 
-    User->>Vigilo: vigilo run test
+    User->>Vigilo: vigilo run validate
     activate Vigilo
 
     Vigilo->>Vigilo: Load and parse profile and dataset inputs
