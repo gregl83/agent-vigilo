@@ -22,6 +22,10 @@ CREATE TABLE shard_placements (
 CREATE INDEX idx_shard_placements_database_alias_status
     ON shard_placements(database_alias, status);
 
+CREATE INDEX idx_shard_placements_inflight_move_target
+    ON shard_placements(move_target_database_alias)
+    WHERE status IN ('draining', 'moving');
+
 COMMENT ON TABLE shard_placements IS
     'Routing catalog for a run logical shard. Each row maps one run_id and run_shard pair to a database placement alias.';
 
@@ -38,7 +42,7 @@ COMMENT ON COLUMN shard_placements.status IS
     'Shard placement lifecycle. Active is dispatchable, draining rejects new work while admitted work finishes, and moving freezes the source while rows are reconciled and copied.';
 
 COMMENT ON COLUMN shard_placements.move_target_database_alias IS
-    'Intended target while a shard is draining or moving. The move workflow persists this before draining and clears it only when fenced target activation succeeds.';
+    'Reserved target while a shard is draining or moving. Database drain and disable reject this incoming reference; move activation or abort clears it.';
 
 COMMENT ON CONSTRAINT ck_shard_placements_move_target_lifecycle ON shard_placements IS
     'Active routes cannot retain a move target. Draining and moving routes require a target distinct from the current owner.';
@@ -48,3 +52,6 @@ COMMENT ON COLUMN shard_placements.route_version IS
 
 COMMENT ON INDEX idx_shard_placements_database_alias_status IS
     'Lookup index for routing and administrative scans grouped by database placement and dispatchability status.';
+
+COMMENT ON INDEX idx_shard_placements_inflight_move_target IS
+    'Lookup index used to prevent draining or disabling a database placement while an in-flight shard move targets it.';

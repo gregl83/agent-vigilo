@@ -2,8 +2,8 @@
 //!
 //! These helpers keep shard topology guardrails behind the database workflow
 //! boundary. CLI commands call them to list database placements, add shard
-//! databases, drain or disable shard databases, assign empty run shards, and move
-//! shard-owned rows between placements.
+//! databases, drain or disable shard databases, assign empty run shards, and
+//! move or restore shard-owned routes between placements.
 
 use std::collections::BTreeMap;
 
@@ -83,6 +83,16 @@ pub(crate) struct ShardMoveOutcome {
     pub(crate) moved: bool,
     pub(crate) placement: ShardPlacement,
     pub(crate) tables: Vec<ShardMoveTableReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ShardMoveAbortOutcome {
+    pub(crate) run_id: Uuid,
+    pub(crate) run_shard: i16,
+    pub(crate) source_database_alias: String,
+    pub(crate) target_database_alias: String,
+    pub(crate) aborted: bool,
+    pub(crate) placement: ShardPlacement,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -361,6 +371,8 @@ pub(crate) async fn disable_database_placement(
         );
     }
 
+    reject_inflight_move_target(&mut *tx, alias).await?;
+
     let route_count = sqlx::query_scalar::<_, i64>(
         r#"
         SELECT COUNT(*)::bigint
@@ -466,15 +478,18 @@ pub(crate) async fn drain_database_placement(
         );
     }
 
-    if existing.status == DATABASE_PLACEMENT_STATUS_DRAINING {
-        tx.commit().await?;
-        return Ok(existing);
-    }
     if existing.status == DATABASE_PLACEMENT_STATUS_DISABLED {
         anyhow::bail!(
             "database placement alias {} is disabled and cannot transition back to draining",
             alias
         );
+    }
+
+    reject_inflight_move_target(&mut *tx, alias).await?;
+
+    if existing.status == DATABASE_PLACEMENT_STATUS_DRAINING {
+        tx.commit().await?;
+        return Ok(existing);
     }
 
     let placement = database_placements::update_database_placement_status(
@@ -486,6 +501,23 @@ pub(crate) async fn drain_database_placement(
     .ok_or_else(|| anyhow::anyhow!("database placement alias {} was not found", alias))?;
     tx.commit().await?;
     Ok(placement)
+}
+
+async fn reject_inflight_move_target<'e, E>(executor: E, database_alias: &str) -> anyhow::Result<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let move_count =
+        shard_placements::count_inflight_moves_to_database(executor, database_alias).await?;
+    if move_count > 0 {
+        anyhow::bail!(
+            "database placement alias {} is the target of {} in-flight shard move(s); complete or abort those moves first",
+            database_alias,
+            move_count
+        );
+    }
+
+    Ok(())
 }
 
 pub(crate) async fn list_shard_placements(
@@ -1112,8 +1144,8 @@ pub(crate) async fn cancel_shard_rebalance(
 ///
 /// `draining` rejects new work while admitted leases and attempts finish.
 /// `moving` freezes every source mutation before stale target rows are removed
-/// and replaced. The intended target is persisted across both states so a
-/// retry cannot redirect an in-progress move.
+/// and replaced. The target is reserved across both states so a retry cannot
+/// redirect the move or drain the target placement.
 pub(crate) async fn move_shard_placement(
     database_router: &database::DatabaseRouter,
     run_id: Uuid,
@@ -1217,6 +1249,7 @@ pub(crate) async fn move_shard_placement(
         );
     }
 
+    let initial_route = current.clone();
     let source_database_alias = current.database_alias.clone();
     let source_is_control = source_database_alias == database_router.control_database_alias();
     let mut source_tx = source_db.begin().await?;
@@ -1275,6 +1308,20 @@ pub(crate) async fn move_shard_placement(
         });
     }
 
+    if !initial_route.same_route_fence(&current) {
+        anyhow::bail!(
+            "run {} shard {} route changed while waiting for move admission; expected {} status {} version {}, found {} status {} version {}",
+            run_id,
+            run_shard,
+            initial_route.database_alias,
+            initial_route.status,
+            initial_route.route_version,
+            current.database_alias,
+            current.status,
+            current.route_version
+        );
+    }
+
     if current.database_alias != source_database_alias
         || !matches!(
             current.status.as_str(),
@@ -1309,27 +1356,15 @@ pub(crate) async fn move_shard_placement(
     }
 
     let draining = if current.status == SHARD_PLACEMENT_STATUS_ACTIVE {
-        let placement = if source_is_control {
-            shard_placements::mark_shard_placement_draining(
-                &mut *source_tx,
-                run_id,
-                run_shard,
-                &source_database_alias,
-                current.route_version,
-                target_database_alias,
-            )
-            .await?
-        } else {
-            shard_placements::mark_shard_placement_draining(
-                control_db,
-                run_id,
-                run_shard,
-                &source_database_alias,
-                current.route_version,
-                target_database_alias,
-            )
-            .await?
-        };
+        let placement = reserve_active_move_target_and_mark_draining(
+            control_db,
+            run_id,
+            run_shard,
+            &source_database_alias,
+            current.route_version,
+            target_database_alias,
+        )
+        .await?;
         placement.ok_or_else(|| {
             anyhow::anyhow!(
                 "run {} shard {} route changed before it could be marked draining",
@@ -1471,6 +1506,215 @@ pub(crate) async fn move_shard_placement(
         placement,
         tables: reports,
     })
+}
+
+/// Restores an in-progress shard move to active ownership on its source.
+///
+/// Partial target rows remain non-authoritative. The source admission lock and
+/// route-version compare-and-swap ensure the abort cannot race a copy or route
+/// activation, and stale movers cannot restart after the route fence advances.
+pub(crate) async fn abort_shard_move(
+    database_router: &database::DatabaseRouter,
+    run_id: Uuid,
+    run_shard: i16,
+    source_database_alias: &str,
+    target_database_alias: &str,
+) -> anyhow::Result<ShardMoveAbortOutcome> {
+    validate_run_shard(run_shard)?;
+    validate_non_empty(source_database_alias, "source database alias")?;
+    validate_non_empty(target_database_alias, "target database alias")?;
+    if source_database_alias == target_database_alias {
+        anyhow::bail!("source and target database aliases must differ");
+    }
+
+    let control_db = database_router.control().await?;
+    ensure_run_creation_is_inactive(control_db, run_id).await?;
+    let initial = shard_placements::select_shard_placement(control_db, run_id, run_shard)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "shard placement for run {} shard {} was not found",
+                run_id,
+                run_shard
+            )
+        })?;
+    if let Some(outcome) = completed_abort_outcome(
+        &initial,
+        run_id,
+        run_shard,
+        source_database_alias,
+        target_database_alias,
+    )? {
+        return Ok(outcome);
+    }
+
+    let source_db = database_router
+        .execution_database(source_database_alias)
+        .await?;
+    let source_is_control = source_database_alias == database_router.control_database_alias();
+    let mut source_tx = source_db.begin().await?;
+    crate::db::shard_write_fence::lock_exclusive(&mut source_tx, run_id, run_shard).await?;
+
+    let current = if source_is_control {
+        shard_placements::select_shard_placement_with(&mut *source_tx, run_id, run_shard).await?
+    } else {
+        shard_placements::select_shard_placement(control_db, run_id, run_shard).await?
+    }
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "shard placement for run {} shard {} was not found",
+            run_id,
+            run_shard
+        )
+    })?;
+    if let Some(outcome) = completed_abort_outcome(
+        &current,
+        run_id,
+        run_shard,
+        source_database_alias,
+        target_database_alias,
+    )? {
+        source_tx.commit().await?;
+        return Ok(outcome);
+    }
+    if !initial.same_route_fence(&current) {
+        anyhow::bail!(
+            "run {} shard {} route changed while waiting for move-abort admission; expected {} status {} version {}, found {} status {} version {}",
+            run_id,
+            run_shard,
+            initial.database_alias,
+            initial.status,
+            initial.route_version,
+            current.database_alias,
+            current.status,
+            current.route_version
+        );
+    }
+    validate_abort_route(
+        &current,
+        run_id,
+        run_shard,
+        source_database_alias,
+        target_database_alias,
+    )?;
+
+    let placement = if source_is_control {
+        shard_placements::abort_shard_placement_move(
+            &mut *source_tx,
+            run_id,
+            run_shard,
+            source_database_alias,
+            current.route_version,
+            target_database_alias,
+        )
+        .await?
+    } else {
+        shard_placements::abort_shard_placement_move(
+            control_db,
+            run_id,
+            run_shard,
+            source_database_alias,
+            current.route_version,
+            target_database_alias,
+        )
+        .await?
+    }
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "run {} shard {} route changed before its move could be aborted",
+            run_id,
+            run_shard
+        )
+    })?;
+    source_tx.commit().await?;
+    database_router
+        .invalidate_execution_placement(run_id, run_shard)
+        .await;
+
+    Ok(ShardMoveAbortOutcome {
+        run_id,
+        run_shard,
+        source_database_alias: source_database_alias.to_string(),
+        target_database_alias: target_database_alias.to_string(),
+        aborted: true,
+        placement,
+    })
+}
+
+fn completed_abort_outcome(
+    placement: &ShardPlacement,
+    run_id: Uuid,
+    run_shard: i16,
+    source_database_alias: &str,
+    target_database_alias: &str,
+) -> anyhow::Result<Option<ShardMoveAbortOutcome>> {
+    if placement.status != SHARD_PLACEMENT_STATUS_ACTIVE {
+        return Ok(None);
+    }
+    if placement.database_alias == target_database_alias {
+        anyhow::bail!(
+            "run {} shard {} move already completed on database placement {}",
+            run_id,
+            run_shard,
+            target_database_alias
+        );
+    }
+    if placement.database_alias != source_database_alias
+        || placement.move_target_database_alias.is_some()
+    {
+        anyhow::bail!(
+            "run {} shard {} has no matching move from {} to {}; found {} status {} version {}",
+            run_id,
+            run_shard,
+            source_database_alias,
+            target_database_alias,
+            placement.database_alias,
+            placement.status,
+            placement.route_version
+        );
+    }
+
+    Ok(Some(ShardMoveAbortOutcome {
+        run_id,
+        run_shard,
+        source_database_alias: source_database_alias.to_string(),
+        target_database_alias: target_database_alias.to_string(),
+        aborted: false,
+        placement: placement.clone(),
+    }))
+}
+
+fn validate_abort_route(
+    placement: &ShardPlacement,
+    run_id: Uuid,
+    run_shard: i16,
+    source_database_alias: &str,
+    target_database_alias: &str,
+) -> anyhow::Result<()> {
+    if placement.database_alias != source_database_alias
+        || !matches!(
+            placement.status.as_str(),
+            SHARD_PLACEMENT_STATUS_DRAINING | SHARD_PLACEMENT_STATUS_MOVING
+        )
+        || placement.move_target_database_alias.as_deref() != Some(target_database_alias)
+    {
+        anyhow::bail!(
+            "run {} shard {} has no matching move from {} to {}; found {} status {} target {} version {}",
+            run_id,
+            run_shard,
+            source_database_alias,
+            target_database_alias,
+            placement.database_alias,
+            placement.status,
+            placement
+                .move_target_database_alias
+                .as_deref()
+                .unwrap_or("<none>"),
+            placement.route_version
+        );
+    }
+
+    Ok(())
 }
 
 fn select_rebalance_candidates(
@@ -2119,6 +2363,34 @@ async fn validate_target_placement(db: &PgPool, alias: &str) -> anyhow::Result<(
     }
 
     Ok(())
+}
+
+/// Reserves an active move target while persisting the durable target reference.
+///
+/// Database drain and disable lock the same placement row `FOR UPDATE` before
+/// checking target references. Holding `FOR SHARE` through this route update
+/// makes either the move reservation or the lifecycle transition win first.
+async fn reserve_active_move_target_and_mark_draining(
+    db: &PgPool,
+    run_id: Uuid,
+    run_shard: i16,
+    expected_database_alias: &str,
+    expected_route_version: i64,
+    target_database_alias: &str,
+) -> anyhow::Result<Option<ShardPlacement>> {
+    let mut tx = db.begin().await?;
+    validate_new_ownership_target(&mut tx, target_database_alias).await?;
+    let placement = shard_placements::mark_shard_placement_draining(
+        &mut *tx,
+        run_id,
+        run_shard,
+        expected_database_alias,
+        expected_route_version,
+        target_database_alias,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(placement)
 }
 
 /// Holds a shared lifecycle lock until the caller commits its ownership write.
@@ -2894,7 +3166,69 @@ mod tests {
 
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
-    async fn move_activation_rejects_target_that_started_draining(pool: PgPool) {
+    async fn move_activation_rejects_target_changed_outside_lifecycle_workflow(pool: PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'active')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            INSERT INTO shard_placements (
+                run_id,
+                run_shard,
+                database_alias,
+                status,
+                move_target_database_alias,
+                route_version
+            )
+            VALUES ($1::uuid, 3, 'primary', 'moving', 'shard_001', 3)
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            UPDATE database_placements
+            SET status = 'draining',
+                updated_at = now()
+            WHERE alias = 'shard_001'
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error =
+            activate_moved_shard_placement_on_target(&pool, run_id, 3, "primary", 3, "shard_001")
+                .await
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot receive new shard ownership"),
+            "{error:#}"
+        );
+
+        let route = shard_placements::select_shard_placement(&pool, run_id, 3)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.database_alias, "primary");
+        assert_eq!(route.status, SHARD_PLACEMENT_STATUS_MOVING);
+        assert_eq!(route.route_version, 3);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn drain_rejects_database_referenced_by_inflight_move(pool: PgPool) {
         sqlx::query(
             r#"
             INSERT INTO database_placements (alias, database_url_env, role, status)
@@ -2923,14 +3257,127 @@ mod tests {
         .await
         .unwrap();
         let database_router = database_router_with_isolated_control_pool(pool.clone()).await;
-        drain_database_placement(&database_router, "shard_001")
-            .await
-            .unwrap();
 
-        let error =
-            activate_moved_shard_placement_on_target(&pool, run_id, 3, "primary", 3, "shard_001")
-                .await
-                .unwrap_err();
+        let error = drain_database_placement(&database_router, "shard_001")
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("target of 1 in-flight shard move"),
+            "{error:#}"
+        );
+        let placement = database_placements::select_database_placement(&pool, "shard_001")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(placement.status, DATABASE_PLACEMENT_STATUS_ACTIVE);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn disable_rejects_database_referenced_by_inflight_move(pool: PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'draining')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            INSERT INTO shard_placements (
+                run_id,
+                run_shard,
+                database_alias,
+                status,
+                move_target_database_alias,
+                route_version
+            )
+            VALUES ($1::uuid, 3, 'primary', 'moving', 'shard_001', 3)
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let database_router = database_router_with_isolated_control_pool(pool).await;
+
+        let error = disable_database_placement(&database_router, "shard_001")
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("target of 1 in-flight shard move"),
+            "{error:#}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn concurrent_database_drain_wins_before_move_target_reservation(pool: PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'active')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
+            VALUES ($1::uuid, 3, 'primary', 'active')
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut lifecycle_tx = pool.begin().await.unwrap();
+        database_placements::select_database_placement_for_update(&mut lifecycle_tx, "shard_001")
+            .await
+            .unwrap()
+            .unwrap();
+        database_placements::update_database_placement_status(
+            &mut lifecycle_tx,
+            "shard_001",
+            DATABASE_PLACEMENT_STATUS_DRAINING,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let reservation_pool = pool.clone();
+        let mut reservation = tokio::spawn(async move {
+            reserve_active_move_target_and_mark_draining(
+                &reservation_pool,
+                run_id,
+                3,
+                DEFAULT_DATABASE_ALIAS,
+                1,
+                "shard_001",
+            )
+            .await
+        });
+        tokio::select! {
+            result = &mut reservation => {
+                panic!("move target reservation bypassed the placement lifecycle lock: {result:?}");
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+
+        lifecycle_tx.commit().await.unwrap();
+        let error = reservation.await.unwrap().unwrap_err();
         assert!(
             error
                 .to_string()
@@ -2942,7 +3389,392 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(route.database_alias, "primary");
+        assert_eq!(route.status, SHARD_PLACEMENT_STATUS_ACTIVE);
+        assert!(route.move_target_database_alias.is_none());
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn concurrent_move_target_reservation_wins_before_database_drain(pool: PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'active')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
+            VALUES ($1::uuid, 3, 'primary', 'active')
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut reservation_tx = pool.begin().await.unwrap();
+        validate_new_ownership_target(&mut reservation_tx, "shard_001")
+            .await
+            .unwrap();
+        shard_placements::mark_shard_placement_draining(
+            &mut *reservation_tx,
+            run_id,
+            3,
+            DEFAULT_DATABASE_ALIAS,
+            1,
+            "shard_001",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let database_router = database_router_with_isolated_control_pool(pool.clone()).await;
+        let mut drain =
+            tokio::spawn(
+                async move { drain_database_placement(&database_router, "shard_001").await },
+            );
+        tokio::select! {
+            result = &mut drain => {
+                panic!("database drain bypassed the move target reservation: {result:?}");
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+
+        reservation_tx.commit().await.unwrap();
+        let error = drain.await.unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("target of 1 in-flight shard move"),
+            "{error:#}"
+        );
+
+        let placement = database_placements::select_database_placement(&pool, "shard_001")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(placement.status, DATABASE_PLACEMENT_STATUS_ACTIVE);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn abort_draining_shard_move_restores_source_route_idempotently(pool: PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'active')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            INSERT INTO shard_placements (
+                run_id,
+                run_shard,
+                database_alias,
+                status,
+                move_target_database_alias,
+                route_version
+            )
+            VALUES ($1::uuid, 3, 'primary', 'draining', 'shard_001', 2)
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let database_router = database_router_with_isolated_control_pool(pool).await;
+
+        let first = abort_shard_move(
+            &database_router,
+            run_id,
+            3,
+            DEFAULT_DATABASE_ALIAS,
+            "shard_001",
+        )
+        .await
+        .unwrap();
+        assert!(first.aborted);
+        assert_eq!(first.placement.database_alias, DEFAULT_DATABASE_ALIAS);
+        assert_eq!(first.placement.status, SHARD_PLACEMENT_STATUS_ACTIVE);
+        assert!(first.placement.move_target_database_alias.is_none());
+        assert_eq!(first.placement.route_version, 3);
+
+        let repeated = abort_shard_move(
+            &database_router,
+            run_id,
+            3,
+            DEFAULT_DATABASE_ALIAS,
+            "shard_001",
+        )
+        .await
+        .unwrap();
+        assert!(!repeated.aborted);
+        assert_eq!(repeated.placement.route_version, 3);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn abort_moving_shard_move_restores_source_route(pool: PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'active')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            INSERT INTO shard_placements (
+                run_id,
+                run_shard,
+                database_alias,
+                status,
+                move_target_database_alias,
+                route_version
+            )
+            VALUES ($1::uuid, 3, 'primary', 'moving', 'shard_001', 3)
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let database_router = database_router_with_isolated_control_pool(pool).await;
+
+        let outcome = abort_shard_move(
+            &database_router,
+            run_id,
+            3,
+            DEFAULT_DATABASE_ALIAS,
+            "shard_001",
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.aborted);
+        assert_eq!(outcome.placement.database_alias, DEFAULT_DATABASE_ALIAS);
+        assert_eq!(outcome.placement.status, SHARD_PLACEMENT_STATUS_ACTIVE);
+        assert!(outcome.placement.move_target_database_alias.is_none());
+        assert_eq!(outcome.placement.route_version, 4);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn abort_rejects_route_that_completed_on_target(pool: PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'active')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            INSERT INTO shard_placements (
+                run_id,
+                run_shard,
+                database_alias,
+                status,
+                route_version
+            )
+            VALUES ($1::uuid, 3, 'shard_001', 'active', 4)
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let database_router = database_router_with_isolated_control_pool(pool).await;
+
+        let error = abort_shard_move(
+            &database_router,
+            run_id,
+            3,
+            DEFAULT_DATABASE_ALIAS,
+            "shard_001",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("already completed on database placement shard_001"),
+            "{error:#}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn stale_mover_cannot_restart_after_abort_advances_route_fence(pool: PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'active')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            INSERT INTO shard_placements (
+                run_id,
+                run_shard,
+                database_alias,
+                status,
+                move_target_database_alias,
+                route_version
+            )
+            VALUES ($1::uuid, 3, 'primary', 'draining', 'shard_001', 2)
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut abort_tx = pool.begin().await.unwrap();
+        crate::db::shard_write_fence::lock_exclusive(&mut abort_tx, run_id, 3)
+            .await
+            .unwrap();
+        let database_router = database_router_with_isolated_control_pool(pool.clone()).await;
+        let mover = tokio::spawn(async move {
+            move_shard_placement(
+                &database_router,
+                run_id,
+                3,
+                "shard_001",
+                ShardMoveOptions {
+                    dry_run: false,
+                    verify_only: false,
+                    force: false,
+                },
+            )
+            .await
+        });
+
+        wait_for_waiting_advisory_lock(&pool, "mover").await;
+
+        shard_placements::abort_shard_placement_move(
+            &mut *abort_tx,
+            run_id,
+            3,
+            DEFAULT_DATABASE_ALIAS,
+            2,
+            "shard_001",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        abort_tx.commit().await.unwrap();
+
+        let error = mover.await.unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("route changed while waiting for move admission"),
+            "{error:#}"
+        );
+        let route = shard_placements::select_shard_placement(&pool, run_id, 3)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.database_alias, DEFAULT_DATABASE_ALIAS);
+        assert_eq!(route.status, SHARD_PLACEMENT_STATUS_ACTIVE);
+        assert!(route.move_target_database_alias.is_none());
+        assert_eq!(route.route_version, 3);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn stale_abort_cannot_cancel_newer_move_route_version(pool: PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'active')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            INSERT INTO shard_placements (
+                run_id,
+                run_shard,
+                database_alias,
+                status,
+                move_target_database_alias,
+                route_version
+            )
+            VALUES ($1::uuid, 3, 'primary', 'draining', 'shard_001', 2)
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut move_tx = pool.begin().await.unwrap();
+        crate::db::shard_write_fence::lock_exclusive(&mut move_tx, run_id, 3)
+            .await
+            .unwrap();
+        let database_router = database_router_with_isolated_control_pool(pool.clone()).await;
+        let abort = tokio::spawn(async move {
+            abort_shard_move(
+                &database_router,
+                run_id,
+                3,
+                DEFAULT_DATABASE_ALIAS,
+                "shard_001",
+            )
+            .await
+        });
+
+        wait_for_waiting_advisory_lock(&pool, "abort").await;
+
+        shard_placements::mark_shard_placement_moving(
+            &mut *move_tx,
+            run_id,
+            3,
+            DEFAULT_DATABASE_ALIAS,
+            2,
+            "shard_001",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        move_tx.commit().await.unwrap();
+
+        let error = abort.await.unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("route changed while waiting for move-abort admission"),
+            "{error:#}"
+        );
+        let route = shard_placements::select_shard_placement(&pool, run_id, 3)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(route.status, SHARD_PLACEMENT_STATUS_MOVING);
         assert_eq!(route.route_version, 3);
     }
@@ -4004,6 +4836,37 @@ mod tests {
             source_database_alias: source_database_alias.to_string(),
             route_version,
         }
+    }
+
+    async fn wait_for_waiting_advisory_lock(pool: &PgPool, operation: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiting = sqlx::query_scalar::<_, bool>(
+                    r#"
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_locks
+                        WHERE locktype = 'advisory'
+                          AND database = (
+                              SELECT oid
+                              FROM pg_database
+                              WHERE datname = current_database()
+                          )
+                          AND NOT granted
+                    )
+                    "#,
+                )
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{operation} did not wait behind source admission"));
     }
 
     async fn database_router_with_isolated_control_pool(pool: PgPool) -> DatabaseRouter {

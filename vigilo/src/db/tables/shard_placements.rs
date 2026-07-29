@@ -121,6 +121,45 @@ where
     Ok(placement)
 }
 
+pub(crate) async fn abort_shard_placement_move<'e, E>(
+    executor: E,
+    run_id: Uuid,
+    run_shard: i16,
+    expected_database_alias: &str,
+    expected_route_version: i64,
+    target_database_alias: &str,
+) -> anyhow::Result<Option<ShardPlacement>>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let placement = sqlx::query_as::<_, ShardPlacement>(
+        r#"
+        UPDATE shard_placements
+        SET status = 'active',
+            move_target_database_alias = NULL,
+            route_version = route_version + 1,
+            updated_at = now()
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+          AND database_alias = $3
+          AND status IN ('draining', 'moving')
+          AND route_version = $4
+          AND move_target_database_alias = $5
+        RETURNING run_id, run_shard, database_alias, status, move_target_database_alias,
+                  route_version, created_at, updated_at
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(expected_database_alias)
+    .bind(expected_route_version)
+    .bind(target_database_alias)
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(placement)
+}
+
 pub(crate) async fn activate_moved_shard_placement<'e, E>(
     executor: E,
     run_id: Uuid,
@@ -159,6 +198,28 @@ where
     .await?;
 
     Ok(placement)
+}
+
+pub(crate) async fn count_inflight_moves_to_database<'e, E>(
+    executor: E,
+    database_alias: &str,
+) -> anyhow::Result<i64>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM shard_placements
+        WHERE move_target_database_alias = $1
+          AND status IN ('draining', 'moving')
+        "#,
+    )
+    .bind(database_alias)
+    .fetch_one(executor)
+    .await?;
+
+    Ok(count)
 }
 
 pub(crate) async fn change_empty_active_shard_placement<'e, E>(

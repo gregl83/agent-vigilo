@@ -1190,14 +1190,40 @@ mod tests {
     }
 
     async fn insert_shard_placements(pool: &PgPool, run_id: Uuid, placements: &[(i16, &str)]) {
+        if placements.iter().any(|(_, status)| *status != "active") {
+            sqlx::query(
+                r#"
+                INSERT INTO database_placements (alias, database_url_env, role, status)
+                VALUES ('test_move_target', 'DATABASE_URL', 'shard', 'active')
+                ON CONFLICT (alias) DO NOTHING
+                "#,
+            )
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
         for (run_shard, status) in placements {
             sqlx::query(
                 r#"
-                INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
-                VALUES ($1::uuid, $2, 'primary', $3)
+                INSERT INTO shard_placements (
+                    run_id,
+                    run_shard,
+                    database_alias,
+                    status,
+                    move_target_database_alias
+                )
+                VALUES (
+                    $1::uuid,
+                    $2,
+                    'primary',
+                    $3,
+                    CASE WHEN $3 = 'active' THEN NULL ELSE 'test_move_target' END
+                )
                 ON CONFLICT (run_id, run_shard) DO UPDATE
                 SET database_alias = EXCLUDED.database_alias,
                     status = EXCLUDED.status,
+                    move_target_database_alias = EXCLUDED.move_target_database_alias,
                     updated_at = now()
                 "#,
             )

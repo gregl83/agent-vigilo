@@ -42,7 +42,7 @@ pub(crate) struct ShardPlacement {
     pub(crate) database_alias: String,
     /// Placement lifecycle: active, draining, or moving.
     pub(crate) status: String,
-    /// Distinct destination required while a shard is draining or moving.
+    /// Durable destination reservation while a shard is draining or moving.
     pub(crate) move_target_database_alias: Option<String>,
     /// Monotonic route fencing token.
     pub(crate) route_version: i64,

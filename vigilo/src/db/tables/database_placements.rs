@@ -357,13 +357,19 @@ mod tests {
         let run_id = Uuid::now_v7();
         sqlx::query(
             r#"
-            INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
+            INSERT INTO shard_placements (
+                run_id,
+                run_shard,
+                database_alias,
+                status,
+                move_target_database_alias
+            )
             VALUES
-                ($1::uuid, 0, 'primary', 'active'),
-                ($1::uuid, 1, 'primary', 'moving'),
-                ($1::uuid, 2, 'shard_001', 'active'),
-                ($1::uuid, 3, 'shard_002', 'active'),
-                ($1::uuid, 4, 'shard_003', 'moving')
+                ($1::uuid, 0, 'primary', 'active', NULL),
+                ($1::uuid, 1, 'primary', 'moving', 'shard_001'),
+                ($1::uuid, 2, 'shard_001', 'active', NULL),
+                ($1::uuid, 3, 'shard_002', 'active', NULL),
+                ($1::uuid, 4, 'shard_003', 'moving', 'shard_001')
             "#,
         )
         .bind(run_id)

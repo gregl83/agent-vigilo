@@ -1,7 +1,7 @@
 //! Shard placement administration commands.
 //!
 //! These commands inspect placement metadata, update empty shard routes, and
-//! run the explicit shard move workflow for routes that already own data.
+//! run, recover, or abort explicit moves for routes that already own data.
 
 use async_trait::async_trait;
 use clap::{
@@ -78,6 +78,24 @@ pub(crate) enum SubCommand {
         force: bool,
     },
 
+    /// Restore an in-progress shard move to its source placement
+    MoveAbort {
+        /// Run UUID
+        run_id: String,
+
+        /// Logical run shard
+        #[arg(value_parser = clap::value_parser!(i16).range(0..=127))]
+        run_shard: i16,
+
+        /// Expected source database placement alias
+        #[arg(long, alias = "from")]
+        source: String,
+
+        /// Expected target database placement alias
+        #[arg(long, alias = "to")]
+        target: String,
+    },
+
     /// Plan, apply, verify, or cancel bulk shard movement
     Rebalance {
         #[command(subcommand)]
@@ -107,13 +125,13 @@ pub(crate) enum DatabaseSubCommand {
 
     /// Disable a non-control database placement
     ///
-    /// The placement must already be draining and own no shard routes.
+    /// The placement must be draining, own no routes, and be no move target.
     Disable {
         /// Stable placement alias
         alias: String,
     },
 
-    /// Stop assigning new shards while existing owned shards keep running
+    /// Stop new ownership unless an in-flight move targets this placement
     Drain {
         /// Stable placement alias
         alias: String,
@@ -242,6 +260,12 @@ impl Executable for Command {
                 )
                 .await
             }
+            SubCommand::MoveAbort {
+                run_id,
+                run_shard,
+                source,
+                target,
+            } => exec_move_abort_command(context, run_id, run_shard, source, target).await,
             SubCommand::Placements { command } => exec_placement_command(context, command).await,
             SubCommand::Rebalance { command } => exec_rebalance_command(context, command).await,
             SubCommand::Route { run_id, run_shard } => {
@@ -329,6 +353,31 @@ async fn exec_move_command(
         "completed shard move workflow"
     );
     out.write_value(&move_payload(&outcome))?;
+    Ok(())
+}
+
+async fn exec_move_abort_command(
+    context: Context,
+    run_id: String,
+    run_shard: i16,
+    source: String,
+    target: String,
+) -> anyhow::Result<()> {
+    let run_id = parse_run_id(&run_id)?;
+    let database_router = context.dbr().await?;
+    let out = context.out().await?;
+    let outcome =
+        shard_admin::abort_shard_move(database_router, run_id, run_shard, &source, &target).await?;
+
+    info!(
+        run_id = %run_id,
+        run_shard,
+        source_database_alias = %outcome.source_database_alias,
+        target_database_alias = %outcome.target_database_alias,
+        aborted = outcome.aborted,
+        "completed shard move abort workflow"
+    );
+    out.write_value(&move_abort_payload(&outcome))?;
     Ok(())
 }
 
@@ -597,6 +646,21 @@ fn move_payload(outcome: &shard_admin::ShardMoveOutcome) -> Value {
     })
 }
 
+fn move_abort_payload(outcome: &shard_admin::ShardMoveAbortOutcome) -> Value {
+    json!({
+        "data": {
+            "run_id": outcome.run_id,
+            "run_shard": outcome.run_shard,
+            "source_database_alias": outcome.source_database_alias,
+            "target_database_alias": outcome.target_database_alias,
+            "placement": outcome.placement,
+        },
+        "meta": {
+            "aborted": outcome.aborted,
+        }
+    })
+}
+
 fn rebalance_plan_payload(outcome: &shard_admin::ShardRebalancePlanOutcome) -> Value {
     json!({
         "data": {
@@ -734,6 +798,37 @@ mod tests {
         };
 
         assert_eq!(alias, "shard_001");
+    }
+
+    #[test]
+    fn move_abort_command_requires_expected_source_and_target() {
+        let run_id = Uuid::now_v7().to_string();
+        let cli = TestCli::try_parse_from([
+            "vigilo",
+            "move-abort",
+            &run_id,
+            "4",
+            "--source",
+            "primary",
+            "--target",
+            "shard_001",
+        ])
+        .unwrap();
+
+        let SubCommand::MoveAbort {
+            run_id: parsed_run_id,
+            run_shard,
+            source,
+            target,
+        } = cli.command
+        else {
+            panic!("expected shard move-abort command");
+        };
+
+        assert_eq!(parsed_run_id, run_id);
+        assert_eq!(run_shard, 4);
+        assert_eq!(source, "primary");
+        assert_eq!(target, "shard_001");
     }
 
     #[test]
@@ -949,6 +1044,38 @@ mod tests {
         assert_eq!(payload["meta"]["moved"], json!(true));
         assert_eq!(payload["meta"]["verified"], json!(true));
         assert_eq!(payload["data"]["tables"][0]["table"], json!("run_chunks"));
+    }
+
+    #[test]
+    fn move_abort_payload_reports_restored_source_route() {
+        let run_id = Uuid::now_v7();
+        let placement = ShardPlacement {
+            run_id,
+            run_shard: 4,
+            database_alias: "primary".to_string(),
+            status: SHARD_PLACEMENT_STATUS_ACTIVE.to_string(),
+            move_target_database_alias: None,
+            route_version: 4,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let outcome = shard_admin::ShardMoveAbortOutcome {
+            run_id,
+            run_shard: 4,
+            source_database_alias: "primary".to_string(),
+            target_database_alias: "shard_001".to_string(),
+            aborted: true,
+            placement,
+        };
+
+        let payload = move_abort_payload(&outcome);
+
+        assert_eq!(payload["meta"]["aborted"], json!(true));
+        assert_eq!(
+            payload["data"]["placement"]["database_alias"],
+            json!("primary")
+        );
+        assert_eq!(payload["data"]["placement"]["status"], json!("active"));
     }
 
     #[test]
