@@ -15,6 +15,7 @@ use serde::{
 use uuid::Uuid;
 
 pub(crate) const SHARD_PLACEMENT_STATUS_ACTIVE: &str = "active";
+pub(crate) const SHARD_PLACEMENT_STATUS_COPYING: &str = "copying";
 pub(crate) const SHARD_PLACEMENT_STATUS_MOVING: &str = "moving";
 pub(crate) const SHARD_PLACEMENT_STATUS_DRAINING: &str = "draining";
 
@@ -27,7 +28,7 @@ pub(crate) struct ShardPlacementDraft {
     pub(crate) run_shard: i16,
     /// Database placement alias for this run shard.
     pub(crate) database_alias: String,
-    /// Placement lifecycle: active, draining, or moving.
+    /// Placement lifecycle: active, copying, draining, or moving.
     pub(crate) status: String,
 }
 
@@ -40,9 +41,9 @@ pub(crate) struct ShardPlacement {
     pub(crate) run_shard: i16,
     /// Database placement alias for this run shard.
     pub(crate) database_alias: String,
-    /// Placement lifecycle: active, draining, or moving.
+    /// Placement lifecycle: active, copying, draining, or moving.
     pub(crate) status: String,
-    /// Durable destination reservation while a shard is draining or moving.
+    /// Durable destination reservation while a shard is copying, draining, or moving.
     pub(crate) move_target_database_alias: Option<String>,
     /// Monotonic route fencing token.
     pub(crate) route_version: i64,
@@ -54,12 +55,45 @@ pub(crate) struct ShardPlacement {
 
 impl ShardPlacement {
     pub(crate) fn is_dispatchable(&self) -> bool {
-        self.status == SHARD_PLACEMENT_STATUS_ACTIVE
+        matches!(
+            self.status.as_str(),
+            SHARD_PLACEMENT_STATUS_ACTIVE | SHARD_PLACEMENT_STATUS_COPYING
+        )
     }
 
     pub(crate) fn same_route_fence(&self, current: &Self) -> bool {
         self.database_alias == current.database_alias
             && self.status == current.status
             && self.route_version == current.route_version
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn placement(status: &str) -> ShardPlacement {
+        let now = Utc::now();
+        ShardPlacement {
+            run_id: Uuid::now_v7(),
+            run_shard: 4,
+            database_alias: "source".to_string(),
+            status: status.to_string(),
+            move_target_database_alias: Some("target".to_string()),
+            route_version: 2,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn copying_route_remains_dispatchable_during_online_backfill() {
+        assert!(placement(SHARD_PLACEMENT_STATUS_COPYING).is_dispatchable());
+    }
+
+    #[test]
+    fn draining_and_moving_routes_reject_new_dispatch() {
+        assert!(!placement(SHARD_PLACEMENT_STATUS_DRAINING).is_dispatchable());
+        assert!(!placement(SHARD_PLACEMENT_STATUS_MOVING).is_dispatchable());
     }
 }

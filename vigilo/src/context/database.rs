@@ -1287,7 +1287,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(refreshed.status, SHARD_PLACEMENT_STATUS_MOVING);
-        assert_eq!(refreshed.route_version, 3);
+        assert_eq!(refreshed.route_version, 4);
 
         let error = database_router.execution(run_id, 7).await.unwrap_err();
         assert!(error.to_string().contains("not dispatchable"));
@@ -1745,13 +1745,24 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        shard_placements::mark_shard_placement_draining(
+        let copying = shard_placements::mark_shard_placement_copying(
             db,
             run_id,
             run_shard,
             &current.database_alias,
             current.route_version,
             "shard_001",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        shard_placements::mark_shard_placement_draining(
+            db,
+            run_id,
+            run_shard,
+            &copying.database_alias,
+            copying.route_version,
+            copying.move_target_database_alias.as_deref().unwrap(),
         )
         .await
         .unwrap()

@@ -17,4 +17,5 @@ pub(crate) mod execution_attempt;
 pub(crate) mod outbox_event;
 pub(crate) mod run;
 pub(crate) mod run_chunk;
+pub(crate) mod run_shard_case;
 pub(crate) mod shard_placement;

@@ -4,11 +4,16 @@ CREATE TABLE run_creation_placements (
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'seeded', 'failed')),
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    expected_case_count BIGINT NOT NULL CHECK (expected_case_count >= 0),
+    seeded_case_count BIGINT NOT NULL DEFAULT 0 CHECK (seeded_case_count >= 0),
+    last_seeded_case_ordinal INTEGER CHECK (last_seeded_case_ordinal >= 0),
+    case_projection_hash TEXT NOT NULL,
     last_error TEXT,
     seeded_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (run_id, database_alias),
+    CHECK (seeded_case_count <= expected_case_count),
     CHECK (status <> 'seeded' OR seeded_at IS NOT NULL)
 );
 
@@ -38,6 +43,12 @@ COMMENT ON COLUMN run_creation_placements.status IS
 
 COMMENT ON COLUMN run_creation_placements.attempt_count IS
     'Number of seed attempts started for this run and database placement.';
+
+COMMENT ON COLUMN run_creation_placements.last_seeded_case_ordinal IS
+    'Last projection ordinal acknowledged after its execution-database transaction committed; count and hash verification determine completion.';
+
+COMMENT ON COLUMN run_creation_placements.case_projection_hash IS
+    'BLAKE3 digest of the ordered immutable shard-case assignment expected on this execution placement.';
 
 COMMENT ON COLUMN run_creation_placements.last_error IS
     'Most recent seed failure retained for recovery diagnostics.';

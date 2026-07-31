@@ -24,11 +24,13 @@ use super::run_create::{
 };
 use crate::{
     context::database,
+    db::workflows::case_projection,
     models::{
         case_blob::CaseBlobDraft,
         dataset_version_case::DatasetVersionCaseDraft,
         run::RunDraft,
         run_chunk::RunChunkDraft,
+        run_shard_case::RunShardCaseDraft,
     },
 };
 
@@ -37,6 +39,7 @@ const RUN_STATUS_PENDING: &str = "pending";
 const RUN_STATUS_FAILED: &str = "failed";
 const INITIAL_CREATION_LEASE_SECONDS: i32 = 300;
 const CREATION_RETRY_DELAY_SECONDS: i32 = 10;
+const RUN_CREATION_CASE_BATCH_SIZE: usize = 1_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RunCreationProgress {
@@ -65,14 +68,38 @@ pub(crate) struct RunCreationRecoveryStats {
 
 struct RunSeedMaterial<'a> {
     draft: &'a RunDraft,
-    case_blobs: &'a [CaseBlobDraft],
-    dataset_cases: &'a [DatasetVersionCaseDraft],
 }
 
 struct OwnedRunSeedMaterial {
     draft: RunDraft,
-    case_blobs: Vec<CaseBlobDraft>,
-    dataset_cases: Vec<DatasetVersionCaseDraft>,
+}
+
+const RUN_CREATION_CASE_PAGE_BUDGET: usize = 64;
+const RUN_CREATION_CASE_BATCH_SIZE_ENV: &str = "VIGILO_RUN_CREATION_CASE_BATCH_SIZE";
+const RUN_CREATION_CASE_PAGE_BUDGET_ENV: &str = "VIGILO_RUN_CREATION_CASE_PAGE_BUDGET";
+
+fn positive_usize_setting(name: &str, default: usize) -> anyhow::Result<usize> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(default);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("{name} must be valid UTF-8"))?;
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("{name} must be a positive integer"))?;
+    if parsed == 0 {
+        anyhow::bail!("{name} must be greater than zero");
+    }
+    Ok(parsed)
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct PlacementSeedProgress {
+    expected_case_count: i64,
+    seeded_case_count: i64,
+    last_seeded_case_ordinal: Option<i32>,
+    case_projection_hash: String,
 }
 
 /// Persists and immediately attempts a recoverable run creation operation.
@@ -98,11 +125,7 @@ pub(crate) async fn create_run(
     )
     .await?;
 
-    let seed = RunSeedMaterial {
-        draft,
-        case_blobs,
-        dataset_cases,
-    };
+    let seed = RunSeedMaterial { draft };
     match resume_claimed_run(
         database_router,
         run_id,
@@ -163,8 +186,6 @@ pub(crate) async fn recover_creating_runs(
         };
         let seed = RunSeedMaterial {
             draft: &owned_seed.draft,
-            case_blobs: &owned_seed.case_blobs,
-            dataset_cases: &owned_seed.dataset_cases,
         };
 
         match resume_claimed_run(database_router, run_id, coordinator_id, seed, lease_seconds).await
@@ -244,6 +265,12 @@ async fn persist_creation_plan(
     assignments: &[RunShardPlacementAssignment],
 ) -> anyhow::Result<()> {
     let chunks_by_alias = run_create::group_chunks_by_assigned_alias(chunks, assignments)?;
+    let projections_by_alias = build_placement_projections(
+        run_id,
+        draft.dataset_version_id,
+        dataset_cases,
+        &chunks_by_alias,
+    )?;
     let control_db = database_router.control().await?;
     let mut tx = control_db.begin().await?;
 
@@ -259,20 +286,8 @@ async fn persist_creation_plan(
         .await?;
     run_create::insert_run_create(&mut tx, run_id, draft, RUN_STATUS_CREATING).await?;
     run_create::bulk_insert_shard_placements(&mut tx, run_id, assignments).await?;
-    insert_creation_placements(&mut tx, run_id, &chunks_by_alias).await?;
+    insert_creation_placements(&mut tx, run_id, &projections_by_alias).await?;
     insert_creation_chunks(&mut tx, run_id, &chunks_by_alias).await?;
-
-    if let Some(control_chunks) = chunks_by_alias.get(database_router.control_database_alias()) {
-        run_create::bulk_insert_run_chunks(
-            &mut tx,
-            run_id,
-            draft.dataset_version_id,
-            control_chunks,
-        )
-        .await?;
-        mark_control_placement_seeded(&mut tx, run_id, database_router.control_database_alias())
-            .await?;
-    }
 
     let claimed = sqlx::query(
         r#"
@@ -299,16 +314,56 @@ async fn persist_creation_plan(
     Ok(())
 }
 
+fn build_placement_projections(
+    run_id: Uuid,
+    dataset_version_id: Uuid,
+    dataset_cases: &[DatasetVersionCaseDraft],
+    chunks_by_alias: &BTreeMap<String, Vec<RunChunkDraft>>,
+) -> anyhow::Result<BTreeMap<String, Vec<RunShardCaseDraft>>> {
+    let mut projections = BTreeMap::new();
+    let mut assigned_ordinals = std::collections::BTreeSet::new();
+    for (alias, chunks) in chunks_by_alias {
+        let projection = case_projection::project_cases_for_chunks(
+            run_id,
+            dataset_version_id,
+            dataset_cases,
+            chunks,
+        )?;
+        for row in &projection {
+            if !assigned_ordinals.insert(row.case_ordinal) {
+                anyhow::bail!(
+                    "case ordinal {} is assigned to multiple execution placements",
+                    row.case_ordinal
+                );
+            }
+        }
+        projections.insert(alias.clone(), projection);
+    }
+    if assigned_ordinals.len() != dataset_cases.len() {
+        anyhow::bail!(
+            "run creation assigns {} of {} canonical cases",
+            assigned_ordinals.len(),
+            dataset_cases.len()
+        );
+    }
+    Ok(projections)
+}
+
 async fn insert_creation_placements(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     run_id: Uuid,
-    chunks_by_alias: &BTreeMap<String, Vec<RunChunkDraft>>,
+    projections_by_alias: &BTreeMap<String, Vec<RunShardCaseDraft>>,
 ) -> anyhow::Result<()> {
     let mut query = QueryBuilder::<Postgres>::new(
-        "INSERT INTO run_creation_placements (run_id, database_alias, status) ",
+        "INSERT INTO run_creation_placements \
+         (run_id, database_alias, status, expected_case_count, case_projection_hash) ",
     );
-    query.push_values(chunks_by_alias.keys(), |mut row, alias| {
-        row.push_bind(run_id).push_bind(alias).push_bind("pending");
+    query.push_values(projections_by_alias, |mut row, (alias, projection)| {
+        row.push_bind(run_id)
+            .push_bind(alias)
+            .push_bind("pending")
+            .push_bind(projection.len() as i64)
+            .push_bind(case_projection::projection_hash(projection));
     });
     query.build().execute(tx.as_mut()).await?;
     Ok(())
@@ -336,38 +391,6 @@ async fn insert_creation_chunks(
             .push_bind(chunk.ordinal_end);
     });
     query.build().execute(tx.as_mut()).await?;
-    Ok(())
-}
-
-async fn mark_control_placement_seeded(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
-    run_id: Uuid,
-    database_alias: &str,
-) -> anyhow::Result<()> {
-    let updated = sqlx::query(
-        r#"
-        UPDATE run_creation_placements
-        SET status = 'seeded',
-            attempt_count = attempt_count + 1,
-            seeded_at = now(),
-            updated_at = now()
-        WHERE run_id = $1::uuid
-          AND database_alias = $2
-          AND status = 'pending'
-        "#,
-    )
-    .bind(run_id)
-    .bind(database_alias)
-    .execute(tx.as_mut())
-    .await?
-    .rows_affected();
-    if updated != 1 {
-        anyhow::bail!(
-            "control placement '{}' was not pending for run creation '{}'",
-            database_alias,
-            run_id
-        );
-    }
     Ok(())
 }
 
@@ -402,34 +425,41 @@ async fn resume_claimed_run(
         let seed_result = seed_execution_placement(
             database_router,
             run_id,
+            owner_id,
             &database_alias,
             seed.draft,
-            seed.case_blobs,
-            seed.dataset_cases,
             &chunks,
+            lease_seconds,
         )
         .await;
 
-        if let Err(error) = seed_result {
-            if run_create::is_seed_invariant_error(&error) {
-                fail_placement_and_run(
-                    control_db,
-                    run_id,
-                    owner_id,
-                    &database_alias,
-                    &error.to_string(),
-                )
-                .await?;
-            } else {
-                defer_placement(
-                    control_db,
-                    run_id,
-                    owner_id,
-                    &database_alias,
-                    &error.to_string(),
-                )
-                .await?;
+        let placement_complete = match seed_result {
+            Ok(complete) => complete,
+            Err(error) => {
+                if run_create::is_seed_invariant_error(&error) {
+                    fail_placement_and_run(
+                        control_db,
+                        run_id,
+                        owner_id,
+                        &database_alias,
+                        &error.to_string(),
+                    )
+                    .await?;
+                } else {
+                    defer_placement(
+                        control_db,
+                        run_id,
+                        owner_id,
+                        &database_alias,
+                        &error.to_string(),
+                    )
+                    .await?;
+                }
+                return select_creation_outcome(control_db, run_id).await;
             }
+        };
+        if !placement_complete {
+            yield_claimed_run(control_db, run_id, owner_id).await?;
             return select_creation_outcome(control_db, run_id).await;
         }
 
@@ -451,6 +481,35 @@ async fn resume_claimed_run(
 
     finish_claimed_run(control_db, run_id, owner_id).await?;
     select_creation_outcome(control_db, run_id).await
+}
+
+async fn yield_claimed_run(db: &PgPool, run_id: Uuid, owner_id: Uuid) -> anyhow::Result<()> {
+    let updated = sqlx::query(
+        r#"
+        UPDATE runs
+        SET coordinator_id = NULL,
+            coordinator_leased_until = now() + make_interval(secs => $3),
+            coordinator_heartbeat_at = NULL,
+            error_message = NULL,
+            updated_at = now()
+        WHERE id = $1::uuid
+          AND status = 'creating'::run_status
+          AND coordinator_id = $2::uuid
+        "#,
+    )
+    .bind(run_id)
+    .bind(owner_id)
+    .bind(CREATION_RETRY_DELAY_SECONDS)
+    .execute(db)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        anyhow::bail!(
+            "run creation '{}' lost ownership while yielding its page budget",
+            run_id
+        );
+    }
+    Ok(())
 }
 
 async fn finish_claimed_run(db: &PgPool, run_id: Uuid, owner_id: Uuid) -> anyhow::Result<()> {
@@ -538,27 +597,263 @@ async fn start_placement_attempt(
 async fn seed_execution_placement(
     database_router: &database::DatabaseRouter,
     run_id: Uuid,
+    owner_id: Uuid,
     database_alias: &str,
     draft: &RunDraft,
-    case_blobs: &[CaseBlobDraft],
-    dataset_cases: &[DatasetVersionCaseDraft],
     chunks: &[RunChunkDraft],
-) -> anyhow::Result<()> {
+    lease_seconds: i32,
+) -> anyhow::Result<bool> {
     let db = database_router.execution_database(database_alias).await?;
-    let mut tx = db.begin().await?;
-    run_create::bulk_insert_case_blobs(&mut tx, case_blobs).await?;
-    run_create::upsert_dataset_version(
-        &mut tx,
-        draft.dataset_version_id,
-        draft.dataset_id,
-        &draft.dataset_version,
-    )
-    .await?;
-    run_create::bulk_insert_dataset_membership(&mut tx, draft.dataset_version_id, dataset_cases)
+    let control_db = database_router.control().await?;
+    let progress = select_placement_seed_progress(control_db, run_id, database_alias).await?;
+    let batch_size = positive_usize_setting(
+        RUN_CREATION_CASE_BATCH_SIZE_ENV,
+        RUN_CREATION_CASE_BATCH_SIZE,
+    )?;
+    let page_budget = positive_usize_setting(
+        RUN_CREATION_CASE_PAGE_BUDGET_ENV,
+        RUN_CREATION_CASE_PAGE_BUDGET,
+    )?;
+    let mut acknowledged_count = progress.seeded_case_count;
+    let mut acknowledged_ordinal = progress.last_seeded_case_ordinal;
+    let mut reached_projection_end = false;
+    for _ in 0..page_budget {
+        let page_rows = select_projection_seed_page(
+            control_db,
+            run_id,
+            database_alias,
+            acknowledged_ordinal,
+            batch_size,
+        )
         .await?;
-    run_create::insert_run_create(&mut tx, run_id, draft, RUN_STATUS_PENDING).await?;
+        if page_rows.is_empty() {
+            reached_projection_end = true;
+            break;
+        }
+        let page_blobs = select_projection_page_blobs(control_db, &page_rows).await?;
+
+        let mut tx = db.begin().await?;
+        run_create::bulk_insert_case_blobs(&mut tx, &page_blobs).await?;
+        run_create::upsert_dataset_version(
+            &mut tx,
+            draft.dataset_version_id,
+            draft.dataset_id,
+            &draft.dataset_version,
+        )
+        .await?;
+        let local_run_status = if database_alias == database_router.control_database_alias() {
+            RUN_STATUS_CREATING
+        } else {
+            RUN_STATUS_PENDING
+        };
+        run_create::insert_run_create(&mut tx, run_id, draft, local_run_status).await?;
+        case_projection::insert_projection_page(&mut tx, &page_rows).await?;
+        tx.commit().await?;
+
+        let last_ordinal = page_rows
+            .last()
+            .expect("projection pages are non-empty")
+            .case_ordinal;
+        acknowledge_projection_page(
+            control_db,
+            run_id,
+            owner_id,
+            database_alias,
+            acknowledged_count,
+            acknowledged_ordinal,
+            page_rows.len() as i64,
+            last_ordinal,
+            lease_seconds,
+        )
+        .await?;
+        acknowledged_count += page_rows.len() as i64;
+        acknowledged_ordinal = Some(last_ordinal);
+    }
+    if acknowledged_count > progress.expected_case_count
+        || (reached_projection_end && acknowledged_count != progress.expected_case_count)
+    {
+        return Err(run_create::seed_invariant_error(format!(
+            "run creation '{}' placement '{}' acknowledged {} of {} planned cases",
+            run_id, database_alias, acknowledged_count, progress.expected_case_count
+        )));
+    }
+    if acknowledged_count < progress.expected_case_count {
+        return Ok(false);
+    }
+
+    let mut placement_shards = chunks
+        .iter()
+        .map(|chunk| chunk.run_shard)
+        .collect::<Vec<_>>();
+    placement_shards.sort_unstable();
+    placement_shards.dedup();
+    let (stored_count, stored_hash) =
+        case_projection::projection_fingerprint(db, run_id, &placement_shards).await?;
+    if stored_count != progress.expected_case_count || stored_hash != progress.case_projection_hash
+    {
+        return Err(run_create::seed_invariant_error(format!(
+            "run creation '{}' placement '{}' projection verification failed",
+            run_id, database_alias
+        )));
+    }
+
+    let mut tx = db.begin().await?;
     run_create::bulk_insert_run_chunks(&mut tx, run_id, draft.dataset_version_id, chunks).await?;
     tx.commit().await?;
+    Ok(true)
+}
+
+async fn select_projection_seed_page(
+    control_db: &PgPool,
+    run_id: Uuid,
+    database_alias: &str,
+    after_ordinal: Option<i32>,
+    limit: usize,
+) -> anyhow::Result<Vec<RunShardCaseDraft>> {
+    let rows = sqlx::query_as::<_, RunShardCaseDraft>(
+        r#"
+        SELECT
+            plan.run_id,
+            plan.run_shard,
+            run.dataset_version_id,
+            membership.case_id,
+            membership.case_ordinal,
+            membership.case_hash
+        FROM run_creation_chunks plan
+        JOIN runs run ON run.id = plan.run_id
+        JOIN dataset_version_cases membership
+          ON membership.dataset_version_id = run.dataset_version_id
+         AND membership.case_ordinal >= plan.ordinal_start
+         AND membership.case_ordinal < plan.ordinal_end
+        WHERE plan.run_id = $1::uuid
+          AND plan.database_alias = $2
+          AND ($3::integer IS NULL OR membership.case_ordinal > $3)
+        ORDER BY membership.case_ordinal, membership.case_id
+        LIMIT $4
+        "#,
+    )
+    .bind(run_id)
+    .bind(database_alias)
+    .bind(after_ordinal)
+    .bind(limit as i64)
+    .fetch_all(control_db)
+    .await?;
+    Ok(rows)
+}
+
+async fn select_projection_page_blobs(
+    control_db: &PgPool,
+    rows: &[RunShardCaseDraft],
+) -> anyhow::Result<Vec<CaseBlobDraft>> {
+    let expected_hashes = rows
+        .iter()
+        .map(|row| row.case_hash.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let hashes = expected_hashes.iter().copied().collect::<Vec<_>>();
+    let blobs = sqlx::query_as::<_, CaseBlobDraft>(
+        r#"
+        SELECT
+            case_hash, task_type, case_group, input_payload,
+            expected_output, context_payload, tags, metadata
+        FROM case_blobs
+        WHERE case_hash = ANY($1::text[])
+        ORDER BY case_hash
+        "#,
+    )
+    .bind(&hashes)
+    .fetch_all(control_db)
+    .await?;
+    if blobs.len() != expected_hashes.len() {
+        return Err(run_create::seed_invariant_error(
+            "projection page references a missing canonical case blob",
+        ));
+    }
+    Ok(blobs)
+}
+
+async fn select_placement_seed_progress(
+    db: &PgPool,
+    run_id: Uuid,
+    database_alias: &str,
+) -> anyhow::Result<PlacementSeedProgress> {
+    sqlx::query_as::<_, PlacementSeedProgress>(
+        r#"
+        SELECT expected_case_count, seeded_case_count,
+               last_seeded_case_ordinal, case_projection_hash
+        FROM run_creation_placements
+        WHERE run_id = $1::uuid
+          AND database_alias = $2
+          AND status = 'pending'
+        "#,
+    )
+    .bind(run_id)
+    .bind(database_alias)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "run creation '{}' placement '{}' is no longer pending",
+            run_id,
+            database_alias
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn acknowledge_projection_page(
+    db: &PgPool,
+    run_id: Uuid,
+    owner_id: Uuid,
+    database_alias: &str,
+    expected_count: i64,
+    expected_ordinal: Option<i32>,
+    page_count: i64,
+    page_last_ordinal: i32,
+    lease_seconds: i32,
+) -> anyhow::Result<()> {
+    let updated = sqlx::query(
+        r#"
+        WITH owned_run AS (
+            UPDATE runs
+            SET coordinator_leased_until = now() + make_interval(secs => $8),
+                coordinator_heartbeat_at = now(),
+                updated_at = now()
+            WHERE id = $1::uuid
+              AND status = 'creating'::run_status
+              AND coordinator_id = $2::uuid
+            RETURNING id
+        )
+        UPDATE run_creation_placements creation
+        SET seeded_case_count = seeded_case_count + $6,
+            last_seeded_case_ordinal = $7,
+            updated_at = now()
+        FROM owned_run
+        WHERE creation.run_id = owned_run.id
+          AND creation.database_alias = $3
+          AND creation.status = 'pending'
+          AND creation.seeded_case_count = $4
+          AND creation.last_seeded_case_ordinal IS NOT DISTINCT FROM $5
+        "#,
+    )
+    .bind(run_id)
+    .bind(owner_id)
+    .bind(database_alias)
+    .bind(expected_count)
+    .bind(expected_ordinal)
+    .bind(page_count)
+    .bind(page_last_ordinal)
+    .bind(lease_seconds.max(INITIAL_CREATION_LEASE_SECONDS))
+    .execute(db)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        anyhow::bail!(
+            "run creation '{}' lost ownership while acknowledging placement '{}' through ordinal {}",
+            run_id,
+            database_alias,
+            page_last_ordinal
+        );
+    }
     Ok(())
 }
 
@@ -622,6 +917,7 @@ async fn mark_placement_seeded(
         WHERE creation.run_id = owned_run.id
           AND creation.database_alias = $3
           AND creation.status = 'pending'
+          AND creation.seeded_case_count = creation.expected_case_count
         "#,
     )
     .bind(run_id)
@@ -997,56 +1293,7 @@ async fn load_seed_material(db: &PgPool, run_id: Uuid) -> anyhow::Result<OwnedRu
         ))
     })?;
 
-    let dataset_cases = sqlx::query_as::<_, DatasetVersionCaseDraft>(
-        r#"
-        SELECT case_id, case_ordinal, case_hash
-        FROM dataset_version_cases
-        WHERE dataset_version_id = $1::uuid
-        ORDER BY case_ordinal, case_id
-        "#,
-    )
-    .bind(draft.dataset_version_id)
-    .fetch_all(db)
-    .await?;
-    if dataset_cases.is_empty() {
-        return Err(run_create::seed_invariant_error(format!(
-            "creating run '{}' has no canonical dataset membership",
-            run_id
-        )));
-    }
-
-    let case_blobs = sqlx::query_as::<_, CaseBlobDraft>(
-        r#"
-        SELECT DISTINCT ON (blob.case_hash)
-            blob.case_hash,
-            blob.task_type,
-            blob.case_group,
-            blob.input_payload,
-            blob.expected_output,
-            blob.context_payload,
-            blob.tags,
-            blob.metadata
-        FROM dataset_version_cases membership
-        JOIN case_blobs blob ON blob.case_hash = membership.case_hash
-        WHERE membership.dataset_version_id = $1::uuid
-        ORDER BY blob.case_hash
-        "#,
-    )
-    .bind(draft.dataset_version_id)
-    .fetch_all(db)
-    .await?;
-    if case_blobs.is_empty() {
-        return Err(run_create::seed_invariant_error(format!(
-            "creating run '{}' has no canonical case blobs",
-            run_id
-        )));
-    }
-
-    Ok(OwnedRunSeedMaterial {
-        draft,
-        case_blobs,
-        dataset_cases,
-    })
+    Ok(OwnedRunSeedMaterial { draft })
 }
 
 async fn select_creation_outcome(db: &PgPool, run_id: Uuid) -> anyhow::Result<RunCreationOutcome> {
@@ -1068,6 +1315,62 @@ mod tests {
     use sqlx::PgPool;
 
     use super::*;
+
+    fn projection_case(ordinal: i32) -> DatasetVersionCaseDraft {
+        DatasetVersionCaseDraft {
+            case_id: Uuid::from_u128(ordinal as u128 + 1),
+            case_ordinal: ordinal,
+            case_hash: format!("hash-{ordinal}"),
+        }
+    }
+
+    fn projection_chunk(run_shard: i16, start: i32, end: i32) -> RunChunkDraft {
+        RunChunkDraft {
+            chunk_id: Uuid::now_v7(),
+            run_shard,
+            profile_group_id: "default".to_string(),
+            ordinal_start: start,
+            ordinal_end: end,
+        }
+    }
+
+    #[test]
+    fn placement_projection_plan_covers_every_case_once() {
+        let run_id = Uuid::now_v7();
+        let dataset_version_id = Uuid::now_v7();
+        let cases = (0..4).map(projection_case).collect::<Vec<_>>();
+        let chunks = BTreeMap::from([
+            ("primary".to_string(), vec![projection_chunk(0, 0, 2)]),
+            ("shard_001".to_string(), vec![projection_chunk(1, 2, 4)]),
+        ]);
+
+        let projections =
+            build_placement_projections(run_id, dataset_version_id, &cases, &chunks).unwrap();
+
+        assert_eq!(projections["primary"].len(), 2);
+        assert_eq!(projections["shard_001"].len(), 2);
+    }
+
+    #[test]
+    fn placement_projection_plan_rejects_unassigned_cases() {
+        let error = build_placement_projections(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            &(0..3).map(projection_case).collect::<Vec<_>>(),
+            &BTreeMap::from([("primary".to_string(), vec![projection_chunk(0, 0, 2)])]),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("assigns 2 of 3"));
+    }
+
+    #[test]
+    fn positive_usize_setting_uses_default_when_unset() {
+        assert_eq!(
+            positive_usize_setting("VIGILO_TEST_UNSET_POSITIVE_USIZE", 17).unwrap(),
+            17
+        );
+    }
 
     async fn insert_creation_fixture(pool: &PgPool, status: &str) -> (Uuid, Uuid) {
         let run_id = Uuid::now_v7();
@@ -1116,10 +1419,15 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO run_creation_placements (
-                run_id, database_alias, status, seeded_at
+                run_id, database_alias, status, expected_case_count,
+                seeded_case_count, last_seeded_case_ordinal,
+                case_projection_hash, seeded_at
             )
             VALUES (
-                $1, 'primary', $2,
+                $1, 'primary', $2, 1,
+                CASE WHEN $2 = 'seeded' THEN 1 ELSE 0 END,
+                CASE WHEN $2 = 'seeded' THEN 0 ELSE NULL END,
+                'fixture-projection-hash',
                 CASE WHEN $2 = 'seeded' THEN now() ELSE NULL END
             )
             "#,
@@ -1145,6 +1453,53 @@ mod tests {
         .unwrap();
 
         (run_id, owner_id)
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx creation tests"]
+    async fn projection_seed_page_reads_only_persisted_placement_ranges(pool: PgPool) {
+        let (run_id, _) = insert_creation_fixture(&pool, "pending").await;
+        let dataset_version_id =
+            sqlx::query_scalar::<_, Uuid>("SELECT dataset_version_id FROM runs WHERE id = $1")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        for ordinal in 0..3 {
+            let case_id = Uuid::now_v7();
+            let case_hash = format!("seed-page-{ordinal}");
+            sqlx::query(
+                "INSERT INTO case_blobs (case_hash, task_type, input_payload, expected_output) VALUES ($1, 'test', '{}'::jsonb, 'null'::jsonb)",
+            )
+            .bind(&case_hash)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO dataset_version_cases (dataset_version_id, case_id, case_ordinal, case_hash) VALUES ($1, $2, $3, $4)",
+            )
+            .bind(dataset_version_id)
+            .bind(case_id)
+            .bind(ordinal)
+            .bind(case_hash)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let page = select_projection_seed_page(&pool, run_id, "primary", None, 10)
+            .await
+            .unwrap();
+        let blobs = select_projection_page_blobs(&pool, &page).await.unwrap();
+        let next_page = select_projection_seed_page(&pool, run_id, "primary", Some(0), 10)
+            .await
+            .unwrap();
+
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].case_ordinal, 0);
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].case_hash, page[0].case_hash);
+        assert!(next_page.is_empty());
     }
 
     #[sqlx::test(migrations = "../migrations")]

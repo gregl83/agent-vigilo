@@ -920,6 +920,11 @@ fn route_payload(route: &shard_admin::ShardRouteInspection) -> Value {
             "dispatchable": route.dispatchable,
             "readable": route.readable,
             "routing_decision": route.routing_decision,
+            "move_operation_id": route.move_operation_id,
+            "move_phase": route.move_phase,
+            "move_completed_page_count": route.move_completed_page_count,
+            "move_copied_row_count": route.move_copied_row_count,
+            "move_copied_byte_count": route.move_copied_byte_count,
         }
     })
 }
@@ -1303,11 +1308,12 @@ mod tests {
             placement,
             tables: vec![shard_admin::ShardMoveTableReport {
                 table: "run_chunks",
-                source_row_count: 1,
-                target_row_count: 1,
+                source_row_count: None,
+                target_row_count: None,
                 copied_row_count: 1,
-                source_checksum: "a".to_string(),
-                target_checksum: "a".to_string(),
+                source_checksum: None,
+                target_checksum: None,
+                verification_mode: "checkpoint_and_replay",
                 verified: true,
             }],
         };
@@ -1317,6 +1323,11 @@ mod tests {
         assert_eq!(payload["meta"]["moved"], json!(true));
         assert_eq!(payload["meta"]["verified"], json!(true));
         assert_eq!(payload["data"]["tables"][0]["table"], json!("run_chunks"));
+        assert_eq!(
+            payload["data"]["tables"][0]["verification_mode"],
+            json!("checkpoint_and_replay")
+        );
+        assert!(payload["data"]["tables"][0]["source_row_count"].is_null());
     }
 
     #[test]
@@ -1389,6 +1400,11 @@ mod tests {
             dispatchable: true,
             readable: true,
             routing_decision: "dispatchable",
+            move_operation_id: None,
+            move_phase: None,
+            move_completed_page_count: None,
+            move_copied_row_count: None,
+            move_copied_byte_count: None,
         };
 
         let payload = route_payload(&route);

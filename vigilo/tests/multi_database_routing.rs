@@ -67,6 +67,7 @@ async fn multi_database_routing_flow() -> anyhow::Result<()> {
     );
     assert_eq!(dispatch_cursor_count(&shard, default_run_id).await?, 0);
     assert_eq!(dataset_version_case_count(&shard, default_run_id).await?, 0);
+    assert_eq!(run_shard_case_count(&shard, default_run_id).await?, 0);
     assert_eq!(case_blob_count(&shard, default_run_id).await?, 0);
     assert_eq!(
         run_creation_placement_state(&primary, default_run_id, PRIMARY_ALIAS).await?,
@@ -96,8 +97,13 @@ async fn multi_database_routing_flow() -> anyhow::Result<()> {
     );
     assert_eq!(
         dataset_version_case_count(&shard, default_run_id).await?,
+        0,
+        "canonical dataset membership remains control-owned"
+    );
+    assert_eq!(
+        run_shard_case_count(&shard, default_run_id).await?,
         1,
-        "shard move copies dataset membership rows needed by workers"
+        "shard move copies only the routed execution projection"
     );
     assert_eq!(
         case_blob_count(&shard, default_run_id).await?,
@@ -119,7 +125,6 @@ async fn multi_database_routing_flow() -> anyhow::Result<()> {
             .is_some_and(|version| version > 1)
     );
     set_run_shard_chunk_status(&shard, default_run_id, 0, "completed").await?;
-
     let moved_default_back_payload = run_vigilo(
         &config,
         PRIMARY_ALIAS,
@@ -224,6 +229,9 @@ async fn multi_database_routing_flow() -> anyhow::Result<()> {
     );
     assert_eq!(run_chunk_count(&primary, spread_run_id).await?, 2);
     assert_eq!(run_chunk_count(&shard, spread_run_id).await?, 1);
+    assert_eq!(run_shard_case_count(&primary, spread_run_id).await?, 101);
+    assert_eq!(run_shard_case_count(&shard, spread_run_id).await?, 100);
+    assert_eq!(dataset_version_case_count(&shard, spread_run_id).await?, 0);
 
     let rebalance_plan = run_vigilo(
         &config,
@@ -334,6 +342,68 @@ async fn multi_database_routing_flow() -> anyhow::Result<()> {
     assert_eq!(run_shard_chunk_count(&primary, routed_run_id, 0).await?, 1);
     assert_eq!(run_shard_chunk_count(&shard, routed_run_id, 0).await?, 1);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn shard_move_replays_cross_database_updates_and_deletes() -> anyhow::Result<()> {
+    let Some(config) = IntegrationConfig::from_env() else {
+        return Ok(());
+    };
+    let config = config.isolated().await?;
+    let primary = connect(&config.primary_url).await?;
+    let shard = connect(&config.shard_url).await?;
+    migrate(&primary).await?;
+    migrate(&shard).await?;
+    seed_evaluator(&primary).await?;
+    configure_shard_placement(&primary).await?;
+    let run_id = create_run(&config, PRIMARY_ALIAS, 1).await?;
+    insert_extra_run_chunk(&primary, run_id, 0).await?;
+    lease_run_shard_chunk(&primary, run_id, 0).await?;
+
+    let pending_move_error = run_vigilo_failure(
+        &config,
+        PRIMARY_ALIAS,
+        [
+            "shard",
+            "move",
+            &run_id.to_string(),
+            "0",
+            "--alias",
+            SHARD_ALIAS,
+        ],
+    )?;
+    assert!(pending_move_error.contains("route remains draining"));
+    assert_eq!(
+        shard_placement_status(&primary, run_id, 0).await?,
+        "draining"
+    );
+
+    delete_extra_run_chunk(&primary, run_id, 0).await?;
+    set_run_shard_chunk_status(&primary, run_id, 0, "completed").await?;
+    let move_payload = run_vigilo(
+        &config,
+        PRIMARY_ALIAS,
+        [
+            "shard",
+            "move",
+            &run_id.to_string(),
+            "0",
+            "--alias",
+            SHARD_ALIAS,
+        ],
+    )?;
+
+    assert_eq!(move_payload["meta"]["moved"], true);
+    assert_eq!(
+        run_shard_chunk_status(&shard, run_id, 0).await?,
+        "completed"
+    );
+    assert_eq!(
+        run_shard_chunk_count(&shard, run_id, 0).await?,
+        1,
+        "replay deletes target rows removed from the source after backfill"
+    );
     Ok(())
 }
 
@@ -512,6 +582,34 @@ fn run_vigilo_with_policy<'a>(
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
+fn run_vigilo_failure<'a>(
+    config: &IntegrationConfig,
+    default_execution_alias: &str,
+    args: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<String> {
+    let args = args.into_iter().collect::<Vec<_>>();
+    let output = Command::new(env!("CARGO_BIN_EXE_vigilo"))
+        .env(PRIMARY_DATABASE_URL_ENV, &config.primary_url)
+        .env(SHARD_DATABASE_URL_ENV, &config.shard_url)
+        .env("MESSAGING_URL", TEST_MESSAGING_URL)
+        .env(
+            "VIGILO_DEFAULT_SHARD_DATABASE_ALIAS",
+            default_execution_alias,
+        )
+        .env("VIGILO_SHARD_ASSIGNMENT_POLICY", "single-default")
+        .args(["-q", "-f", "json"])
+        .args(&args)
+        .output()?;
+    if output.status.success() {
+        anyhow::bail!("vigilo command {:?} unexpectedly succeeded", args);
+    }
+    Ok(format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
+}
+
 struct RunInputFiles {
     profile: PathBuf,
     dataset: PathBuf,
@@ -650,6 +748,71 @@ async fn set_run_shard_chunk_status(
     Ok(())
 }
 
+async fn lease_run_shard_chunk(db: &PgPool, run_id: Uuid, run_shard: i16) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE run_chunks
+        SET status = 'leased',
+            lease_token = gen_random_uuid(),
+            leased_until = now() + interval '5 minutes',
+            updated_at = now()
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn insert_extra_run_chunk(db: &PgPool, run_id: Uuid, run_shard: i16) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO run_chunks (
+            id, run_id, run_shard, dataset_version_id,
+            profile_group_id, ordinal_start, ordinal_end
+        )
+        SELECT
+            gen_random_uuid(), id, $2, dataset_version_id,
+            'dirty-delete', 0, 1
+        FROM runs
+        WHERE id = $1::uuid
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn delete_extra_run_chunk(db: &PgPool, run_id: Uuid, run_shard: i16) -> anyhow::Result<()> {
+    sqlx::query(
+        "DELETE FROM run_chunks WHERE run_id = $1::uuid AND run_shard = $2 AND profile_group_id = 'dirty-delete'",
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn shard_placement_status(
+    db: &PgPool,
+    run_id: Uuid,
+    run_shard: i16,
+) -> anyhow::Result<String> {
+    Ok(sqlx::query_scalar(
+        "SELECT status FROM shard_placements WHERE run_id = $1::uuid AND run_shard = $2",
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .fetch_one(db)
+    .await?)
+}
+
 async fn run_shard_chunk_status(
     db: &PgPool,
     run_id: Uuid,
@@ -725,6 +888,15 @@ async fn dataset_version_case_count(db: &PgPool, run_id: Uuid) -> anyhow::Result
     .await?)
 }
 
+async fn run_shard_case_count(db: &PgPool, run_id: Uuid) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM run_shard_cases WHERE run_id = $1::uuid",
+    )
+    .bind(run_id)
+    .fetch_one(db)
+    .await?)
+}
+
 async fn case_blob_count(db: &PgPool, run_id: Uuid) -> anyhow::Result<i64> {
     Ok(sqlx::query_scalar::<_, i64>(
         r#"
@@ -732,11 +904,9 @@ async fn case_blob_count(db: &PgPool, run_id: Uuid) -> anyhow::Result<i64> {
         FROM case_blobs cb
         WHERE EXISTS (
             SELECT 1
-            FROM runs r
-            JOIN dataset_version_cases cvc
-              ON cvc.dataset_version_id = r.dataset_version_id
-            WHERE r.id = $1::uuid
-              AND cvc.case_hash = cb.case_hash
+            FROM run_shard_cases projected
+            WHERE projected.run_id = $1::uuid
+              AND projected.case_hash = cb.case_hash
         )
         "#,
     )

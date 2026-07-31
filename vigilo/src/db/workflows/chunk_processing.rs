@@ -171,11 +171,11 @@ pub(crate) async fn extend_chunk_lease(
     Ok(chunk)
 }
 
-/// Loads the dataset cases covered by a claimed chunk's ordinal range.
+/// Loads the shard-local cases covered by a claimed chunk's ordinal range.
 ///
-/// Query behavior: reads immutable dataset membership rows joined to case
-/// blobs, ordered by ordinal, for `[ordinal_start, ordinal_end)`. This function
-/// does not claim work; callers must already own the chunk lease.
+/// Query behavior: reads only the run-and-shard projection routed to this
+/// execution database, joined to immutable case blobs and ordered by ordinal.
+/// This function does not claim work; callers must already own the chunk lease.
 pub(crate) async fn load_chunk_case_batch(
     db: &PgPool,
     chunk: &RunChunk,
@@ -183,9 +183,9 @@ pub(crate) async fn load_chunk_case_batch(
     let rows = sqlx::query_as::<_, WorkerCaseBatchItem>(
         r#"
 		SELECT
-			cvc.case_id,
-			cvc.case_hash,
-			cvc.case_ordinal,
+			projected.case_id,
+			projected.case_hash,
+			projected.case_ordinal,
 			cb.task_type,
 			cb.case_group,
 			cb.input_payload,
@@ -193,21 +193,62 @@ pub(crate) async fn load_chunk_case_batch(
 			cb.context_payload,
 			cb.tags,
 			cb.metadata
-		FROM dataset_version_cases cvc
-		JOIN case_blobs cb ON cvc.case_hash = cb.case_hash
-		WHERE cvc.dataset_version_id = $1
-		  AND cvc.case_ordinal >= $2
-		  AND cvc.case_ordinal < $3
-		ORDER BY cvc.case_ordinal
+		FROM run_shard_cases projected
+		JOIN case_blobs cb ON projected.case_hash = cb.case_hash
+		WHERE projected.run_id = $1::uuid
+		  AND projected.run_shard = $2
+		  AND projected.dataset_version_id = $3::uuid
+		  AND projected.case_ordinal >= $4
+		  AND projected.case_ordinal < $5
+		ORDER BY projected.case_ordinal
 		"#,
     )
+    .bind(chunk.run_id)
+    .bind(chunk.run_shard)
     .bind(chunk.dataset_version_id)
     .bind(chunk.ordinal_start)
     .bind(chunk.ordinal_end)
     .fetch_all(db)
     .await?;
 
+    validate_chunk_case_ordinals(
+        chunk.ordinal_start,
+        chunk.ordinal_end,
+        rows.iter().map(|row| row.case_ordinal),
+    )?;
     Ok(rows)
+}
+
+fn validate_chunk_case_ordinals(
+    ordinal_start: i32,
+    ordinal_end: i32,
+    ordinals: impl IntoIterator<Item = i32>,
+) -> anyhow::Result<()> {
+    if ordinal_end < ordinal_start {
+        anyhow::bail!(
+            "chunk projection range is invalid: ordinal end {} is before start {}",
+            ordinal_end,
+            ordinal_start
+        );
+    }
+    let mut expected = ordinal_start;
+    for actual in ordinals {
+        if actual != expected {
+            anyhow::bail!(
+                "chunk projection is incomplete: expected case ordinal {}, found {}",
+                expected,
+                actual
+            );
+        }
+        expected += 1;
+    }
+    if expected != ordinal_end {
+        anyhow::bail!(
+            "chunk projection is incomplete: expected case ordinal {}, found end of projection",
+            expected
+        );
+    }
+    Ok(())
 }
 
 /// Marks a leased chunk complete if the caller still owns the same lease.
@@ -341,4 +382,144 @@ fn require_chunk_lease_token(chunk: &RunChunk) -> anyhow::Result<Uuid> {
             chunk.run_shard
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    use super::*;
+
+    #[test]
+    fn chunk_projection_accepts_exact_contiguous_range() {
+        validate_chunk_case_ordinals(4, 7, [4, 5, 6]).unwrap();
+    }
+
+    #[test]
+    fn chunk_projection_rejects_missing_first_case() {
+        let error = validate_chunk_case_ordinals(4, 7, [5, 6]).unwrap_err();
+        assert!(error.to_string().contains("expected case ordinal 4"));
+    }
+
+    #[test]
+    fn chunk_projection_rejects_internal_gap() {
+        let error = validate_chunk_case_ordinals(4, 7, [4, 6]).unwrap_err();
+        assert!(error.to_string().contains("expected case ordinal 5"));
+    }
+
+    #[test]
+    fn chunk_projection_rejects_early_end() {
+        let error = validate_chunk_case_ordinals(4, 7, [4, 5]).unwrap_err();
+        assert!(error.to_string().contains("expected case ordinal 6"));
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx workflow tests"]
+    async fn case_batch_rejects_an_incomplete_run_shard_projection(pool: PgPool) {
+        let run_id = Uuid::now_v7();
+        let dataset_id = Uuid::now_v7();
+        let dataset_version_id = Uuid::now_v7();
+        let first_case_id = Uuid::now_v7();
+        let second_case_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO dataset_versions (dataset_version_id, dataset_id, dataset_version) VALUES ($1, $2, 'test')",
+        )
+        .bind(dataset_version_id)
+        .bind(dataset_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO runs (
+                id, run_key, dataset_id, dataset_version_id, dataset_version,
+                evaluation_profile_id, evaluation_profile_version,
+                profile_version_id, profile_hash,
+                aggregation_policy_id, aggregation_policy_version,
+                aggregation_policy_hash, agent_provider, agent_name,
+                prompt_config_id, prompt_config_version, expected_execution_count
+            )
+            VALUES (
+                $1, $2, $3, $4, 'test', 'profile', '1.0.0',
+                'profile-version', 'profile-hash', 'aggregate', '1.0.0',
+                'aggregate-hash', 'test', 'agent', 'prompt', '1.0.0', 2
+            )
+            "#,
+        )
+        .bind(run_id)
+        .bind(format!("run-{run_id}"))
+        .bind(dataset_id)
+        .bind(dataset_version_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (case_id, ordinal) in [(first_case_id, 0), (second_case_id, 1)] {
+            let case_hash = format!("hash-{ordinal}");
+            sqlx::query(
+                r#"
+                INSERT INTO case_blobs (
+                    case_hash, task_type, input_payload, expected_output
+                )
+                VALUES ($1, 'classification', '{}'::jsonb, 'null'::jsonb)
+                "#,
+            )
+            .bind(&case_hash)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                r#"
+                INSERT INTO dataset_version_cases (
+                    dataset_version_id, case_id, case_ordinal, case_hash
+                )
+                VALUES ($1, $2, $3, $4)
+                "#,
+            )
+            .bind(dataset_version_id)
+            .bind(case_id)
+            .bind(ordinal)
+            .bind(&case_hash)
+            .execute(&pool)
+            .await
+            .unwrap();
+            if ordinal == 1 {
+                sqlx::query(
+                    r#"
+                    INSERT INTO run_shard_cases (
+                        run_id, run_shard, dataset_version_id,
+                        case_id, case_ordinal, case_hash
+                    )
+                    VALUES ($1, 7, $2, $3, $4, $5)
+                    "#,
+                )
+                .bind(run_id)
+                .bind(dataset_version_id)
+                .bind(case_id)
+                .bind(ordinal)
+                .bind(&case_hash)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        }
+        let chunk = RunChunk {
+            id: Uuid::now_v7(),
+            run_id,
+            run_shard: 7,
+            dataset_version_id,
+            profile_group_id: "default".to_string(),
+            ordinal_start: 0,
+            ordinal_end: 2,
+            status: "leased".to_string(),
+            lease_token: Some(Uuid::now_v7()),
+            leased_until: Some(chrono::Utc::now() + chrono::Duration::minutes(1)),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let error = load_chunk_case_batch(&pool, &chunk).await.unwrap_err();
+
+        assert!(error.to_string().contains("expected case ordinal 0"));
+    }
 }

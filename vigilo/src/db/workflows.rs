@@ -28,6 +28,7 @@
 //! - `run_profile_validation` verifies profile/dataset/evaluator compatibility
 //!   before durable run work is created.
 
+pub(crate) mod case_projection;
 pub(crate) mod chunk_processing;
 pub(crate) mod execution_processing;
 pub(crate) mod run_cancel;

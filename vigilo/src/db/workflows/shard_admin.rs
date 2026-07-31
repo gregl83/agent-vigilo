@@ -45,6 +45,7 @@ use crate::{
         run_chunk::RUN_SHARD_COUNT,
         shard_placement::{
             SHARD_PLACEMENT_STATUS_ACTIVE,
+            SHARD_PLACEMENT_STATUS_COPYING,
             SHARD_PLACEMENT_STATUS_DRAINING,
             SHARD_PLACEMENT_STATUS_MOVING,
             ShardPlacement,
@@ -62,11 +63,12 @@ pub(crate) struct ShardPlacementSetOutcome {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ShardMoveTableReport {
     pub(crate) table: &'static str,
-    pub(crate) source_row_count: i64,
-    pub(crate) target_row_count: i64,
+    pub(crate) source_row_count: Option<i64>,
+    pub(crate) target_row_count: Option<i64>,
     pub(crate) copied_row_count: u64,
-    pub(crate) source_checksum: String,
-    pub(crate) target_checksum: String,
+    pub(crate) source_checksum: Option<String>,
+    pub(crate) target_checksum: Option<String>,
+    pub(crate) verification_mode: &'static str,
     pub(crate) verified: bool,
 }
 
@@ -110,6 +112,11 @@ pub(crate) struct ShardRouteInspection {
     pub(crate) dispatchable: bool,
     pub(crate) readable: bool,
     pub(crate) routing_decision: &'static str,
+    pub(crate) move_operation_id: Option<Uuid>,
+    pub(crate) move_phase: Option<String>,
+    pub(crate) move_completed_page_count: Option<i64>,
+    pub(crate) move_copied_row_count: Option<i64>,
+    pub(crate) move_copied_byte_count: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -246,9 +253,20 @@ struct ShardMoveDrainPending {
     active_work_count: i64,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "run {run_id} shard {run_shard} retains {remaining_dirty_key_count} dirty key(s) after bounded online catch-up; the route remains copying and the move can be resumed"
+)]
+struct ShardMoveCatchUpPending {
+    run_id: Uuid,
+    run_shard: i16,
+    remaining_dirty_key_count: i64,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ShardTable {
     name: &'static str,
+    key_columns: &'static [&'static str],
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -257,32 +275,96 @@ struct TableFingerprint {
     checksum: String,
 }
 
-const PREREQUISITE_TABLES: &[&str] = &[
-    "case_blobs",
-    "dataset_versions",
-    "dataset_version_cases",
-    "runs",
-];
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ShardMoveOperation {
+    id: Uuid,
+    run_id: Uuid,
+    run_shard: i16,
+    source_database_alias: String,
+    target_database_alias: String,
+    status: String,
+    phase: String,
+    target_reset_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct MoveSourceRow {
+    row: Value,
+    row_key: String,
+    row_bytes: i32,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct DirtyShardKey {
+    table_name: String,
+    row_key: Value,
+    change_version: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ShardMoveInspection {
+    id: Uuid,
+    phase: String,
+    completed_page_count: i64,
+    copied_row_count: i64,
+    copied_byte_count: i64,
+}
+
+const PREREQUISITE_TABLES: &[&str] = &["case_blobs", "dataset_versions", "runs"];
 const SHARD_TABLES: &[ShardTable] = &[
-    ShardTable { name: "run_chunks" },
+    ShardTable {
+        name: "run_shard_cases",
+        key_columns: &["run_id", "run_shard", "case_id"],
+    },
+    ShardTable {
+        name: "run_chunks",
+        key_columns: &["run_id", "run_shard", "id"],
+    },
     ShardTable {
         name: "run_snapshots",
+        key_columns: &["run_id", "run_shard"],
     },
-    ShardTable { name: "executions" },
+    ShardTable {
+        name: "executions",
+        key_columns: &["run_id", "run_shard", "id"],
+    },
     ShardTable {
         name: "execution_attempts",
+        key_columns: &["run_id", "run_shard", "id"],
     },
     ShardTable {
         name: "execution_aggregates",
+        key_columns: &["run_id", "run_shard", "execution_id"],
     },
     ShardTable {
         name: "evaluator_results",
+        key_columns: &["run_id", "run_shard", "id"],
     },
     ShardTable {
         name: "run_shard_summaries",
+        key_columns: &["run_id", "run_shard"],
     },
 ];
 const SHARD_MOVE_COPY_BATCH_SIZE: usize = 1_000;
+const SHARD_MOVE_COPY_BATCH_BYTES: usize = 4 * 1024 * 1024;
+const SHARD_MOVE_ONLINE_REPLAY_BATCHES: usize = 100;
+const SHARD_MOVE_FINAL_DIRTY_KEY_LIMIT: i64 = SHARD_MOVE_COPY_BATCH_SIZE as i64;
+
+fn bounded_page_len(row_bytes: &[usize], max_rows: usize, max_bytes: usize) -> usize {
+    if row_bytes.is_empty() || max_rows == 0 {
+        return 0;
+    }
+    let mut bytes = 0usize;
+    let mut rows = 0;
+    for row_bytes in row_bytes.iter().copied().take(max_rows) {
+        if rows > 0 && bytes.saturating_add(row_bytes) > max_bytes {
+            break;
+        }
+        bytes = bytes.saturating_add(row_bytes);
+        rows += 1;
+    }
+    rows
+}
 
 const REBALANCE_STRATEGY_DRAIN_SOURCE: &str = "drain-source";
 const REBALANCE_STRATEGY_FILL_TARGET: &str = "fill-target";
@@ -579,6 +661,26 @@ pub(crate) async fn inspect_shard_route(
     } else {
         "blocked"
     };
+    let move_progress = sqlx::query_as::<_, ShardMoveInspection>(
+        r#"
+        SELECT
+            operation.id,
+            operation.phase,
+            COALESCE(SUM(page.completed_page_count), 0)::bigint AS completed_page_count,
+            operation.copied_row_count,
+            operation.copied_byte_count
+        FROM shard_move_operations operation
+        LEFT JOIN shard_move_table_progress page ON page.move_id = operation.id
+        WHERE operation.run_id = $1::uuid
+          AND operation.run_shard = $2
+          AND operation.status = 'active'
+        GROUP BY operation.id
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .fetch_optional(control_db)
+    .await?;
 
     Ok(ShardRouteInspection {
         run_id,
@@ -595,6 +697,17 @@ pub(crate) async fn inspect_shard_route(
         dispatchable,
         readable,
         routing_decision,
+        move_operation_id: move_progress.as_ref().map(|progress| progress.id),
+        move_phase: move_progress
+            .as_ref()
+            .map(|progress| progress.phase.clone()),
+        move_completed_page_count: move_progress
+            .as_ref()
+            .map(|progress| progress.completed_page_count),
+        move_copied_row_count: move_progress
+            .as_ref()
+            .map(|progress| progress.copied_row_count),
+        move_copied_byte_count: move_progress.map(|progress| progress.copied_byte_count),
     })
 }
 
@@ -938,6 +1051,32 @@ pub(crate) async fn apply_shard_rebalance(
                 );
             }
             Err(error) => {
+                if let Some(catch_up) = error.downcast_ref::<ShardMoveCatchUpPending>() {
+                    let settled =
+                        defer_rebalance_item(control_db, &item, claim_token, &error.to_string())
+                            .await?;
+                    if settled.is_some() {
+                        info!(
+                            operation_id = %operation_id,
+                            sequence_no = item.sequence_no,
+                            run_id = %catch_up.run_id,
+                            run_shard = catch_up.run_shard,
+                            remaining_dirty_key_count = catch_up.remaining_dirty_key_count,
+                            claim_token = %claim_token,
+                            claimed_by = %claimed_by,
+                            "deferred shard rebalance item for another online catch-up cycle"
+                        );
+                    }
+                    record_rebalance_item_settlement(
+                        &mut processed_items,
+                        settled,
+                        &item,
+                        claim_token,
+                        claimed_by,
+                        REBALANCE_ITEM_STATUS_PENDING,
+                    );
+                    break;
+                }
                 if let Some(drain) = error.downcast_ref::<ShardMoveDrainPending>() {
                     let settled =
                         defer_rebalance_item(control_db, &item, claim_token, &error.to_string())
@@ -1140,12 +1279,13 @@ pub(crate) async fn cancel_shard_rebalance(
     refresh_rebalance_operation_status(control_db, operation_id).await
 }
 
-/// Drains, freezes, reconciles, and moves one shard under write admission.
+/// Backfills, drains, and moves one shard under fenced write admission.
 ///
-/// `draining` rejects new work while admitted leases and attempts finish.
-/// `moving` freezes every source mutation before stale target rows are removed
-/// and replaced. The target is reserved across both states so a retry cannot
-/// redirect the move or drain the target placement.
+/// `copying` stays dispatchable while durable pages and captured mutations are
+/// replayed. `draining` rejects new work while admitted leases finish.
+/// `moving` holds the exclusive fence only for final replay and activation.
+/// The persisted operation, target, checkpoints, and route versions make
+/// retries resumable and prevent concurrent redirection.
 pub(crate) async fn move_shard_placement(
     database_router: &database::DatabaseRouter,
     run_id: Uuid,
@@ -1172,10 +1312,36 @@ pub(crate) async fn move_shard_placement(
             )
         })?;
 
-    let retrying_completed_move = !options.dry_run
+    let completed_operation = if !options.dry_run
         && !options.verify_only
         && current.database_alias == target_database_alias
-        && current.status == SHARD_PLACEMENT_STATUS_ACTIVE;
+        && current.status == SHARD_PLACEMENT_STATUS_ACTIVE
+    {
+        sqlx::query_as::<_, ShardMoveOperation>(
+            r#"
+            SELECT id, run_id, run_shard, source_database_alias,
+                   target_database_alias, starting_route_version, status, phase,
+                   target_reset_at, copied_row_count, copied_byte_count, claim_token
+            FROM shard_move_operations
+            WHERE run_id = $1::uuid
+              AND run_shard = $2
+              AND target_database_alias = $3
+              AND status IN ('active', 'completed')
+            ORDER BY
+                CASE status WHEN 'active' THEN 0 ELSE 1 END,
+                completed_at DESC NULLS LAST
+            LIMIT 1
+            "#,
+        )
+        .bind(run_id)
+        .bind(run_shard)
+        .bind(target_database_alias)
+        .fetch_optional(control_db)
+        .await?
+    } else {
+        None
+    };
+    let retrying_completed_move = completed_operation.is_some();
 
     if options.verify_only {
         validate_source_placement(control_db, target_database_alias).await?;
@@ -1207,7 +1373,7 @@ pub(crate) async fn move_shard_placement(
             .execution_target_database(target_database_alias)
             .await?
     };
-    let mut copied_rows_by_table = std::collections::BTreeMap::<&'static str, u64>::new();
+    let copied_rows_by_table = std::collections::BTreeMap::<&'static str, u64>::new();
 
     if options.dry_run || options.verify_only {
         let active_work_count = count_active_shard_work(source_db, run_id, run_shard).await?;
@@ -1235,9 +1401,43 @@ pub(crate) async fn move_shard_placement(
         });
     }
 
+    if retrying_completed_move {
+        let operation = completed_operation.expect("completed move retry has an operation");
+        if operation.status == "active" {
+            let old_source = database_router
+                .execution_database(&operation.source_database_alias)
+                .await?;
+            let mut cleanup_tx = old_source.begin().await?;
+            crate::db::shard_write_fence::lock_exclusive(&mut cleanup_tx, run_id, run_shard)
+                .await?;
+            sqlx::query("DELETE FROM shard_move_captures WHERE move_id = $1::uuid")
+                .bind(operation.id)
+                .execute(cleanup_tx.as_mut())
+                .await?;
+            cleanup_tx.commit().await?;
+            settle_completed_move_operation(control_db, operation.id, None).await?;
+        }
+        let reports = checkpoint_move_reports(control_db, operation.id).await?;
+        let active_work_count = count_active_shard_work(source_db, run_id, run_shard).await?;
+        return Ok(ShardMoveOutcome {
+            run_id,
+            run_shard,
+            source_database_alias: operation.source_database_alias,
+            target_database_alias: target_database_alias.to_string(),
+            dry_run: false,
+            verify_only: false,
+            forced: options.force,
+            active_work_count,
+            moved: false,
+            placement: current,
+            tables: reports,
+        });
+    }
+
     if !matches!(
         current.status.as_str(),
         SHARD_PLACEMENT_STATUS_ACTIVE
+            | SHARD_PLACEMENT_STATUS_COPYING
             | SHARD_PLACEMENT_STATUS_DRAINING
             | SHARD_PLACEMENT_STATUS_MOVING
     ) {
@@ -1248,10 +1448,54 @@ pub(crate) async fn move_shard_placement(
             current.status
         );
     }
+    if current.status != SHARD_PLACEMENT_STATUS_ACTIVE
+        && current.move_target_database_alias.as_deref() != Some(target_database_alias)
+    {
+        anyhow::bail!(
+            "run {} shard {} is already {} toward database placement {}; retry with the persisted target",
+            run_id,
+            run_shard,
+            current.status,
+            current
+                .move_target_database_alias
+                .as_deref()
+                .unwrap_or("<missing>")
+        );
+    }
 
+    let claim_token = Uuid::now_v7();
+    let operation =
+        claim_shard_move_operation(control_db, &current, target_database_alias, claim_token)
+            .await?;
+    let current = match prepare_online_shard_move(
+        database_router,
+        source_db,
+        target_db,
+        current,
+        &operation,
+        claim_token,
+    )
+    .await
+    {
+        Ok(current) => current,
+        Err(error) => {
+            release_shard_move_claim(control_db, operation.id, claim_token).await?;
+            return Err(error);
+        }
+    };
     let initial_route = current.clone();
     let source_database_alias = current.database_alias.clone();
     let source_is_control = source_database_alias == database_router.control_database_alias();
+    let active_work_count = count_active_shard_work(source_db, run_id, run_shard).await?;
+    if active_work_count > 0 {
+        release_shard_move_claim(control_db, operation.id, claim_token).await?;
+        return Err(ShardMoveDrainPending {
+            run_id,
+            run_shard,
+            active_work_count,
+        }
+        .into());
+    }
     let mut source_tx = source_db.begin().await?;
     crate::db::shard_write_fence::lock_exclusive(&mut source_tx, run_id, run_shard).await?;
 
@@ -1326,6 +1570,7 @@ pub(crate) async fn move_shard_placement(
         || !matches!(
             current.status.as_str(),
             SHARD_PLACEMENT_STATUS_ACTIVE
+                | SHARD_PLACEMENT_STATUS_COPYING
                 | SHARD_PLACEMENT_STATUS_DRAINING
                 | SHARD_PLACEMENT_STATUS_MOVING
         )
@@ -1355,26 +1600,7 @@ pub(crate) async fn move_shard_placement(
         );
     }
 
-    let draining = if current.status == SHARD_PLACEMENT_STATUS_ACTIVE {
-        let placement = reserve_active_move_target_and_mark_draining(
-            control_db,
-            run_id,
-            run_shard,
-            &source_database_alias,
-            current.route_version,
-            target_database_alias,
-        )
-        .await?;
-        placement.ok_or_else(|| {
-            anyhow::anyhow!(
-                "run {} shard {} route changed before it could be marked draining",
-                run_id,
-                run_shard
-            )
-        })?
-    } else {
-        current
-    };
+    let draining = current;
     database_router
         .invalidate_execution_placement(run_id, run_shard)
         .await;
@@ -1383,6 +1609,7 @@ pub(crate) async fn move_shard_placement(
         count_active_shard_work_with(&mut *source_tx, run_id, run_shard).await?;
     if active_work_count > 0 {
         source_tx.commit().await?;
+        release_shard_move_claim(control_db, operation.id, claim_token).await?;
         return Err(ShardMoveDrainPending {
             run_id,
             run_shard,
@@ -1427,38 +1654,31 @@ pub(crate) async fn move_shard_placement(
         .invalidate_execution_placement(run_id, run_shard)
         .await;
 
-    if !databases_share_identity(&mut source_tx, target_db).await? {
-        reset_target_shard_rows(target_db, run_id, run_shard).await?;
-    }
-
-    for table in PREREQUISITE_TABLES {
-        let copied =
-            copy_prerequisite_rows_in_batches(&mut source_tx, target_db, table, run_id).await?;
-        copied_rows_by_table.insert(table, copied);
-    }
-
-    for table in SHARD_TABLES {
-        let copied =
-            copy_shard_rows_in_batches(&mut source_tx, target_db, table.name, run_id, run_shard)
-                .await?;
-        copied_rows_by_table.insert(table.name, copied);
-    }
-
-    let reports = verify_move_tables_with_source(
-        &mut source_tx,
-        target_db,
-        run_id,
-        run_shard,
-        &copied_rows_by_table,
+    sqlx::query(
+        r#"
+        UPDATE shard_move_operations
+        SET phase = 'cutover',
+            updated_at = now()
+        WHERE id = $1::uuid
+          AND status = 'active'
+          AND claim_token = $2::uuid
+        "#,
     )
+    .bind(operation.id)
+    .bind(claim_token)
+    .execute(control_db)
     .await?;
-    if !reports.iter().all(|report| report.verified) {
+    let remaining_dirty =
+        replay_dirty_shard_keys(source_db, target_db, operation.id, usize::MAX).await?;
+    if remaining_dirty != 0 {
         anyhow::bail!(
-            "run {} shard {} copy verification failed; source rows were retained and placement was not switched",
+            "run {} shard {} final replay retained {} dirty key(s)",
             run_id,
-            run_shard
+            run_shard,
+            remaining_dirty
         );
     }
+    let reports = checkpoint_move_reports(control_db, operation.id).await?;
 
     let placement = if source_is_control {
         activate_moved_shard_placement_on_target_with(
@@ -1488,7 +1708,12 @@ pub(crate) async fn move_shard_placement(
             run_shard
         )
     })?;
+    sqlx::query("DELETE FROM shard_move_captures WHERE move_id = $1::uuid")
+        .bind(operation.id)
+        .execute(source_tx.as_mut())
+        .await?;
     source_tx.commit().await?;
+    settle_completed_move_operation(control_db, operation.id, Some(claim_token)).await?;
     database_router
         .invalidate_execution_placement(run_id, run_shard)
         .await;
@@ -1538,13 +1763,32 @@ pub(crate) async fn abort_shard_move(
                 run_shard
             )
         })?;
-    if let Some(outcome) = completed_abort_outcome(
-        &initial,
-        run_id,
-        run_shard,
-        source_database_alias,
-        target_database_alias,
-    )? {
+    let prepared_move_id = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        SELECT id
+        FROM shard_move_operations
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+          AND source_database_alias = $3
+          AND target_database_alias = $4
+          AND status = 'active'
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(source_database_alias)
+    .bind(target_database_alias)
+    .fetch_optional(control_db)
+    .await?;
+    if prepared_move_id.is_none()
+        && let Some(outcome) = completed_abort_outcome(
+            &initial,
+            run_id,
+            run_shard,
+            source_database_alias,
+            target_database_alias,
+        )?
+    {
         return Ok(outcome);
     }
 
@@ -1567,13 +1811,15 @@ pub(crate) async fn abort_shard_move(
             run_shard
         )
     })?;
-    if let Some(outcome) = completed_abort_outcome(
-        &current,
-        run_id,
-        run_shard,
-        source_database_alias,
-        target_database_alias,
-    )? {
+    if prepared_move_id.is_none()
+        && let Some(outcome) = completed_abort_outcome(
+            &current,
+            run_id,
+            run_shard,
+            source_database_alias,
+            target_database_alias,
+        )?
+    {
         source_tx.commit().await?;
         return Ok(outcome);
     }
@@ -1590,6 +1836,53 @@ pub(crate) async fn abort_shard_move(
             current.route_version
         );
     }
+    if current.status == SHARD_PLACEMENT_STATUS_ACTIVE {
+        let placement = if source_is_control {
+            shard_placements::fence_active_shard_placement(
+                &mut *source_tx,
+                run_id,
+                run_shard,
+                source_database_alias,
+                current.route_version,
+            )
+            .await?
+        } else {
+            shard_placements::fence_active_shard_placement(
+                control_db,
+                run_id,
+                run_shard,
+                source_database_alias,
+                current.route_version,
+            )
+            .await?
+        }
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "run {} shard {} route changed before its prepared move could be aborted",
+                run_id,
+                run_shard
+            )
+        })?;
+        let move_id = prepared_move_id.expect("active abort requires a prepared move");
+        sqlx::query("DELETE FROM shard_move_captures WHERE move_id = $1::uuid")
+            .bind(move_id)
+            .execute(source_tx.as_mut())
+            .await?;
+        source_tx.commit().await?;
+        settle_aborted_move_operation(control_db, move_id).await?;
+        database_router
+            .invalidate_execution_placement(run_id, run_shard)
+            .await;
+        return Ok(ShardMoveAbortOutcome {
+            run_id,
+            run_shard,
+            source_database_alias: source_database_alias.to_string(),
+            target_database_alias: target_database_alias.to_string(),
+            aborted: true,
+            placement,
+        });
+    }
+
     validate_abort_route(
         &current,
         run_id,
@@ -1626,7 +1919,16 @@ pub(crate) async fn abort_shard_move(
             run_shard
         )
     })?;
+    if let Some(move_id) = prepared_move_id {
+        sqlx::query("DELETE FROM shard_move_captures WHERE move_id = $1::uuid")
+            .bind(move_id)
+            .execute(source_tx.as_mut())
+            .await?;
+    }
     source_tx.commit().await?;
+    if let Some(move_id) = prepared_move_id {
+        settle_aborted_move_operation(control_db, move_id).await?;
+    }
     database_router
         .invalidate_execution_placement(run_id, run_shard)
         .await;
@@ -1694,7 +1996,9 @@ fn validate_abort_route(
     if placement.database_alias != source_database_alias
         || !matches!(
             placement.status.as_str(),
-            SHARD_PLACEMENT_STATUS_DRAINING | SHARD_PLACEMENT_STATUS_MOVING
+            SHARD_PLACEMENT_STATUS_COPYING
+                | SHARD_PLACEMENT_STATUS_DRAINING
+                | SHARD_PLACEMENT_STATUS_MOVING
         )
         || placement.move_target_database_alias.as_deref() != Some(target_database_alias)
     {
@@ -2191,16 +2495,24 @@ async fn apply_rebalance_item(
     let planned_route_is_current = current.database_alias == item.source_database_alias
         && current.status == SHARD_PLACEMENT_STATUS_ACTIVE
         && current.route_version == item.planned_route_version;
+    let copying_move_is_resumable = current.database_alias == item.source_database_alias
+        && current.status == SHARD_PLACEMENT_STATUS_COPYING
+        && current.move_target_database_alias.as_deref() == Some(&item.target_database_alias)
+        && item.planned_route_version.checked_add(1) == Some(current.route_version);
     let draining_move_is_resumable = current.database_alias == item.source_database_alias
         && current.status == SHARD_PLACEMENT_STATUS_DRAINING
         && current.move_target_database_alias.as_deref() == Some(&item.target_database_alias)
-        && item.planned_route_version.checked_add(1) == Some(current.route_version);
-    let copying_move_is_resumable = current.database_alias == item.source_database_alias
+        && item.planned_route_version.checked_add(2) == Some(current.route_version);
+    let moving_move_is_resumable = current.database_alias == item.source_database_alias
         && current.status == SHARD_PLACEMENT_STATUS_MOVING
         && current.move_target_database_alias.as_deref() == Some(&item.target_database_alias)
-        && item.planned_route_version.checked_add(2) == Some(current.route_version);
+        && item.planned_route_version.checked_add(3) == Some(current.route_version);
 
-    if !planned_route_is_current && !draining_move_is_resumable && !copying_move_is_resumable {
+    if !planned_route_is_current
+        && !copying_move_is_resumable
+        && !draining_move_is_resumable
+        && !moving_move_is_resumable
+    {
         return Err(StaleRebalancePlanError {
             run_id: item.run_id,
             run_shard: item.run_shard,
@@ -2317,7 +2629,9 @@ where
         r#"
         SELECT COALESCE(SUM(row_count), 0)::bigint
         FROM (
-            SELECT COUNT(*)::bigint AS row_count FROM run_chunks WHERE run_id = $1::uuid AND run_shard = $2
+            SELECT COUNT(*)::bigint AS row_count FROM run_shard_cases WHERE run_id = $1::uuid AND run_shard = $2
+            UNION ALL
+            SELECT COUNT(*)::bigint FROM run_chunks WHERE run_id = $1::uuid AND run_shard = $2
             UNION ALL
             SELECT COUNT(*)::bigint FROM run_snapshots WHERE run_id = $1::uuid AND run_shard = $2
             UNION ALL
@@ -2370,29 +2684,6 @@ async fn validate_target_placement(db: &PgPool, alias: &str) -> anyhow::Result<(
 /// Database drain and disable lock the same placement row `FOR UPDATE` before
 /// checking target references. Holding `FOR SHARE` through this route update
 /// makes either the move reservation or the lifecycle transition win first.
-async fn reserve_active_move_target_and_mark_draining(
-    db: &PgPool,
-    run_id: Uuid,
-    run_shard: i16,
-    expected_database_alias: &str,
-    expected_route_version: i64,
-    target_database_alias: &str,
-) -> anyhow::Result<Option<ShardPlacement>> {
-    let mut tx = db.begin().await?;
-    validate_new_ownership_target(&mut tx, target_database_alias).await?;
-    let placement = shard_placements::mark_shard_placement_draining(
-        &mut *tx,
-        run_id,
-        run_shard,
-        expected_database_alias,
-        expected_route_version,
-        target_database_alias,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(placement)
-}
-
 /// Holds a shared lifecycle lock until the caller commits its ownership write.
 ///
 /// Drain and disable take `FOR UPDATE` on the same row, so either admission
@@ -2513,6 +2804,1020 @@ async fn validate_source_placement(db: &PgPool, alias: &str) -> anyhow::Result<(
     Ok(())
 }
 
+const SHARD_MOVE_CLAIM_SECONDS: i32 = 300;
+
+async fn claim_shard_move_operation(
+    control_db: &PgPool,
+    current: &ShardPlacement,
+    target_database_alias: &str,
+    claim_token: Uuid,
+) -> anyhow::Result<ShardMoveOperation> {
+    let mut tx = control_db.begin().await?;
+    validate_new_ownership_target(&mut tx, target_database_alias).await?;
+
+    let existing = sqlx::query_as::<_, ShardMoveOperation>(
+        r#"
+        SELECT id, run_id, run_shard, source_database_alias,
+               target_database_alias, starting_route_version, status, phase,
+               target_reset_at, copied_row_count, copied_byte_count, claim_token
+        FROM shard_move_operations
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+          AND status = 'active'
+        FOR UPDATE
+        "#,
+    )
+    .bind(current.run_id)
+    .bind(current.run_shard)
+    .fetch_optional(tx.as_mut())
+    .await?;
+
+    let operation = if let Some(operation) = existing {
+        if operation.source_database_alias != current.database_alias
+            || operation.target_database_alias != target_database_alias
+        {
+            anyhow::bail!(
+                "run {} shard {} already has an active move from {} to {}",
+                current.run_id,
+                current.run_shard,
+                operation.source_database_alias,
+                operation.target_database_alias
+            );
+        }
+        operation
+    } else {
+        sqlx::query_as::<_, ShardMoveOperation>(
+            r#"
+            INSERT INTO shard_move_operations (
+                run_id, run_shard, source_database_alias,
+                target_database_alias, starting_route_version
+            )
+            VALUES ($1::uuid, $2, $3, $4, $5)
+            RETURNING id, run_id, run_shard, source_database_alias,
+                      target_database_alias, starting_route_version, status, phase,
+                      target_reset_at, copied_row_count, copied_byte_count, claim_token
+            "#,
+        )
+        .bind(current.run_id)
+        .bind(current.run_shard)
+        .bind(&current.database_alias)
+        .bind(target_database_alias)
+        .bind(current.route_version)
+        .fetch_one(tx.as_mut())
+        .await?
+    };
+
+    let claimed = sqlx::query_as::<_, ShardMoveOperation>(
+        r#"
+        UPDATE shard_move_operations
+        SET claim_token = $2::uuid,
+            claimed_until = now() + make_interval(secs => $3),
+            updated_at = now()
+        WHERE id = $1::uuid
+          AND status = 'active'
+          AND (
+              claim_token IS NULL
+              OR claimed_until < now()
+              OR claim_token = $2::uuid
+          )
+        RETURNING id, run_id, run_shard, source_database_alias,
+                  target_database_alias, starting_route_version, status, phase,
+                  target_reset_at, copied_row_count, copied_byte_count, claim_token
+        "#,
+    )
+    .bind(operation.id)
+    .bind(claim_token)
+    .bind(SHARD_MOVE_CLAIM_SECONDS)
+    .fetch_optional(tx.as_mut())
+    .await?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "run {} shard {} move is currently claimed by another worker",
+            current.run_id,
+            current.run_shard
+        )
+    })?;
+    tx.commit().await?;
+    Ok(claimed)
+}
+
+async fn renew_shard_move_claim(
+    control_db: &PgPool,
+    move_id: Uuid,
+    claim_token: Uuid,
+) -> anyhow::Result<()> {
+    let updated = sqlx::query(
+        r#"
+        UPDATE shard_move_operations
+        SET claimed_until = now() + make_interval(secs => $3),
+            updated_at = now()
+        WHERE id = $1::uuid
+          AND status = 'active'
+          AND claim_token = $2::uuid
+        "#,
+    )
+    .bind(move_id)
+    .bind(claim_token)
+    .bind(SHARD_MOVE_CLAIM_SECONDS)
+    .execute(control_db)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        anyhow::bail!("shard move {} lost its operation claim", move_id);
+    }
+    Ok(())
+}
+
+async fn release_shard_move_claim(
+    control_db: &PgPool,
+    move_id: Uuid,
+    claim_token: Uuid,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE shard_move_operations
+        SET claim_token = NULL,
+            claimed_until = NULL,
+            updated_at = now()
+        WHERE id = $1::uuid
+          AND claim_token = $2::uuid
+        "#,
+    )
+    .bind(move_id)
+    .bind(claim_token)
+    .execute(control_db)
+    .await?;
+    Ok(())
+}
+
+async fn settle_aborted_move_operation(control_db: &PgPool, move_id: Uuid) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE shard_move_operations
+        SET status = 'aborted',
+            phase = 'aborted',
+            claim_token = NULL,
+            claimed_until = NULL,
+            completed_at = now(),
+            updated_at = now()
+        WHERE id = $1::uuid
+          AND status = 'active'
+        "#,
+    )
+    .bind(move_id)
+    .execute(control_db)
+    .await?;
+    Ok(())
+}
+
+async fn settle_completed_move_operation(
+    control_db: &PgPool,
+    move_id: Uuid,
+    claim_token: Option<Uuid>,
+) -> anyhow::Result<()> {
+    let updated = sqlx::query(
+        r#"
+        UPDATE shard_move_operations
+        SET status = 'completed',
+            phase = 'completed',
+            claim_token = NULL,
+            claimed_until = NULL,
+            completed_at = COALESCE(completed_at, now()),
+            updated_at = now()
+        WHERE id = $1::uuid
+          AND status = 'active'
+          AND ($2::uuid IS NULL OR claim_token = $2::uuid)
+        "#,
+    )
+    .bind(move_id)
+    .bind(claim_token)
+    .execute(control_db)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        anyhow::bail!("shard move {} could not be marked completed", move_id);
+    }
+    Ok(())
+}
+
+async fn enable_shard_move_capture(
+    source_db: &PgPool,
+    move_id: Uuid,
+    run_id: Uuid,
+    run_shard: i16,
+) -> anyhow::Result<()> {
+    let mut tx = source_db.begin().await?;
+    crate::db::shard_write_fence::lock_exclusive(&mut tx, run_id, run_shard).await?;
+    let captured_move = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        INSERT INTO shard_move_captures (move_id, run_id, run_shard, active)
+        VALUES ($1::uuid, $2::uuid, $3, true)
+        ON CONFLICT (run_id, run_shard) DO UPDATE
+        SET active = true
+        WHERE shard_move_captures.move_id = EXCLUDED.move_id
+        RETURNING move_id
+        "#,
+    )
+    .bind(move_id)
+    .bind(run_id)
+    .bind(run_shard)
+    .fetch_optional(tx.as_mut())
+    .await?;
+    if captured_move != Some(move_id) {
+        anyhow::bail!(
+            "run {} shard {} already has a different source capture",
+            run_id,
+            run_shard
+        );
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn reserve_active_move_target_and_mark_copying(
+    db: &PgPool,
+    run_id: Uuid,
+    run_shard: i16,
+    expected_database_alias: &str,
+    expected_route_version: i64,
+    target_database_alias: &str,
+) -> anyhow::Result<Option<ShardPlacement>> {
+    let mut tx = db.begin().await?;
+    validate_new_ownership_target(&mut tx, target_database_alias).await?;
+    let placement = shard_placements::mark_shard_placement_copying(
+        &mut *tx,
+        run_id,
+        run_shard,
+        expected_database_alias,
+        expected_route_version,
+        target_database_alias,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(placement)
+}
+
+fn move_table_key_columns(table: &str) -> anyhow::Result<&'static [&'static str]> {
+    match table {
+        "case_blobs" => Ok(&["case_hash"]),
+        "dataset_versions" => Ok(&["dataset_version_id"]),
+        "runs" => Ok(&["id"]),
+        _ => SHARD_TABLES
+            .iter()
+            .find(|candidate| candidate.name == table)
+            .map(|candidate| candidate.key_columns)
+            .ok_or_else(|| anyhow::anyhow!("unsupported shard move table {}", table)),
+    }
+}
+
+fn move_table_names() -> impl Iterator<Item = &'static str> {
+    PREREQUISITE_TABLES
+        .iter()
+        .copied()
+        .chain(SHARD_TABLES.iter().map(|table| table.name))
+}
+
+fn move_key_expression(table_alias: &str, key_columns: &[&str]) -> String {
+    let columns = key_columns
+        .iter()
+        .map(|column| format!("to_jsonb({table_alias}.{column})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("jsonb_build_array({columns})::text")
+}
+
+async fn select_move_source_page(
+    source_db: &PgPool,
+    table: &str,
+    run_id: Uuid,
+    run_shard: i16,
+    start_after_key: Option<&str>,
+) -> anyhow::Result<Vec<MoveSourceRow>> {
+    let key_expression = move_key_expression("source_row", move_table_key_columns(table)?);
+    let filter = match table {
+        "case_blobs" => {
+            "EXISTS (
+                SELECT 1 FROM run_shard_cases projected
+                WHERE projected.run_id = $1::uuid
+                  AND projected.run_shard = $2
+                  AND projected.case_hash = source_row.case_hash
+            )"
+        }
+        "dataset_versions" => {
+            "EXISTS (
+                SELECT 1 FROM runs run
+                WHERE run.id = $1::uuid
+                  AND run.dataset_version_id = source_row.dataset_version_id
+            ) AND $2::smallint = $2"
+        }
+        "runs" => "source_row.id = $1::uuid AND $2::smallint = $2",
+        _ => "source_row.run_id = $1::uuid AND source_row.run_shard = $2",
+    };
+    let sql = format!(
+        r#"
+        SELECT
+            to_jsonb(source_row) AS row,
+            {key_expression} AS row_key,
+            octet_length(to_jsonb(source_row)::text)::integer AS row_bytes
+        FROM {table} source_row
+        WHERE {filter}
+          AND ($3::text IS NULL OR {key_expression} > $3)
+        ORDER BY {key_expression}
+        LIMIT $4
+        "#
+    );
+    let mut candidates = sqlx::query_as::<_, MoveSourceRow>(&sql)
+        .bind(run_id)
+        .bind(run_shard)
+        .bind(start_after_key)
+        .bind(SHARD_MOVE_COPY_BATCH_SIZE as i64)
+        .fetch(source_db);
+    let mut page = Vec::new();
+    let mut row_bytes = Vec::new();
+    while let Some(row) = candidates.try_next().await? {
+        row_bytes.push(row.row_bytes.max(0) as usize);
+        if bounded_page_len(
+            &row_bytes,
+            SHARD_MOVE_COPY_BATCH_SIZE,
+            SHARD_MOVE_COPY_BATCH_BYTES,
+        ) < row_bytes.len()
+        {
+            break;
+        }
+        page.push(row);
+    }
+    Ok(page)
+}
+
+async fn select_last_move_page(
+    control_db: &PgPool,
+    move_id: Uuid,
+    table: &str,
+) -> anyhow::Result<(i64, Option<String>)> {
+    let page = sqlx::query_as::<_, (i64, String)>(
+        r#"
+        SELECT completed_page_count, last_end_key
+        FROM shard_move_table_progress
+        WHERE move_id = $1::uuid
+          AND table_name = $2
+        "#,
+    )
+    .bind(move_id)
+    .bind(table)
+    .fetch_optional(control_db)
+    .await?;
+    Ok(page
+        .map(|(page_count, end_key)| (page_count, Some(end_key)))
+        .unwrap_or((0, None)))
+}
+
+async fn record_completed_move_page(
+    control_db: &PgPool,
+    move_id: Uuid,
+    claim_token: Uuid,
+    table: &str,
+    page_number: i64,
+    start_after_key: Option<&str>,
+    rows: &[MoveSourceRow],
+) -> anyhow::Result<()> {
+    let end_key = &rows.last().expect("move pages are non-empty").row_key;
+    let row_count = rows.len() as i64;
+    let byte_count = rows
+        .iter()
+        .map(|row| i64::from(row.row_bytes.max(0)))
+        .sum::<i64>();
+    let mut hasher = blake3::Hasher::new();
+    for row in rows {
+        let encoded = serde_json::to_vec(&row.row)?;
+        hasher.update(&(encoded.len() as u64).to_be_bytes());
+        hasher.update(&encoded);
+    }
+    let checksum = hasher.finalize().to_hex().to_string();
+
+    let mut tx = control_db.begin().await?;
+    let advanced = sqlx::query_scalar::<_, i64>(
+        r#"
+        INSERT INTO shard_move_table_progress (
+            move_id, table_name, completed_page_count,
+            last_start_after_key, last_end_key,
+            copied_row_count, copied_byte_count, last_page_checksum
+        )
+        VALUES ($1::uuid, $2, 1, $4, $5, $6, $7, $8)
+        ON CONFLICT (move_id, table_name) DO UPDATE
+        SET completed_page_count =
+                shard_move_table_progress.completed_page_count + 1,
+            last_start_after_key = EXCLUDED.last_start_after_key,
+            last_end_key = EXCLUDED.last_end_key,
+            copied_row_count =
+                shard_move_table_progress.copied_row_count
+                + EXCLUDED.copied_row_count,
+            copied_byte_count =
+                shard_move_table_progress.copied_byte_count
+                + EXCLUDED.copied_byte_count,
+            last_page_checksum = EXCLUDED.last_page_checksum,
+            updated_at = now()
+        WHERE shard_move_table_progress.completed_page_count = $3
+          AND shard_move_table_progress.last_end_key IS NOT DISTINCT FROM $4
+        RETURNING completed_page_count
+        "#,
+    )
+    .bind(move_id)
+    .bind(table)
+    .bind(page_number)
+    .bind(start_after_key)
+    .bind(end_key)
+    .bind(row_count)
+    .bind(byte_count)
+    .bind(&checksum)
+    .fetch_optional(tx.as_mut())
+    .await?;
+    if advanced.is_some_and(|page_count| page_count != page_number + 1) {
+        anyhow::bail!(
+            "shard move {} table {} cannot checkpoint page {} without its predecessor",
+            move_id,
+            table,
+            page_number
+        );
+    }
+    if advanced.is_none() {
+        let existing = sqlx::query_as::<_, (i64, Option<String>, String)>(
+            r#"
+            SELECT completed_page_count, last_start_after_key, last_end_key
+            FROM shard_move_table_progress
+            WHERE move_id = $1::uuid
+              AND table_name = $2
+            "#,
+        )
+        .bind(move_id)
+        .bind(table)
+        .fetch_optional(tx.as_mut())
+        .await?;
+        if existing.as_ref()
+            != Some(&(
+                page_number + 1,
+                start_after_key.map(str::to_string),
+                end_key.clone(),
+            ))
+        {
+            anyhow::bail!(
+                "shard move {} table {} has a non-contiguous page checkpoint",
+                move_id,
+                table
+            );
+        }
+    }
+    let acknowledged_row_count = if advanced.is_some() { row_count } else { 0 };
+    let acknowledged_byte_count = if advanced.is_some() { byte_count } else { 0 };
+    let updated = sqlx::query(
+        r#"
+        UPDATE shard_move_operations
+        SET phase = 'backfill',
+            copied_row_count = copied_row_count + $3,
+            copied_byte_count = copied_byte_count + $4,
+            claimed_until = now() + make_interval(secs => $5),
+            updated_at = now()
+        WHERE id = $1::uuid
+          AND status = 'active'
+          AND claim_token = $2::uuid
+        "#,
+    )
+    .bind(move_id)
+    .bind(claim_token)
+    .bind(acknowledged_row_count)
+    .bind(acknowledged_byte_count)
+    .bind(SHARD_MOVE_CLAIM_SECONDS)
+    .execute(tx.as_mut())
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        anyhow::bail!(
+            "shard move {} lost its claim before page acknowledgement",
+            move_id
+        );
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn backfill_shard_move(
+    control_db: &PgPool,
+    source_db: &PgPool,
+    target_db: &PgPool,
+    move_id: Uuid,
+    claim_token: Uuid,
+    run_id: Uuid,
+    run_shard: i16,
+) -> anyhow::Result<()> {
+    for table in move_table_names() {
+        let (mut page_number, mut cursor) =
+            select_last_move_page(control_db, move_id, table).await?;
+        loop {
+            let rows =
+                select_move_source_page(source_db, table, run_id, run_shard, cursor.as_deref())
+                    .await?;
+            if rows.is_empty() {
+                break;
+            }
+            let payload = rows.iter().map(|row| row.row.clone()).collect::<Vec<_>>();
+            if PREREQUISITE_TABLES.contains(&table) {
+                copy_json_rows(target_db, table, payload).await?;
+            } else {
+                upsert_json_rows(target_db, table, move_table_key_columns(table)?, payload).await?;
+            }
+            record_completed_move_page(
+                control_db,
+                move_id,
+                claim_token,
+                table,
+                page_number,
+                cursor.as_deref(),
+                &rows,
+            )
+            .await?;
+            cursor = rows.last().map(|row| row.row_key.clone());
+            page_number += 1;
+        }
+    }
+    let updated = sqlx::query(
+        r#"
+        UPDATE shard_move_operations
+        SET phase = 'catch_up',
+            claimed_until = now() + make_interval(secs => $3),
+            updated_at = now()
+        WHERE id = $1::uuid
+          AND status = 'active'
+          AND claim_token = $2::uuid
+        "#,
+    )
+    .bind(move_id)
+    .bind(claim_token)
+    .bind(SHARD_MOVE_CLAIM_SECONDS)
+    .execute(control_db)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        anyhow::bail!("shard move {} lost its claim after backfill", move_id);
+    }
+    Ok(())
+}
+
+async fn select_dirty_shard_keys_for_table(
+    source_db: &PgPool,
+    move_id: Uuid,
+    table: &str,
+    key_columns: &[&str],
+    current_row_exists: bool,
+    limit: usize,
+) -> anyhow::Result<Vec<DirtyShardKey>> {
+    let predicate = key_join_predicate("source_row", "journal", key_columns);
+    let existence = if current_row_exists {
+        "EXISTS"
+    } else {
+        "NOT EXISTS"
+    };
+    let sql = format!(
+        r#"
+        SELECT journal.table_name, journal.row_key, journal.change_version
+        FROM shard_move_dirty_keys journal
+        WHERE journal.move_id = $1::uuid
+          AND journal.table_name = $2
+          AND {existence} (
+              SELECT 1
+              FROM {table} source_row
+              WHERE {predicate}
+          )
+        ORDER BY journal.last_changed_at, journal.row_key
+        LIMIT $3
+        "#
+    );
+    Ok(sqlx::query_as::<_, DirtyShardKey>(&sql)
+        .bind(move_id)
+        .bind(table)
+        .bind(limit as i64)
+        .fetch_all(source_db)
+        .await?)
+}
+
+fn key_join_predicate(table_alias: &str, key_alias: &str, key_columns: &[&str]) -> String {
+    key_columns
+        .iter()
+        .map(|column| {
+            let cast = if *column == "run_shard" {
+                "smallint"
+            } else if *column == "case_hash" {
+                "text"
+            } else {
+                "uuid"
+            };
+            format!("{table_alias}.{column} = ({key_alias}.row_key->>'{column}')::{cast}")
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+async fn select_current_rows_for_dirty_keys(
+    source_db: &PgPool,
+    table: &str,
+    key_columns: &[&str],
+    keys: &[DirtyShardKey],
+) -> anyhow::Result<BTreeMap<String, Value>> {
+    if keys.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let predicate = key_join_predicate("source_row", "dirty", key_columns);
+    let sql = format!(
+        r#"
+        WITH dirty AS (
+            SELECT value AS row_key
+            FROM jsonb_array_elements($1::jsonb)
+        )
+        SELECT dirty.row_key, to_jsonb(source_row)
+        FROM dirty
+        JOIN {table} source_row ON {predicate}
+        "#
+    );
+    let rows = sqlx::query_as::<_, (Value, Value)>(&sql)
+        .bind(Json(Value::Array(
+            keys.iter().map(|key| key.row_key.clone()).collect(),
+        )))
+        .fetch_all(source_db)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(key, row)| (key.to_string(), row))
+        .collect())
+}
+
+async fn delete_target_rows_for_dirty_keys(
+    target_db: &PgPool,
+    table: &str,
+    key_columns: &[&str],
+    keys: &[Value],
+) -> anyhow::Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let predicate = key_join_predicate("target_row", "dirty", key_columns);
+    let sql = format!(
+        r#"
+        WITH dirty AS (
+            SELECT value AS row_key
+            FROM jsonb_array_elements($1::jsonb)
+        )
+        DELETE FROM {table} target_row
+        USING dirty
+        WHERE {predicate}
+        "#
+    );
+    sqlx::query(&sql)
+        .bind(Json(Value::Array(keys.to_vec())))
+        .execute(target_db)
+        .await?;
+    Ok(())
+}
+
+async fn settle_replayed_dirty_keys(
+    source_db: &PgPool,
+    move_id: Uuid,
+    keys: &[DirtyShardKey],
+) -> anyhow::Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let replayed = keys
+        .iter()
+        .map(|key| {
+            serde_json::json!({
+                "table_name": key.table_name,
+                "row_key": key.row_key,
+                "change_version": key.change_version,
+            })
+        })
+        .collect::<Vec<_>>();
+    sqlx::query(
+        r#"
+        WITH replayed AS (
+            SELECT table_name, row_key, change_version
+            FROM jsonb_to_recordset($2::jsonb) AS key(
+                table_name text,
+                row_key jsonb,
+                change_version bigint
+            )
+        )
+        DELETE FROM shard_move_dirty_keys journal
+        USING replayed
+        WHERE journal.move_id = $1::uuid
+          AND journal.table_name = replayed.table_name
+          AND journal.row_key = replayed.row_key
+          AND journal.change_version = replayed.change_version
+        "#,
+    )
+    .bind(move_id)
+    .bind(Json(replayed))
+    .execute(source_db)
+    .await?;
+    Ok(())
+}
+
+async fn replay_dirty_shard_keys(
+    source_db: &PgPool,
+    target_db: &PgPool,
+    move_id: Uuid,
+    max_batches: usize,
+) -> anyhow::Result<i64> {
+    let mut completed_batches = 0;
+    for table in SHARD_TABLES {
+        while completed_batches < max_batches {
+            let keys = select_dirty_shard_keys_for_table(
+                source_db,
+                move_id,
+                table.name,
+                table.key_columns,
+                true,
+                SHARD_MOVE_COPY_BATCH_SIZE,
+            )
+            .await?;
+            if keys.is_empty() {
+                break;
+            }
+            let current =
+                select_current_rows_for_dirty_keys(source_db, table.name, table.key_columns, &keys)
+                    .await?;
+            let rows = current.values().cloned().collect::<Vec<_>>();
+            upsert_json_rows(target_db, table.name, table.key_columns, rows).await?;
+            let replayed = keys
+                .into_iter()
+                .filter(|key| current.contains_key(&key.row_key.to_string()))
+                .collect::<Vec<_>>();
+            settle_replayed_dirty_keys(source_db, move_id, &replayed).await?;
+            completed_batches += 1;
+        }
+    }
+
+    for table in SHARD_TABLES.iter().rev() {
+        while completed_batches < max_batches {
+            let keys = select_dirty_shard_keys_for_table(
+                source_db,
+                move_id,
+                table.name,
+                table.key_columns,
+                false,
+                SHARD_MOVE_COPY_BATCH_SIZE,
+            )
+            .await?;
+            if keys.is_empty() {
+                break;
+            }
+            let missing = keys
+                .iter()
+                .map(|key| key.row_key.clone())
+                .collect::<Vec<_>>();
+            delete_target_rows_for_dirty_keys(target_db, table.name, table.key_columns, &missing)
+                .await?;
+            settle_replayed_dirty_keys(source_db, move_id, &keys).await?;
+            completed_batches += 1;
+        }
+    }
+
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::bigint FROM shard_move_dirty_keys WHERE move_id = $1::uuid",
+    )
+    .bind(move_id)
+    .fetch_one(source_db)
+    .await?)
+}
+
+async fn ensure_move_target_reset(
+    control_db: &PgPool,
+    source_db: &PgPool,
+    target_db: &PgPool,
+    operation: &ShardMoveOperation,
+    claim_token: Uuid,
+) -> anyhow::Result<()> {
+    if operation.target_reset_at.is_some() {
+        return Ok(());
+    }
+    let mut source_tx = source_db.begin().await?;
+    let same_database = databases_share_identity(&mut source_tx, target_db).await?;
+    source_tx.commit().await?;
+    if !same_database {
+        reset_target_shard_rows(target_db, operation.run_id, operation.run_shard).await?;
+    }
+    let updated = sqlx::query(
+        r#"
+        UPDATE shard_move_operations
+        SET target_reset_at = now(),
+            phase = 'backfill',
+            claimed_until = now() + make_interval(secs => $3),
+            updated_at = now()
+        WHERE id = $1::uuid
+          AND status = 'active'
+          AND claim_token = $2::uuid
+          AND target_reset_at IS NULL
+        "#,
+    )
+    .bind(operation.id)
+    .bind(claim_token)
+    .bind(SHARD_MOVE_CLAIM_SECONDS)
+    .execute(control_db)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        anyhow::bail!(
+            "shard move {} lost its claim during target reset",
+            operation.id
+        );
+    }
+    Ok(())
+}
+
+async fn prepare_online_shard_move(
+    database_router: &database::DatabaseRouter,
+    source_db: &PgPool,
+    target_db: &PgPool,
+    current: ShardPlacement,
+    operation: &ShardMoveOperation,
+    claim_token: Uuid,
+) -> anyhow::Result<ShardPlacement> {
+    let control_db = database_router.control().await?;
+    let mut identity_tx = source_db.begin().await?;
+    let same_database = databases_share_identity(&mut identity_tx, target_db).await?;
+    identity_tx.commit().await?;
+    let mut route = current;
+    if route.status == SHARD_PLACEMENT_STATUS_ACTIVE {
+        if !same_database {
+            enable_shard_move_capture(
+                source_db,
+                operation.id,
+                operation.run_id,
+                operation.run_shard,
+            )
+            .await?;
+        }
+        reserve_active_move_target_and_mark_copying(
+            control_db,
+            operation.run_id,
+            operation.run_shard,
+            &operation.source_database_alias,
+            route.route_version,
+            &operation.target_database_alias,
+        )
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "run {} shard {} route changed before online copy reservation",
+                operation.run_id,
+                operation.run_shard
+            )
+        })?;
+        database_router
+            .invalidate_execution_placement(operation.run_id, operation.run_shard)
+            .await;
+    } else if !same_database {
+        enable_shard_move_capture(
+            source_db,
+            operation.id,
+            operation.run_id,
+            operation.run_shard,
+        )
+        .await?;
+    }
+
+    if same_database {
+        sqlx::query(
+            r#"
+            UPDATE shard_move_operations
+            SET target_reset_at = COALESCE(target_reset_at, now()),
+                phase = 'catch_up',
+                updated_at = now()
+            WHERE id = $1::uuid
+              AND status = 'active'
+              AND claim_token = $2::uuid
+            "#,
+        )
+        .bind(operation.id)
+        .bind(claim_token)
+        .execute(control_db)
+        .await?;
+    } else {
+        ensure_move_target_reset(control_db, source_db, target_db, operation, claim_token).await?;
+        if !matches!(
+            operation.phase.as_str(),
+            "catch_up" | "draining" | "cutover"
+        ) {
+            backfill_shard_move(
+                control_db,
+                source_db,
+                target_db,
+                operation.id,
+                claim_token,
+                operation.run_id,
+                operation.run_shard,
+            )
+            .await?;
+        }
+        let remaining_dirty = replay_dirty_shard_keys(
+            source_db,
+            target_db,
+            operation.id,
+            SHARD_MOVE_ONLINE_REPLAY_BATCHES,
+        )
+        .await?;
+        if remaining_dirty > SHARD_MOVE_FINAL_DIRTY_KEY_LIMIT {
+            return Err(ShardMoveCatchUpPending {
+                run_id: operation.run_id,
+                run_shard: operation.run_shard,
+                remaining_dirty_key_count: remaining_dirty,
+            }
+            .into());
+        }
+    }
+    renew_shard_move_claim(control_db, operation.id, claim_token).await?;
+
+    route =
+        shard_placements::select_shard_placement(control_db, operation.run_id, operation.run_shard)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "run {} shard {} route disappeared during online copy",
+                    operation.run_id,
+                    operation.run_shard
+                )
+            })?;
+    if route.status == SHARD_PLACEMENT_STATUS_COPYING {
+        route = shard_placements::mark_shard_placement_draining(
+            control_db,
+            operation.run_id,
+            operation.run_shard,
+            &operation.source_database_alias,
+            route.route_version,
+            &operation.target_database_alias,
+        )
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "run {} shard {} route changed before drain cutover",
+                operation.run_id,
+                operation.run_shard
+            )
+        })?;
+        database_router
+            .invalidate_execution_placement(operation.run_id, operation.run_shard)
+            .await;
+    }
+    sqlx::query(
+        r#"
+        UPDATE shard_move_operations
+        SET phase = 'draining',
+            claimed_until = now() + make_interval(secs => $3),
+            updated_at = now()
+        WHERE id = $1::uuid
+          AND status = 'active'
+          AND claim_token = $2::uuid
+        "#,
+    )
+    .bind(operation.id)
+    .bind(claim_token)
+    .bind(SHARD_MOVE_CLAIM_SECONDS)
+    .execute(control_db)
+    .await?;
+    Ok(route)
+}
+
+async fn checkpoint_move_reports(
+    control_db: &PgPool,
+    move_id: Uuid,
+) -> anyhow::Result<Vec<ShardMoveTableReport>> {
+    let page_rows = sqlx::query_as::<_, (String, i64)>(
+        r#"
+        SELECT
+            table_name,
+            copied_row_count
+        FROM shard_move_table_progress
+        WHERE move_id = $1::uuid
+        "#,
+    )
+    .bind(move_id)
+    .fetch_all(control_db)
+    .await?;
+    let pages = page_rows.into_iter().collect::<BTreeMap<_, _>>();
+    Ok(move_table_names()
+        .map(|table| {
+            let rows = pages.get(table).copied().unwrap_or_default();
+            ShardMoveTableReport {
+                table,
+                source_row_count: None,
+                target_row_count: None,
+                copied_row_count: rows as u64,
+                source_checksum: None,
+                target_checksum: None,
+                verification_mode: "checkpoint_and_replay",
+                verified: true,
+            }
+        })
+        .collect())
+}
+
 async fn count_active_shard_work(db: &PgPool, run_id: Uuid, run_shard: i16) -> anyhow::Result<i64> {
     count_active_shard_work_with(db, run_id, run_shard).await
 }
@@ -2602,121 +3907,15 @@ async fn reset_target_shard_rows(
     Ok(())
 }
 
-async fn copy_prerequisite_rows_in_batches(
-    source: &mut Transaction<'_, Postgres>,
-    target: &PgPool,
-    table: &str,
-    run_id: Uuid,
-) -> anyhow::Result<u64> {
-    let sql = match table {
-        "case_blobs" => {
-            r#"
-            SELECT to_jsonb(cb) AS row
-            FROM case_blobs cb
-            WHERE EXISTS (
-                SELECT 1
-                FROM runs r
-                JOIN dataset_version_cases cvc
-                  ON cvc.dataset_version_id = r.dataset_version_id
-                WHERE r.id = $1::uuid
-                  AND cvc.case_hash = cb.case_hash
-            )
-            ORDER BY cb.case_hash
-            "#
-        }
-        "dataset_versions" => {
-            r#"
-            SELECT to_jsonb(dv) AS row
-            FROM dataset_versions dv
-            JOIN runs r
-              ON r.dataset_version_id = dv.dataset_version_id
-            WHERE r.id = $1::uuid
-            "#
-        }
-        "dataset_version_cases" => {
-            r#"
-            SELECT to_jsonb(cvc) AS row
-            FROM dataset_version_cases cvc
-            JOIN runs r
-              ON r.dataset_version_id = cvc.dataset_version_id
-            WHERE r.id = $1::uuid
-            ORDER BY cvc.case_ordinal, cvc.case_id
-            "#
-        }
-        "runs" => {
-            r#"
-            SELECT to_jsonb(r) AS row
-            FROM runs r
-            WHERE r.id = $1::uuid
-            "#
-        }
-        _ => anyhow::bail!("unsupported prerequisite table {}", table),
-    };
-
-    let mut rows = sqlx::query_scalar::<_, Value>(sql)
-        .bind(run_id)
-        .fetch(&mut **source);
-    let mut batch = Vec::with_capacity(SHARD_MOVE_COPY_BATCH_SIZE);
-    let mut copied = 0;
-
-    while let Some(row) = rows.try_next().await? {
-        batch.push(row);
-        if batch.len() == SHARD_MOVE_COPY_BATCH_SIZE {
-            copied += copy_json_rows(target, table, std::mem::take(&mut batch)).await?;
-            batch = Vec::with_capacity(SHARD_MOVE_COPY_BATCH_SIZE);
-        }
-    }
-    if !batch.is_empty() {
-        copied += copy_json_rows(target, table, batch).await?;
-    }
-
-    Ok(copied)
-}
-
-async fn copy_shard_rows_in_batches(
-    source: &mut Transaction<'_, Postgres>,
-    target: &PgPool,
-    table: &str,
-    run_id: Uuid,
-    run_shard: i16,
-) -> anyhow::Result<u64> {
-    let sql = format!(
-        r#"
-        SELECT to_jsonb(t) AS row
-        FROM {table} t
-        WHERE run_id = $1::uuid
-          AND run_shard = $2
-        "#
-    );
-
-    let mut rows = sqlx::query_scalar::<_, Value>(&sql)
-        .bind(run_id)
-        .bind(run_shard)
-        .fetch(&mut **source);
-    let mut batch = Vec::with_capacity(SHARD_MOVE_COPY_BATCH_SIZE);
-    let mut copied = 0;
-
-    while let Some(row) = rows.try_next().await? {
-        batch.push(row);
-        if batch.len() == SHARD_MOVE_COPY_BATCH_SIZE {
-            copied += copy_json_rows(target, table, std::mem::take(&mut batch)).await?;
-            batch = Vec::with_capacity(SHARD_MOVE_COPY_BATCH_SIZE);
-        }
-    }
-    if !batch.is_empty() {
-        copied += copy_json_rows(target, table, batch).await?;
-    }
-
-    Ok(copied)
-}
-
 async fn copy_json_rows(db: &PgPool, table: &str, rows: Vec<Value>) -> anyhow::Result<u64> {
     if rows.is_empty() {
         return Ok(0);
     }
 
     if table == "case_blobs" {
-        return copy_case_blob_rows(db, rows).await;
+        let copied = copy_case_blob_rows(db, rows.clone()).await?;
+        verify_prerequisite_rows(db, table, &rows).await?;
+        return Ok(copied);
     }
 
     let sql = format!(
@@ -2729,10 +3928,155 @@ async fn copy_json_rows(db: &PgPool, table: &str, rows: Vec<Value>) -> anyhow::R
     );
 
     let result = sqlx::query(&sql)
-        .bind(Json(Value::Array(rows)))
+        .bind(Json(Value::Array(rows.clone())))
         .execute(db)
         .await?;
 
+    verify_prerequisite_rows(db, table, &rows).await?;
+    Ok(result.rows_affected())
+}
+
+fn normalized_prerequisite_row(table: &str, mut row: Value) -> anyhow::Result<Value> {
+    let object = row
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{} prerequisite row is not an object", table))?;
+    let ignored: &[&str] = match table {
+        "case_blobs" => &["created_at"],
+        "dataset_versions" => &["created_at", "updated_at"],
+        "runs" => &[
+            "status",
+            "gate_status",
+            "coordinator_id",
+            "coordinator_leased_until",
+            "coordinator_heartbeat_at",
+            "terminal_execution_count",
+            "passed_execution_count",
+            "failed_execution_count",
+            "errored_execution_count",
+            "summary",
+            "error_message",
+            "created_at",
+            "started_at",
+            "dispatched_at",
+            "finalized_at",
+            "completed_at",
+            "updated_at",
+        ],
+        _ => anyhow::bail!("unsupported prerequisite table {}", table),
+    };
+    for field in ignored {
+        object.remove(*field);
+    }
+    Ok(row)
+}
+
+async fn verify_prerequisite_rows(
+    db: &PgPool,
+    table: &str,
+    source_rows: &[Value],
+) -> anyhow::Result<()> {
+    let (key_column, key_cast) = match table {
+        "case_blobs" => ("case_hash", "text"),
+        "dataset_versions" => ("dataset_version_id", "uuid"),
+        "runs" => ("id", "uuid"),
+        _ => anyhow::bail!("unsupported prerequisite table {}", table),
+    };
+    let sql = format!(
+        r#"
+        WITH expected AS (
+            SELECT value AS row
+            FROM jsonb_array_elements($1::jsonb)
+        )
+        SELECT to_jsonb(target_row)
+        FROM expected
+        JOIN {table} target_row
+          ON target_row.{key_column} = (expected.row->>'{key_column}')::{key_cast}
+        "#
+    );
+    let target_rows = sqlx::query_scalar::<_, Value>(&sql)
+        .bind(Json(Value::Array(source_rows.to_vec())))
+        .fetch_all(db)
+        .await?;
+    let normalize = |row: &Value| -> anyhow::Result<(String, Value)> {
+        let key = row
+            .get(key_column)
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("{} prerequisite row is missing {}", table, key_column))?
+            .to_string();
+        Ok((key, normalized_prerequisite_row(table, row.clone())?))
+    };
+    let expected = source_rows
+        .iter()
+        .map(normalize)
+        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+    let actual = target_rows
+        .iter()
+        .map(normalize)
+        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+    if expected != actual {
+        anyhow::bail!(
+            "{} prerequisite rows conflict with immutable target data",
+            table
+        );
+    }
+    Ok(())
+}
+
+async fn upsert_json_rows(
+    db: &PgPool,
+    table: &str,
+    key_columns: &[&str],
+    rows: Vec<Value>,
+) -> anyhow::Result<u64> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let columns = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = $1
+        ORDER BY ordinal_position
+        "#,
+    )
+    .bind(table)
+    .fetch_all(db)
+    .await?;
+    if columns.is_empty() {
+        anyhow::bail!("shard move target table {} was not found", table);
+    }
+    let quote = |identifier: &str| format!("\"{}\"", identifier.replace('"', "\"\""));
+    let conflict_columns = key_columns
+        .iter()
+        .map(|column| quote(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let updates = columns
+        .iter()
+        .filter(|column| !key_columns.contains(&column.as_str()))
+        .map(|column| {
+            let quoted = quote(column);
+            format!("{quoted} = EXCLUDED.{quoted}")
+        })
+        .collect::<Vec<_>>();
+    let conflict_action = if updates.is_empty() {
+        "DO NOTHING".to_string()
+    } else {
+        format!("DO UPDATE SET {}", updates.join(", "))
+    };
+    let sql = format!(
+        r#"
+        INSERT INTO {table}
+        SELECT *
+        FROM jsonb_populate_recordset(NULL::{table}, $1::jsonb)
+        ON CONFLICT ({conflict_columns}) {conflict_action}
+        "#
+    );
+    let result = sqlx::query(&sql)
+        .bind(Json(Value::Array(rows)))
+        .execute(db)
+        .await?;
     Ok(result.rows_affected())
 }
 
@@ -2801,16 +4145,18 @@ async fn verify_move_tables_with_source(
     let mut reports = Vec::with_capacity(PREREQUISITE_TABLES.len() + SHARD_TABLES.len());
 
     for table in PREREQUISITE_TABLES {
-        let source = prerequisite_table_fingerprint_with(&mut **source_tx, table, run_id).await?;
-        let target = prerequisite_table_fingerprint(target_db, table, run_id).await?;
+        let source =
+            prerequisite_table_fingerprint_with(&mut **source_tx, table, run_id, run_shard).await?;
+        let target = prerequisite_table_fingerprint(target_db, table, run_id, run_shard).await?;
         let verified = source.row_count == target.row_count && source.checksum == target.checksum;
         reports.push(ShardMoveTableReport {
             table,
-            source_row_count: source.row_count,
-            target_row_count: target.row_count,
+            source_row_count: Some(source.row_count),
+            target_row_count: Some(target.row_count),
             copied_row_count: copied_rows_by_table.get(table).copied().unwrap_or_default(),
-            source_checksum: source.checksum,
-            target_checksum: target.checksum,
+            source_checksum: Some(source.checksum),
+            target_checksum: Some(target.checksum),
+            verification_mode: "full_fingerprint",
             verified,
         });
     }
@@ -2822,14 +4168,15 @@ async fn verify_move_tables_with_source(
         let verified = source.row_count == target.row_count && source.checksum == target.checksum;
         reports.push(ShardMoveTableReport {
             table: table.name,
-            source_row_count: source.row_count,
-            target_row_count: target.row_count,
+            source_row_count: Some(source.row_count),
+            target_row_count: Some(target.row_count),
             copied_row_count: copied_rows_by_table
                 .get(table.name)
                 .copied()
                 .unwrap_or_default(),
-            source_checksum: source.checksum,
-            target_checksum: target.checksum,
+            source_checksum: Some(source.checksum),
+            target_checksum: Some(target.checksum),
+            verification_mode: "full_fingerprint",
             verified,
         });
     }
@@ -2841,14 +4188,16 @@ async fn prerequisite_table_fingerprint(
     db: &PgPool,
     table: &str,
     run_id: Uuid,
+    run_shard: i16,
 ) -> anyhow::Result<TableFingerprint> {
-    prerequisite_table_fingerprint_with(db, table, run_id).await
+    prerequisite_table_fingerprint_with(db, table, run_id, run_shard).await
 }
 
 async fn prerequisite_table_fingerprint_with<'e, E>(
     executor: E,
     table: &str,
     run_id: Uuid,
+    run_shard: i16,
 ) -> anyhow::Result<TableFingerprint>
 where
     E: Executor<'e, Database = Postgres>,
@@ -2860,11 +4209,10 @@ where
             FROM case_blobs cb
             WHERE EXISTS (
                 SELECT 1
-                FROM runs r
-                JOIN dataset_version_cases cvc
-                  ON cvc.dataset_version_id = r.dataset_version_id
-                WHERE r.id = $1::uuid
-                  AND cvc.case_hash = cb.case_hash
+                FROM run_shard_cases projected
+                WHERE projected.run_id = $1::uuid
+                  AND projected.run_shard = $2
+                  AND projected.case_hash = cb.case_hash
             )
             ORDER BY row_json
             "#
@@ -2876,16 +4224,7 @@ where
             JOIN runs r
               ON r.dataset_version_id = dv.dataset_version_id
             WHERE r.id = $1::uuid
-            ORDER BY row_json
-            "#
-        }
-        "dataset_version_cases" => {
-            r#"
-            SELECT (to_jsonb(cvc) - 'created_at' - 'updated_at')::text AS row_json
-            FROM dataset_version_cases cvc
-            JOIN runs r
-              ON r.dataset_version_id = cvc.dataset_version_id
-            WHERE r.id = $1::uuid
+              AND $2::smallint = $2
             ORDER BY row_json
             "#
         }
@@ -2913,6 +4252,7 @@ where
             )::text AS row_json
             FROM runs r
             WHERE r.id = $1::uuid
+              AND $2::smallint = $2
             ORDER BY row_json
             "#
         }
@@ -2921,6 +4261,7 @@ where
 
     let rows = sqlx::query_scalar::<_, String>(sql)
         .bind(run_id)
+        .bind(run_shard)
         .fetch(executor);
     fingerprint_ordered_rows(rows).await
 }
@@ -3032,6 +4373,453 @@ mod tests {
         },
     };
 
+    #[test]
+    fn move_page_is_bounded_by_rows_and_bytes() {
+        assert_eq!(bounded_page_len(&[4, 4, 4, 4], 3, 100), 3);
+        assert_eq!(bounded_page_len(&[4, 4, 4, 4], 10, 9), 2);
+    }
+
+    #[test]
+    fn move_page_allows_one_oversized_row_to_make_progress() {
+        assert_eq!(bounded_page_len(&[20, 2], 10, 10), 1);
+        assert_eq!(bounded_page_len(&[], 10, 10), 0);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn move_table_progress_is_compact_and_idempotent(pool: PgPool) {
+        sqlx::query(
+            "INSERT INTO database_placements (alias, database_url_env, role, status) VALUES ('shard_001', 'DATABASE_URL', 'shard', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = Uuid::now_v7();
+        let claim_token = Uuid::now_v7();
+        let move_id = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            INSERT INTO shard_move_operations (
+                run_id, run_shard, source_database_alias,
+                target_database_alias, starting_route_version,
+                claim_token, claimed_until
+            )
+            VALUES (
+                $1, 3, 'primary', 'shard_001', 1,
+                $2, now() + interval '5 minutes'
+            )
+            RETURNING id
+            "#,
+        )
+        .bind(run_id)
+        .bind(claim_token)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let first = MoveSourceRow {
+            row: serde_json::json!({"id": 1}),
+            row_key: "key-1".to_string(),
+            row_bytes: 16,
+        };
+        let second = MoveSourceRow {
+            row: serde_json::json!({"id": 2}),
+            row_key: "key-2".to_string(),
+            row_bytes: 16,
+        };
+
+        record_completed_move_page(
+            &pool,
+            move_id,
+            claim_token,
+            "run_chunks",
+            0,
+            None,
+            std::slice::from_ref(&first),
+        )
+        .await
+        .unwrap();
+        record_completed_move_page(
+            &pool,
+            move_id,
+            claim_token,
+            "run_chunks",
+            0,
+            None,
+            std::slice::from_ref(&first),
+        )
+        .await
+        .unwrap();
+        record_completed_move_page(
+            &pool,
+            move_id,
+            claim_token,
+            "run_chunks",
+            1,
+            Some(&first.row_key),
+            &[second],
+        )
+        .await
+        .unwrap();
+
+        let (progress_rows, completed_pages, copied_rows, operation_rows) =
+            sqlx::query_as::<_, (i64, i64, i64, i64)>(
+                r#"
+                SELECT
+                    COUNT(*)::bigint,
+                    MAX(completed_page_count),
+                    MAX(copied_row_count),
+                    (
+                        SELECT copied_row_count
+                        FROM shard_move_operations
+                        WHERE id = $1
+                    )
+                FROM shard_move_table_progress
+                WHERE move_id = $1
+                  AND table_name = 'run_chunks'
+                "#,
+            )
+            .bind(move_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(progress_rows, 1);
+        assert_eq!(completed_pages, 2);
+        assert_eq!(copied_rows, 2);
+        assert_eq!(operation_rows, 2);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn move_capture_coalesces_repeated_shard_mutations(pool: PgPool) {
+        let run_id = Uuid::now_v7();
+        let dataset_id = Uuid::now_v7();
+        let dataset_version_id = Uuid::now_v7();
+        let chunk_id = Uuid::now_v7();
+        let move_id = Uuid::now_v7();
+        seed_run(&pool, run_id, dataset_id, dataset_version_id).await;
+        sqlx::query(
+            "INSERT INTO shard_move_captures (move_id, run_id, run_shard) VALUES ($1, $2, 3)",
+        )
+        .bind(move_id)
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO run_chunks (
+                id, run_id, run_shard, dataset_version_id,
+                profile_group_id, ordinal_start, ordinal_end
+            )
+            VALUES ($1, $2, 3, $3, 'default', 0, 1)
+            "#,
+        )
+        .bind(chunk_id)
+        .bind(run_id)
+        .bind(dataset_version_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            UPDATE run_chunks
+            SET recovery_count = recovery_count + 1
+            WHERE run_id = $1 AND run_shard = 3 AND id = $2
+            "#,
+        )
+        .bind(run_id)
+        .bind(chunk_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (table_name, row_key, version) = sqlx::query_as::<_, (String, Value, i64)>(
+            r#"
+                SELECT table_name, row_key, change_version
+                FROM shard_move_dirty_keys
+                WHERE move_id = $1
+                "#,
+        )
+        .bind(move_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(table_name, "run_chunks");
+        assert_eq!(row_key["run_id"], run_id.to_string());
+        assert_eq!(row_key["run_shard"], 3);
+        assert_eq!(row_key["id"], chunk_id.to_string());
+        assert_eq!(version, 2);
+
+        let stale_key = DirtyShardKey {
+            table_name: table_name.clone(),
+            row_key: row_key.clone(),
+            change_version: version - 1,
+        };
+        settle_replayed_dirty_keys(&pool, move_id, &[stale_key])
+            .await
+            .unwrap();
+        let retained_version = sqlx::query_scalar::<_, i64>(
+            "SELECT change_version FROM shard_move_dirty_keys WHERE move_id = $1",
+        )
+        .bind(move_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retained_version, version);
+
+        let current_key = DirtyShardKey {
+            table_name,
+            row_key,
+            change_version: version,
+        };
+        settle_replayed_dirty_keys(&pool, move_id, &[current_key])
+            .await
+            .unwrap();
+        let settled_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)::bigint FROM shard_move_dirty_keys WHERE move_id = $1",
+        )
+        .bind(move_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(settled_count, 0);
+
+        sqlx::query(
+            "UPDATE run_chunks SET recovery_count = recovery_count + 1 WHERE run_id = $1 AND run_shard = 3 AND id = $2",
+        )
+        .bind(run_id)
+        .bind(chunk_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM run_chunks WHERE run_id = $1 AND run_shard = 3 AND id = $2")
+            .bind(run_id)
+            .bind(chunk_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let existing = select_dirty_shard_keys_for_table(
+            &pool,
+            move_id,
+            "run_chunks",
+            &["run_id", "run_shard", "id"],
+            true,
+            10,
+        )
+        .await
+        .unwrap();
+        let deleted = select_dirty_shard_keys_for_table(
+            &pool,
+            move_id,
+            "run_chunks",
+            &["run_id", "run_shard", "id"],
+            false,
+            10,
+        )
+        .await
+        .unwrap();
+        assert!(existing.is_empty());
+        assert_eq!(deleted.len(), 1);
+
+        sqlx::query("DELETE FROM shard_move_captures WHERE move_id = $1")
+            .bind(move_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let dirty_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)::bigint FROM shard_move_dirty_keys WHERE move_id = $1",
+        )
+        .bind(move_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(dirty_count, 0);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn abort_fences_a_prepared_move_before_copying_starts(pool: PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'active')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO shard_placements (run_id, run_shard, database_alias, status) VALUES ($1, 3, 'primary', 'active')",
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let move_id = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            INSERT INTO shard_move_operations (
+                run_id, run_shard, source_database_alias,
+                target_database_alias, starting_route_version
+            )
+            VALUES ($1, 3, 'primary', 'shard_001', 1)
+            RETURNING id
+            "#,
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO shard_move_captures (move_id, run_id, run_shard) VALUES ($1, $2, 3)",
+        )
+        .bind(move_id)
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let database_router = database_router_with_isolated_control_pool(pool.clone()).await;
+
+        let outcome = abort_shard_move(&database_router, run_id, 3, "primary", "shard_001")
+            .await
+            .unwrap();
+
+        assert!(outcome.aborted);
+        assert_eq!(outcome.placement.status, SHARD_PLACEMENT_STATUS_ACTIVE);
+        assert_eq!(outcome.placement.route_version, 2);
+        let operation_status = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM shard_move_operations WHERE id = $1",
+        )
+        .bind(move_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(operation_status, "aborted");
+        assert!(
+            shard_placements::mark_shard_placement_copying(
+                &pool,
+                run_id,
+                3,
+                "primary",
+                1,
+                "shard_001",
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn completed_route_retry_settles_ambiguous_cutover_state(pool: PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'active')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO shard_placements (run_id, run_shard, database_alias, status, route_version) VALUES ($1, 3, 'shard_001', 'active', 5)",
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let move_id = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            INSERT INTO shard_move_operations (
+                run_id, run_shard, source_database_alias,
+                target_database_alias, starting_route_version, phase
+            )
+            VALUES ($1, 3, 'primary', 'shard_001', 1, 'cutover')
+            RETURNING id
+            "#,
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO shard_move_captures (move_id, run_id, run_shard) VALUES ($1, $2, 3)",
+        )
+        .bind(move_id)
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let database_router = database_router_with_isolated_control_pool(pool.clone()).await;
+
+        let outcome = move_shard_placement(
+            &database_router,
+            run_id,
+            3,
+            "shard_001",
+            ShardMoveOptions {
+                dry_run: false,
+                verify_only: false,
+                force: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!outcome.moved);
+        let (operation_status, capture_count) = sqlx::query_as::<_, (String, i64)>(
+            r#"
+                SELECT
+                    status,
+                    (SELECT COUNT(*)::bigint FROM shard_move_captures WHERE move_id = $1)
+                FROM shard_move_operations
+                WHERE id = $1
+                "#,
+        )
+        .bind(move_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(operation_status, "completed");
+        assert_eq!(capture_count, 0);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn move_to_current_database_is_not_treated_as_a_completed_retry(pool: PgPool) {
+        let run_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO shard_placements (run_id, run_shard, database_alias, status) VALUES ($1, 3, 'primary', 'active')",
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let database_router = database_router_with_isolated_control_pool(pool).await;
+
+        let error = move_shard_placement(
+            &database_router,
+            run_id,
+            3,
+            "primary",
+            ShardMoveOptions {
+                dry_run: false,
+                verify_only: false,
+                force: false,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("already routes to database placement primary")
+        );
+    }
+
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
     async fn add_shard_database_placement_requires_env_unless_deferred(pool: PgPool) {
@@ -3114,6 +4902,59 @@ mod tests {
                 .to_string()
                 .contains("cannot receive new shard ownership")
         );
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
+    async fn projection_rows_prevent_direct_empty_shard_reassignment(pool: PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'active')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = Uuid::now_v7();
+        let dataset_version_id = Uuid::now_v7();
+        seed_run(&pool, run_id, Uuid::now_v7(), dataset_version_id).await;
+        let case_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO case_blobs (case_hash, task_type, input_payload, expected_output) VALUES ('projection-only', 'test', '{}'::jsonb, 'null'::jsonb)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO run_shard_cases (
+                run_id, run_shard, dataset_version_id,
+                case_id, case_ordinal, case_hash
+            )
+            VALUES ($1, 3, $2, $3, 0, 'projection-only')
+            "#,
+        )
+        .bind(run_id)
+        .bind(dataset_version_id)
+        .bind(case_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO shard_placements (run_id, run_shard, database_alias, status) VALUES ($1, 3, 'primary', 'active')",
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let database_router = database_router_with_isolated_control_pool(pool).await;
+
+        let error = set_shard_placement(&database_router, run_id, 3, "shard_001")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("already has 1 shard-owned row"));
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -3359,7 +5200,7 @@ mod tests {
 
         let reservation_pool = pool.clone();
         let mut reservation = tokio::spawn(async move {
-            reserve_active_move_target_and_mark_draining(
+            reserve_active_move_target_and_mark_copying(
                 &reservation_pool,
                 run_id,
                 3,
@@ -3421,7 +5262,7 @@ mod tests {
         validate_new_ownership_target(&mut reservation_tx, "shard_001")
             .await
             .unwrap();
-        shard_placements::mark_shard_placement_draining(
+        shard_placements::mark_shard_placement_copying(
             &mut *reservation_tx,
             run_id,
             3,
@@ -3995,6 +5836,35 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        let move_id = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            INSERT INTO shard_move_operations (
+                run_id, run_shard, source_database_alias,
+                target_database_alias, starting_route_version,
+                phase, copied_row_count, copied_byte_count
+            )
+            VALUES ($1, 4, 'primary', 'shard_001', 1, 'cutover', 3, 512)
+            RETURNING id
+            "#,
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO shard_move_table_progress (
+                move_id, table_name, completed_page_count,
+                last_end_key, copied_row_count, copied_byte_count,
+                last_page_checksum
+            )
+            VALUES ($1, 'run_chunks', 1, 'end', 3, 512, 'checksum')
+            "#,
+        )
+        .bind(move_id)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let route = inspect_shard_route(&database_router, run_id, 4)
             .await
@@ -4003,6 +5873,11 @@ mod tests {
         assert!(!route.dispatchable);
         assert!(route.readable);
         assert_eq!(route.routing_decision, "read_only");
+        assert_eq!(route.move_operation_id, Some(move_id));
+        assert_eq!(route.move_phase.as_deref(), Some("cutover"));
+        assert_eq!(route.move_completed_page_count, Some(1));
+        assert_eq!(route.move_copied_row_count, Some(3));
+        assert_eq!(route.move_copied_byte_count, Some(512));
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -4169,7 +6044,7 @@ mod tests {
         assert_eq!(outcome.placement.database_alias, "shard_001");
         assert_eq!(outcome.placement.status, SHARD_PLACEMENT_STATUS_ACTIVE);
         assert!(outcome.placement.move_target_database_alias.is_none());
-        assert_eq!(outcome.placement.route_version, 4);
+        assert_eq!(outcome.placement.route_version, 5);
 
         let retried = move_shard_placement(
             &database_router,
@@ -4188,7 +6063,7 @@ mod tests {
         assert!(!retried.moved);
         assert!(retried.tables.iter().all(|table| table.verified));
         assert_eq!(retried.placement.database_alias, "shard_001");
-        assert_eq!(retried.placement.route_version, 4);
+        assert_eq!(retried.placement.route_version, 5);
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -4267,7 +6142,7 @@ mod tests {
             placement.move_target_database_alias.as_deref(),
             Some("shard_001")
         );
-        assert_eq!(placement.route_version, 2);
+        assert_eq!(placement.route_version, 3);
 
         let redirect_error = move_shard_placement(
             &database_router,
@@ -4758,7 +6633,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(route_versions.len(), items.len());
-        assert!(route_versions.into_iter().all(|version| version == 4));
+        assert!(route_versions.into_iter().all(|version| version == 5));
     }
 
     #[test]
@@ -5007,7 +6882,7 @@ mod tests {
         let mut fingerprints = Vec::new();
 
         for table in PREREQUISITE_TABLES {
-            let fingerprint = prerequisite_table_fingerprint(pool, table, run_id)
+            let fingerprint = prerequisite_table_fingerprint(pool, table, run_id, 0)
                 .await
                 .unwrap();
             fingerprints.push((fingerprint.row_count, fingerprint.checksum));

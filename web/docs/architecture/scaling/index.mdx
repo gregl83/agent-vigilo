@@ -333,7 +333,34 @@ vigilo run shard show <run_id> <run_shard>
 `vigilo run shard show` reports the database alias, placement statuses,
 `move_target_database_alias`, `route_version`, `database_url_env`, env-var
 availability, and whether the route is `dispatchable`, `read_only`, or
-`blocked`. It never prints the database URL.
+`blocked`. An active move also reports its operation ID, phase, completed page
+count, and copied row and byte counts. It never prints the database URL.
+
+## Shard-Local Case Data
+
+Control storage owns complete `dataset_version_cases` membership. Each
+execution database receives only the `run_shard_cases` rows routed to it and
+the content-addressed `case_blobs` referenced by those rows.
+
+```mermaid
+flowchart LR
+    membership[Control dataset_version_cases]
+    plan[Control creation chunks]
+    page[Bounded projection page]
+    local[Execution run_shard_cases]
+    worker[Worker chunk read]
+
+    membership --> page
+    plan --> page
+    page --> local
+    local --> worker
+```
+
+Creation stores expected counts, a stable BLAKE3 projection hash, and the last
+acknowledged ordinal per placement. The execution transaction commits before
+the control cursor advances, so an ambiguous response safely replays the same
+immutable page. `VIGILO_RUN_CREATION_CASE_BATCH_SIZE` bounds page rows, and
+`VIGILO_RUN_CREATION_CASE_PAGE_BUDGET` bounds work per coordinator claim.
 
 ## Moving A Run Shard
 
@@ -349,24 +376,23 @@ Routes are immutable while their run is `creating`; move and direct placement
 changes are rejected until creation reaches `pending` or `failed`. Rebalance
 plans omit creating runs for the same reason.
 
-The normal move takes the exclusive form of a transaction-scoped PostgreSQL
-advisory admission lock for the source shard, revalidates its route fence, and
-persists the destination while changing the shard placement from `active` to
-`draining`. New dispatch and worker claims stop, while cleanup for work admitted
-before the transition can finish. Once leased chunks and running attempts reach
-zero, the workflow changes the route to `moving`. At that point all source
-writes, including cancellation cleanup, are frozen while the target is
-reconciled and copied. PostgreSQL enforces that draining and moving routes have
-a target distinct from their current owner, and that active routes have no
-pending target.
+The move briefly fences the source to enable source-local dirty-key capture,
+then changes the route from `active` to `copying`. This state remains
+dispatchable while the target is reset once and copied in durable
+row-and-byte-bounded pages.
 
 ```mermaid
 stateDiagram-v2
     [*] --> active
-    active --> draining: persist target and stop new work
+    active --> copying: capture mutations and reserve target
+    copying --> copying: checkpointed backfill and replay
+    copying --> draining: backfill complete and catch-up bounded
     draining --> draining: admitted work remains
     draining --> moving: active work reaches zero
-    moving --> active: reset, copy, verify, and activate target
+    moving --> active: final replay and activate target
+    copying --> active: abort
+    draining --> active: abort
+    moving --> active: abort
 ```
 
 Worker claims, dispatch writes, and routed cancellation cleanup take the shared
@@ -376,14 +402,21 @@ explicitly acquire it. PostgreSQL does not infer which rows belong to the
 shard.
 
 The route fence is the expected alias, placement status, and `route_version`.
-After movement changes any of those values, a writer holding an older route is
-rejected before it changes shard-owned rows. With the fence established, the
-move checks for active leased or running work. After the shard is frozen, it
-deletes rows for the exact `run_id + run_shard` from the target in reverse
-foreign-key order, copies the source rows in bounded batches, verifies ordered
-streaming BLAKE3 fingerprints and row counts, and compare-and-swaps the route to
-the target alias with status `active`. Shared prerequisite rows are upserted and
-are not deleted because other target shards may reference them.
+After movement changes any value, an older route is rejected before writing.
+The source transaction that changes a shard row also upserts its key into the
+move journal. Replay rereads current source state: existing rows are upserted
+in dependency order and missing rows are deleted in reverse dependency order.
+A version-guarded journal delete leaves a key pending when it changes during
+replay.
+
+One compact page-count/cursor checkpoint per moved table lives in control
+storage. Capture state and dirty keys live on the source. Because the target
+page commits before its checkpoint, a lost acknowledgement replays at most one
+idempotent page without growing control metadata per page. After backfill,
+a bounded catch-up cycle keeps the route in dispatchable `copying` when too
+many dirty keys remain. After the backlog is bounded, `draining` stops new work
+while admitted work settles. The exclusive fence is held only for final replay,
+an empty-journal check, and route activation.
 
 After claim admission commits, an opaque chunk claim token and renewable
 deadline carry worker authority. Attempt allocation and result persistence lock
@@ -393,13 +426,20 @@ any failed-shard summary atomically. Terminal worker settlement and cancellation
 also refresh shard summaries in the transaction that clears active work.
 
 When active work exists, the route stays `draining`; re-run the move after that
-work finishes. An interrupted `draining` or `moving` move can be retried only
-with its persisted target alias. A `moving` retry resets the target shard rows
-and repeats the bounded copy, making stale retained target data harmless when a
-shard later moves back to a database. Repeating a move after fenced activation
-returns a verified no-op, which makes a lost command response safe to retry.
+work finishes. When an online catch-up cycle reaches its work bound with too
+many dirty keys remaining, the route stays `copying`; re-run the move to
+continue. Interrupted `copying`, `draining`, or `moving` work resumes only with
+its persisted target. Target reset occurs once, completed pages resume from
+their last key, and dirty replay stays version guarded. Repeating a move after
+fenced activation returns a verified no-op.
 `--force` remains accepted for CLI compatibility but cannot bypass the
 active-work or write-admission fence.
+
+Dry-run and verify-only output uses `full_fingerprint` verification with
+source/target counts and checksums. Executed moves use
+`checkpoint_and_replay`: they report checkpoint copy counts and leave
+full-fingerprint fields empty so route activation does not add table scans to
+the exclusive freeze.
 
 Every route alias or status change increments `shard_placements.route_version`.
 Execution route caches are accepted only while alias, status, and
@@ -409,6 +449,7 @@ fenced before new dispatch or worker claims continue.
 Moved shard-owned tables:
 
 ```text
+run_shard_cases
 run_chunks
 run_snapshots
 executions
@@ -424,9 +465,11 @@ Those prerequisites are:
 ```text
 case_blobs
 dataset_versions
-dataset_version_cases
 runs
 ```
+
+Complete `dataset_version_cases` membership remains control-owned and is never
+copied to execution-only databases.
 
 `run_shard_dispatch_cursors` stays in the control database and is never copied
 between execution placements. Source cleanup is intentionally outside the move

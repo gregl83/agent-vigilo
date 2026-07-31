@@ -248,9 +248,14 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO run_creation_placements (
-                run_id, database_alias, status, attempt_count, last_error
+                run_id, database_alias, status, attempt_count,
+                expected_case_count, seeded_case_count,
+                case_projection_hash, last_error
             )
-            VALUES ($1, 'unseeded', 'failed', 1, 'immutable seed mismatch')
+            VALUES (
+                $1, 'unseeded', 'failed', 1,
+                1, 0, 'fixture-projection-hash', 'immutable seed mismatch'
+            )
             "#,
         )
         .bind(run_id)
