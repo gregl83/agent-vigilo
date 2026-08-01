@@ -109,6 +109,8 @@ struct ChunkReadyMessage {
     run_id: Uuid,
     run_shard: i16,
     chunk_id: Uuid,
+    database_alias: String,
+    write_epoch: i64,
 }
 
 struct ChunkLeaseGuard {
@@ -290,13 +292,13 @@ fn worker_stream_prefetch(max_inflight_chunks: u16) -> u16 {
 }
 
 fn execution_route_is_temporarily_blocked(error: &anyhow::Error) -> bool {
-    matches!(
-        error.downcast_ref::<ExecutionRouteError>(),
-        Some(
-            ExecutionRouteError::NonDispatchableShardPlacement { .. }
-                | ExecutionRouteError::StaleExecutionRoute { .. }
+    error
+        .downcast_ref::<crate::db::workflows::local_shard_admission::LocalShardAdmissionError>()
+        .is_some()
+        || matches!(
+            error.downcast_ref::<ExecutionRouteError>(),
+            Some(ExecutionRouteError::NonDispatchableShardPlacement { .. })
         )
-    )
 }
 
 #[derive(Clone)]
@@ -675,13 +677,20 @@ async fn run_worker_message(
         "parsed chunk-ready message payload"
     );
 
-    // --- Resolve execution database ---
-    // Chunk leases, case batches, attempts, evaluator results, aggregates, and
-    // chunk terminal state are execution-owned. Resolve this once at the worker
-    // workflow boundary so lower helpers do not need to know topology.
+    // --- Resolve execution database and claim local write authority ---
+    // The queue message carries the route used by dispatch. The execution
+    // database validates its local epoch in the same transaction as the claim,
+    // avoiding a control-database read on the normal worker path.
     let database_router = context.dbr().await?;
-    let route = match database_router
-        .execution_route(payload.run_id, payload.run_shard)
+    let hinted_route = match database_router
+        .execution_write_route(
+            crate::db::workflows::local_shard_admission::LocalShardRouteHint {
+                run_id: payload.run_id,
+                run_shard: payload.run_shard,
+                database_alias: payload.database_alias.clone(),
+                write_epoch: payload.write_epoch,
+            },
+        )
         .await
     {
         Ok(route) => route,
@@ -690,7 +699,7 @@ async fn run_worker_message(
                 &message.raw,
                 WORKER_ROUTE_RETRY_DELAY_SECONDS,
                 &err.to_string(),
-                "execution_route_blocked",
+                "execution_database_unavailable",
             )
             .await?;
             info!(
@@ -699,27 +708,22 @@ async fn run_worker_message(
                 chunk_id = %payload.chunk_id,
                 delay_seconds = WORKER_ROUTE_RETRY_DELAY_SECONDS,
                 error = %err,
-                "execution route is temporarily blocked; delayed worker message"
+                "execution database is temporarily unavailable; delayed worker message"
             );
             return Ok(WorkerCycleOutcome::Processed);
         }
         Err(err) => return Err(err),
     };
-    let db = &route.pool;
-
     // --- Claim chunk ownership ---
     // Duplicate, stale, cancelled, completed, or not-yet-running chunks are
     // acknowledged because the database refused ownership.
-    let claim = chunk_processing::claim_routed_chunk_for_processing(
+    let (db, claimed) = match claim_hinted_chunk_with_route_refresh(
         database_router,
-        &route,
-        payload.run_id,
-        payload.run_shard,
+        &hinted_route,
         payload.chunk_id,
-        CHUNK_LEASE_SECONDS,
     )
-    .await;
-    let claimed = match claim {
+    .await
+    {
         Ok(claimed) => claimed,
         Err(err) if execution_route_is_temporarily_blocked(&err) => {
             mq.delay_worker_message(
@@ -741,6 +745,7 @@ async fn run_worker_message(
         }
         Err(err) => return Err(err),
     };
+    let db = &db;
     let Some(mut chunk) = claimed else {
         mq.ack(&message.raw).await?;
         info!(
@@ -1044,6 +1049,49 @@ async fn run_worker_message(
     }
 }
 
+pub(crate) async fn claim_hinted_chunk_with_route_refresh(
+    database_router: &crate::context::database::DatabaseRouter,
+    hinted_route: &crate::context::database::ExecutionWriteRoute,
+    chunk_id: Uuid,
+) -> anyhow::Result<(sqlx::PgPool, Option<crate::models::run_chunk::RunChunk>)> {
+    match chunk_processing::claim_hinted_chunk_for_processing(
+        database_router,
+        hinted_route,
+        chunk_id,
+        CHUNK_LEASE_SECONDS,
+    )
+    .await
+    {
+        Ok(claim) => Ok((hinted_route.pool.clone(), claim)),
+        Err(error)
+            if error
+                .downcast_ref::<crate::db::workflows::local_shard_admission::LocalShardAdmissionError>()
+                .is_some() =>
+        {
+            database_router
+                .invalidate_execution_placement(
+                    hinted_route.hint.run_id,
+                    hinted_route.hint.run_shard,
+                )
+                .await;
+            let route = database_router
+                .execution_route(hinted_route.hint.run_id, hinted_route.hint.run_shard)
+                .await?;
+            let claim = chunk_processing::claim_routed_chunk_for_processing(
+                database_router,
+                &route,
+                hinted_route.hint.run_id,
+                hinted_route.hint.run_shard,
+                chunk_id,
+                CHUNK_LEASE_SECONDS,
+            )
+            .await?;
+            Ok((route.pool, claim))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -1082,12 +1130,16 @@ mod tests {
             "run_id": run_id,
             "run_shard": 42,
             "chunk_id": chunk_id,
+            "database_alias": "shard_001",
+            "write_epoch": 7,
         }))
         .unwrap();
 
         assert_eq!(message.run_id, run_id);
         assert_eq!(message.run_shard, 42);
         assert_eq!(message.chunk_id, chunk_id);
+        assert_eq!(message.database_alias, "shard_001");
+        assert_eq!(message.write_epoch, 7);
     }
 
     #[test]
@@ -1112,15 +1164,16 @@ mod tests {
     }
 
     #[test]
-    fn stale_execution_route_is_temporary_worker_backpressure() {
-        let error = anyhow::Error::new(ExecutionRouteError::StaleExecutionRoute {
+    fn stale_write_epoch_is_temporary_worker_backpressure() {
+        let error = anyhow::Error::new(
+            crate::db::workflows::local_shard_admission::LocalShardAdmissionError::StaleWriteEpoch {
             run_id: Uuid::now_v7(),
             run_shard: 7,
-            expected_database_alias: "primary".to_string(),
-            expected_route_version: 1,
-            actual_database_alias: "primary".to_string(),
-            actual_status: "moving".to_string(),
-            actual_route_version: 2,
+            database_alias: "primary".to_string(),
+            expected_write_epoch: 1,
+            actual_write_epoch: 2,
+            actual_state: "closed".to_string(),
+            redirect_database_alias: Some("shard_001".to_string()),
         });
 
         assert!(execution_route_is_temporarily_blocked(&error));

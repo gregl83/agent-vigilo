@@ -378,9 +378,55 @@ async fn shard_move_replays_cross_database_updates_and_deletes() -> anyhow::Resu
         shard_placement_status(&primary, run_id, 0).await?,
         "draining"
     );
+    assert_eq!(
+        shard_route_state(&primary, run_id, 0).await?,
+        (PRIMARY_ALIAS.to_string(), "draining".to_string(), 1)
+    );
+    assert_eq!(
+        local_admission_state(&primary, run_id, 0).await?,
+        (
+            PRIMARY_ALIAS.to_string(),
+            1,
+            "draining".to_string(),
+            Some(SHARD_ALIAS.to_string())
+        )
+    );
+    assert_eq!(
+        local_admission_state(&shard, run_id, 0).await?,
+        (SHARD_ALIAS.to_string(), 2, "prepared".to_string(), None)
+    );
+
+    for source_state in ["open", "draining"] {
+        simulate_before_control_draining(&primary, run_id, 0, source_state).await?;
+        let retry_error = run_vigilo_failure(
+            &config,
+            PRIMARY_ALIAS,
+            [
+                "shard",
+                "move",
+                &run_id.to_string(),
+                "0",
+                "--alias",
+                SHARD_ALIAS,
+            ],
+        )?;
+        assert!(
+            retry_error.contains("route remains draining"),
+            "{retry_error}"
+        );
+        assert_eq!(
+            shard_route_state(&primary, run_id, 0).await?,
+            (PRIMARY_ALIAS.to_string(), "draining".to_string(), 1)
+        );
+        assert_eq!(
+            local_admission_state(&primary, run_id, 0).await?.2,
+            "draining"
+        );
+    }
 
     delete_extra_run_chunk(&primary, run_id, 0).await?;
     set_run_shard_chunk_status(&primary, run_id, 0, "completed").await?;
+    simulate_source_closed_before_control_activation(&primary, run_id, 0).await?;
     let move_payload = run_vigilo(
         &config,
         PRIMARY_ALIAS,
@@ -404,6 +450,43 @@ async fn shard_move_replays_cross_database_updates_and_deletes() -> anyhow::Resu
         1,
         "replay deletes target rows removed from the source after backfill"
     );
+    assert_eq!(
+        shard_route_state(&primary, run_id, 0).await?,
+        (SHARD_ALIAS.to_string(), "active".to_string(), 2)
+    );
+    assert_eq!(
+        local_admission_state(&primary, run_id, 0).await?,
+        (
+            PRIMARY_ALIAS.to_string(),
+            2,
+            "closed".to_string(),
+            Some(SHARD_ALIAS.to_string())
+        )
+    );
+    assert_eq!(
+        local_admission_state(&shard, run_id, 0).await?,
+        (SHARD_ALIAS.to_string(), 2, "open".to_string(), None)
+    );
+
+    simulate_control_activated_before_target_open(&primary, &shard, run_id, 0).await?;
+    let retry_payload = run_vigilo(
+        &config,
+        PRIMARY_ALIAS,
+        [
+            "shard",
+            "move",
+            &run_id.to_string(),
+            "0",
+            "--alias",
+            SHARD_ALIAS,
+        ],
+    )?;
+    assert_eq!(retry_payload["meta"]["moved"], false);
+    assert_eq!(
+        local_admission_state(&shard, run_id, 0).await?,
+        (SHARD_ALIAS.to_string(), 2, "open".to_string(), None)
+    );
+    assert_eq!(active_move_operation_count(&primary, run_id, 0).await?, 0);
     Ok(())
 }
 
@@ -806,6 +889,210 @@ async fn shard_placement_status(
 ) -> anyhow::Result<String> {
     Ok(sqlx::query_scalar(
         "SELECT status FROM shard_placements WHERE run_id = $1::uuid AND run_shard = $2",
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .fetch_one(db)
+    .await?)
+}
+
+async fn shard_route_state(
+    db: &PgPool,
+    run_id: Uuid,
+    run_shard: i16,
+) -> anyhow::Result<(String, String, i64)> {
+    Ok(sqlx::query_as(
+        r#"
+        SELECT database_alias, status, write_epoch
+        FROM shard_placements
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .fetch_one(db)
+    .await?)
+}
+
+async fn local_admission_state(
+    db: &PgPool,
+    run_id: Uuid,
+    run_shard: i16,
+) -> anyhow::Result<(String, i64, String, Option<String>)> {
+    Ok(sqlx::query_as(
+        r#"
+        SELECT database_alias, write_epoch, state, redirect_database_alias
+        FROM local_shard_admissions
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .fetch_one(db)
+    .await?)
+}
+
+async fn simulate_source_closed_before_control_activation(
+    primary: &PgPool,
+    run_id: Uuid,
+    run_shard: i16,
+) -> anyhow::Result<()> {
+    let mut tx = primary.begin().await?;
+    sqlx::query(
+        r#"
+        UPDATE shard_placements
+        SET status = 'moving',
+            route_version = route_version + 1,
+            updated_at = now()
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+          AND status = 'draining'
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE local_shard_admissions
+        SET write_epoch = write_epoch + 1,
+            state = 'closed',
+            updated_at = now()
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+          AND state = 'draining'
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE shard_move_operations
+        SET phase = 'cutover',
+            updated_at = now()
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+          AND status = 'active'
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn simulate_before_control_draining(
+    primary: &PgPool,
+    run_id: Uuid,
+    run_shard: i16,
+    source_state: &str,
+) -> anyhow::Result<()> {
+    let mut tx = primary.begin().await?;
+    sqlx::query(
+        r#"
+        UPDATE shard_placements
+        SET status = 'copying',
+            route_version = route_version + 1,
+            updated_at = now()
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+          AND status = 'draining'
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE local_shard_admissions
+        SET state = $3,
+            updated_at = now()
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(source_state)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE shard_move_operations
+        SET phase = 'catch_up',
+            updated_at = now()
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+          AND status = 'active'
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn simulate_control_activated_before_target_open(
+    primary: &PgPool,
+    target: &PgPool,
+    run_id: Uuid,
+    run_shard: i16,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE local_shard_admissions
+        SET state = 'prepared',
+            updated_at = now()
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .execute(target)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE shard_move_operations
+        SET status = 'active',
+            phase = 'cutover',
+            completed_at = NULL,
+            updated_at = now()
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+          AND status = 'completed'
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .execute(primary)
+    .await?;
+    Ok(())
+}
+
+async fn active_move_operation_count(
+    db: &PgPool,
+    run_id: Uuid,
+    run_shard: i16,
+) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM shard_move_operations
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+          AND status = 'active'
+        "#,
     )
     .bind(run_id)
     .bind(run_shard)

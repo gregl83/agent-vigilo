@@ -31,7 +31,7 @@ where
     let placement = sqlx::query_as::<_, ShardPlacement>(
         r#"
         SELECT run_id, run_shard, database_alias, status, move_target_database_alias,
-               route_version, created_at, updated_at
+               route_version, write_epoch, created_at, updated_at
         FROM shard_placements
         WHERE run_id = $1
           AND run_shard = $2
@@ -69,7 +69,7 @@ where
           AND status = 'active'
           AND route_version = $4
         RETURNING run_id, run_shard, database_alias, status, move_target_database_alias,
-                  route_version, created_at, updated_at
+                  route_version, write_epoch, created_at, updated_at
         "#,
     )
     .bind(run_id)
@@ -107,7 +107,7 @@ where
           AND route_version = $4
           AND move_target_database_alias = $5
         RETURNING run_id, run_shard, database_alias, status, move_target_database_alias,
-                  route_version, created_at, updated_at
+                  route_version, write_epoch, created_at, updated_at
         "#,
     )
     .bind(run_id)
@@ -145,7 +145,7 @@ where
           AND route_version = $4
           AND move_target_database_alias = $5
         RETURNING run_id, run_shard, database_alias, status, move_target_database_alias,
-                  route_version, created_at, updated_at
+                  route_version, write_epoch, created_at, updated_at
         "#,
     )
     .bind(run_id)
@@ -176,6 +176,10 @@ where
         SET status = 'active',
             move_target_database_alias = NULL,
             route_version = route_version + 1,
+            write_epoch = write_epoch + CASE
+                WHEN status IN ('draining', 'moving') THEN 1
+                ELSE 0
+            END,
             updated_at = now()
         WHERE run_id = $1::uuid
           AND run_shard = $2
@@ -184,7 +188,7 @@ where
           AND route_version = $4
           AND move_target_database_alias = $5
         RETURNING run_id, run_shard, database_alias, status, move_target_database_alias,
-                  route_version, created_at, updated_at
+                  route_version, write_epoch, created_at, updated_at
         "#,
     )
     .bind(run_id)
@@ -222,7 +226,7 @@ where
           AND move_target_database_alias IS NULL
           AND route_version = $4
         RETURNING run_id, run_shard, database_alias, status, move_target_database_alias,
-                  route_version, created_at, updated_at
+                  route_version, write_epoch, created_at, updated_at
         "#,
     )
     .bind(run_id)
@@ -252,6 +256,7 @@ where
             status = 'active',
             move_target_database_alias = NULL,
             route_version = route_version + 1,
+            write_epoch = write_epoch + 1,
             updated_at = now()
         WHERE run_id = $1::uuid
           AND run_shard = $2
@@ -260,7 +265,7 @@ where
           AND route_version = $4
           AND move_target_database_alias = $5
         RETURNING run_id, run_shard, database_alias, status, move_target_database_alias,
-                  route_version, created_at, updated_at
+                  route_version, write_epoch, created_at, updated_at
         "#,
     )
     .bind(run_id)
@@ -313,6 +318,7 @@ where
         SET database_alias = $5,
             move_target_database_alias = NULL,
             route_version = route_version + 1,
+            write_epoch = write_epoch + 1,
             updated_at = now()
         WHERE run_id = $1::uuid
           AND run_shard = $2
@@ -320,7 +326,7 @@ where
           AND status = 'active'
           AND route_version = $4
         RETURNING run_id, run_shard, database_alias, status, move_target_database_alias,
-                  route_version, created_at, updated_at
+                  route_version, write_epoch, created_at, updated_at
         "#,
     )
     .bind(run_id)
@@ -341,7 +347,7 @@ pub(crate) async fn list_shard_placements_for_run(
     let placements = sqlx::query_as::<_, ShardPlacement>(
         r#"
         SELECT run_id, run_shard, database_alias, status, move_target_database_alias,
-               route_version, created_at, updated_at
+               route_version, write_epoch, created_at, updated_at
         FROM shard_placements
         WHERE run_id = $1
         ORDER BY run_shard
@@ -368,7 +374,7 @@ where
         INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
         VALUES ($1::uuid, $2, $3, 'active')
         RETURNING run_id, run_shard, database_alias, status, move_target_database_alias,
-                  route_version, created_at, updated_at
+                  route_version, write_epoch, created_at, updated_at
         "#,
     )
     .bind(run_id)

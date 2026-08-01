@@ -3,10 +3,9 @@
 //! Commands call this module through
 //! [`crate::context::Context::dbr`] when they first need database
 //! access. This context initializes the database router once, then the router
-//! lazily initializes its control pool and per-placement pools. Connection
-//! parameters remain fixed for the process lifetime, while placement status
-//! and role are read from the control database before new work is admitted.
-//! Environment variables only provide secret connection values.
+//! lazily initializes its control pool and per-placement pools. New aliases are
+//! discovered on first use when their secret is already in the environment;
+//! existing connection parameters remain fixed for the process lifetime.
 //!
 //! Keep topology choices behind database workflow boundaries. Thin command dispatch,
 //! generic runtime code, and arbitrary domain callers should prefer workflows
@@ -14,6 +13,7 @@
 
 use std::{
     collections::HashMap,
+    sync::Arc,
     time::{
         Duration,
         Instant,
@@ -32,9 +32,20 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    db::tables::{
-        database_placements,
-        shard_placements,
+    db::{
+        tables::{
+            database_placements,
+            shard_placements,
+        },
+        workflows::local_shard_admission::{
+            LocalShardAdmissionDraft,
+            LocalShardAdmissionError,
+            LocalShardAdmissionState,
+            LocalShardRouteHint,
+            LocalShardWriteKind,
+            upsert_local_shard_admission,
+            validate_local_shard_admission,
+        },
     },
     models::{
         database_placement::{
@@ -42,10 +53,7 @@ use crate::{
             DEFAULT_DATABASE_URL_ENV,
             DatabasePlacement,
         },
-        shard_placement::{
-            SHARD_PLACEMENT_STATUS_MOVING,
-            ShardPlacement,
-        },
+        shard_placement::ShardPlacement,
     },
 };
 
@@ -65,18 +73,6 @@ pub(crate) enum ExecutionRouteError {
         run_id: Uuid,
         run_shard: i16,
         status: String,
-    },
-    #[error(
-        "stale execution route for run {run_id} shard {run_shard}; expected {expected_database_alias} version {expected_route_version}, found {actual_database_alias} status {actual_status} version {actual_route_version}"
-    )]
-    StaleExecutionRoute {
-        run_id: Uuid,
-        run_shard: i16,
-        expected_database_alias: String,
-        expected_route_version: i64,
-        actual_database_alias: String,
-        actual_status: String,
-        actual_route_version: i64,
     },
 }
 
@@ -173,17 +169,25 @@ pub(crate) struct DatabaseRouter {
     pub(crate) control_pool: OnceCell<PgPool>,
     #[allow(dead_code)]
     pub(crate) placement_pools: OnceCell<PlacementPools>,
+    pub(crate) dynamic_placement_pools: Cache<String, Arc<PlacementPool>>,
     #[allow(dead_code)]
     pub(crate) shard_placement_cache: Cache<ShardPlacementKey, ShardPlacement>,
 }
 
-/// One serviceable execution route resolved from authoritative control metadata.
+/// One serviceable execution route resolved from control metadata.
 ///
-/// Write paths retain the route fence alongside the pool so admission can be
-/// revalidated immediately before changing execution-owned state.
+/// Write paths retain the control route alongside the pool; the execution
+/// database validates its local write epoch before changing owned state.
 #[derive(Clone)]
 pub(crate) struct ExecutionRoute {
     pub(crate) placement: ShardPlacement,
+    pub(crate) pool: PgPool,
+}
+
+/// Message-carried route hint paired with its process-local execution pool.
+#[derive(Clone)]
+pub(crate) struct ExecutionWriteRoute {
+    pub(crate) hint: LocalShardRouteHint,
     pub(crate) pool: PgPool,
 }
 
@@ -195,6 +199,7 @@ impl DatabaseRouter {
             placement_config: config.placement_config,
             control_pool: OnceCell::new(),
             placement_pools: OnceCell::new(),
+            dynamic_placement_pools: Cache::builder().max_capacity(1_000).build(),
             shard_placement_cache: new_shard_placement_cache(),
         }
     }
@@ -267,7 +272,7 @@ impl DatabaseRouter {
     /// Status is read from the control database on every call; connection
     /// parameters and pools remain fixed for the process lifetime.
     #[allow(dead_code)]
-    pub async fn placement(&self, alias: &str) -> anyhow::Result<&PgPool> {
+    pub async fn placement(&self, alias: &str) -> anyhow::Result<PgPool> {
         let started = Instant::now();
         let alias = normalize_alias(alias.to_string(), "database alias")?;
         let placement = self.require_serviceable_placement(&alias).await?;
@@ -279,7 +284,7 @@ impl DatabaseRouter {
     ///
     /// Active and draining targets remain available because draining must not
     /// strand routed work, recovery, creation replay, or source-side movement.
-    pub(crate) async fn execution_database(&self, alias: &str) -> anyhow::Result<&PgPool> {
+    pub(crate) async fn execution_database(&self, alias: &str) -> anyhow::Result<PgPool> {
         let started = Instant::now();
         let alias = normalize_alias(alias.to_string(), "database alias")?;
         let placement = self.require_serviceable_placement(&alias).await?;
@@ -289,7 +294,7 @@ impl DatabaseRouter {
     }
 
     /// Returns a pool for a target that may receive new shard ownership.
-    pub(crate) async fn execution_target_database(&self, alias: &str) -> anyhow::Result<&PgPool> {
+    pub(crate) async fn execution_target_database(&self, alias: &str) -> anyhow::Result<PgPool> {
         let started = Instant::now();
         let alias = normalize_alias(alias.to_string(), "database alias")?;
         let placement = self.require_active_placement(&alias).await?;
@@ -302,15 +307,56 @@ impl DatabaseRouter {
         &self,
         placement: &DatabasePlacement,
         started: Instant,
-    ) -> anyhow::Result<&PgPool> {
+    ) -> anyhow::Result<PgPool> {
         let pools = self.placement_pools().await?;
-        let Some(pool) = pools.pools_by_alias.get(&placement.alias) else {
-            anyhow::bail!(
-                "database placement alias {} has no process-local connection configuration; restart Vigilo after adding database placements",
-                placement.alias
+        if placement.alias == self.placement_config.control_database_alias {
+            if let Some(configured) = pools.pools_by_alias.get(&placement.alias)
+                && configured.database_url_env != placement.database_url_env
+            {
+                anyhow::bail!(
+                    "database placement alias {} changed database_url_env from {} to {}; restart Vigilo to load new connection parameters",
+                    placement.alias,
+                    configured.database_url_env,
+                    placement.database_url_env
+                );
+            }
+            let pool = self.control().await?;
+            debug!(
+                database_alias = %placement.alias,
+                placement_pool_acquisition_ms = started.elapsed().as_millis() as u64,
+                pool_source = "control",
+                "resolved database placement pool"
             );
-        };
+            return Ok(pool.clone());
+        }
 
+        if let Some(pool) = pools.pools_by_alias.get(&placement.alias) {
+            if pool.database_url_env != placement.database_url_env {
+                anyhow::bail!(
+                    "database placement alias {} changed database_url_env from {} to {}; restart Vigilo to load new connection parameters",
+                    placement.alias,
+                    pool.database_url_env,
+                    placement.database_url_env
+                );
+            }
+            return Ok(pool
+                .get(&placement.alias, self.max_connections)
+                .await?
+                .clone());
+        }
+
+        let database_url = self.resolve_database_url_env(&placement.database_url_env)?;
+        let database_url_env = placement.database_url_env.clone();
+        let pool = self
+            .dynamic_placement_pools
+            .get_with(placement.alias.clone(), async move {
+                Arc::new(PlacementPool {
+                    database_url_env,
+                    database_url,
+                    pool: OnceCell::new(),
+                })
+            })
+            .await;
         if pool.database_url_env != placement.database_url_env {
             anyhow::bail!(
                 "database placement alias {} changed database_url_env from {} to {}; restart Vigilo to load new connection parameters",
@@ -319,18 +365,6 @@ impl DatabaseRouter {
                 placement.database_url_env
             );
         }
-
-        if placement.alias == self.placement_config.control_database_alias {
-            let pool = self.control().await?;
-            debug!(
-                database_alias = %placement.alias,
-                placement_pool_acquisition_ms = started.elapsed().as_millis() as u64,
-                pool_source = "control",
-                "resolved database placement pool"
-            );
-            return Ok(pool);
-        }
-
         let pool = pool.get(&placement.alias, self.max_connections).await?;
         debug!(
             database_alias = %placement.alias,
@@ -338,7 +372,7 @@ impl DatabaseRouter {
             pool_source = "placement",
             "resolved database placement pool"
         );
-        Ok(pool)
+        Ok(pool.clone())
     }
 
     /// Resolves the stored execution placement for a run shard.
@@ -363,44 +397,18 @@ impl DatabaseRouter {
 
         let key = ShardPlacementKey { run_id, run_shard };
         if let Some(placement) = self.shard_placement_cache.get(&key).await {
-            let current = self
-                .select_control_shard_placement(run_id, run_shard)
-                .await?;
-
-            if placement.same_route_fence(&current) {
-                debug!(
-                    run_id = %run_id,
-                    run_shard,
-                    database_alias = %placement.database_alias,
-                    placement_status = %placement.status,
-                    route_version = placement.route_version,
-                    route_resolution_ms = started.elapsed().as_millis() as u64,
-                    route_cache = "hit",
-                    routing_decision = "cached_execution_placement",
-                    "resolved execution placement from route-version cache"
-                );
-                return Ok(placement);
-            }
-
-            self.shard_placement_cache.invalidate(&key).await;
             debug!(
                 run_id = %run_id,
                 run_shard,
-                previous_database_alias = %placement.database_alias,
-                previous_placement_status = %placement.status,
-                previous_route_version = placement.route_version,
-                database_alias = %current.database_alias,
-                placement_status = %current.status,
-                route_version = current.route_version,
+                database_alias = %placement.database_alias,
+                placement_status = %placement.status,
+                route_version = placement.route_version,
                 route_resolution_ms = started.elapsed().as_millis() as u64,
-                route_cache = "stale_refresh",
-                routing_decision = "refreshed_stale_execution_placement",
-                "refreshed stale execution placement cache"
+                route_cache = "hit",
+                routing_decision = "cached_execution_placement",
+                "resolved execution placement from route cache"
             );
-            self.shard_placement_cache
-                .insert(key, current.clone())
-                .await;
-            return Ok(current);
+            return Ok(placement);
         }
 
         let placement = self
@@ -430,7 +438,7 @@ impl DatabaseRouter {
     /// Routing is based on persisted `shard_placements` data. Callers that do
     /// not own execution data should use a workflow that hides this choice.
     #[allow(dead_code)]
-    pub async fn execution(&self, run_id: Uuid, run_shard: i16) -> anyhow::Result<&PgPool> {
+    pub async fn execution(&self, run_id: Uuid, run_shard: i16) -> anyhow::Result<PgPool> {
         let placement = self.resolve_execution_placement(run_id, run_shard).await?;
 
         if !placement.is_dispatchable() {
@@ -484,11 +492,61 @@ impl DatabaseRouter {
         Ok(ExecutionRoute { placement, pool })
     }
 
-    /// Acquires write admission and revalidates a previously resolved route.
+    /// Resolves a queue-carried route without consulting shard control metadata.
+    ///
+    /// Known placement pools are process-local. A previously unseen database
+    /// alias is discovered once from control metadata and cached, allowing
+    /// workers to consume routes added after process startup.
+    pub(crate) async fn execution_write_route(
+        &self,
+        hint: LocalShardRouteHint,
+    ) -> anyhow::Result<ExecutionWriteRoute> {
+        validate_run_shard(hint.run_shard)?;
+        if hint.write_epoch <= 0 {
+            anyhow::bail!("write epoch must be greater than zero");
+        }
+        let alias = normalize_alias(hint.database_alias.clone(), "database alias")?;
+        if alias != hint.database_alias {
+            anyhow::bail!("database alias in route hint must be normalized");
+        }
+        let pool = self.execution_database_from_hint(&alias).await?;
+        Ok(ExecutionWriteRoute { hint, pool })
+    }
+
+    async fn execution_database_from_hint(&self, alias: &str) -> anyhow::Result<PgPool> {
+        if alias == self.control_database_alias() {
+            return Ok(self.control().await?.clone());
+        }
+
+        let pools = self.placement_pools().await?;
+        if let Some(pool) = pools.pools_by_alias.get(alias) {
+            return Ok(pool.get(alias, self.max_connections).await?.clone());
+        }
+        if let Some(pool) = self.dynamic_placement_pools.get(alias).await {
+            return Ok(pool.get(alias, self.max_connections).await?.clone());
+        }
+        let placement = self.require_serviceable_placement(alias).await?;
+        require_shard_capable_placement(&placement)?;
+        let database_url = self.resolve_database_url_env(&placement.database_url_env)?;
+        let database_url_env = placement.database_url_env;
+        let pool = self
+            .dynamic_placement_pools
+            .get_with(alias.to_string(), async move {
+                Arc::new(PlacementPool {
+                    database_url_env,
+                    database_url,
+                    pool: OnceCell::new(),
+                })
+            })
+            .await;
+        Ok(pool.get(alias, self.max_connections).await?.clone())
+    }
+
+    /// Acquires write admission for a previously resolved route.
     ///
     /// Movement takes the exclusive form of the same advisory lock. Holding
-    /// the shared lock from revalidation through the local write closes the
-    /// gap where a route could become `moving` after pool resolution.
+    /// the shared lock from local epoch validation through the write closes
+    /// the cutover gap after pool resolution.
     pub(crate) async fn begin_execution_admission(
         &self,
         route: &ExecutionRoute,
@@ -501,42 +559,57 @@ impl DatabaseRouter {
         )
         .await?;
 
-        let current = if route.placement.database_alias == self.control_database_alias() {
-            select_shard_placement_on_connection(
-                &mut tx,
-                route.placement.run_id,
-                route.placement.run_shard,
-            )
-            .await?
-        } else {
-            self.select_control_shard_placement(route.placement.run_id, route.placement.run_shard)
-                .await?
+        let hint = LocalShardRouteHint {
+            run_id: route.placement.run_id,
+            run_shard: route.placement.run_shard,
+            database_alias: route.placement.database_alias.clone(),
+            write_epoch: route.placement.write_epoch,
         };
+        let validation =
+            validate_local_shard_admission(&mut *tx, &hint, LocalShardWriteKind::NewWork).await;
+        if let Err(error) = validation {
+            if !matches!(
+                error.downcast_ref::<LocalShardAdmissionError>(),
+                Some(LocalShardAdmissionError::Missing { .. })
+            ) {
+                return Err(error);
+            }
 
-        if !route.placement.same_route_fence(&current) {
-            let error = ExecutionRouteError::StaleExecutionRoute {
-                run_id: current.run_id,
-                run_shard: current.run_shard,
-                expected_database_alias: route.placement.database_alias.clone(),
-                expected_route_version: route.placement.route_version,
-                actual_database_alias: current.database_alias,
-                actual_status: current.status,
-                actual_route_version: current.route_version,
-            };
-            tx.rollback().await?;
-            return Err(error.into());
+            // Upgrade/new-placement repair path only. The shared local fence
+            // prevents movement from changing admission while control metadata
+            // is re-read and the missing row is created.
+            let current = self
+                .select_control_shard_placement(hint.run_id, hint.run_shard)
+                .await?;
+            if !route.placement.same_route_fence(&current) || !current.is_dispatchable() {
+                return Err(error);
+            }
+            upsert_local_shard_admission(
+                &mut *tx,
+                LocalShardAdmissionDraft {
+                    run_id: hint.run_id,
+                    run_shard: hint.run_shard,
+                    database_alias: hint.database_alias,
+                    write_epoch: hint.write_epoch,
+                    state: LocalShardAdmissionState::Open,
+                    redirect_database_alias: None,
+                },
+            )
+            .await?;
         }
 
-        if !current.is_dispatchable() {
-            let error = ExecutionRouteError::NonDispatchableShardPlacement {
-                run_id: current.run_id,
-                run_shard: current.run_shard,
-                status: current.status,
-            };
-            tx.rollback().await?;
-            return Err(error.into());
-        }
+        Ok(tx)
+    }
 
+    /// Acquires local write admission for a message-carried route hint.
+    pub(crate) async fn begin_execution_write_admission(
+        &self,
+        route: &ExecutionWriteRoute,
+    ) -> anyhow::Result<Transaction<'static, Postgres>> {
+        let mut tx = route.pool.begin().await?;
+        crate::db::shard_write_fence::lock_shared(&mut tx, route.hint.run_id, route.hint.run_shard)
+            .await?;
+        validate_local_shard_admission(&mut *tx, &route.hint, LocalShardWriteKind::NewWork).await?;
         Ok(tx)
     }
 
@@ -572,41 +645,51 @@ impl DatabaseRouter {
         }
 
         for route in ordered {
-            let current = if route.placement.database_alias == self.control_database_alias() {
-                select_shard_placement_on_connection(
-                    &mut tx,
-                    route.placement.run_id,
-                    route.placement.run_shard,
-                )
-                .await?
-            } else {
-                self.select_control_shard_placement(
-                    route.placement.run_id,
-                    route.placement.run_shard,
-                )
-                .await?
-            };
-            if !route.placement.same_route_fence(&current) {
-                let error = ExecutionRouteError::StaleExecutionRoute {
-                    run_id: current.run_id,
-                    run_shard: current.run_shard,
-                    expected_database_alias: route.placement.database_alias.clone(),
-                    expected_route_version: route.placement.route_version,
-                    actual_database_alias: current.database_alias,
-                    actual_status: current.status,
-                    actual_route_version: current.route_version,
-                };
-                tx.rollback().await?;
-                return Err(error.into());
+            if route.placement.status
+                == crate::models::shard_placement::SHARD_PLACEMENT_STATUS_MOVING
+            {
+                return Err(ExecutionRouteError::NonDispatchableShardPlacement {
+                    run_id: route.placement.run_id,
+                    run_shard: route.placement.run_shard,
+                    status: route.placement.status.clone(),
+                }
+                .into());
             }
-            if current.status == SHARD_PLACEMENT_STATUS_MOVING {
-                let error = ExecutionRouteError::NonDispatchableShardPlacement {
-                    run_id: current.run_id,
-                    run_shard: current.run_shard,
-                    status: current.status,
+            let hint = LocalShardRouteHint {
+                run_id: route.placement.run_id,
+                run_shard: route.placement.run_shard,
+                database_alias: route.placement.database_alias.clone(),
+                write_epoch: route.placement.write_epoch,
+            };
+            let validation =
+                validate_local_shard_admission(&mut *tx, &hint, LocalShardWriteKind::Settlement)
+                    .await;
+            if let Err(error) = validation {
+                if !matches!(
+                    error.downcast_ref::<LocalShardAdmissionError>(),
+                    Some(LocalShardAdmissionError::Missing { .. })
+                ) {
+                    return Err(error);
+                }
+                let state = if route.placement.status
+                    == crate::models::shard_placement::SHARD_PLACEMENT_STATUS_DRAINING
+                {
+                    LocalShardAdmissionState::Draining
+                } else {
+                    LocalShardAdmissionState::Open
                 };
-                tx.rollback().await?;
-                return Err(error.into());
+                upsert_local_shard_admission(
+                    &mut *tx,
+                    LocalShardAdmissionDraft {
+                        run_id: hint.run_id,
+                        run_shard: hint.run_shard,
+                        database_alias: hint.database_alias,
+                        write_epoch: hint.write_epoch,
+                        state,
+                        redirect_database_alias: route.placement.move_target_database_alias.clone(),
+                    },
+                )
+                .await?;
             }
         }
 
@@ -898,27 +981,6 @@ impl DatabaseRouter {
     }
 }
 
-async fn select_shard_placement_on_connection(
-    tx: &mut Transaction<'_, Postgres>,
-    run_id: Uuid,
-    run_shard: i16,
-) -> anyhow::Result<ShardPlacement> {
-    sqlx::query_as::<_, ShardPlacement>(
-        r#"
-        SELECT run_id, run_shard, database_alias, status, move_target_database_alias,
-               route_version, created_at, updated_at
-        FROM shard_placements
-        WHERE run_id = $1::uuid
-          AND run_shard = $2
-        "#,
-    )
-    .bind(run_id)
-    .bind(run_shard)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or_else(|| ExecutionRouteError::MissingShardPlacement { run_id, run_shard }.into())
-}
-
 pub(crate) fn new_shard_placement_cache() -> Cache<ShardPlacementKey, ShardPlacement> {
     Cache::builder()
         .time_to_live(SHARD_PLACEMENT_CACHE_TTL)
@@ -1183,9 +1245,12 @@ mod tests {
         )
         .await;
 
-        let control = database_router.control().await.unwrap() as *const PgPool;
-        let routed = database_router.execution(run_id, 42).await.unwrap() as *const PgPool;
-        assert_eq!(control, routed);
+        let control = database_router.control().await.unwrap();
+        let routed = database_router.execution(run_id, 42).await.unwrap();
+        assert_eq!(
+            control.connect_options().get_database(),
+            routed.connect_options().get_database()
+        );
 
         let placement = database_router
             .execution_placement(run_id, 42)
@@ -1257,7 +1322,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
-    async fn execution_placement_refreshes_stale_cached_route_version(pool: PgPool) {
+    async fn execution_placement_refreshes_after_explicit_invalidation(pool: PgPool) {
         let database_router = database_router_with_control_pool(pool);
         let run_id = Uuid::now_v7();
 
@@ -1282,6 +1347,16 @@ mod tests {
                 .await;
         mark_test_shard_placement_moving(database_router.control().await.unwrap(), &draining).await;
 
+        let cached = database_router
+            .execution_placement(run_id, 7)
+            .await
+            .unwrap();
+        assert_eq!(cached.status, SHARD_PLACEMENT_STATUS_ACTIVE);
+        assert_eq!(cached.route_version, 1);
+
+        database_router
+            .invalidate_execution_placement(run_id, 7)
+            .await;
         let refreshed = database_router
             .execution_placement(run_id, 7)
             .await
@@ -1310,6 +1385,20 @@ mod tests {
         .await;
         let stale_route = database_router.execution_route(run_id, 7).await.unwrap();
 
+        upsert_local_shard_admission(
+            database_router.control().await.unwrap(),
+            LocalShardAdmissionDraft {
+                run_id,
+                run_shard: 7,
+                database_alias: DEFAULT_DATABASE_ALIAS.to_string(),
+                write_epoch: stale_route.placement.write_epoch,
+                state: LocalShardAdmissionState::Draining,
+                redirect_database_alias: Some("shard_001".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
         let draining =
             mark_test_shard_placement_draining(database_router.control().await.unwrap(), run_id, 7)
                 .await;
@@ -1327,9 +1416,195 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(
-            error.downcast_ref::<ExecutionRouteError>(),
-            Some(ExecutionRouteError::StaleExecutionRoute { .. })
+            error.downcast_ref::<LocalShardAdmissionError>(),
+            Some(LocalShardAdmissionError::RejectedState { .. })
         ));
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
+    async fn worker_stale_hint_invalidates_cache_and_claims_current_epoch(pool: PgPool) {
+        let database_router = database_router_with_control_pool(pool.clone());
+        let run_id = Uuid::now_v7();
+        let chunk_id = seed_claimable_chunk(&pool, run_id, 7).await;
+        insert_shard_placement(
+            &pool,
+            run_id,
+            7,
+            DEFAULT_DATABASE_ALIAS,
+            SHARD_PLACEMENT_STATUS_ACTIVE,
+        )
+        .await;
+        let cached = database_router
+            .execution_placement(run_id, 7)
+            .await
+            .unwrap();
+        assert_eq!(cached.write_epoch, 1);
+
+        sqlx::query(
+            r#"
+            UPDATE shard_placements
+            SET write_epoch = 2,
+                route_version = route_version + 1,
+                updated_at = now()
+            WHERE run_id = $1::uuid
+              AND run_shard = 7
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        upsert_local_shard_admission(
+            &pool,
+            LocalShardAdmissionDraft {
+                run_id,
+                run_shard: 7,
+                database_alias: DEFAULT_DATABASE_ALIAS.to_string(),
+                write_epoch: 2,
+                state: LocalShardAdmissionState::Open,
+                redirect_database_alias: None,
+            },
+        )
+        .await
+        .unwrap();
+        let hinted_route = database_router
+            .execution_write_route(LocalShardRouteHint {
+                run_id,
+                run_shard: 7,
+                database_alias: DEFAULT_DATABASE_ALIAS.to_string(),
+                write_epoch: 1,
+            })
+            .await
+            .unwrap();
+
+        let (_, claimed) = crate::cli::claim_hinted_chunk_with_route_refresh(
+            &database_router,
+            &hinted_route,
+            chunk_id,
+        )
+        .await
+        .unwrap();
+
+        let claimed = claimed.expect("current route should claim the pending chunk");
+        assert_eq!(claimed.write_epoch, 2);
+        assert_eq!(claimed.status, "leased");
+        assert_eq!(
+            database_router
+                .execution_placement(run_id, 7)
+                .await
+                .unwrap()
+                .write_epoch,
+            2
+        );
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
+    async fn missing_admission_is_repaired_for_an_unchanged_route(pool: PgPool) {
+        let database_router = database_router_with_control_pool(pool.clone());
+        let run_id = Uuid::now_v7();
+        insert_shard_placement(
+            &pool,
+            run_id,
+            7,
+            DEFAULT_DATABASE_ALIAS,
+            SHARD_PLACEMENT_STATUS_ACTIVE,
+        )
+        .await;
+        let route = database_router.execution_route(run_id, 7).await.unwrap();
+
+        database_router
+            .begin_execution_admission(&route)
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+
+        let admission = sqlx::query_as::<_, (String, i64, String)>(
+            r#"
+            SELECT database_alias, write_epoch, state
+            FROM local_shard_admissions
+            WHERE run_id = $1::uuid
+              AND run_shard = 7
+            "#,
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            admission,
+            (DEFAULT_DATABASE_ALIAS.to_string(), 1, "open".to_string())
+        );
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
+    async fn missing_admission_repair_rechecks_route_after_waiting_for_fence(pool: PgPool) {
+        let database_router = database_router_with_control_pool(pool.clone());
+        let run_id = Uuid::now_v7();
+        insert_shard_placement(
+            &pool,
+            run_id,
+            7,
+            DEFAULT_DATABASE_ALIAS,
+            SHARD_PLACEMENT_STATUS_ACTIVE,
+        )
+        .await;
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_001', 'DATABASE_URL', 'shard', 'active')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let stale_route = database_router.execution_route(run_id, 7).await.unwrap();
+
+        let mut move_tx = pool.begin().await.unwrap();
+        crate::db::shard_write_fence::lock_exclusive(&mut move_tx, run_id, 7)
+            .await
+            .unwrap();
+        let repair = tokio::spawn(async move {
+            database_router
+                .begin_execution_admission(&stale_route)
+                .await
+        });
+        wait_for_waiting_advisory_lock(&pool, "missing-admission repair").await;
+
+        sqlx::query(
+            r#"
+            UPDATE shard_placements
+            SET status = 'copying',
+                move_target_database_alias = 'shard_001',
+                route_version = route_version + 1,
+                updated_at = now()
+            WHERE run_id = $1::uuid
+              AND run_shard = 7
+            "#,
+        )
+        .bind(run_id)
+        .execute(&mut *move_tx)
+        .await
+        .unwrap();
+        move_tx.commit().await.unwrap();
+
+        let error = repair.await.unwrap().unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<LocalShardAdmissionError>(),
+            Some(LocalShardAdmissionError::Missing { .. })
+        ));
+        let admission_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)::bigint FROM local_shard_admissions WHERE run_id = $1::uuid AND run_shard = 7",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(admission_count, 0);
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -1386,6 +1661,71 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(outcome.cancelled);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
+    async fn dropped_write_transaction_releases_waiting_move_fence(pool: PgPool) {
+        let database_router = database_router_with_control_pool(pool.clone());
+        let run_id = Uuid::now_v7();
+        insert_shard_placement(
+            &pool,
+            run_id,
+            7,
+            DEFAULT_DATABASE_ALIAS,
+            SHARD_PLACEMENT_STATUS_ACTIVE,
+        )
+        .await;
+        upsert_local_shard_admission(
+            &pool,
+            LocalShardAdmissionDraft {
+                run_id,
+                run_shard: 7,
+                database_alias: DEFAULT_DATABASE_ALIAS.to_string(),
+                write_epoch: 1,
+                state: LocalShardAdmissionState::Open,
+                redirect_database_alias: None,
+            },
+        )
+        .await
+        .unwrap();
+        let route = database_router.execution_route(run_id, 7).await.unwrap();
+        let admitted_write = database_router
+            .begin_execution_admission(&route)
+            .await
+            .unwrap();
+
+        let move_pool = pool.clone();
+        let mover = tokio::spawn(async move {
+            let mut tx = move_pool.begin().await.unwrap();
+            crate::db::shard_write_fence::lock_exclusive(&mut tx, run_id, 7)
+                .await
+                .unwrap();
+            sqlx::query(
+                "UPDATE local_shard_admissions SET state = 'draining' WHERE run_id = $1::uuid AND run_shard = 7",
+            )
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        });
+        wait_for_waiting_advisory_lock(&pool, "move").await;
+
+        drop(admitted_write);
+        tokio::time::timeout(Duration::from_secs(5), mover)
+            .await
+            .expect("move fence remained blocked after admitted transaction was dropped")
+            .unwrap();
+
+        let state = sqlx::query_scalar::<_, String>(
+            "SELECT state FROM local_shard_admissions WHERE run_id = $1::uuid AND run_shard = 7",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state, "draining");
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -1593,8 +1933,9 @@ mod tests {
 
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
-    async fn placement_requires_restart_for_alias_added_after_pool_initialization(pool: PgPool) {
-        let database_router = database_router_with_control_pool(pool);
+    async fn placement_discovers_alias_added_after_pool_initialization(pool: PgPool) {
+        let database_url = isolated_database_url(&pool).await;
+        let database_router = database_router_with_control_pool_and_uri(pool, database_url);
         database_router
             .placement(DEFAULT_DATABASE_ALIAS)
             .await
@@ -1603,20 +1944,21 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO database_placements (alias, database_url_env, role, status)
-            VALUES ('shard_late', 'VIGILO_TEST_LATE_SHARD_URL', 'shard', 'active')
+            VALUES ('shard_late', 'DATABASE_URL', 'shard', 'active')
             "#,
         )
         .execute(database_router.control().await.unwrap())
         .await
         .unwrap();
 
-        let error = database_router.placement("shard_late").await.unwrap_err();
+        database_router.placement("shard_late").await.unwrap();
         assert!(
-            error
-                .to_string()
-                .contains("no process-local connection configuration")
+            database_router
+                .dynamic_placement_pools
+                .get("shard_late")
+                .await
+                .is_some()
         );
-        assert!(error.to_string().contains("restart Vigilo"));
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -1686,6 +2028,7 @@ mod tests {
             placement_config: PlacementConfig::default_single_database(),
             control_pool: OnceCell::new(),
             placement_pools: OnceCell::new(),
+            dynamic_placement_pools: Cache::builder().max_capacity(1_000).build(),
             shard_placement_cache: new_shard_placement_cache(),
         };
         assert!(database_router.control_pool.set(pool).is_ok());
@@ -1701,6 +2044,37 @@ mod tests {
             url::Url::parse(&std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap()).unwrap();
         database_url.set_path(&database_name);
         database_url.to_string()
+    }
+
+    async fn wait_for_waiting_advisory_lock(pool: &PgPool, operation: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting = sqlx::query_scalar::<_, bool>(
+                    r#"
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_locks
+                        WHERE locktype = 'advisory'
+                          AND database = (
+                              SELECT oid
+                              FROM pg_database
+                              WHERE datname = current_database()
+                          )
+                          AND NOT granted
+                    )
+                    "#,
+                )
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{operation} did not wait behind shard admission"));
     }
 
     async fn insert_shard_placement(

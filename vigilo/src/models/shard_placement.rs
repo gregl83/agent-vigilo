@@ -47,6 +47,8 @@ pub(crate) struct ShardPlacement {
     pub(crate) move_target_database_alias: Option<String>,
     /// Monotonic route fencing token.
     pub(crate) route_version: i64,
+    /// Monotonic execution write-ownership generation.
+    pub(crate) write_epoch: i64,
     /// Time this placement row was inserted.
     pub(crate) created_at: DateTime<Utc>,
     /// Time this placement row was last updated.
@@ -81,6 +83,7 @@ mod tests {
             status: status.to_string(),
             move_target_database_alias: Some("target".to_string()),
             route_version: 2,
+            write_epoch: 1,
             created_at: now,
             updated_at: now,
         }

@@ -31,6 +31,22 @@ Chunk-ready broker messages are delivered at least once. A worker holds the Rabb
 
 Duplicate broker deliveries are allowed. Exactly-once effects are managed in the database: chunks can only be claimed from an open or expired lease, recovered chunk-ready outbox event records carry unique recovery dedupe keys, executions only accept terminal transitions from the current attempt id, attempt number, worker id, and live attempt lease, and evaluator findings are unique per run, attempt, evaluator, and finding index.
 
+## Stale shard route
+
+Chunk-ready messages include the execution database alias and write epoch used
+at dispatch. The worker validates that epoch against `local_shard_admissions`
+in the same execution-database transaction as the chunk claim. A stale or
+closed owner cannot accept the write. The worker invalidates its route cache,
+refreshes control metadata once, and retries the current owner; if cutover is
+in progress, it delays the message. Move recovery may temporarily leave no
+writable owner, but source closure always precedes target opening.
+
+Shard-move retries reconcile the durable boundary states. A prepared target can
+resume while the source is still open; a locally draining source is never
+reopened when control still reports `copying`; a closed source can finish
+control activation; and an active target route repairs a target admission that
+was not opened before the mover exited.
+
 ## Outbox publisher crash
 
 Outbox claims assign a `claim_token` and future availability window on `outbox_delivery_queue`. A publisher only deletes or reschedules a delivery row while that token is still current. If it crashes, the delivery row becomes available again and another coordinator can retry publication from the durable `outbox_events` ledger.

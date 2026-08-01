@@ -1260,6 +1260,7 @@ mod tests {
             status: SHARD_PLACEMENT_STATUS_ACTIVE.to_string(),
             move_target_database_alias: None,
             route_version: 1,
+            write_epoch: 1,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1292,6 +1293,7 @@ mod tests {
             status: SHARD_PLACEMENT_STATUS_ACTIVE.to_string(),
             move_target_database_alias: None,
             route_version: 2,
+            write_epoch: 2,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1340,6 +1342,7 @@ mod tests {
             status: SHARD_PLACEMENT_STATUS_ACTIVE.to_string(),
             move_target_database_alias: None,
             route_version: 4,
+            write_epoch: 2,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

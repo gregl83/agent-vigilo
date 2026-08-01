@@ -2,8 +2,8 @@
 //!
 //! Workers use this module to claim a run chunk, load the corresponding dataset
 //! case rows, and then either complete or release the chunk. Lease fields are
-//! checked on completion/release so stale workers cannot overwrite a newer
-//! lease holder.
+//! and local write epochs are checked on completion/release so stale workers
+//! cannot overwrite a newer lease holder or shard owner.
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -12,6 +12,7 @@ use crate::{
     context::database::{
         self,
         ExecutionRoute,
+        ExecutionWriteRoute,
     },
     models::run_chunk::RunChunk,
 };
@@ -26,7 +27,7 @@ pub(crate) async fn claim_routed_chunk_for_processing(
     lease_seconds: i32,
 ) -> anyhow::Result<Option<RunChunk>> {
     let mut tx = database_router.begin_execution_admission(route).await?;
-    let chunk = claim_chunk_for_processing_in_transaction(
+    let mut chunk = claim_chunk_for_processing_in_transaction(
         &mut tx,
         run_id,
         run_shard,
@@ -34,6 +35,34 @@ pub(crate) async fn claim_routed_chunk_for_processing(
         lease_seconds,
     )
     .await?;
+    if let Some(chunk) = &mut chunk {
+        chunk.write_epoch = route.placement.write_epoch;
+    }
+    tx.commit().await?;
+    Ok(chunk)
+}
+
+/// Claims a chunk using a queue-carried route and local write epoch.
+pub(crate) async fn claim_hinted_chunk_for_processing(
+    database_router: &database::DatabaseRouter,
+    route: &ExecutionWriteRoute,
+    chunk_id: Uuid,
+    lease_seconds: i32,
+) -> anyhow::Result<Option<RunChunk>> {
+    let mut tx = database_router
+        .begin_execution_write_admission(route)
+        .await?;
+    let mut chunk = claim_chunk_for_processing_in_transaction(
+        &mut tx,
+        route.hint.run_id,
+        route.hint.run_shard,
+        chunk_id,
+        lease_seconds,
+    )
+    .await?;
+    if let Some(chunk) = &mut chunk {
+        chunk.write_epoch = route.hint.write_epoch;
+    }
     tx.commit().await?;
     Ok(chunk)
 }
@@ -69,7 +98,7 @@ async fn claim_chunk_for_processing_in_transaction(
     chunk_id: Uuid,
     lease_seconds: i32,
 ) -> anyhow::Result<Option<RunChunk>> {
-    let chunk = sqlx::query_as::<_, RunChunk>(
+    let updated = sqlx::query_as::<_, RunChunk>(
         r#"
 		UPDATE run_chunks
 		SET status = 'leased',
@@ -111,7 +140,7 @@ async fn claim_chunk_for_processing_in_transaction(
     .fetch_optional(&mut **tx)
     .await?;
 
-    Ok(chunk)
+    Ok(updated)
 }
 
 /// Extends a currently owned chunk lease and returns the updated lease token.
@@ -128,7 +157,7 @@ pub(crate) async fn extend_chunk_lease(
     lease_seconds: i32,
 ) -> anyhow::Result<Option<RunChunk>> {
     let lease_token = require_chunk_lease_token(chunk)?;
-    let chunk = sqlx::query_as::<_, RunChunk>(
+    let mut updated = sqlx::query_as::<_, RunChunk>(
         r#"
 		UPDATE run_chunks
 		SET leased_until = now() + ($4::int * interval '1 second'),
@@ -139,6 +168,14 @@ pub(crate) async fn extend_chunk_lease(
 		  AND status = 'leased'
 		  AND lease_token = $5::uuid
 		  AND leased_until >= now()
+		  AND EXISTS (
+			SELECT 1
+			FROM local_shard_admissions admission
+			WHERE admission.run_id = run_chunks.run_id
+			  AND admission.run_shard = run_chunks.run_shard
+			  AND admission.write_epoch = $6
+			  AND admission.state IN ('open', 'draining')
+		  )
 		  AND EXISTS (
 			SELECT 1
 			FROM run_snapshots rs
@@ -165,10 +202,14 @@ pub(crate) async fn extend_chunk_lease(
     .bind(chunk.id)
     .bind(lease_seconds)
     .bind(lease_token)
+    .bind(chunk.write_epoch)
     .fetch_optional(db)
     .await?;
 
-    Ok(chunk)
+    if let Some(updated) = &mut updated {
+        updated.write_epoch = chunk.write_epoch;
+    }
+    Ok(updated)
 }
 
 /// Loads the shard-local cases covered by a claimed chunk's ordinal range.
@@ -275,12 +316,21 @@ pub(crate) async fn mark_chunk_completed_and_refresh_summary(
 		  AND status = 'leased'
 		  AND lease_token = $4::uuid
 		  AND leased_until >= now()
+		  AND EXISTS (
+			SELECT 1
+			FROM local_shard_admissions admission
+			WHERE admission.run_id = run_chunks.run_id
+			  AND admission.run_shard = run_chunks.run_shard
+			  AND admission.write_epoch = $5
+			  AND admission.state IN ('open', 'draining')
+		  )
 		"#,
     )
     .bind(chunk.run_id)
     .bind(chunk.run_shard)
     .bind(chunk.id)
     .bind(lease_token)
+    .bind(chunk.write_epoch)
     .execute(&mut *tx)
     .await?;
     if result.rows_affected() > 0 {
@@ -316,12 +366,21 @@ pub(crate) async fn release_chunk_as_pending(db: &PgPool, chunk: &RunChunk) -> a
 		  AND status = 'leased'
 		  AND lease_token = $4::uuid
 		  AND leased_until >= now()
+		  AND EXISTS (
+			SELECT 1
+			FROM local_shard_admissions admission
+			WHERE admission.run_id = run_chunks.run_id
+			  AND admission.run_shard = run_chunks.run_shard
+			  AND admission.write_epoch = $5
+			  AND admission.state IN ('open', 'draining')
+		  )
 		"#,
     )
     .bind(chunk.run_id)
     .bind(chunk.run_shard)
     .bind(chunk.id)
     .bind(lease_token)
+    .bind(chunk.write_epoch)
     .execute(db)
     .await?;
 
@@ -504,6 +563,7 @@ mod tests {
             }
         }
         let chunk = RunChunk {
+            write_epoch: 1,
             id: Uuid::now_v7(),
             run_id,
             run_shard: 7,

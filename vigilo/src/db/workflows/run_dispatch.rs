@@ -65,6 +65,7 @@ pub(crate) struct DispatchRoute {
     pub(crate) database_alias: String,
     pub(crate) placement_status: String,
     pub(crate) route_version: i64,
+    pub(crate) write_epoch: i64,
 }
 
 pub(crate) struct ClaimedDispatchRoute {
@@ -166,6 +167,10 @@ pub(crate) async fn recover_expired_chunk_leases(
             JOIN run_snapshots rs
               ON rs.run_id = rc.run_id
              AND rs.run_shard = rc.run_shard
+            JOIN local_shard_admissions admission
+              ON admission.run_id = rc.run_id
+             AND admission.run_shard = rc.run_shard
+             AND admission.state = 'open'
             WHERE rc.status = 'leased'
               AND rc.leased_until < now()
               AND rc.recovery_count < $1
@@ -225,9 +230,15 @@ pub(crate) async fn recover_expired_chunk_leases(
                     'run_id', recovered.run_id,
                     'run_shard', recovered.run_shard,
                     'chunk_id', recovered.id,
+                    'database_alias', admission.database_alias,
+                    'write_epoch', admission.write_epoch,
                     'recovery_count', recovered.recovery_count
                 )
             FROM recovered
+            JOIN local_shard_admissions admission
+              ON admission.run_id = recovered.run_id
+             AND admission.run_shard = recovered.run_shard
+             AND admission.state = 'open'
             ON CONFLICT (dedupe_key) DO NOTHING
             RETURNING id
         )
@@ -351,7 +362,8 @@ pub(crate) async fn claim_next_dispatch_route(
             c.run_shard,
             sp.database_alias,
             sp.status AS placement_status,
-            sp.route_version
+            sp.route_version,
+            sp.write_epoch
         FROM run_shard_dispatch_cursors c
         JOIN runs r
           ON r.id = c.run_id
@@ -752,7 +764,9 @@ async fn dispatch_routed_run_window_with_transactions(
                 $17::text AS agent_version,
                 $18::text AS prompt_config_id,
                 $19::text AS prompt_config_version,
-                $20::jsonb AS config_snapshot
+                $20::jsonb AS config_snapshot,
+                $21::text AS database_alias,
+                $22::bigint AS write_epoch
         ),
         snapshot_upsert AS (
             INSERT INTO run_snapshots (
@@ -854,9 +868,12 @@ async fn dispatch_routed_run_window_with_transactions(
                 jsonb_build_object(
                     'run_id', selected_chunks.run_id,
                     'run_shard', selected_chunks.run_shard,
-                    'chunk_id', selected_chunks.id
+                    'chunk_id', selected_chunks.id,
+                    'database_alias', snapshot_input.database_alias,
+                    'write_epoch', snapshot_input.write_epoch
                 )
             FROM selected_chunks
+            CROSS JOIN snapshot_input
             ON CONFLICT (dedupe_key) DO NOTHING
             RETURNING id
         ),
@@ -894,7 +911,7 @@ async fn dispatch_routed_run_window_with_transactions(
             claimed.run_shard,
             (SELECT COUNT(*)::bigint FROM chunk_events) AS chunk_ready_event_records_inserted,
             (SELECT COUNT(*)::bigint FROM marked_chunks) AS chunks_marked_dispatched,
-            $21::bigint AS run_started_event_records_inserted,
+            $23::bigint AS run_started_event_records_inserted,
             remaining_chunks.has_remaining AS has_remaining_chunks
         FROM claimed, remaining_chunks
         "#,
@@ -919,6 +936,8 @@ async fn dispatch_routed_run_window_with_transactions(
     .bind(&snapshot.prompt_config_id)
     .bind(&snapshot.prompt_config_version)
     .bind(&snapshot.config_snapshot)
+    .bind(&route.database_alias)
+    .bind(route.write_epoch)
     .bind(snapshot.run_started_event_records_inserted)
     .fetch_optional(&mut *execution_tx)
     .await
@@ -1492,6 +1511,7 @@ mod tests {
             database_alias: "primary".to_string(),
             placement_status: "active".to_string(),
             route_version: 1,
+            write_epoch: 1,
         };
         let snapshot = prepare_dispatch_run_snapshot(&pool, &route, Uuid::now_v7(), 60)
             .await
@@ -1508,6 +1528,15 @@ mod tests {
         assert_eq!(dispatched_chunk_count(&pool, run_id, 0).await, 0);
         assert_eq!(dispatched_chunk_count(&pool, run_id, 1).await, 1);
         assert_eq!(run_snapshot_count(&pool, run_id, 1).await, 1);
+        let payload = sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT payload FROM outbox_events WHERE event_type = 'run.chunk.ready' AND aggregate_id = $1 LIMIT 1",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(payload["database_alias"], "primary");
+        assert_eq!(payload["write_epoch"], 1);
     }
 
     #[sqlx::test(migrations = "../migrations")]

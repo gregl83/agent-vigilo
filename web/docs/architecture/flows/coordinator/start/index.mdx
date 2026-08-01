@@ -23,9 +23,9 @@ expired `creating` runs before chunk lease recovery and normal dispatch.
 
 Dispatch claims one open `run_id + run_shard` cursor per window. Dispatch and
 recovery insert one `run.chunk.ready` outbox event record per chunk, including
-the chunk's `run_shard` in the payload. Publication preserves that payload in
-the broker message so workers can claim chunk-local work without an extra
-routing lookup.
+the chunk's `run_shard`, execution `database_alias`, and `write_epoch` in the
+payload. Publication preserves that route hint so workers can claim
+chunk-local work without an extra control-database routing lookup.
 
 ## Execution Flow
 

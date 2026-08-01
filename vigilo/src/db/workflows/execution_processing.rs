@@ -1310,6 +1310,14 @@ async fn lock_live_chunk_lease(
           AND status = 'leased'
           AND lease_token = $4::uuid
           AND leased_until >= now()
+          AND EXISTS (
+              SELECT 1
+              FROM local_shard_admissions admission
+              WHERE admission.run_id = run_chunks.run_id
+                AND admission.run_shard = run_chunks.run_shard
+                AND admission.write_epoch = $5
+                AND admission.state IN ('open', 'draining')
+          )
         FOR UPDATE
         "#,
     )
@@ -1317,6 +1325,7 @@ async fn lock_live_chunk_lease(
     .bind(chunk.run_shard)
     .bind(chunk.id)
     .bind(lease_token)
+    .bind(chunk.write_epoch)
     .fetch_optional(&mut **tx)
     .await?;
 
@@ -2851,6 +2860,20 @@ mod tests {
 
         sqlx::query(
             r#"
+            INSERT INTO local_shard_admissions (
+                run_id, run_shard, database_alias, write_epoch, state
+            )
+            VALUES ($1::uuid, $2, 'primary', 1, 'open')
+            "#,
+        )
+        .bind(run_id)
+        .bind(run_shard)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
             INSERT INTO run_chunks (
                 id,
                 run_id,
@@ -2891,6 +2914,7 @@ mod tests {
         let chunk = sqlx::query_as::<_, crate::models::run_chunk::RunChunk>(
             r#"
             SELECT
+                1::bigint AS write_epoch,
                 id, run_id, run_shard, dataset_version_id, profile_group_id,
                 ordinal_start, ordinal_end, status, lease_token, leased_until,
                 created_at, updated_at

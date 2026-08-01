@@ -26,11 +26,11 @@ How `run_chunks.status` protects worker ownership and prevents stale workers fro
   placement. They cannot be dispatched while the control run is `creating`;
   dispatch cursors are created only after all placements are seeded.
 - Each chunk receives a stable `run_shard` in the 128-shard logical range. Child execution, attempt, aggregate, and evaluator result rows inherit that shard.
-- Each coordinator dispatch operation selects a bounded window from one run shard, marks each selected pending chunk with `dispatched_at`, and inserts one `run.chunk.ready` outbox event record per chunk.
+- Each coordinator dispatch operation selects a bounded window from one run shard, marks each selected pending chunk with `dispatched_at`, and inserts one `run.chunk.ready` outbox event record per chunk with its execution database alias and write epoch.
 - Coordinator recovery scans expired `leased` chunks for running runs, increments `recovery_count`, resets recoverable chunks to `pending`, and inserts a recovery-scoped `run.chunk.ready` outbox event record.
 - Chunks that exceed the configured recovery limit are marked `failed` so run finalization can complete with a failed gate instead of waiting forever.
 - Workers can claim a chunk only when the owning run is `running`.
-- A chunk is completed only after all executions in its case range are terminal. If any execution is `retry_scheduled`, the worker releases the chunk and delays the chunk-ready broker message until the next `retry_after` window.
+- A chunk is completed only after all executions in its case range are terminal and the local shard admission still accepts the claimed write epoch. If any execution is `retry_scheduled`, the worker releases the chunk and delays the chunk-ready broker message until the next `retry_after` window.
 - Completion and release both compare the stored lease timestamp to the worker's claimed lease.
 - Cancellation changes open chunks to `cancelled`.
 

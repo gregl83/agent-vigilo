@@ -17,20 +17,24 @@ grow beyond it. The default deployment stores control data and execution data
 in the same placement. As evaluation volume grows, execution-owned rows can move
 to additional PostgreSQL placements without changing coordinator or worker code.
 
-The design principle is simple: **control metadata decides where work lives;
-workers and coordinators follow the stored route.**
+The design principle is simple: **control metadata decides where work should
+live; each execution database enforces whether a routed write is still valid.**
 
 ## Routing At A Glance
 
 ```mermaid
 flowchart LR
     control[("Control database")]
-    route["Shard placement<br/>run_id + run_shard<br/>alias + route_version"]
+    route["Shard placement<br/>alias + route_version + write_epoch"]
     router["DatabaseRouter"]
+    message["Chunk-ready route hint<br/>alias + write_epoch"]
     target[("Execution database")]
+    admission["Local shard admission<br/>state + write_epoch"]
     data["Chunks, executions, results,<br/>summaries, and outbox"]
 
-    control --> route --> router --> target --> data
+    control --> route --> router --> target
+    route --> message --> router
+    target --> admission --> data
 ```
 
 - The system has 128 possible logical shard numbers, but a run uses only the
@@ -57,10 +61,12 @@ shard before invoking the single-shard move operation.
 | --- | --- |
 | Run shard | Stable logical segment identified by `run_id + run_shard`. |
 | Database placement | Catalog entry for one PostgreSQL target, named by a database alias. |
-| Shard placement | Authoritative mapping from one used run shard to a database alias, status, and route version. |
+| Shard placement | Desired mapping from one used run shard to a database alias, lifecycle, route version, and write epoch. |
 | Database router | Process-local resolver that turns stored placement metadata into a PostgreSQL pool. |
 | Execution route | Resolved shard placement plus its current execution database pool. |
 | Route version | Per-shard-placement generation incremented when its alias or status changes. |
+| Write epoch | Ownership generation incremented only when write ownership moves or is restored. |
+| Local shard admission | Execution-database row that accepts or rejects a write epoch in the same local transaction as the write. |
 | Dispatch cursor | Control-database progress row claimed while preparing the next window for one run shard. |
 | Chunk dispatch window | Bounded set of pending chunks selected from one run shard in one dispatch operation. |
 | Admission lock | Cooperative advisory lock shared by normal shard writers and held exclusively by shard movement. |
@@ -108,17 +114,17 @@ There is one active control-capable placement. Additional placements can have
 role `shard` and store execution data. Environment variables hold connection
 secrets; the placement catalog in PostgreSQL is the routing authority.
 
-Placement status and role are checked in the control database before Vigilo
-admits work. An `active` placement accepts new shard ownership. A `draining`
+Placement status and role are checked in the control database when routes and
+placement pools are resolved. An `active` placement accepts new shard ownership. A `draining`
 placement rejects new ownership but remains serviceable for shards it already
 owns, including dispatch, workers, recovery, reads, outbox publication, and
 movement away from the placement. A `disabled` placement is not serviceable.
 
-Connection parameters are process-lifetime configuration. Adding an alias,
-changing `database_url_env`, changing its URL value, or rotating credentials
-requires the catalog row and secret to be present before the relevant Vigilo
-processes start or restart. Runtime metadata checks do not distribute or reload
-database secrets.
+Connection secrets remain process configuration. A newly added alias is
+discovered and cached on first use when its referenced environment variable was
+already provisioned in the process. Changing `database_url_env`, changing its
+URL value, or rotating credentials still requires a process restart; control
+metadata does not distribute or reload secrets.
 
 ## Logical Shards
 
@@ -189,8 +195,13 @@ Coordinator dispatch is route-constrained:
 
 Workers stay chunk-local:
 
-- Worker messages carry `run_id`, `run_shard`, and `chunk_id`.
-- The worker resolves the execution route once, then claims chunks, loads the
+- Worker messages carry `run_id`, `run_shard`, `chunk_id`, `database_alias`, and
+  `write_epoch`.
+- The worker resolves the hinted database pool locally and validates the
+  execution database's admission row in the chunk-claim transaction. A valid
+  hint requires no control-database route read. Rejected hints invalidate the
+  route cache and perform one authoritative refresh.
+- After claiming, the worker loads the
   local run snapshot and case data, persists attempts/results/aggregates, and
   refreshes the shard summary in that execution placement.
 - Evaluator registry metadata remains a control-database read.
@@ -212,7 +223,7 @@ Cancellation fans out:
   `drained` first.
 - The workflow resolves the run's execution placements and cancels local
   chunks, executions, and attempts in each placement with bounded fanout. Each
-  group holds shared movement admission, revalidates its route fences, and
+  group holds shared movement admission, validates local settlement authority, and
   refreshes shard summaries in the cancellation transaction.
 - `run.cancelled` remains a control-database outbox event record.
 
@@ -396,13 +407,17 @@ stateDiagram-v2
 ```
 
 Worker claims, dispatch writes, and routed cancellation cleanup take the shared
-form of the same advisory lock and revalidate the alias, status, and
-`route_version`. The lock is cooperative: every protected writer must
-explicitly acquire it. PostgreSQL does not infer which rows belong to the
-shard.
+form of the shard advisory lock and validate the local admission state and
+`write_epoch` in their execution-database transaction. The lock is cooperative:
+every protected writer must explicitly acquire it. PostgreSQL does not infer
+which rows belong to the shard.
 
-The route fence is the expected alias, placement status, and `route_version`.
-After movement changes any value, an older route is rejected before writing.
+`route_version` is the control-plane CAS token for lifecycle changes.
+`write_epoch` is the data-plane ownership token carried by work. Movement keeps
+the epoch stable through `copying` and `draining`, closes the source at the next
+epoch before activating the target, then opens the target at that epoch. A
+crash can therefore leave a retryable no-writer gap, but never two admitted
+writers.
 The source transaction that changes a shard row also upserts its key into the
 move journal. Replay rereads current source state: existing rows are upserted
 in dependency order and missing rows are deleted in reverse dependency order.
@@ -442,9 +457,10 @@ full-fingerprint fields empty so route activation does not add table scans to
 the exclusive freeze.
 
 Every route alias or status change increments `shard_placements.route_version`.
-Execution route caches are accepted only while alias, status, and
-`route_version` still match control metadata, so stale cached active routes are
-fenced before new dispatch or worker claims continue.
+Ownership transfer or restoration also increments
+`shard_placements.write_epoch`. Route caches are invalidated on local admission
+rejection; correctness does not depend on cache freshness because the
+execution database rejects stale epochs locally.
 
 Moved shard-owned tables:
 

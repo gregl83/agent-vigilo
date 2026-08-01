@@ -27,12 +27,16 @@ sequenceDiagram
             Vigilo->>Vigilo: Cancel consumer loop and wait for service stop
             Vigilo-->>User: Success response
         else Delivery received
-            Queue-->>Vigilo: Chunk-ready broker message
+            Queue-->>Vigilo: Chunk-ready message with alias and write epoch
             Vigilo->>Vigilo: Deserialize message payload
-            Vigilo->>ControlDB: Resolve execution route
-            ControlDB-->>Vigilo: Database alias and placement status
-            Vigilo->>ExecutionDB: Claim chunk lease
+            Vigilo->>ExecutionDB: Validate local admission and claim chunk lease
             ExecutionDB-->>Vigilo: Claimed chunk or no claim
+
+            opt Route hint rejected
+                Vigilo->>ControlDB: Refresh authoritative route once
+                ControlDB-->>Vigilo: Current alias, lifecycle, and write epoch
+                Vigilo->>ExecutionDB: Validate refreshed admission and retry claim
+            end
 
             alt Chunk claimed
                 Vigilo->>ExecutionDB: Load run snapshot and case batch

@@ -30,7 +30,8 @@ Which process owns each state transition and which database guard prevents confl
 | Claim token | Opaque fencing value that must still match when a claim is renewed or settled. |
 | Row lock | PostgreSQL-enforced lock on selected rows for the duration of a transaction. |
 | Admission lock | Cooperative transaction-scoped advisory lock shared by normal shard writers and held exclusively by shard movement. |
-| Route fence | Expected database alias, placement status, and `route_version` checked before a routed write. |
+| Route CAS | Expected alias, lifecycle, and `route_version` used to serialize control-plane changes. |
+| Write epoch | Monotonic ownership token validated against local shard admission in the write transaction. |
 
 The [Glossary](/docs/glossary) provides the complete ownership and concurrency definitions.
 
@@ -41,6 +42,9 @@ The [Glossary](/docs/glossary) provides the complete ownership and concurrency d
 - Coordinators own expired run-creation recovery, expired chunk lease recovery,
   run dispatch, run finalization, and outbox publishing.
 - Workers own chunk leases, attempt leases, execution attempt allocation, retry scheduling, and execution/attempt terminal transitions. Chunk-local worker state is addressed by `run_id + run_shard + chunk_id`.
+- Chunk-ready messages carry the execution alias and write epoch. Workers use
+  the hinted pool without a control lookup on the normal path; a rejected hint
+  triggers cache invalidation and an authoritative route refresh.
 - Database guards are the authority boundary: creation and coordinator leases,
   idempotent seed checks, shared run-state locks, chunk and attempt leases,
   conflict keys, current-attempt checks, worker ownership checks, and outbox

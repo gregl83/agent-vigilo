@@ -20,7 +20,9 @@ Describes the major internal responsibilities of the worker runtime.
 
 ## Notes
 
-- Workers consume `run.chunk.ready` broker messages carrying `run_id`, `run_shard`, and `chunk_id`, then claim chunk leases before loading case data.
+- Workers consume `run.chunk.ready` broker messages carrying `run_id`,
+  `run_shard`, `chunk_id`, `database_alias`, and `write_epoch`, then validate
+  local shard admission while claiming the chunk lease.
 - `vigilo worker start` defaults to one in-flight chunk per worker process. `--max-inflight-chunks` / `VIGILO_WORKER_MAX_INFLIGHT_CHUNKS` can raise that limit, and RabbitMQ prefetch is set to the same value.
 - Workers attach a process `worker_id`, host label, internal queue message UUID, broker message id, attempt lease, and heartbeat timestamp to newly allocated attempts.
 - While a chunk is processing, the worker renews the chunk lease and current running attempt leases. Terminal execution transitions require current-attempt authority and a live attempt lease for that worker.

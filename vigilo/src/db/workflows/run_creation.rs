@@ -18,9 +18,16 @@ use tracing::{
 };
 use uuid::Uuid;
 
-use super::run_create::{
-    self,
-    RunShardPlacementAssignment,
+use super::{
+    local_shard_admission::{
+        LocalShardAdmissionDraft,
+        LocalShardAdmissionState,
+        upsert_local_shard_admission,
+    },
+    run_create::{
+        self,
+        RunShardPlacementAssignment,
+    },
 };
 use crate::{
     context::database,
@@ -688,7 +695,7 @@ async fn seed_execution_placement(
     placement_shards.sort_unstable();
     placement_shards.dedup();
     let (stored_count, stored_hash) =
-        case_projection::projection_fingerprint(db, run_id, &placement_shards).await?;
+        case_projection::projection_fingerprint(&db, run_id, &placement_shards).await?;
     if stored_count != progress.expected_case_count || stored_hash != progress.case_projection_hash
     {
         return Err(run_create::seed_invariant_error(format!(
@@ -698,6 +705,20 @@ async fn seed_execution_placement(
     }
 
     let mut tx = db.begin().await?;
+    for run_shard in placement_shards {
+        upsert_local_shard_admission(
+            &mut *tx,
+            LocalShardAdmissionDraft {
+                run_id,
+                run_shard,
+                database_alias: database_alias.to_string(),
+                write_epoch: 1,
+                state: LocalShardAdmissionState::Open,
+                redirect_database_alias: None,
+            },
+        )
+        .await?;
+    }
     run_create::bulk_insert_run_chunks(&mut tx, run_id, draft.dataset_version_id, chunks).await?;
     tx.commit().await?;
     Ok(true)

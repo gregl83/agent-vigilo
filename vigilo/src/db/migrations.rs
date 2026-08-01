@@ -164,7 +164,7 @@ mod tests {
             INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
             VALUES ($1::uuid, 42, 'primary', 'active')
             RETURNING run_id, run_shard, database_alias, status, move_target_database_alias,
-                      route_version, created_at, updated_at
+                      route_version, write_epoch, created_at, updated_at
             "#,
         )
         .bind(run_id)

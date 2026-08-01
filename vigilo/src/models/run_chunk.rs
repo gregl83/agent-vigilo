@@ -38,6 +38,10 @@ pub(crate) struct RunChunkDraft {
 /// Persisted run scheduling chunk.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub(crate) struct RunChunk {
+    /// Route generation admitted for this in-memory lease; not persisted on the chunk row.
+    #[serde(skip, default)]
+    #[sqlx(default)]
+    pub(crate) write_epoch: i64,
     /// Chunk id, unique within the run and shard key.
     pub(crate) id: Uuid,
     /// Parent run id.

@@ -19,7 +19,11 @@ import decisionFlowDiagram from './decision-flow.mmd';
 
 How `vigilo worker start` runs a long-lived worker consumer that processes chunk-ready broker messages until shutdown, reopening the broker consumer after transient RabbitMQ interruptions.
 
-Chunk-ready broker messages carry `run_id`, `run_shard`, and `chunk_id`. The worker uses that tuple to claim a partition-local chunk and to keep execution, attempt, aggregate, and evaluator-result writes on the same logical shard.
+Chunk-ready broker messages carry `run_id`, `run_shard`, `chunk_id`,
+`database_alias`, and `write_epoch`. The worker resolves the hinted pool and
+claims the chunk only when the execution database accepts that epoch locally.
+Stale hints are refreshed from control metadata; valid hints avoid a
+control-database route lookup.
 
 By default, one worker process keeps one chunk in flight at a time. Set `--max-inflight-chunks` or `VIGILO_WORKER_MAX_INFLIGHT_CHUNKS` to allow multiple chunk messages to be processed concurrently by the same process. RabbitMQ prefetch is set to the same value, so the worker only reserves chunk messages it has capacity to run.
 

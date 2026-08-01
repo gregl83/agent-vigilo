@@ -29,10 +29,14 @@ sequenceDiagram
             Vigilo->>Queue: Acknowledge message
             Vigilo-->>User: Success response
         else Valid payload
-            Vigilo->>ControlDB: Resolve execution route
-            ControlDB-->>Vigilo: Database alias and placement status
-            Vigilo->>ExecutionDB: Claim chunk lease
+            Vigilo->>ExecutionDB: Validate hinted write epoch and claim chunk lease
             ExecutionDB-->>Vigilo: Claimed chunk or no claim
+
+            opt Route hint rejected
+                Vigilo->>ControlDB: Refresh authoritative route once
+                ControlDB-->>Vigilo: Current alias, lifecycle, and write epoch
+                Vigilo->>ExecutionDB: Validate refreshed admission and retry claim
+            end
 
             alt Chunk not claimable
                 Vigilo->>Queue: Acknowledge duplicate or stale message

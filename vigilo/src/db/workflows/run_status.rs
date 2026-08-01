@@ -286,6 +286,7 @@ mod tests {
             placement_config: PlacementConfig::default_single_database(),
             control_pool: OnceCell::new(),
             placement_pools: OnceCell::new(),
+            dynamic_placement_pools: moka::future::Cache::builder().max_capacity(1_000).build(),
             shard_placement_cache: new_shard_placement_cache(),
         };
         assert!(database_router.control_pool.set(pool).is_ok());

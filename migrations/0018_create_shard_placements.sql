@@ -5,6 +5,7 @@ CREATE TABLE shard_placements (
     status TEXT NOT NULL CHECK (status IN ('active', 'copying', 'draining', 'moving')),
     move_target_database_alias TEXT REFERENCES database_placements(alias),
     route_version BIGINT NOT NULL DEFAULT 1 CHECK (route_version > 0),
+    write_epoch BIGINT NOT NULL DEFAULT 1 CHECK (write_epoch > 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
@@ -49,6 +50,9 @@ COMMENT ON CONSTRAINT ck_shard_placements_move_target_lifecycle ON shard_placeme
 
 COMMENT ON COLUMN shard_placements.route_version IS
     'Monotonic fencing token incremented whenever the route alias or lifecycle changes. Cached routes are valid only while alias, status, and route_version still match control metadata.';
+
+COMMENT ON COLUMN shard_placements.write_epoch IS
+    'Monotonic execution ownership generation. It changes only when local write ownership is closed, transferred, or restored.';
 
 COMMENT ON INDEX idx_shard_placements_database_alias_status IS
     'Lookup index for routing and administrative scans grouped by database placement and dispatchability status.';

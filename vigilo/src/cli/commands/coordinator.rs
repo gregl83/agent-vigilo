@@ -329,7 +329,7 @@ async fn recover_expired_chunk_leases(
         let db = database_router.execution_database(&alias).await?;
         let recovery_started = Instant::now();
         let stats = run_dispatch::recover_expired_chunk_leases(
-            db,
+            &db,
             config.chunk_lease_max_recoveries,
             config.chunk_lease_recovery_batch_size,
         )
@@ -491,6 +491,9 @@ async fn dispatch_ready_chunk_windows(
                 "dispatch route changed before execution pool resolution"
             );
             dispatch_claim.control_tx.rollback().await?;
+            database_router
+                .invalidate_execution_placement(route.run_id, route.run_shard)
+                .await;
             continue;
         }
         let execution_pool_resolution_ms = execution_pool_started.elapsed().as_millis() as u64;
@@ -590,10 +593,10 @@ async fn publish_outbox_events(
     let batch = run_placement_operations(aliases, |alias| async move {
         let db = database_router.placement(&alias).await?;
         let backlog_started = Instant::now();
-        let outbox_backlog = outbox_events::count_publishable_outbox_backlog(db).await?;
+        let outbox_backlog = outbox_events::count_publishable_outbox_backlog(&db).await?;
         let outbox_backlog_query_ms = backlog_started.elapsed().as_millis() as u64;
         let publish_started = Instant::now();
-        let alias_stats = publish_pending_events(db, publisher, config).await?;
+        let alias_stats = publish_pending_events(&db, publisher, config).await?;
         let outbox_publish_ms = publish_started.elapsed().as_millis() as u64;
         Ok((
             alias_stats,
@@ -803,7 +806,7 @@ async fn collect_run_shard_summaries(
                 }
 
                 let Some(summary) =
-                    run_shard_summary::select_run_shard_summary(db, run_id, placement.run_shard)
+                    run_shard_summary::select_run_shard_summary(&db, run_id, placement.run_shard)
                         .await?
                 else {
                     complete = false;
