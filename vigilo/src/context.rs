@@ -1,10 +1,11 @@
 //! Lazily initialized process context.
 //!
-//! Commands receive a cloned [`Context`] and request services on demand:
+//! Commands receive a cloned [`Context`] and request configured services on demand:
 //! database router, HTTP client, message queue client, output buffer,
 //! evaluator registry cache, and Wasm runtime. Service modules in `context::*`
 //! should remain thin initialization boundaries; domain behavior belongs in
-//! runtime, db, mq, or command modules.
+//! runtime, db, mq, or command modules. Message-queue configuration is present
+//! only for coordinator and worker commands.
 
 use std::sync::Arc;
 
@@ -29,27 +30,21 @@ pub(crate) struct Context(Arc<ContextInner>);
 
 impl Context {
     pub fn new(
-        database_uri: String,
-        database_max_connections: u32,
-        placement_config: database::PlacementConfig,
-        mq_uri: String,
+        database_config: database::Config,
+        mq_uri: Option<String>,
         wasm_config: wasm::Config,
         output_format: output::OutputFormat,
     ) -> Self {
         Self(Arc::new(ContextInner {
             dbr: database::Context {
-                config: database::Config {
-                    uri: database_uri,
-                    max_connections: database_max_connections,
-                    placement_config,
-                },
+                config: database_config,
                 cell: Default::default(),
             },
             http: http::Context {
                 cell: Default::default(),
             },
             mq: messaging::Context {
-                config: crate::mq::Config::new(mq_uri),
+                config: mq_uri.map(crate::mq::Config::new),
                 cell: Default::default(),
             },
             out: output::Context {

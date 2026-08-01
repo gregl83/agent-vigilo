@@ -5,16 +5,10 @@
 //! behavior in command/runtime modules; the entry point should stay limited to
 //! process setup, error reporting, and exit-code selection.
 
-//! Binary entry point for the `agent-vigilo` CLI.
-//!
-//! This module wires clap argument parsing, process logging, shared runtime
-//! context construction, and top-level command dispatch. Keep application
-//! behavior in command/runtime modules; the entry point should stay limited to
-//! process setup, error reporting, and exit-code selection.
-
 use std::{
     io::stderr,
     process::ExitCode,
+    time::Duration,
 };
 
 use clap::Parser;
@@ -36,11 +30,7 @@ use cli::{
     Executable,
 };
 mod context;
-use context::{
-    Context,
-    database::PlacementConfig,
-    wasm,
-};
+use context::Context;
 mod contracts;
 mod db;
 mod evaluators;
@@ -80,37 +70,24 @@ async fn main() -> ExitCode {
         Ok(app) => {
             init_logger(app.quiet, app.verbose);
 
-            let wasm_config = wasm::Config {
-                max_memory_bytes: app.wasm_max_memory_bytes,
-                max_table_elements: app.wasm_max_table_elements,
-                max_instances: app.wasm_max_instances,
-                max_memories: app.wasm_max_memories,
-                max_tables: app.wasm_max_tables,
-                fuel_per_evaluation: app.wasm_fuel_per_evaluation,
-                timeout_ms: app.wasm_timeout_ms,
-                epoch_tick_interval_ms: app.wasm_epoch_tick_interval_ms,
-                max_concurrent_evaluations: app.wasm_max_concurrent_evaluations,
-                max_log_message_bytes: app.wasm_max_log_message_bytes,
-                max_log_messages: app.wasm_max_log_messages,
-            };
-            let placement_config = match PlacementConfig::new(
-                app.control_database_alias.clone(),
-                app.default_shard_database_alias.clone(),
-                app.shard_assignment_policy.clone(),
-            ) {
+            let command_context = match app.command.context_config(&app.control_database_alias) {
                 Ok(config) => config,
                 Err(e) => {
-                    error!(error = %e, "invalid database placement configuration");
+                    error!(error = %e, "invalid command configuration");
                     return ExitCode::FAILURE;
                 }
             };
 
             let context = Context::new(
-                app.database_url.clone(),
-                app.database_max_connections,
-                placement_config,
-                app.messaging_url.clone(),
-                wasm_config,
+                context::database::Config::new(
+                    app.database_url.clone(),
+                    app.database_pool_max_connections_per_target,
+                    Duration::from_secs(app.database_acquire_timeout_seconds),
+                    command_context.circuit_breaker,
+                    command_context.placement,
+                ),
+                command_context.messaging_url,
+                command_context.wasm,
                 app.output_format,
             );
 

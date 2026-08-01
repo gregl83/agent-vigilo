@@ -25,6 +25,13 @@ starting `coordinator` or `worker` may also start setup/config services.
 In the sharded topology, shard setup waits for primary setup so the shared
 Cargo cache is not written by two setup jobs at once.
 
+Compose passes configuration by service responsibility: all Vigilo services
+receive database-client settings, only setup receives placement-bootstrap
+settings, only the coordinator receives creation and coordinator settings, and
+only coordinator and worker services receive `MESSAGING_URL`. This mirrors the
+CLI command scopes and prevents unrelated configuration from becoming a
+startup dependency.
+
 ## Agent Model
 
 The `agent` service runs llama.cpp and expects this host file:

@@ -10,7 +10,45 @@ keywords:
 
 # Runtime Limits
 
-These process-level settings bound evaluator execution resource use. They can be supplied as CLI flags or environment variables.
+These settings bound database and evaluator resource use. They can be supplied
+as CLI flags or environment variables. Vigilo parses subsystem settings only
+for commands that consume that subsystem; unrelated configuration cannot block
+a database-only command.
+
+## Command Scope
+
+```mermaid
+flowchart LR
+    root["All commands<br/>database client + output"]
+    create["run create<br/>placement + creation + breaker"]
+    coordinator["coordinator<br/>messaging + creation + breaker"]
+    worker["worker<br/>messaging + Wasm"]
+    evaluator["setup / evaluator publish or test<br/>Wasm"]
+
+    root --> create
+    root --> coordinator
+    root --> worker
+    root --> evaluator
+```
+
+`DATABASE_URL`, database-pool settings, `VIGILO_CONTROL_DATABASE_ALIAS`, and
+output settings are root options because every current command uses the control
+database. `MESSAGING_URL` is accepted only by `coordinator` and `worker`.
+Wasm limits are accepted only by `worker`, `setup`, `evaluator publish`, and
+`evaluator test`. Command-scoped CLI flags follow their owning command, while
+the existing environment-variable names remain compatible.
+
+```bash
+vigilo coordinator --messaging-url amqp://broker start
+vigilo worker --messaging-url amqp://broker --wasm-timeout-ms 5000 start
+vigilo run create --shard-assignment-policy spread-active \
+  --profile-file profile.yaml --dataset-file dataset.yaml
+```
+
+`DATABASE_MAX_CONNECTIONS` is a limit for each lazily initialized database
+pool, not an aggregate process limit. A process that contacts several database
+aliases can own one pool per alias; size the setting against the database
+connection budget and number of processes.
 
 ## Terms On This Page
 
@@ -25,6 +63,29 @@ These process-level settings bound evaluator execution resource use. They can be
 
 See the [Glossary](/docs/glossary) for chunk, attempt, and broker-message terms.
 
+## Database Failure Isolation
+
+Coordinator execution-database operations use one process-local circuit breaker
+per database alias. Repeated connection-level failures open only that alias's
+circuit. Durable creation, recovery, dispatch, finalization, and outbox work is
+left pending while the coordinator continues with healthy aliases. After the
+cooldown, one half-open probe tests recovery. Explicit database and shard
+administration bypasses the breaker.
+
+| Flag | Environment | Scope | Default | Purpose |
+| --- | --- | --- | ---: | --- |
+| `--database-acquire-timeout-seconds` | `VIGILO_DATABASE_ACQUIRE_TIMEOUT_SECONDS` | All commands | `10` | Maximum wait to acquire a PostgreSQL connection. |
+| `--database-circuit-breaker-enabled` | `VIGILO_DATABASE_CIRCUIT_BREAKER_ENABLED` | `coordinator`, `run create` | `true` | Enables process-local execution-database circuit breakers. |
+| `--database-circuit-failure-threshold` | `VIGILO_DATABASE_CIRCUIT_FAILURE_THRESHOLD` | `coordinator`, `run create` | `3` | Consecutive availability failures required to open an alias's circuit. |
+| `--database-circuit-initial-open-seconds` | `VIGILO_DATABASE_CIRCUIT_INITIAL_OPEN_SECONDS` | `coordinator`, `run create` | `10` | Initial open interval before one recovery probe is admitted. |
+| `--database-circuit-max-open-seconds` | `VIGILO_DATABASE_CIRCUIT_MAX_OPEN_SECONDS` | `coordinator`, `run create` | `120` | Maximum open interval after repeated failed probes. |
+
+I/O, TLS, protocol, connection-class, shutdown, target resource, and pool
+acquisition timeout failures affect the breaker. Route state, constraints,
+serialization failures, deadlocks, lock contention, and missing secrets do not.
+Cooldowns use process-local jitter, so coordinators do not all probe at the same
+instant.
+
 ## Worker Chunk Concurrency
 
 `vigilo worker start` processes chunk-ready broker messages with bounded per-process concurrency. The default keeps one chunk in flight per worker process, which matches the safest local/dev posture and scales horizontally by running more workers. Larger deployments can raise the limit to improve process utilization when chunks are uneven, agent calls are I/O-bound, or retry waits create tail latency.
@@ -32,6 +93,18 @@ See the [Glossary](/docs/glossary) for chunk, attempt, and broker-message terms.
 | Flag | Environment | Default | Purpose |
 | --- | --- | ---: | --- |
 | `--max-inflight-chunks` | `VIGILO_WORKER_MAX_INFLIGHT_CHUNKS` | `1` | Maximum unacked chunk messages processed concurrently by one worker process. RabbitMQ stream prefetch is set to the same value so a worker does not reserve more chunk messages than it can actively process. |
+
+## Run Creation Paging
+
+Immediate creation and coordinator recovery use the same explicitly validated
+paging policy.
+
+| Flag | Environment | Scope | Default | Purpose |
+| --- | --- | --- | ---: | --- |
+| `--run-creation-case-batch-size` | `VIGILO_RUN_CREATION_CASE_BATCH_SIZE` | `run create`, `coordinator` | `1000` | Maximum cases written in one creation page. |
+| `--run-creation-case-page-budget` | `VIGILO_RUN_CREATION_CASE_PAGE_BUDGET` | `run create`, `coordinator` | `64` | Maximum pages written for one placement attempt. |
+| `--default-shard-database-alias` | `VIGILO_DEFAULT_SHARD_DATABASE_ALIAS` | `setup`, `run create` | `primary` | Default target for `single-default` assignment. |
+| `--shard-assignment-policy` | `VIGILO_SHARD_ASSIGNMENT_POLICY` | `setup`, `run create` | `single-default` | Placement policy used for newly created runs. |
 
 When increasing this value, size the database pool, agent endpoint capacity, and Wasm evaluator semaphore together. A practical upper-bound check is:
 
@@ -42,7 +115,7 @@ wasm_max_concurrent_evaluations <= CPU and memory budget
 
 ## Wasm Evaluator Isolation
 
-Each evaluator invocation runs in a fresh Wasmtime store with CPU, memory, table, instance, timeout, and logging limits. Workers also use a process-wide semaphore so many valid evaluators cannot exhaust host resources at the same time.
+Each evaluator invocation runs in a fresh Wasmtime store with CPU, memory, table, instance, timeout, and logging limits. Workers also use a process-wide semaphore so many valid evaluators cannot exhaust host resources at the same time. These flags are scoped to `worker`, `setup`, `evaluator publish`, and `evaluator test`.
 
 | Flag | Environment | Default | Purpose |
 | --- | --- | ---: | --- |

@@ -844,17 +844,17 @@ pub struct Component {
     pub serialized: Vec<u8>,
 }
 
-const DEFAULT_MAX_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
-const DEFAULT_MAX_TABLE_ELEMENTS: u64 = 10_000;
-const DEFAULT_MAX_INSTANCES: u64 = 3;
-const DEFAULT_MAX_MEMORIES: u64 = 1;
-const DEFAULT_MAX_TABLES: u64 = 2;
-const DEFAULT_FUEL_PER_EVALUATION: u64 = 50_000_000;
-const DEFAULT_TIMEOUT_MS: u64 = 5_000;
-const DEFAULT_EPOCH_TICK_INTERVAL_MS: u64 = 10;
-const DEFAULT_MAX_CONCURRENT_EVALUATIONS: u64 = 8;
-const DEFAULT_MAX_LOG_MESSAGE_BYTES: u64 = 4 * 1024;
-const DEFAULT_MAX_LOG_MESSAGES: u32 = 128;
+pub(crate) const DEFAULT_MAX_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_TABLE_ELEMENTS: u64 = 10_000;
+pub(crate) const DEFAULT_MAX_INSTANCES: u64 = 3;
+pub(crate) const DEFAULT_MAX_MEMORIES: u64 = 1;
+pub(crate) const DEFAULT_MAX_TABLES: u64 = 2;
+pub(crate) const DEFAULT_FUEL_PER_EVALUATION: u64 = 50_000_000;
+pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 5_000;
+pub(crate) const DEFAULT_EPOCH_TICK_INTERVAL_MS: u64 = 10;
+pub(crate) const DEFAULT_MAX_CONCURRENT_EVALUATIONS: u64 = 8;
+pub(crate) const DEFAULT_MAX_LOG_MESSAGE_BYTES: u64 = 4 * 1024;
+pub(crate) const DEFAULT_MAX_LOG_MESSAGES: u32 = 128;
 
 #[derive(Debug, Clone)]
 pub struct Config {

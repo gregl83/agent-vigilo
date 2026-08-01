@@ -27,12 +27,13 @@ flowchart LR
     control[("Control database")]
     route["Shard placement<br/>alias + route_version + write_epoch"]
     router["DatabaseRouter"]
+    breaker["Database circuit breaker<br/>process-local by alias"]
     message["Chunk-ready route hint<br/>alias + write_epoch"]
     target[("Execution database")]
     admission["Local shard admission<br/>state + write_epoch"]
     data["Chunks, executions, results,<br/>summaries, and outbox"]
 
-    control --> route --> router --> target
+    control --> route --> router --> breaker --> target
     route --> message --> router
     target --> admission --> data
 ```
@@ -63,6 +64,7 @@ shard before invoking the single-shard move operation.
 | Database placement | Catalog entry for one PostgreSQL target, named by a database alias. |
 | Shard placement | Desired mapping from one used run shard to a database alias, lifecycle, route version, and write epoch. |
 | Database router | Process-local resolver that turns stored placement metadata into a PostgreSQL pool. |
+| Database circuit breaker | Process-local coordinator admission that temporarily skips one unavailable execution database alias without changing durable routing. |
 | Execution route | Resolved shard placement plus its current execution database pool. |
 | Route version | Per-shard-placement generation incremented when its alias or status changes. |
 | Write epoch | Ownership generation incremented only when write ownership moves or is restored. |
@@ -125,6 +127,14 @@ discovered and cached on first use when its referenced environment variable was
 already provisioned in the process. Changing `database_url_env`, changing its
 URL value, or rotating credentials still requires a process restart; control
 metadata does not distribute or reload secrets.
+
+Placement pool configuration resolves the requested alias lazily. An unset
+secret for one placement therefore fails that placement without preventing a
+healthy alias from initializing. Coordinator runtime operations also pass
+through a process-local per-alias circuit breaker. Open circuits defer durable
+work for the unavailable alias while other aliases continue. Breaker state is
+neither shared between coordinators nor persisted, and explicit administrative
+commands bypass it.
 
 ## Logical Shards
 
@@ -371,7 +381,10 @@ Creation stores expected counts, a stable BLAKE3 projection hash, and the last
 acknowledged ordinal per placement. The execution transaction commits before
 the control cursor advances, so an ambiguous response safely replays the same
 immutable page. `VIGILO_RUN_CREATION_CASE_BATCH_SIZE` bounds page rows, and
-`VIGILO_RUN_CREATION_CASE_PAGE_BUDGET` bounds work per coordinator claim.
+`VIGILO_RUN_CREATION_CASE_PAGE_BUDGET` bounds work per coordinator claim. Both
+settings are parsed only by `run create` and `coordinator`, then passed as typed
+workflow configuration rather than read from the environment inside database
+code.
 
 ## Moving A Run Shard
 

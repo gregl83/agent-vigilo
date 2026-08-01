@@ -13,13 +13,16 @@ use crate::mq::{
 };
 
 pub struct Context {
-    pub(crate) config: Config,
+    pub(crate) config: Option<Config>,
     pub(crate) cell: OnceCell<Client>,
 }
 impl Context {
     pub async fn get(&self) -> anyhow::Result<&Client> {
+        let config = self.config.clone().ok_or_else(|| {
+            anyhow::anyhow!("messaging configuration is unavailable for this command")
+        })?;
         self.cell
-            .get_or_try_init(|| async { Ok(Client::new(self.config.clone())) })
+            .get_or_try_init(|| async { Ok(Client::new(config)) })
             .await
     }
 }

@@ -30,11 +30,17 @@ sequenceDiagram
             Vigilo->>ControlDB: Persist creation progress or activate seeded runs
             Vigilo->>ControlDB: List active execution placements
             loop Active execution placements
-                Vigilo->>ExecutionDB: Recover expired chunk leases for alias
-                alt Placement succeeds
+                Vigilo->>Vigilo: Acquire alias circuit permission
+                alt Circuit is open
+                    Note over Vigilo,ExecutionDB: Leave durable work pending
+                else Circuit is closed or half-open probe
+                    Vigilo->>ExecutionDB: Recover expired chunk leases for alias
+                end
+                alt Placement succeeds or probe recovers
                     ExecutionDB-->>Vigilo: Recovered and failed chunk counts
-                else Placement fails
-                    Vigilo->>Vigilo: Classify, count, and continue aliases
+                    Vigilo->>Vigilo: Reset or close alias circuit
+                else Availability failure reaches threshold
+                    Vigilo->>Vigilo: Open alias circuit and continue aliases
                 end
             end
             Vigilo->>ControlDB: Log dispatch cursor backlog

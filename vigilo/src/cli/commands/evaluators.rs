@@ -21,9 +21,12 @@ use tracing::{
 
 use super::{
     Executable,
-    args::parsers::{
-        parse_dir,
-        parse_filepath,
+    args::{
+        WasmOptions,
+        parsers::{
+            parse_dir,
+            parse_filepath,
+        },
     },
 };
 use crate::{
@@ -68,6 +71,9 @@ pub(crate) enum SubCommand {
 
     /// Publish evaluator version
     Publish {
+        #[command(flatten)]
+        wasm: WasmOptions,
+
         /// Path to evaluator crate
         #[arg(value_parser = parse_dir)]
         evaluator_path: PathBuf,
@@ -102,6 +108,9 @@ pub(crate) enum SubCommand {
     },
     /// Execute a single evaluator with canonical test input
     Test {
+        #[command(flatten)]
+        wasm: WasmOptions,
+
         /// Fully qualified evaluator identifier (<namespace>/<name>:<version>)
         #[arg()]
         evaluator: String,
@@ -150,6 +159,7 @@ impl Executable for SubCommand {
         match self {
             SubCommand::List => list(context).await,
             SubCommand::Publish {
+                wasm: _,
                 evaluator_path,
                 release,
                 profile,
@@ -161,6 +171,7 @@ impl Executable for SubCommand {
                 query,
             } => search::exec(context, namespace, limit, query).await,
             SubCommand::Test {
+                wasm: _,
                 evaluator,
                 input,
                 input_file,
@@ -170,6 +181,15 @@ impl Executable for SubCommand {
                 state,
                 state_reason,
             } => set_state::exec(context, evaluator, state, state_reason).await,
+        }
+    }
+}
+
+impl SubCommand {
+    pub(crate) fn wasm_options(&self) -> Option<WasmOptions> {
+        match self {
+            Self::Publish { wasm, .. } | Self::Test { wasm, .. } => Some(*wasm),
+            _ => None,
         }
     }
 }

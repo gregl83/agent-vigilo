@@ -38,7 +38,13 @@ use tracing::{
 };
 use uuid::Uuid;
 
-use super::Executable;
+use super::{
+    Executable,
+    args::{
+        MessagingOptions,
+        WasmOptions,
+    },
+};
 use crate::{
     context::{
         Context,
@@ -467,6 +473,12 @@ pub(crate) enum SubCommand {
 #[derive(Debug, Args)]
 /// Arguments for `vigilo worker`.
 pub(crate) struct Command {
+    #[command(flatten)]
+    pub(crate) messaging: MessagingOptions,
+
+    #[command(flatten)]
+    pub(crate) wasm: WasmOptions,
+
     #[command(subcommand)]
     pub command: Option<SubCommand>,
 }

@@ -14,6 +14,8 @@ flowchart TD
     Event{Next service event?}
     Database{Database context available?}
     RecoverCreation[Resume expired creating runs]
+    Circuit{Alias circuit admits operation?}
+    CircuitSkip[Leave durable work pending and continue]
     Recover[Recover expired chunk leases]
     RecoveryIsolated[Count placement failure and continue aliases]
     Dispatch[Dispatch ready run-shard windows]
@@ -43,7 +45,10 @@ flowchart TD
     Database -- No --> ContextFail
     Database -- Yes --> RecoverCreation
 
-    RecoverCreation --> Recover
+    RecoverCreation --> Circuit
+    Circuit -- Open --> CircuitSkip
+    Circuit -- Closed or probe --> Recover
+    CircuitSkip --> Recover
     RecoverCreation -. Control recovery fails .-> CycleFail
 
     Recover --> Dispatch
@@ -78,5 +83,5 @@ flowchart TD
 
     class Start command
     class Success success
-    class CoordinatorId,Runner,Event,Database,RecoverCreation,Recover,RecoveryIsolated,Dispatch,DispatchIsolated,Finalize,FinalizeIsolated,Messaging,Outbox,OutboxIsolated,Wait,Shutdown,Stop system
+    class CoordinatorId,Runner,Event,Database,RecoverCreation,Circuit,CircuitSkip,Recover,RecoveryIsolated,Dispatch,DispatchIsolated,Finalize,FinalizeIsolated,Messaging,Outbox,OutboxIsolated,Wait,Shutdown,Stop system
     class ContextFail,CycleFail,ShutdownFail error

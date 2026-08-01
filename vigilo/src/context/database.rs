@@ -11,6 +11,8 @@
 //! generic runtime code, and arbitrary domain callers should prefer workflows
 //! over directly choosing the control or execution database.
 
+mod circuit_breaker;
+
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -20,6 +22,16 @@ use std::{
     },
 };
 
+pub(crate) use circuit_breaker::{
+    CircuitBreakerConfig,
+    CircuitOpen,
+    CircuitPermit,
+    CircuitTransition,
+    DEFAULT_FAILURE_THRESHOLD as DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
+    DEFAULT_INITIAL_OPEN as DEFAULT_CIRCUIT_INITIAL_OPEN,
+    DEFAULT_MAX_OPEN as DEFAULT_CIRCUIT_MAX_OPEN,
+    DatabaseCircuitBreakers,
+};
 use moka::future::Cache;
 use sqlx::{
     PgPool,
@@ -142,8 +154,28 @@ impl PlacementConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Config {
     pub(crate) uri: String,
-    pub(crate) max_connections: u32,
+    pub(crate) max_connections_per_pool: u32,
+    pub(crate) acquire_timeout: Duration,
+    pub(crate) circuit_breaker_config: CircuitBreakerConfig,
     pub(crate) placement_config: PlacementConfig,
+}
+
+impl Config {
+    pub(crate) fn new(
+        uri: String,
+        max_connections_per_pool: u32,
+        acquire_timeout: Duration,
+        circuit_breaker_config: CircuitBreakerConfig,
+        placement_config: PlacementConfig,
+    ) -> Self {
+        Self {
+            uri,
+            max_connections_per_pool,
+            acquire_timeout,
+            circuit_breaker_config,
+            placement_config,
+        }
+    }
 }
 
 pub(crate) struct Context {
@@ -164,8 +196,10 @@ impl Context {
 /// Resolves control and execution database pools from placement metadata.
 pub(crate) struct DatabaseRouter {
     pub(crate) uri: String,
-    pub(crate) max_connections: u32,
+    pub(crate) max_connections_per_pool: u32,
+    pub(crate) acquire_timeout: Duration,
     pub(crate) placement_config: PlacementConfig,
+    pub(crate) circuit_breakers: DatabaseCircuitBreakers,
     pub(crate) control_pool: OnceCell<PgPool>,
     #[allow(dead_code)]
     pub(crate) placement_pools: OnceCell<PlacementPools>,
@@ -195,8 +229,12 @@ impl DatabaseRouter {
     fn new(config: Config) -> Self {
         Self {
             uri: config.uri,
-            max_connections: config.max_connections,
+            max_connections_per_pool: config.max_connections_per_pool,
+            acquire_timeout: config.acquire_timeout,
             placement_config: config.placement_config,
+            circuit_breakers: circuit_breaker::DatabaseCircuitBreakers::new(
+                config.circuit_breaker_config,
+            ),
             control_pool: OnceCell::new(),
             placement_pools: OnceCell::new(),
             dynamic_placement_pools: Cache::builder().max_capacity(1_000).build(),
@@ -215,7 +253,8 @@ impl DatabaseRouter {
                 debug!("initializing postgres database connection");
 
                 PgPoolOptions::new()
-                    .max_connections(self.max_connections)
+                    .max_connections(self.max_connections_per_pool)
+                    .acquire_timeout(self.acquire_timeout)
                     .connect(&self.uri)
                     .await
                     .map_err(|error| {
@@ -239,6 +278,40 @@ impl DatabaseRouter {
 
     pub(crate) fn shard_assignment_policy(&self) -> &ShardAssignmentPolicy {
         &self.placement_config.shard_assignment_policy
+    }
+
+    /// Acquires process-local runtime permission to contact one execution database.
+    ///
+    /// Durable work remains pending when the circuit is open. Administrative
+    /// workflows use the normal pool methods directly and therefore retain an
+    /// explicit recovery path.
+    pub(crate) fn acquire_database_operation(
+        &self,
+        database_alias: &str,
+    ) -> Result<CircuitPermit, CircuitOpen> {
+        self.circuit_breakers
+            .acquire(database_alias, Instant::now())
+    }
+
+    pub(crate) fn record_database_operation_success(
+        &self,
+        permit: CircuitPermit,
+    ) -> Option<CircuitTransition> {
+        self.circuit_breakers.record_success(permit)
+    }
+
+    pub(crate) fn record_database_operation_error(
+        &self,
+        permit: CircuitPermit,
+        error: &anyhow::Error,
+    ) -> (bool, Option<CircuitTransition>) {
+        let (impact, transition) =
+            self.circuit_breakers
+                .record_error(permit, Instant::now(), error);
+        (
+            impact == circuit_breaker::FailureImpact::Unavailable,
+            transition,
+        )
     }
 
     pub(crate) fn control_database_alias(&self) -> &str {
@@ -339,8 +412,14 @@ impl DatabaseRouter {
                     placement.database_url_env
                 );
             }
+            let database_url = self.resolve_database_url_env(&placement.database_url_env)?;
             return Ok(pool
-                .get(&placement.alias, self.max_connections)
+                .get(
+                    &placement.alias,
+                    &database_url,
+                    self.max_connections_per_pool,
+                    self.acquire_timeout,
+                )
                 .await?
                 .clone());
         }
@@ -352,7 +431,6 @@ impl DatabaseRouter {
             .get_with(placement.alias.clone(), async move {
                 Arc::new(PlacementPool {
                     database_url_env,
-                    database_url,
                     pool: OnceCell::new(),
                 })
             })
@@ -365,7 +443,14 @@ impl DatabaseRouter {
                 placement.database_url_env
             );
         }
-        let pool = pool.get(&placement.alias, self.max_connections).await?;
+        let pool = pool
+            .get(
+                &placement.alias,
+                &database_url,
+                self.max_connections_per_pool,
+                self.acquire_timeout,
+            )
+            .await?;
         debug!(
             database_alias = %placement.alias,
             placement_pool_acquisition_ms = started.elapsed().as_millis() as u64,
@@ -520,10 +605,28 @@ impl DatabaseRouter {
 
         let pools = self.placement_pools().await?;
         if let Some(pool) = pools.pools_by_alias.get(alias) {
-            return Ok(pool.get(alias, self.max_connections).await?.clone());
+            let database_url = self.resolve_database_url_env(&pool.database_url_env)?;
+            return Ok(pool
+                .get(
+                    alias,
+                    &database_url,
+                    self.max_connections_per_pool,
+                    self.acquire_timeout,
+                )
+                .await?
+                .clone());
         }
         if let Some(pool) = self.dynamic_placement_pools.get(alias).await {
-            return Ok(pool.get(alias, self.max_connections).await?.clone());
+            let database_url = self.resolve_database_url_env(&pool.database_url_env)?;
+            return Ok(pool
+                .get(
+                    alias,
+                    &database_url,
+                    self.max_connections_per_pool,
+                    self.acquire_timeout,
+                )
+                .await?
+                .clone());
         }
         let placement = self.require_serviceable_placement(alias).await?;
         require_shard_capable_placement(&placement)?;
@@ -534,12 +637,19 @@ impl DatabaseRouter {
             .get_with(alias.to_string(), async move {
                 Arc::new(PlacementPool {
                     database_url_env,
-                    database_url,
                     pool: OnceCell::new(),
                 })
             })
             .await;
-        Ok(pool.get(alias, self.max_connections).await?.clone())
+        Ok(pool
+            .get(
+                alias,
+                &database_url,
+                self.max_connections_per_pool,
+                self.acquire_timeout,
+            )
+            .await?
+            .clone())
     }
 
     /// Acquires write admission for a previously resolved route.
@@ -913,14 +1023,11 @@ impl DatabaseRouter {
                 let mut pools_by_alias = HashMap::with_capacity(placements.len());
 
                 for placement in placements {
-                    let database_url =
-                        self.resolve_database_url_env(&placement.database_url_env)?;
                     let alias = placement.alias.clone();
                     pools_by_alias.insert(
                         alias,
                         PlacementPool {
                             database_url_env: placement.database_url_env,
-                            database_url,
                             pool: OnceCell::new(),
                         },
                     );
@@ -996,21 +1103,26 @@ pub(crate) struct PlacementPools {
 pub(crate) struct PlacementPool {
     database_url_env: String,
     #[allow(dead_code)]
-    database_url: String,
-    #[allow(dead_code)]
     pool: OnceCell<PgPool>,
 }
 
 impl PlacementPool {
     #[allow(dead_code)]
-    async fn get(&self, alias: &str, max_connections: u32) -> anyhow::Result<&PgPool> {
+    async fn get(
+        &self,
+        alias: &str,
+        database_url: &str,
+        max_connections_per_pool: u32,
+        acquire_timeout: Duration,
+    ) -> anyhow::Result<&PgPool> {
         self.pool
             .get_or_try_init(|| async {
                 debug!(database_alias = %alias, "initializing postgres placement connection");
 
                 PgPoolOptions::new()
-                    .max_connections(max_connections)
-                    .connect(&self.database_url)
+                    .max_connections(max_connections_per_pool)
+                    .acquire_timeout(acquire_timeout)
+                    .connect(database_url)
                     .await
                     .map_err(|error| {
                         let message =
@@ -1217,7 +1329,9 @@ mod tests {
         let context = Context {
             config: Config {
                 uri: "postgres://lazy-control-pool".to_string(),
-                max_connections: 5,
+                max_connections_per_pool: 5,
+                acquire_timeout: Duration::from_secs(10),
+                circuit_breaker_config: CircuitBreakerConfig::default(),
                 placement_config: PlacementConfig::default_single_database(),
             },
             cell: OnceCell::new(),
@@ -2014,6 +2128,32 @@ mod tests {
         );
     }
 
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
+    async fn unrelated_missing_placement_secret_does_not_block_healthy_database(pool: PgPool) {
+        let database_router = database_router_with_control_pool(pool);
+
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES ('shard_missing', 'VIGILO_TEST_MISSING_SHARD_URL', 'shard', 'active')
+            "#,
+        )
+        .execute(database_router.control().await.unwrap())
+        .await
+        .unwrap();
+
+        database_router
+            .placement(DEFAULT_DATABASE_ALIAS)
+            .await
+            .unwrap();
+        let error = database_router
+            .placement("shard_missing")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("VIGILO_TEST_MISSING_SHARD_URL"));
+    }
+
     fn database_router_with_control_pool(pool: PgPool) -> DatabaseRouter {
         database_router_with_control_pool_and_uri(
             pool,
@@ -2024,8 +2164,12 @@ mod tests {
     fn database_router_with_control_pool_and_uri(pool: PgPool, uri: String) -> DatabaseRouter {
         let database_router = DatabaseRouter {
             uri,
-            max_connections: 5,
+            max_connections_per_pool: 5,
+            acquire_timeout: Duration::from_secs(10),
             placement_config: PlacementConfig::default_single_database(),
+            circuit_breakers: circuit_breaker::DatabaseCircuitBreakers::new(
+                CircuitBreakerConfig::default(),
+            ),
             control_pool: OnceCell::new(),
             placement_pools: OnceCell::new(),
             dynamic_placement_pools: Cache::builder().max_capacity(1_000).build(),

@@ -2,8 +2,9 @@
 //!
 //! This module defines global options, shared output selection, and the
 //! `Executable` dispatch contract used by subcommands. Command implementations
-//! should live under `cli::commands`; this root should only own arguments that
-//! apply process-wide and values needed to construct [`crate::context::Context`].
+//! and subsystem-specific configuration live under `cli::commands`; this root
+//! owns only database-client, logging, and output options shared by every
+//! command.
 
 use async_trait::async_trait;
 use clap::{
@@ -42,77 +43,17 @@ pub(crate) struct App {
     #[arg(long, env = "DATABASE_URL")]
     pub database_url: String,
 
-    /// Maximum Postgres connections for this process
-    #[arg(long, env = "DATABASE_MAX_CONNECTIONS", default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=256))]
-    pub database_max_connections: u32,
+    /// Maximum Postgres connections in each database pool
+    #[arg(long = "database-max-connections", env = "DATABASE_MAX_CONNECTIONS", value_name = "COUNT_PER_DATABASE", default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=256))]
+    pub database_pool_max_connections_per_target: u32,
+
+    /// Maximum seconds to acquire a PostgreSQL connection
+    #[arg(long, env = "VIGILO_DATABASE_ACQUIRE_TIMEOUT_SECONDS", default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=300))]
+    pub database_acquire_timeout_seconds: u64,
 
     /// Active control-capable database placement alias
     #[arg(long, env = "VIGILO_CONTROL_DATABASE_ALIAS", default_value = "primary")]
     pub control_database_alias: String,
-
-    /// Default shard-capable placement alias for newly created run shards
-    #[arg(
-        long,
-        env = "VIGILO_DEFAULT_SHARD_DATABASE_ALIAS",
-        default_value = "primary"
-    )]
-    pub default_shard_database_alias: String,
-
-    /// Shard assignment policy for newly created runs
-    #[arg(
-        long,
-        env = "VIGILO_SHARD_ASSIGNMENT_POLICY",
-        default_value = "single-default"
-    )]
-    pub shard_assignment_policy: String,
-
-    /// Messaging URL (connection string)
-    #[arg(long, env = "MESSAGING_URL")]
-    pub messaging_url: String,
-
-    /// Maximum linear memory bytes per Wasm evaluator invocation
-    #[arg(long, env = "VIGILO_WASM_MAX_MEMORY_BYTES", default_value_t = 67_108_864, value_parser = clap::value_parser!(u64).range(65_536..=1_073_741_824))]
-    pub wasm_max_memory_bytes: u64,
-
-    /// Maximum table elements per Wasm evaluator invocation
-    #[arg(long, env = "VIGILO_WASM_MAX_TABLE_ELEMENTS", default_value_t = 10_000, value_parser = clap::value_parser!(u64).range(1..=10_000_000))]
-    pub wasm_max_table_elements: u64,
-
-    /// Maximum component instances per Wasm evaluator invocation
-    #[arg(long, env = "VIGILO_WASM_MAX_INSTANCES", default_value_t = 3, value_parser = clap::value_parser!(u64).range(1..=1024))]
-    pub wasm_max_instances: u64,
-
-    /// Maximum linear memories per Wasm evaluator invocation
-    #[arg(long, env = "VIGILO_WASM_MAX_MEMORIES", default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=64))]
-    pub wasm_max_memories: u64,
-
-    /// Maximum tables per Wasm evaluator invocation
-    #[arg(long, env = "VIGILO_WASM_MAX_TABLES", default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=256))]
-    pub wasm_max_tables: u64,
-
-    /// Fuel budget per Wasm evaluator invocation
-    #[arg(long, env = "VIGILO_WASM_FUEL_PER_EVALUATION", default_value_t = 50_000_000, value_parser = clap::value_parser!(u64).range(1..=10_000_000_000))]
-    pub wasm_fuel_per_evaluation: u64,
-
-    /// Wall-clock timeout in milliseconds per Wasm evaluator invocation
-    #[arg(long, env = "VIGILO_WASM_TIMEOUT_MS", default_value_t = 5_000, value_parser = clap::value_parser!(u64).range(1..=600_000))]
-    pub wasm_timeout_ms: u64,
-
-    /// Epoch ticker interval in milliseconds used for Wasm timeout traps
-    #[arg(long, env = "VIGILO_WASM_EPOCH_TICK_INTERVAL_MS", default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=1_000))]
-    pub wasm_epoch_tick_interval_ms: u64,
-
-    /// Maximum active Wasm evaluator executions per process
-    #[arg(long, env = "VIGILO_WASM_MAX_CONCURRENT_EVALUATIONS", default_value_t = 8, value_parser = clap::value_parser!(u64).range(1..=1024))]
-    pub wasm_max_concurrent_evaluations: u64,
-
-    /// Maximum bytes logged per evaluator host log message
-    #[arg(long, env = "VIGILO_WASM_MAX_LOG_MESSAGE_BYTES", default_value_t = 4_096, value_parser = clap::value_parser!(u64).range(1..=1_048_576))]
-    pub wasm_max_log_message_bytes: u64,
-
-    /// Maximum evaluator host log messages per invocation
-    #[arg(long, env = "VIGILO_WASM_MAX_LOG_MESSAGES", default_value_t = 128, value_parser = clap::value_parser!(u32).range(0..=100_000))]
-    pub wasm_max_log_messages: u32,
 
     /// Suppress all diagnostic output and progress messages
     #[arg(global = true, short, long, default_value_t = false)]
@@ -147,12 +88,110 @@ impl Executable for App {
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory;
+    use clap::{
+        CommandFactory,
+        Parser,
+    };
 
     use super::App;
 
     #[test]
     fn cli_definition_has_no_argument_conflicts() {
         App::command().debug_assert();
+    }
+
+    #[test]
+    fn database_commands_do_not_require_unrelated_runtime_configuration() {
+        App::try_parse_from([
+            "vigilo",
+            "--database-url",
+            "postgres://control",
+            "database",
+            "list",
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn runtime_configuration_is_scoped_to_consuming_commands() {
+        let root = App::command();
+        assert!(root.get_arguments().all(|arg| {
+            !matches!(
+                arg.get_long(),
+                Some("messaging-url" | "wasm-timeout-ms" | "database-circuit-failure-threshold")
+            )
+        }));
+
+        let coordinator = root.find_subcommand("coordinator").unwrap();
+        assert!(has_long(coordinator, "messaging-url"));
+        assert!(has_long(coordinator, "database-circuit-failure-threshold"));
+        assert!(!has_long(coordinator, "wasm-timeout-ms"));
+
+        let worker = root.find_subcommand("worker").unwrap();
+        assert!(has_long(worker, "messaging-url"));
+        assert!(has_long(worker, "wasm-timeout-ms"));
+        assert!(!has_long(worker, "database-circuit-failure-threshold"));
+
+        let evaluator_test = root
+            .find_subcommand("evaluator")
+            .unwrap()
+            .find_subcommand("test")
+            .unwrap();
+        assert!(has_long(evaluator_test, "wasm-timeout-ms"));
+
+        let run_create = root
+            .find_subcommand("run")
+            .unwrap()
+            .find_subcommand("create")
+            .unwrap();
+        assert!(has_long(run_create, "shard-assignment-policy"));
+        assert!(has_long(run_create, "database-circuit-failure-threshold"));
+        assert!(has_long(run_create, "run-creation-case-batch-size"));
+    }
+
+    #[test]
+    fn selected_command_contributes_only_its_external_service_configuration() {
+        let database = App::try_parse_from([
+            "vigilo",
+            "--database-url",
+            "postgres://control",
+            "database",
+            "list",
+        ])
+        .unwrap();
+        assert!(
+            database
+                .command
+                .context_config("primary")
+                .unwrap()
+                .messaging_url
+                .is_none()
+        );
+
+        let coordinator = App::try_parse_from([
+            "vigilo",
+            "--database-url",
+            "postgres://control",
+            "coordinator",
+            "--messaging-url",
+            "amqp://broker",
+            "start",
+        ])
+        .unwrap();
+        assert_eq!(
+            coordinator
+                .command
+                .context_config("primary")
+                .unwrap()
+                .messaging_url
+                .as_deref(),
+            Some("amqp://broker")
+        );
+    }
+
+    fn has_long(command: &clap::Command, name: &str) -> bool {
+        command
+            .get_arguments()
+            .any(|arg| arg.get_long() == Some(name))
     }
 }

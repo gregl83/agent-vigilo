@@ -1,13 +1,21 @@
 //! Root command router for the `vigilo` CLI.
 //!
-//! This module owns the top-level command enum used by clap and delegates
-//! execution to feature-specific command modules. Public command groups use
-//! singular resource names and follow ownership boundaries.
+//! This module owns the top-level command enum used by clap, delegates execution
+//! to feature-specific modules, and derives lazy context configuration from the
+//! selected command. Public command groups use singular resource names and
+//! follow ownership boundaries.
 
 use async_trait::async_trait;
 use clap::Subcommand;
 
-use crate::context::Context;
+use crate::context::{
+    Context,
+    database::{
+        CircuitBreakerConfig,
+        PlacementConfig,
+    },
+    wasm,
+};
 
 pub(super) mod coordinator;
 pub(super) mod evaluators;
@@ -18,8 +26,20 @@ pub(super) mod worker;
 
 use super::{
     Executable,
-    args,
+    args::{
+        self,
+        CircuitBreakerOptions,
+        PlacementOptions,
+        WasmOptions,
+    },
 };
+
+pub(crate) struct CommandContextConfig {
+    pub(crate) messaging_url: Option<String>,
+    pub(crate) wasm: wasm::Config,
+    pub(crate) circuit_breaker: CircuitBreakerConfig,
+    pub(crate) placement: PlacementConfig,
+}
 
 #[derive(Debug, Subcommand)]
 /// Top-level CLI commands exposed by `vigilo`.
@@ -54,6 +74,66 @@ pub(crate) enum Command {
     /// Deprecated shard administration hierarchy
     #[command(hide = true)]
     Shard(shard::Command),
+}
+
+impl Command {
+    pub(crate) fn context_config(
+        &self,
+        control_database_alias: &str,
+    ) -> anyhow::Result<CommandContextConfig> {
+        let mut messaging_url = None;
+        let mut wasm = WasmOptions::default();
+        let mut circuit_breaker = CircuitBreakerOptions::default();
+        let mut placement = PlacementOptions::default();
+
+        match self {
+            Self::Coordinator(command) => {
+                messaging_url = Some(command.messaging.messaging_url.clone());
+                circuit_breaker = command.circuit_breaker;
+            }
+            Self::Worker(command) => {
+                messaging_url = Some(command.messaging.messaging_url.clone());
+                wasm = command.wasm;
+            }
+            Self::Setup(command) => {
+                placement = command.placement.clone();
+                wasm = command.wasm;
+            }
+            Self::Evaluator(command) => {
+                if let Some(options) = command.command.wasm_options() {
+                    wasm = options;
+                }
+            }
+            Self::Evaluators(command) => {
+                if let Some(options) = command
+                    .command
+                    .as_ref()
+                    .and_then(evaluators::SubCommand::wasm_options)
+                {
+                    wasm = options;
+                }
+            }
+            Self::Run(command) => {
+                if let Some((placement_options, circuit_breaker_options)) = command.create_options()
+                {
+                    placement = placement_options.clone();
+                    circuit_breaker = circuit_breaker_options;
+                }
+            }
+            Self::Database(_) | Self::Rebalance(_) | Self::Shard(_) => {}
+        }
+
+        Ok(CommandContextConfig {
+            messaging_url,
+            wasm: wasm.config(),
+            circuit_breaker: circuit_breaker.config()?,
+            placement: PlacementConfig::new(
+                control_database_alias.to_string(),
+                placement.default_shard_database_alias,
+                placement.shard_assignment_policy,
+            )?,
+        })
+    }
 }
 
 #[async_trait]

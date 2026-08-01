@@ -31,7 +31,12 @@ use uuid::Uuid;
 
 use super::{
     Executable,
-    args::parsers::parse_filepath,
+    args::{
+        CircuitBreakerOptions,
+        PlacementOptions,
+        RunCreationOptions,
+        parsers::parse_filepath,
+    },
     shard,
 };
 use crate::{
@@ -515,6 +520,15 @@ async fn select_existing_run(db: &sqlx::PgPool, run_id: Uuid) -> anyhow::Result<
 pub(crate) enum SubCommand {
     /// Create a run from profile + dataset inputs
     Create {
+        #[command(flatten)]
+        placement: PlacementOptions,
+
+        #[command(flatten)]
+        circuit_breaker: CircuitBreakerOptions,
+
+        #[command(flatten)]
+        run_creation: RunCreationOptions,
+
         /// Run profile YAML/JSON inline string
         #[arg(
             long,
@@ -664,13 +678,24 @@ impl Executable for Command {
     async fn exec(self, context: Context) -> anyhow::Result<()> {
         match self.command {
             Some(SubCommand::Create {
+                placement: _,
+                circuit_breaker: _,
+                run_creation,
                 profile,
                 profile_file,
                 dataset,
                 dataset_file,
             }) => {
                 info!("creating run from profile and dataset inputs");
-                create::exec(context, profile, profile_file, dataset, dataset_file).await
+                create::exec(
+                    context,
+                    run_creation.config(),
+                    profile,
+                    profile_file,
+                    dataset,
+                    dataset_file,
+                )
+                .await
             }
             Some(SubCommand::Status { run_id }) => {
                 info!("fetching status for run {}", run_id);
@@ -721,6 +746,19 @@ impl Executable for Command {
             None => anyhow::bail!(
                 "missing run subcommand; use `vigilo run validate --profile-file <file> --dataset-file <file>`"
             ),
+        }
+    }
+}
+
+impl Command {
+    pub(crate) fn create_options(&self) -> Option<(&PlacementOptions, CircuitBreakerOptions)> {
+        match &self.command {
+            Some(SubCommand::Create {
+                placement,
+                circuit_breaker,
+                ..
+            }) => Some((placement, *circuit_breaker)),
+            _ => None,
         }
     }
 }
@@ -994,10 +1032,14 @@ mod tests {
     #[tokio::test]
     async fn watch_rejects_malformed_run_id_before_database_initialization() {
         let context = Context::new(
-            "not-a-postgres-url".to_string(),
-            1,
-            PlacementConfig::default_single_database(),
-            "not-used".to_string(),
+            crate::context::database::Config::new(
+                "not-a-postgres-url".to_string(),
+                1,
+                std::time::Duration::from_secs(10),
+                crate::context::database::CircuitBreakerConfig::default(),
+                PlacementConfig::default_single_database(),
+            ),
+            Some("not-used".to_string()),
             wasm::Config::default(),
             OutputFormat::Json,
         );
@@ -1219,10 +1261,14 @@ mod tests {
     #[tokio::test]
     async fn export_rejects_malformed_run_id_before_database_initialization() {
         let context = Context::new(
-            "not-a-postgres-url".to_string(),
-            1,
-            PlacementConfig::default_single_database(),
-            "not-used".to_string(),
+            crate::context::database::Config::new(
+                "not-a-postgres-url".to_string(),
+                1,
+                std::time::Duration::from_secs(10),
+                crate::context::database::CircuitBreakerConfig::default(),
+                PlacementConfig::default_single_database(),
+            ),
+            Some("not-used".to_string()),
             wasm::Config::default(),
             OutputFormat::Json,
         );
@@ -1242,10 +1288,14 @@ mod tests {
     #[tokio::test]
     async fn status_rejects_malformed_run_id_before_database_initialization() {
         let context = Context::new(
-            "not-a-postgres-url".to_string(),
-            1,
-            PlacementConfig::default_single_database(),
-            "not-used".to_string(),
+            crate::context::database::Config::new(
+                "not-a-postgres-url".to_string(),
+                1,
+                std::time::Duration::from_secs(10),
+                crate::context::database::CircuitBreakerConfig::default(),
+                PlacementConfig::default_single_database(),
+            ),
+            Some("not-used".to_string()),
             wasm::Config::default(),
             OutputFormat::Json,
         );

@@ -46,7 +46,24 @@ const RUN_STATUS_PENDING: &str = "pending";
 const RUN_STATUS_FAILED: &str = "failed";
 const INITIAL_CREATION_LEASE_SECONDS: i32 = 300;
 const CREATION_RETRY_DELAY_SECONDS: i32 = 10;
-const RUN_CREATION_CASE_BATCH_SIZE: usize = 1_000;
+pub(crate) const DEFAULT_CASE_BATCH_SIZE: usize = 1_000;
+pub(crate) const DEFAULT_CASE_PAGE_BUDGET: usize = 64;
+
+/// Bounded paging policy shared by immediate and coordinator run creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Config {
+    pub(crate) case_batch_size: usize,
+    pub(crate) case_page_budget: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            case_batch_size: DEFAULT_CASE_BATCH_SIZE,
+            case_page_budget: DEFAULT_CASE_PAGE_BUDGET,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RunCreationProgress {
@@ -65,6 +82,16 @@ pub(crate) struct RunCreationOutcome {
     pub(crate) error_message: Option<String>,
 }
 
+/// Immutable material persisted and seeded for one new run.
+pub(crate) struct RunCreationRequest<'a> {
+    pub(crate) run_id: Uuid,
+    pub(crate) draft: &'a RunDraft,
+    pub(crate) case_blobs: &'a [CaseBlobDraft],
+    pub(crate) dataset_cases: &'a [DatasetVersionCaseDraft],
+    pub(crate) chunks: &'a [RunChunkDraft],
+    pub(crate) assignments: &'a [RunShardPlacementAssignment],
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RunCreationRecoveryStats {
     pub(crate) claimed_runs: usize,
@@ -81,26 +108,6 @@ struct OwnedRunSeedMaterial {
     draft: RunDraft,
 }
 
-const RUN_CREATION_CASE_PAGE_BUDGET: usize = 64;
-const RUN_CREATION_CASE_BATCH_SIZE_ENV: &str = "VIGILO_RUN_CREATION_CASE_BATCH_SIZE";
-const RUN_CREATION_CASE_PAGE_BUDGET_ENV: &str = "VIGILO_RUN_CREATION_CASE_PAGE_BUDGET";
-
-fn positive_usize_setting(name: &str, default: usize) -> anyhow::Result<usize> {
-    let Some(value) = std::env::var_os(name) else {
-        return Ok(default);
-    };
-    let value = value
-        .into_string()
-        .map_err(|_| anyhow::anyhow!("{name} must be valid UTF-8"))?;
-    let parsed = value
-        .parse::<usize>()
-        .map_err(|_| anyhow::anyhow!("{name} must be a positive integer"))?;
-    if parsed == 0 {
-        anyhow::bail!("{name} must be greater than zero");
-    }
-    Ok(parsed)
-}
-
 #[derive(Debug, sqlx::FromRow)]
 struct PlacementSeedProgress {
     expected_case_count: i64,
@@ -112,13 +119,17 @@ struct PlacementSeedProgress {
 /// Persists and immediately attempts a recoverable run creation operation.
 pub(crate) async fn create_run(
     database_router: &database::DatabaseRouter,
-    run_id: Uuid,
-    draft: &RunDraft,
-    case_blobs: &[CaseBlobDraft],
-    dataset_cases: &[DatasetVersionCaseDraft],
-    chunks: &[RunChunkDraft],
-    assignments: &[RunShardPlacementAssignment],
+    config: Config,
+    request: RunCreationRequest<'_>,
 ) -> anyhow::Result<RunCreationOutcome> {
+    let RunCreationRequest {
+        run_id,
+        draft,
+        case_blobs,
+        dataset_cases,
+        chunks,
+        assignments,
+    } = request;
     let owner_id = Uuid::now_v7();
     persist_creation_plan(
         database_router,
@@ -135,6 +146,7 @@ pub(crate) async fn create_run(
     let seed = RunSeedMaterial { draft };
     match resume_claimed_run(
         database_router,
+        config,
         run_id,
         owner_id,
         seed,
@@ -158,6 +170,7 @@ pub(crate) async fn create_run(
 /// Recovers a bounded set of expired `creating` runs.
 pub(crate) async fn recover_creating_runs(
     database_router: &database::DatabaseRouter,
+    config: Config,
     coordinator_id: Uuid,
     lease_seconds: i32,
     limit: usize,
@@ -195,7 +208,15 @@ pub(crate) async fn recover_creating_runs(
             draft: &owned_seed.draft,
         };
 
-        match resume_claimed_run(database_router, run_id, coordinator_id, seed, lease_seconds).await
+        match resume_claimed_run(
+            database_router,
+            config,
+            run_id,
+            coordinator_id,
+            seed,
+            lease_seconds,
+        )
+        .await
         {
             Ok(RunCreationOutcome { status, .. }) if status == RUN_STATUS_PENDING => {
                 stats.completed_runs += 1;
@@ -403,6 +424,7 @@ async fn insert_creation_chunks(
 
 async fn resume_claimed_run(
     database_router: &database::DatabaseRouter,
+    config: Config,
     run_id: Uuid,
     owner_id: Uuid,
     seed: RunSeedMaterial<'_>,
@@ -412,6 +434,19 @@ async fn resume_claimed_run(
     let pending_aliases = select_pending_placements(control_db, run_id, owner_id).await?;
 
     for database_alias in pending_aliases {
+        let database_permit = match database_router.acquire_database_operation(&database_alias) {
+            Ok(permit) => permit,
+            Err(open) => {
+                debug!(
+                    run_id = %run_id,
+                    database_alias,
+                    retry_after_ms = open.retry_after.as_millis() as u64,
+                    "deferred run creation placement while database circuit is open"
+                );
+                yield_claimed_run(control_db, run_id, owner_id).await?;
+                return select_creation_outcome(control_db, run_id).await;
+            }
+        };
         start_placement_attempt(control_db, run_id, owner_id, &database_alias, lease_seconds)
             .await?;
         let chunks = match select_creation_chunks(control_db, run_id, &database_alias).await {
@@ -431,6 +466,7 @@ async fn resume_claimed_run(
         };
         let seed_result = seed_execution_placement(
             database_router,
+            config,
             run_id,
             owner_id,
             &database_alias,
@@ -439,6 +475,33 @@ async fn resume_claimed_run(
             lease_seconds,
         )
         .await;
+
+        match &seed_result {
+            Ok(_) => {
+                if matches!(
+                    database_router.record_database_operation_success(database_permit),
+                    Some(database::CircuitTransition::Closed)
+                ) {
+                    debug!(
+                        run_id = %run_id,
+                        database_alias,
+                        "closed execution database circuit after successful creation probe"
+                    );
+                }
+            }
+            Err(error) => {
+                let (_, transition) =
+                    database_router.record_database_operation_error(database_permit, error);
+                if let Some(database::CircuitTransition::Opened { retry_after }) = transition {
+                    warn!(
+                        run_id = %run_id,
+                        database_alias,
+                        retry_after_ms = retry_after.as_millis() as u64,
+                        "opened execution database circuit after creation availability failures"
+                    );
+                }
+            }
+        }
 
         let placement_complete = match seed_result {
             Ok(complete) => complete,
@@ -603,6 +666,7 @@ async fn start_placement_attempt(
 #[allow(clippy::too_many_arguments)]
 async fn seed_execution_placement(
     database_router: &database::DatabaseRouter,
+    config: Config,
     run_id: Uuid,
     owner_id: Uuid,
     database_alias: &str,
@@ -613,14 +677,8 @@ async fn seed_execution_placement(
     let db = database_router.execution_database(database_alias).await?;
     let control_db = database_router.control().await?;
     let progress = select_placement_seed_progress(control_db, run_id, database_alias).await?;
-    let batch_size = positive_usize_setting(
-        RUN_CREATION_CASE_BATCH_SIZE_ENV,
-        RUN_CREATION_CASE_BATCH_SIZE,
-    )?;
-    let page_budget = positive_usize_setting(
-        RUN_CREATION_CASE_PAGE_BUDGET_ENV,
-        RUN_CREATION_CASE_PAGE_BUDGET,
-    )?;
+    let batch_size = config.case_batch_size;
+    let page_budget = config.case_page_budget;
     let mut acknowledged_count = progress.seeded_case_count;
     let mut acknowledged_ordinal = progress.last_seeded_case_ordinal;
     let mut reached_projection_end = false;
@@ -1386,10 +1444,13 @@ mod tests {
     }
 
     #[test]
-    fn positive_usize_setting_uses_default_when_unset() {
+    fn run_creation_config_has_bounded_defaults() {
         assert_eq!(
-            positive_usize_setting("VIGILO_TEST_UNSET_POSITIVE_USIZE", 17).unwrap(),
-            17
+            Config::default(),
+            Config {
+                case_batch_size: 1_000,
+                case_page_budget: 64,
+            }
         );
     }
 

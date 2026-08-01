@@ -11,7 +11,11 @@ use tracing::info;
 
 use super::{
     Executable,
-    args::parsers::parse_dir,
+    args::{
+        PlacementOptions,
+        WasmOptions,
+        parsers::parse_dir,
+    },
 };
 use crate::{
     context::Context,
@@ -25,6 +29,12 @@ use crate::{
 /// This command is intended to be safe to re-run; migrations are applied using
 /// the existing migration workflow and only pending migrations are executed.
 pub(crate) struct Command {
+    #[command(flatten)]
+    pub(crate) placement: PlacementOptions,
+
+    #[command(flatten)]
+    pub(crate) wasm: WasmOptions,
+
     /// Path to migrations source directory
     #[arg(long, default_value = "migrations", value_parser = parse_dir)]
     pub migrations_dir: PathBuf,

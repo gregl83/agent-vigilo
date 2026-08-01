@@ -15,6 +15,7 @@ use super::*;
 /// the run running.
 pub(super) async fn exec(
     context: Context,
+    run_creation_config: run_creation::Config,
     profile: Option<String>,
     profile_file: Option<PathBuf>,
     dataset: Option<String>,
@@ -133,12 +134,15 @@ pub(super) async fn exec(
         .collect::<std::collections::BTreeSet<_>>();
     let creation = run_creation::create_run(
         database_router,
-        run_id,
-        &run_draft,
-        &case_blobs,
-        &dataset_cases,
-        &chunks,
-        &shard_assignments,
+        run_creation_config,
+        run_creation::RunCreationRequest {
+            run_id,
+            draft: &run_draft,
+            case_blobs: &case_blobs,
+            dataset_cases: &dataset_cases,
+            chunks: &chunks,
+            assignments: &shard_assignments,
+        },
     )
     .await?;
 
