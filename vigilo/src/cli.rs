@@ -125,12 +125,14 @@ mod tests {
         let coordinator = root.find_subcommand("coordinator").unwrap();
         assert!(has_long(coordinator, "messaging-url"));
         assert!(has_long(coordinator, "database-circuit-failure-threshold"));
+        assert!(has_long(coordinator, "database-operation-timeout-seconds"));
         assert!(!has_long(coordinator, "wasm-timeout-ms"));
 
         let worker = root.find_subcommand("worker").unwrap();
         assert!(has_long(worker, "messaging-url"));
         assert!(has_long(worker, "wasm-timeout-ms"));
         assert!(!has_long(worker, "database-circuit-failure-threshold"));
+        assert!(!has_long(worker, "database-operation-timeout-seconds"));
 
         let evaluator_test = root
             .find_subcommand("evaluator")
@@ -146,6 +148,7 @@ mod tests {
             .unwrap();
         assert!(has_long(run_create, "shard-assignment-policy"));
         assert!(has_long(run_create, "database-circuit-failure-threshold"));
+        assert!(has_long(run_create, "database-operation-timeout-seconds"));
         assert!(has_long(run_create, "run-creation-case-batch-size"));
     }
 

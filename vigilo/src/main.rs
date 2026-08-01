@@ -85,7 +85,8 @@ async fn main() -> ExitCode {
                     Duration::from_secs(app.database_acquire_timeout_seconds),
                     command_context.circuit_breaker,
                     command_context.placement,
-                ),
+                )
+                .with_operation_timeout(command_context.database_operation_timeout),
                 command_context.messaging_url,
                 command_context.wasm,
                 app.output_format,

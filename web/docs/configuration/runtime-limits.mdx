@@ -20,8 +20,8 @@ a database-only command.
 ```mermaid
 flowchart LR
     root["All commands<br/>database client + output"]
-    create["run create<br/>placement + creation + breaker"]
-    coordinator["coordinator<br/>messaging + creation + breaker"]
+    create["run create<br/>placement + creation + DB resilience"]
+    coordinator["coordinator<br/>messaging + creation + DB resilience"]
     worker["worker<br/>messaging + Wasm"]
     evaluator["setup / evaluator publish or test<br/>Wasm"]
 
@@ -72,19 +72,44 @@ left pending while the coordinator continues with healthy aliases. After the
 cooldown, one half-open probe tests recovery. Explicit database and shard
 administration bypasses the breaker.
 
+Runtime pools also apply bounded PostgreSQL `statement_timeout` and
+`lock_timeout` settings. Coordinator placement operations have an outer
+wall-clock deadline, so a connected target that stops making progress cannot
+hold the placement sweep indefinitely. The statement timeout is 80% of the
+configured operation timeout; lock timeout is one quarter of the statement
+timeout, capped at 5 seconds. A single setting keeps these limits ordered.
+
+```mermaid
+flowchart LR
+    op["placement database operation"] --> outer["outer Tokio deadline<br/>30s default"]
+    outer --> acquire["pool acquire<br/>10s default"]
+    outer --> statement["PostgreSQL statement<br/>24s default"]
+    statement --> lock["lock wait<br/>5s maximum"]
+    outer --> outcome{"outcome"}
+    outcome -->|timeout / unavailable| breaker["alias-local breaker"]
+    outcome -->|lock contention| retry["retry without opening circuit"]
+    outcome -->|success| durable["commit durable progress"]
+```
+
 | Flag | Environment | Scope | Default | Purpose |
 | --- | --- | --- | ---: | --- |
 | `--database-acquire-timeout-seconds` | `VIGILO_DATABASE_ACQUIRE_TIMEOUT_SECONDS` | All commands | `10` | Maximum wait to acquire a PostgreSQL connection. |
+| `--database-operation-timeout-seconds` | `VIGILO_DATABASE_OPERATION_TIMEOUT_SECONDS` | `coordinator`, `run create` | `30` | Maximum wall-clock time for one retryable runtime database operation; derives the server statement and lock limits. |
 | `--database-circuit-breaker-enabled` | `VIGILO_DATABASE_CIRCUIT_BREAKER_ENABLED` | `coordinator`, `run create` | `true` | Enables process-local execution-database circuit breakers. |
 | `--database-circuit-failure-threshold` | `VIGILO_DATABASE_CIRCUIT_FAILURE_THRESHOLD` | `coordinator`, `run create` | `3` | Consecutive availability failures required to open an alias's circuit. |
 | `--database-circuit-initial-open-seconds` | `VIGILO_DATABASE_CIRCUIT_INITIAL_OPEN_SECONDS` | `coordinator`, `run create` | `10` | Initial open interval before one recovery probe is admitted. |
 | `--database-circuit-max-open-seconds` | `VIGILO_DATABASE_CIRCUIT_MAX_OPEN_SECONDS` | `coordinator`, `run create` | `120` | Maximum open interval after repeated failed probes. |
 
-I/O, TLS, protocol, connection-class, shutdown, target resource, and pool
-acquisition timeout failures affect the breaker. Route state, constraints,
-serialization failures, deadlocks, lock contention, and missing secrets do not.
-Cooldowns use process-local jitter, so coordinators do not all probe at the same
-instant.
+I/O, TLS, protocol, connection-class, shutdown, target resource, pool
+acquisition timeout, statement timeout, and outer operation timeout failures
+affect the breaker. Route state, constraints, serialization failures, deadlocks,
+lock contention, and missing secrets do not. Cooldowns use process-local jitter,
+so coordinators do not all probe at the same instant.
+
+Outbox claim and settlement SQL uses the server limits. The outer database
+deadline deliberately excludes broker publication, so slow RabbitMQ delivery
+does not open a database circuit. Cancellation drops owned transactions;
+uncommitted dispatch cursors and creation work remain durable for retry.
 
 ## Worker Chunk Concurrency
 

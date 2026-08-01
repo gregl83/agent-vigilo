@@ -288,6 +288,7 @@ mod tests {
             acquire_timeout: std::time::Duration::from_secs(10),
             placement_config: PlacementConfig::default_single_database(),
             circuit_breakers: DatabaseCircuitBreakers::new(CircuitBreakerConfig::default()),
+            operation_timeout_config: None,
             control_pool: OnceCell::new(),
             placement_pools: OnceCell::new(),
             dynamic_placement_pools: moka::future::Cache::builder().max_capacity(1_000).build(),

@@ -15,11 +15,14 @@ use crate::{
             DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
             DEFAULT_CIRCUIT_INITIAL_OPEN,
             DEFAULT_CIRCUIT_MAX_OPEN,
+            DatabaseOperationTimeoutConfig,
         },
         wasm,
     },
     db::workflows::run_creation,
 };
+
+pub(crate) const DEFAULT_DATABASE_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Broker connection options shared by coordinator and worker processes.
 #[derive(Debug, Clone, Args)]
@@ -67,6 +70,28 @@ impl Default for CircuitBreakerOptions {
             failure_threshold: DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
             initial_open_seconds: DEFAULT_CIRCUIT_INITIAL_OPEN.as_secs(),
             max_open_seconds: DEFAULT_CIRCUIT_MAX_OPEN.as_secs(),
+        }
+    }
+}
+
+/// Deadline policy for database work that can be retried from durable state.
+#[derive(Debug, Clone, Copy, Args)]
+pub(crate) struct DatabaseOperationTimeoutOptions {
+    /// Maximum wall-clock seconds for one runtime database operation
+    #[arg(long = "database-operation-timeout-seconds", env = "VIGILO_DATABASE_OPERATION_TIMEOUT_SECONDS", default_value_t = DEFAULT_DATABASE_OPERATION_TIMEOUT.as_secs(), value_parser = clap::value_parser!(u64).range(1..=3600))]
+    operation_timeout_seconds: u64,
+}
+
+impl DatabaseOperationTimeoutOptions {
+    pub(crate) fn config(self) -> anyhow::Result<DatabaseOperationTimeoutConfig> {
+        DatabaseOperationTimeoutConfig::new(Duration::from_secs(self.operation_timeout_seconds))
+    }
+}
+
+impl Default for DatabaseOperationTimeoutOptions {
+    fn default() -> Self {
+        Self {
+            operation_timeout_seconds: DEFAULT_DATABASE_OPERATION_TIMEOUT.as_secs(),
         }
     }
 }

@@ -6,6 +6,8 @@
 //! lazily initializes its control pool and per-placement pools. New aliases are
 //! discovered on first use when their secret is already in the environment;
 //! existing connection parameters remain fixed for the process lifetime.
+//! Runtime commands may attach one operation deadline policy; the router then
+//! applies its derived statement and lock limits to every new pool connection.
 //!
 //! Keep topology choices behind database workflow boundaries. Thin command dispatch,
 //! generic runtime code, and arbitrary domain callers should prefer workflows
@@ -71,6 +73,69 @@ use crate::{
 
 const SHARD_PLACEMENT_CACHE_TTL: Duration = Duration::from_secs(5);
 const SHARD_PLACEMENT_CACHE_CAPACITY: u64 = 10_000;
+const MAX_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Deadline policy for runtime database work.
+///
+/// PostgreSQL limits are derived from one operator-facing value so session and
+/// client deadlines cannot drift independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DatabaseOperationTimeoutConfig {
+    operation_timeout: Duration,
+    statement_timeout: Duration,
+    lock_timeout: Duration,
+}
+
+impl DatabaseOperationTimeoutConfig {
+    pub(crate) fn new(operation_timeout: Duration) -> anyhow::Result<Self> {
+        if operation_timeout.is_zero() {
+            anyhow::bail!("database operation timeout must be greater than zero");
+        }
+        let statement_timeout = operation_timeout.mul_f64(0.8);
+        let lock_timeout = statement_timeout.div_f64(4.0).min(MAX_LOCK_TIMEOUT);
+        Ok(Self {
+            operation_timeout,
+            statement_timeout,
+            lock_timeout,
+        })
+    }
+
+    pub(crate) fn operation_timeout(self) -> Duration {
+        self.operation_timeout
+    }
+
+    pub(crate) fn statement_timeout(self) -> Duration {
+        self.statement_timeout
+    }
+
+    pub(crate) fn lock_timeout(self) -> Duration {
+        self.lock_timeout
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "database operation {operation_name} timed out for placement {database_alias} after {timeout_ms}ms"
+)]
+pub(crate) struct DatabaseOperationTimeout {
+    database_alias: String,
+    operation_name: &'static str,
+    timeout_ms: u128,
+}
+
+impl DatabaseOperationTimeout {
+    pub(crate) fn new(
+        database_alias: impl Into<String>,
+        operation_name: &'static str,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            database_alias: database_alias.into(),
+            operation_name,
+            timeout_ms: timeout.as_millis(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ExecutionRouteError {
@@ -158,6 +223,7 @@ pub(crate) struct Config {
     pub(crate) acquire_timeout: Duration,
     pub(crate) circuit_breaker_config: CircuitBreakerConfig,
     pub(crate) placement_config: PlacementConfig,
+    pub(crate) operation_timeout_config: Option<DatabaseOperationTimeoutConfig>,
 }
 
 impl Config {
@@ -174,7 +240,16 @@ impl Config {
             acquire_timeout,
             circuit_breaker_config,
             placement_config,
+            operation_timeout_config: None,
         }
+    }
+
+    pub(crate) fn with_operation_timeout(
+        mut self,
+        operation_timeout_config: Option<DatabaseOperationTimeoutConfig>,
+    ) -> Self {
+        self.operation_timeout_config = operation_timeout_config;
+        self
     }
 }
 
@@ -200,6 +275,7 @@ pub(crate) struct DatabaseRouter {
     pub(crate) acquire_timeout: Duration,
     pub(crate) placement_config: PlacementConfig,
     pub(crate) circuit_breakers: DatabaseCircuitBreakers,
+    pub(crate) operation_timeout_config: Option<DatabaseOperationTimeoutConfig>,
     pub(crate) control_pool: OnceCell<PgPool>,
     #[allow(dead_code)]
     pub(crate) placement_pools: OnceCell<PlacementPools>,
@@ -235,6 +311,7 @@ impl DatabaseRouter {
             circuit_breakers: circuit_breaker::DatabaseCircuitBreakers::new(
                 config.circuit_breaker_config,
             ),
+            operation_timeout_config: config.operation_timeout_config,
             control_pool: OnceCell::new(),
             placement_pools: OnceCell::new(),
             dynamic_placement_pools: Cache::builder().max_capacity(1_000).build(),
@@ -252,15 +329,17 @@ impl DatabaseRouter {
             .get_or_try_init(|| async {
                 debug!("initializing postgres database connection");
 
-                PgPoolOptions::new()
-                    .max_connections(self.max_connections_per_pool)
-                    .acquire_timeout(self.acquire_timeout)
-                    .connect(&self.uri)
-                    .await
-                    .map_err(|error| {
-                        let message = format!("database connection failed: {error}");
-                        anyhow::Error::new(error).context(message)
-                    })
+                runtime_pool_options(
+                    self.max_connections_per_pool,
+                    self.acquire_timeout,
+                    self.operation_timeout_config,
+                )
+                .connect(&self.uri)
+                .await
+                .map_err(|error| {
+                    let message = format!("database connection failed: {error}");
+                    anyhow::Error::new(error).context(message)
+                })
             })
             .await
             .inspect(|_| {
@@ -274,6 +353,31 @@ impl DatabaseRouter {
 
     pub(crate) fn default_execution_database_alias(&self) -> &str {
         &self.placement_config.default_shard_database_alias
+    }
+
+    /// Applies the outer deadline to one database future while preserving its
+    /// output type. Callers decide how domain errors are classified.
+    pub(crate) async fn deadline_database_operation<T, Operation>(
+        &self,
+        database_alias: &str,
+        operation_name: &'static str,
+        operation: Operation,
+    ) -> Result<T, DatabaseOperationTimeout>
+    where
+        Operation: std::future::Future<Output = T>,
+    {
+        let Some(config) = self.operation_timeout_config else {
+            return Ok(operation.await);
+        };
+        tokio::time::timeout(config.operation_timeout(), operation)
+            .await
+            .map_err(|_| {
+                DatabaseOperationTimeout::new(
+                    database_alias,
+                    operation_name,
+                    config.operation_timeout(),
+                )
+            })
     }
 
     pub(crate) fn shard_assignment_policy(&self) -> &ShardAssignmentPolicy {
@@ -419,6 +523,7 @@ impl DatabaseRouter {
                     &database_url,
                     self.max_connections_per_pool,
                     self.acquire_timeout,
+                    self.operation_timeout_config,
                 )
                 .await?
                 .clone());
@@ -449,6 +554,7 @@ impl DatabaseRouter {
                 &database_url,
                 self.max_connections_per_pool,
                 self.acquire_timeout,
+                self.operation_timeout_config,
             )
             .await?;
         debug!(
@@ -612,6 +718,7 @@ impl DatabaseRouter {
                     &database_url,
                     self.max_connections_per_pool,
                     self.acquire_timeout,
+                    self.operation_timeout_config,
                 )
                 .await?
                 .clone());
@@ -624,6 +731,7 @@ impl DatabaseRouter {
                     &database_url,
                     self.max_connections_per_pool,
                     self.acquire_timeout,
+                    self.operation_timeout_config,
                 )
                 .await?
                 .clone());
@@ -647,6 +755,7 @@ impl DatabaseRouter {
                 &database_url,
                 self.max_connections_per_pool,
                 self.acquire_timeout,
+                self.operation_timeout_config,
             )
             .await?
             .clone())
@@ -1114,24 +1223,57 @@ impl PlacementPool {
         database_url: &str,
         max_connections_per_pool: u32,
         acquire_timeout: Duration,
+        operation_timeout_config: Option<DatabaseOperationTimeoutConfig>,
     ) -> anyhow::Result<&PgPool> {
         self.pool
             .get_or_try_init(|| async {
                 debug!(database_alias = %alias, "initializing postgres placement connection");
 
-                PgPoolOptions::new()
-                    .max_connections(max_connections_per_pool)
-                    .acquire_timeout(acquire_timeout)
-                    .connect(database_url)
-                    .await
-                    .map_err(|error| {
-                        let message =
-                            format!("database placement {alias} connection failed: {error}");
-                        anyhow::Error::new(error).context(message)
-                    })
+                runtime_pool_options(
+                    max_connections_per_pool,
+                    acquire_timeout,
+                    operation_timeout_config,
+                )
+                .connect(database_url)
+                .await
+                .map_err(|error| {
+                    let message = format!("database placement {alias} connection failed: {error}");
+                    anyhow::Error::new(error).context(message)
+                })
             })
             .await
     }
+}
+
+fn runtime_pool_options(
+    max_connections: u32,
+    acquire_timeout: Duration,
+    operation_timeout_config: Option<DatabaseOperationTimeoutConfig>,
+) -> PgPoolOptions {
+    let options = PgPoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(acquire_timeout);
+    let Some(config) = operation_timeout_config else {
+        return options;
+    };
+
+    let statement_timeout = format!("{}ms", config.statement_timeout().as_millis().max(1));
+    let lock_timeout = format!("{}ms", config.lock_timeout().as_millis().max(1));
+    options.after_connect(move |connection, _| {
+        let statement_timeout = statement_timeout.clone();
+        let lock_timeout = lock_timeout.clone();
+        Box::pin(async move {
+            sqlx::query("SELECT set_config('statement_timeout', $1, false)")
+                .bind(statement_timeout)
+                .execute(&mut *connection)
+                .await?;
+            sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+                .bind(lock_timeout)
+                .execute(&mut *connection)
+                .await?;
+            Ok(())
+        })
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1305,6 +1447,20 @@ mod tests {
     }
 
     #[test]
+    fn operation_timeout_derives_bounded_server_timeouts() {
+        let config = DatabaseOperationTimeoutConfig::new(Duration::from_secs(30)).unwrap();
+
+        assert_eq!(config.operation_timeout(), Duration::from_secs(30));
+        assert_eq!(config.statement_timeout(), Duration::from_secs(24));
+        assert_eq!(config.lock_timeout(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn operation_timeout_rejects_zero() {
+        assert!(DatabaseOperationTimeoutConfig::new(Duration::ZERO).is_err());
+    }
+
+    #[test]
     fn validates_run_shard_range() {
         assert!(validate_run_shard(0).is_ok());
         assert!(validate_run_shard(127).is_ok());
@@ -1333,6 +1489,7 @@ mod tests {
                 acquire_timeout: Duration::from_secs(10),
                 circuit_breaker_config: CircuitBreakerConfig::default(),
                 placement_config: PlacementConfig::default_single_database(),
+                operation_timeout_config: None,
             },
             cell: OnceCell::new(),
         };
@@ -1342,6 +1499,76 @@ mod tests {
 
         assert_eq!(first, second);
         assert!(context.cell.get().unwrap().control_pool.get().is_none());
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
+    async fn configured_statement_timeout_cancels_slow_query_and_keeps_pool_usable(pool: PgPool) {
+        let database_url = isolated_database_url(&pool).await;
+        let database_router = DatabaseRouter::new(
+            Config::new(
+                database_url,
+                1,
+                Duration::from_secs(1),
+                CircuitBreakerConfig::default(),
+                PlacementConfig::default_single_database(),
+            )
+            .with_operation_timeout(Some(
+                DatabaseOperationTimeoutConfig::new(Duration::from_millis(125)).unwrap(),
+            )),
+        );
+        let db = database_router.control().await.unwrap();
+
+        let error = sqlx::query("SELECT pg_sleep(1)")
+            .execute(db)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_database_error().and_then(|error| error.code()),
+            Some(std::borrow::Cow::Borrowed("57014"))
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i32>("SELECT 1")
+                .fetch_one(db)
+                .await
+                .unwrap(),
+            1
+        );
+
+        db.close().await;
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx router tests"]
+    async fn outer_database_deadline_rolls_back_owned_transaction(pool: PgPool) {
+        sqlx::query("CREATE TABLE timeout_probe (value INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut database_router = database_router_with_control_pool(pool.clone());
+        database_router.operation_timeout_config =
+            Some(DatabaseOperationTimeoutConfig::new(Duration::from_millis(20)).unwrap());
+
+        let result = database_router
+            .deadline_database_operation("primary", "test", async {
+                let mut tx = pool.begin().await.unwrap();
+                sqlx::query("INSERT INTO timeout_probe (value) VALUES (1)")
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                std::future::pending::<()>().await;
+                tx.commit().await.unwrap();
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM timeout_probe")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -2170,6 +2397,7 @@ mod tests {
             circuit_breakers: circuit_breaker::DatabaseCircuitBreakers::new(
                 CircuitBreakerConfig::default(),
             ),
+            operation_timeout_config: None,
             control_pool: OnceCell::new(),
             placement_pools: OnceCell::new(),
             dynamic_placement_pools: Cache::builder().max_capacity(1_000).build(),

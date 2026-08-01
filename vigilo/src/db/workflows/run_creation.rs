@@ -464,17 +464,24 @@ async fn resume_claimed_run(
             }
             Err(error) => return Err(error),
         };
-        let seed_result = seed_execution_placement(
-            database_router,
-            config,
-            run_id,
-            owner_id,
-            &database_alias,
-            seed.draft,
-            &chunks,
-            lease_seconds,
-        )
-        .await;
+        let seed_result = database_router
+            .deadline_database_operation(
+                &database_alias,
+                "run_creation_seed",
+                seed_execution_placement(
+                    database_router,
+                    config,
+                    run_id,
+                    owner_id,
+                    &database_alias,
+                    seed.draft,
+                    &chunks,
+                    lease_seconds,
+                ),
+            )
+            .await
+            .map_err(anyhow::Error::new)
+            .and_then(std::convert::identity);
 
         match &seed_result {
             Ok(_) => {

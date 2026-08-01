@@ -33,6 +33,7 @@ use super::{
     Executable,
     args::{
         CircuitBreakerOptions,
+        DatabaseOperationTimeoutOptions,
         PlacementOptions,
         RunCreationOptions,
         parsers::parse_filepath,
@@ -527,6 +528,9 @@ pub(crate) enum SubCommand {
         circuit_breaker: CircuitBreakerOptions,
 
         #[command(flatten)]
+        database_operation_timeout: DatabaseOperationTimeoutOptions,
+
+        #[command(flatten)]
         run_creation: RunCreationOptions,
 
         /// Run profile YAML/JSON inline string
@@ -680,6 +684,7 @@ impl Executable for Command {
             Some(SubCommand::Create {
                 placement: _,
                 circuit_breaker: _,
+                database_operation_timeout: _,
                 run_creation,
                 profile,
                 profile_file,
@@ -751,13 +756,20 @@ impl Executable for Command {
 }
 
 impl Command {
-    pub(crate) fn create_options(&self) -> Option<(&PlacementOptions, CircuitBreakerOptions)> {
+    pub(crate) fn create_options(
+        &self,
+    ) -> Option<(
+        &PlacementOptions,
+        CircuitBreakerOptions,
+        DatabaseOperationTimeoutOptions,
+    )> {
         match &self.command {
             Some(SubCommand::Create {
                 placement,
                 circuit_breaker,
+                database_operation_timeout,
                 ..
-            }) => Some((placement, *circuit_breaker)),
+            }) => Some((placement, *circuit_breaker, *database_operation_timeout)),
             _ => None,
         }
     }

@@ -22,6 +22,8 @@ use std::{
 
 use uuid::Uuid;
 
+use super::DatabaseOperationTimeout;
+
 const DEFAULT_JITTER_PERCENT: u8 = 20;
 pub(crate) const DEFAULT_FAILURE_THRESHOLD: u32 = 3;
 pub(crate) const DEFAULT_INITIAL_OPEN: Duration = Duration::from_secs(10);
@@ -315,6 +317,12 @@ enum CircuitState {
 }
 
 pub(super) fn classify_error(error: &anyhow::Error) -> FailureImpact {
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<DatabaseOperationTimeout>().is_some())
+    {
+        return FailureImpact::Unavailable;
+    }
     let Some(error) = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<sqlx::Error>())
@@ -340,7 +348,8 @@ fn classify_database_error_code(code: Option<&str>) -> FailureImpact {
         return FailureImpact::Available;
     };
 
-    if code.starts_with("08")
+    if code == "57014"
+        || code.starts_with("08")
         || code.starts_with("53")
         || matches!(code, "57P01" | "57P02" | "57P03" | "58030")
     {
@@ -509,6 +518,22 @@ mod tests {
         );
         assert_eq!(
             classify_error(&anyhow::Error::new(sqlx::Error::PoolTimedOut)),
+            FailureImpact::Unavailable
+        );
+        assert_eq!(
+            classify_database_error_code(Some("57014")),
+            FailureImpact::Unavailable
+        );
+        assert_eq!(
+            classify_database_error_code(Some("55P03")),
+            FailureImpact::Available
+        );
+        assert_eq!(
+            classify_error(&anyhow::Error::new(DatabaseOperationTimeout::new(
+                "shard_001",
+                "test",
+                Duration::from_secs(30),
+            ))),
             FailureImpact::Unavailable
         );
     }

@@ -38,6 +38,8 @@ pub(crate) struct CommandContextConfig {
     pub(crate) messaging_url: Option<String>,
     pub(crate) wasm: wasm::Config,
     pub(crate) circuit_breaker: CircuitBreakerConfig,
+    pub(crate) database_operation_timeout:
+        Option<crate::context::database::DatabaseOperationTimeoutConfig>,
     pub(crate) placement: PlacementConfig,
 }
 
@@ -84,12 +86,14 @@ impl Command {
         let mut messaging_url = None;
         let mut wasm = WasmOptions::default();
         let mut circuit_breaker = CircuitBreakerOptions::default();
+        let mut database_operation_timeout = None;
         let mut placement = PlacementOptions::default();
 
         match self {
             Self::Coordinator(command) => {
                 messaging_url = Some(command.messaging.messaging_url.clone());
                 circuit_breaker = command.circuit_breaker;
+                database_operation_timeout = Some(command.database_operation_timeout.config()?);
             }
             Self::Worker(command) => {
                 messaging_url = Some(command.messaging.messaging_url.clone());
@@ -114,10 +118,15 @@ impl Command {
                 }
             }
             Self::Run(command) => {
-                if let Some((placement_options, circuit_breaker_options)) = command.create_options()
+                if let Some((
+                    placement_options,
+                    circuit_breaker_options,
+                    database_operation_timeout_options,
+                )) = command.create_options()
                 {
                     placement = placement_options.clone();
                     circuit_breaker = circuit_breaker_options;
+                    database_operation_timeout = Some(database_operation_timeout_options.config()?);
                 }
             }
             Self::Database(_) | Self::Rebalance(_) | Self::Shard(_) => {}
@@ -127,6 +136,7 @@ impl Command {
             messaging_url,
             wasm: wasm.config(),
             circuit_breaker: circuit_breaker.config()?,
+            database_operation_timeout,
             placement: PlacementConfig::new(
                 control_database_alias.to_string(),
                 placement.default_shard_database_alias,

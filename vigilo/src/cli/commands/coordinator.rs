@@ -31,6 +31,7 @@ use super::{
     Executable,
     args::{
         CircuitBreakerOptions,
+        DatabaseOperationTimeoutOptions,
         MessagingOptions,
         RunCreationOptions,
     },
@@ -70,6 +71,7 @@ use placement::{
     record_open as record_placement_open,
     record_skip as record_placement_skip,
     run_operations as run_placement_operations,
+    run_operations_without_outer_deadline,
 };
 
 const COORDINATOR_TICK_SECONDS: u64 = 5;
@@ -124,6 +126,9 @@ pub(crate) struct Command {
 
     #[command(flatten)]
     pub(crate) circuit_breaker: CircuitBreakerOptions,
+
+    #[command(flatten)]
+    pub(crate) database_operation_timeout: DatabaseOperationTimeoutOptions,
 
     #[command(flatten)]
     pub(crate) run_creation: RunCreationOptions,
@@ -556,10 +561,16 @@ async fn dispatch_ready_chunk_windows(
         }
 
         let execution_pool_started = Instant::now();
-        let execution_route = match database_router
-            .execution_route(route.run_id, route.run_shard)
+        let execution_route_result = database_router
+            .deadline_database_operation(
+                &database_alias,
+                "dispatch_execution_pool",
+                database_router.execution_route(route.run_id, route.run_shard),
+            )
             .await
-        {
+            .map_err(anyhow::Error::new)
+            .and_then(std::convert::identity);
+        let execution_route = match execution_route_result {
             Ok(route) => route,
             Err(error) => {
                 dispatch_claim.control_tx.rollback().await?;
@@ -607,15 +618,26 @@ async fn dispatch_ready_chunk_windows(
         }
         let execution_pool_resolution_ms = execution_pool_started.elapsed().as_millis() as u64;
         let dispatch_started = Instant::now();
-        let dispatch_result = run_dispatch::dispatch_admitted_run_window(
-            database_router,
-            dispatch_claim.control_tx,
-            &execution_route,
-            config.run_chunk_dispatch_window_size,
-            &route,
-            &snapshot,
-        )
-        .await;
+        let dispatch_result = match database_router
+            .deadline_database_operation(
+                &database_alias,
+                "dispatch_execution_write",
+                run_dispatch::dispatch_admitted_run_window(
+                    database_router,
+                    dispatch_claim.control_tx,
+                    &execution_route,
+                    config.run_chunk_dispatch_window_size,
+                    &route,
+                    &snapshot,
+                ),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(run_dispatch::RoutedDispatchError::ExecutionWrite(
+                error.into(),
+            )),
+        };
         let run = match dispatch_result {
             Ok(Some(run)) => {
                 log_database_operation_success(
@@ -734,7 +756,7 @@ async fn publish_outbox_events(
         active_outbox_alias_list_ms = alias_list_started.elapsed().as_millis() as u64,
         "listed active outbox placements"
     );
-    let batch = run_placement_operations(
+    let batch = run_operations_without_outer_deadline(
         database_router,
         coordinator_id,
         "outbox_publication",
@@ -1188,7 +1210,54 @@ mod placement {
         coordinator_id: Uuid,
         operation_name: &'static str,
         aliases: Vec<String>,
+        operation: Operation,
+    ) -> PlacementOperationBatch<T>
+    where
+        Operation: FnMut(String) -> OperationFuture,
+        OperationFuture: Future<Output = anyhow::Result<T>>,
+    {
+        run_operations_with_deadline(
+            database_router,
+            coordinator_id,
+            operation_name,
+            aliases,
+            operation,
+            true,
+        )
+        .await
+    }
+
+    /// Broker publication is intentionally excluded from the database wall-clock
+    /// deadline. Its individual SQL statements still use the pool session limits.
+    pub(super) async fn run_operations_without_outer_deadline<T, Operation, OperationFuture>(
+        database_router: &database::DatabaseRouter,
+        coordinator_id: Uuid,
+        operation_name: &'static str,
+        aliases: Vec<String>,
+        operation: Operation,
+    ) -> PlacementOperationBatch<T>
+    where
+        Operation: FnMut(String) -> OperationFuture,
+        OperationFuture: Future<Output = anyhow::Result<T>>,
+    {
+        run_operations_with_deadline(
+            database_router,
+            coordinator_id,
+            operation_name,
+            aliases,
+            operation,
+            false,
+        )
+        .await
+    }
+
+    async fn run_operations_with_deadline<T, Operation, OperationFuture>(
+        database_router: &database::DatabaseRouter,
+        coordinator_id: Uuid,
+        operation_name: &'static str,
+        aliases: Vec<String>,
         mut operation: Operation,
+        enforce_outer_deadline: bool,
     ) -> PlacementOperationBatch<T>
     where
         Operation: FnMut(String) -> OperationFuture,
@@ -1217,7 +1286,16 @@ mod placement {
                     "probing half-open execution database circuit"
                 );
             }
-            match operation(alias.clone()).await {
+            let result = if enforce_outer_deadline {
+                database_router
+                    .deadline_database_operation(&alias, operation_name, operation(alias.clone()))
+                    .await
+                    .map_err(anyhow::Error::new)
+                    .and_then(std::convert::identity)
+            } else {
+                operation(alias.clone()).await
+            };
+            match result {
                 Ok(output) => {
                     if matches!(
                         database_router.record_database_operation_success(permit),
@@ -1311,6 +1389,16 @@ mod placement {
     fn classify_error(error: &anyhow::Error) -> ErrorClassification {
         if error.chain().any(|cause| {
             cause
+                .downcast_ref::<database::DatabaseOperationTimeout>()
+                .is_some()
+        }) {
+            return ErrorClassification {
+                kind: ErrorKind::DatabaseUnavailable,
+                retryable: true,
+            };
+        }
+        if error.chain().any(|cause| {
+            cause
                 .downcast_ref::<database::ExecutionRouteError>()
                 .is_some()
         }) {
@@ -1364,7 +1452,8 @@ mod placement {
             };
         }
 
-        if code.starts_with("08")
+        if code == "57014"
+            || code.starts_with("08")
             || code.starts_with("53")
             || matches!(code, "57P01" | "57P02" | "57P03" | "58030")
         {
@@ -1492,6 +1581,99 @@ mod placement {
             );
         }
 
+        #[tokio::test]
+        async fn placement_operation_timeout_does_not_block_healthy_aliases() {
+            let context = test_context_with_timeout(Duration::from_millis(20));
+            let database_router = context.dbr().await.unwrap();
+            let started = std::time::Instant::now();
+
+            let batch = run_operations(
+                database_router,
+                Uuid::now_v7(),
+                "test",
+                vec!["slow".to_string(), "healthy".to_string()],
+                |alias| async move {
+                    if alias == "slow" {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok::<_, anyhow::Error>(alias)
+                },
+            )
+            .await;
+
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert_eq!(
+                batch.successes,
+                vec![("healthy".to_string(), "healthy".to_string())]
+            );
+            assert_eq!(batch.failures.len(), 1);
+            assert!(
+                batch.failures[0]
+                    .error
+                    .downcast_ref::<database::DatabaseOperationTimeout>()
+                    .is_some()
+            );
+            assert_eq!(
+                batch.failures[0].classification.kind,
+                ErrorKind::DatabaseUnavailable
+            );
+        }
+
+        #[tokio::test]
+        async fn database_operation_timeouts_open_only_the_affected_circuit() {
+            let context = test_context_with_timeout(Duration::from_millis(5));
+            let database_router = context.dbr().await.unwrap();
+            let coordinator_id = Uuid::now_v7();
+
+            for _ in 0..3 {
+                let batch = run_operations(
+                    database_router,
+                    coordinator_id,
+                    "test",
+                    vec!["slow".to_string()],
+                    |_| std::future::pending::<anyhow::Result<()>>(),
+                )
+                .await;
+                assert_eq!(batch.failures.len(), 1);
+            }
+
+            let batch = run_operations(
+                database_router,
+                coordinator_id,
+                "test",
+                vec!["slow".to_string(), "healthy".to_string()],
+                |alias| async move { Ok::<_, anyhow::Error>(alias) },
+            )
+            .await;
+
+            assert_eq!(batch.skipped.len(), 1);
+            assert_eq!(batch.skipped[0].database_alias, "slow");
+            assert_eq!(batch.successes.len(), 1);
+            assert_eq!(batch.successes[0].0, "healthy");
+        }
+
+        #[tokio::test]
+        async fn broker_wait_is_excluded_from_database_operation_deadline() {
+            let context = test_context_with_timeout(Duration::from_millis(5));
+            let database_router = context.dbr().await.unwrap();
+
+            let batch = run_operations_without_outer_deadline(
+                database_router,
+                Uuid::now_v7(),
+                "outbox_publication",
+                vec!["primary".to_string()],
+                |alias| async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok::<_, anyhow::Error>(alias)
+                },
+            )
+            .await;
+
+            assert!(batch.failures.is_empty());
+            assert!(batch.skipped.is_empty());
+            assert_eq!(batch.successes[0].0, "primary");
+        }
+
         #[test]
         fn postgres_retryable_codes_are_classified_by_failure_kind() {
             assert_eq!(
@@ -1526,6 +1708,24 @@ mod placement {
                     database::CircuitBreakerConfig::default(),
                     database::PlacementConfig::default_single_database(),
                 ),
+                Some("amqp://not-used".to_string()),
+                crate::context::wasm::Config::default(),
+                crate::context::output::OutputFormat::Json,
+            )
+        }
+
+        fn test_context_with_timeout(timeout: Duration) -> crate::context::Context {
+            crate::context::Context::new(
+                database::Config::new(
+                    "postgres://not-used".to_string(),
+                    1,
+                    Duration::from_secs(10),
+                    database::CircuitBreakerConfig::default(),
+                    database::PlacementConfig::default_single_database(),
+                )
+                .with_operation_timeout(Some(
+                    database::DatabaseOperationTimeoutConfig::new(timeout).unwrap(),
+                )),
                 Some("amqp://not-used".to_string()),
                 crate::context::wasm::Config::default(),
                 crate::context::output::OutputFormat::Json,
