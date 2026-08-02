@@ -33,6 +33,8 @@ pub(crate) use circuit_breaker::{
     DEFAULT_INITIAL_OPEN as DEFAULT_CIRCUIT_INITIAL_OPEN,
     DEFAULT_MAX_OPEN as DEFAULT_CIRCUIT_MAX_OPEN,
     DatabaseCircuitBreakers,
+    is_database_contention,
+    is_database_unavailable,
 };
 use moka::future::Cache;
 use sqlx::{
@@ -378,6 +380,23 @@ impl DatabaseRouter {
                     config.operation_timeout(),
                 )
             })
+    }
+
+    /// Applies the outer deadline and preserves the operation's error chain for
+    /// circuit-breaker and retry classification.
+    pub(crate) async fn run_database_operation<T, Operation>(
+        &self,
+        database_alias: &str,
+        operation_name: &'static str,
+        operation: Operation,
+    ) -> anyhow::Result<T>
+    where
+        Operation: std::future::Future<Output = anyhow::Result<T>>,
+    {
+        self.deadline_database_operation(database_alias, operation_name, operation)
+            .await
+            .map_err(anyhow::Error::new)
+            .and_then(std::convert::identity)
     }
 
     pub(crate) fn shard_assignment_policy(&self) -> &ShardAssignmentPolicy {

@@ -2419,6 +2419,7 @@ async fn persist_completed_execution_results_batch(
 pub(crate) async fn process_case_batch_execution(
     context: &Context,
     db: &PgPool,
+    database_alias: &str,
     chunk: &RunChunk,
     lease: &AttemptLeaseContext,
     run_profile: &RunProfile,
@@ -2437,15 +2438,21 @@ pub(crate) async fn process_case_batch_execution(
         .map(|case| evaluation_plan_for_case(run_profile, case))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    let allocations = allocate_execution_attempts_for_cases(
-        db,
-        chunk,
-        lease,
-        run_profile,
-        cases,
-        &evaluation_plans_by_case,
-    )
-    .await?;
+    let database_router = context.dbr().await?;
+    let allocations = database_router
+        .run_database_operation(
+            database_alias,
+            "worker_attempt_allocation",
+            allocate_execution_attempts_for_cases(
+                db,
+                chunk,
+                lease,
+                run_profile,
+                cases,
+                &evaluation_plans_by_case,
+            ),
+        )
+        .await?;
 
     debug!(
         run_id = %run_id,
@@ -2544,8 +2551,13 @@ pub(crate) async fn process_case_batch_execution(
     }
 
     let persistence_started = Instant::now();
-    let persistence_stats =
-        persist_completed_execution_results_batch(db, chunk, lease.worker_id, &completed).await?;
+    let persistence_stats = database_router
+        .run_database_operation(
+            database_alias,
+            "worker_result_persistence",
+            persist_completed_execution_results_batch(db, chunk, lease.worker_id, &completed),
+        )
+        .await?;
     debug!(
         run_id = %run_id,
         case_count = cases.len(),

@@ -5,7 +5,8 @@
 //! requeue queue messages based on outcome. Chunk-local worker persistence uses
 //! the execution database selected by `run_id + run_shard`; run profile
 //! snapshots are read from that execution placement, while evaluator registry
-//! metadata remains a control-database read.
+//! metadata remains a control-database read. Retryable database failures are
+//! contained per alias so the process can continue serving healthy placements.
 
 use std::{
     sync::Arc,
@@ -24,7 +25,10 @@ use futures_util::StreamExt;
 use moka::future::Cache;
 use serde::Deserialize;
 use tokio::{
-    sync::Mutex,
+    sync::{
+        Mutex,
+        OnceCell,
+    },
     task::{
         JoinHandle,
         JoinSet,
@@ -41,6 +45,8 @@ use uuid::Uuid;
 use super::{
     Executable,
     args::{
+        CircuitBreakerOptions,
+        DatabaseOperationTimeoutOptions,
         MessagingOptions,
         WasmOptions,
     },
@@ -179,6 +185,8 @@ impl ChunkLeaseGuard {
 
 impl ChunkHeartbeat {
     fn start(
+        context: Context,
+        database_alias: String,
         db: &sqlx::PgPool,
         chunk: crate::models::run_chunk::RunChunk,
         runtime: WorkerRuntime,
@@ -188,7 +196,14 @@ impl ChunkHeartbeat {
         let heartbeat_guard = guard.clone();
         let heartbeat_cancel = cancel.clone();
         let handle = tokio::spawn(async move {
-            run_chunk_heartbeat(heartbeat_guard, runtime, heartbeat_cancel).await;
+            run_chunk_heartbeat(
+                context,
+                database_alias,
+                heartbeat_guard,
+                runtime,
+                heartbeat_cancel,
+            )
+            .await;
         });
 
         Self {
@@ -216,6 +231,8 @@ fn worker_host_label() -> Option<String> {
 }
 
 async fn run_chunk_heartbeat(
+    context: Context,
+    database_alias: String,
     guard: Arc<ChunkLeaseGuard>,
     runtime: WorkerRuntime,
     cancel: CancellationToken,
@@ -229,39 +246,45 @@ async fn run_chunk_heartbeat(
             _ = cancel.cancelled() => return,
             _ = interval.tick() => {
                 let chunk = guard.current_chunk().await;
-                match guard.renew().await {
-                    Ok(true) => {
-                        match execution_processing::heartbeat_running_attempts_for_chunk(
-                            &guard.db,
-                            chunk.run_id,
-                            chunk.run_shard,
-                            chunk.id,
-                            runtime.worker_id,
-                            ATTEMPT_LEASE_SECONDS,
-                        )
-                        .await
-                        {
-                            Ok(renewed_attempts) => {
-                                debug!(
-                                    run_id = %chunk.run_id,
-                                    chunk_id = %chunk.id,
-                                    worker_id = %runtime.worker_id,
-                                    renewed_attempts,
-                                    "renewed worker chunk and attempt leases"
-                                );
-                            }
-                            Err(err) => {
-                                warn!(
-                                    run_id = %chunk.run_id,
-                                    chunk_id = %chunk.id,
-                                    worker_id = %runtime.worker_id,
-                                    error = %err,
-                                    "failed to renew attempt leases during worker heartbeat"
-                                );
-                            }
-                        }
+                let database_router = match context.dbr().await {
+                    Ok(database_router) => database_router,
+                    Err(err) => {
+                        warn!(error = %err, "failed to resolve database router during worker heartbeat");
+                        continue;
                     }
-                    Ok(false) => {
+                };
+                let heartbeat_result = database_router.run_database_operation(
+                    &database_alias,
+                    "worker_chunk_heartbeat",
+                    async {
+                        let renewed = guard.renew().await?;
+                        let renewed_attempts = if renewed {
+                            Some(execution_processing::heartbeat_running_attempts_for_chunk(
+                                &guard.db,
+                                chunk.run_id,
+                                chunk.run_shard,
+                                chunk.id,
+                                runtime.worker_id,
+                                ATTEMPT_LEASE_SECONDS,
+                            ).await?)
+                        } else {
+                            None
+                        };
+                        Ok((renewed, renewed_attempts))
+                    },
+                ).await;
+                match heartbeat_result {
+                    Ok((true, Some(renewed_attempts))) => {
+                        debug!(
+                            run_id = %chunk.run_id,
+                            chunk_id = %chunk.id,
+                            worker_id = %runtime.worker_id,
+                            renewed_attempts,
+                            "renewed worker chunk and attempt leases"
+                        );
+                    }
+                    Ok((true, None)) => {}
+                    Ok((false, _)) => {
                         warn!(
                             run_id = %chunk.run_id,
                             chunk_id = %chunk.id,
@@ -276,7 +299,7 @@ async fn run_chunk_heartbeat(
                             chunk_id = %chunk.id,
                             worker_id = %runtime.worker_id,
                             error = %err,
-                            "failed to renew chunk lease during worker heartbeat"
+                            "failed to renew worker leases during heartbeat"
                         );
                     }
                 }
@@ -315,7 +338,7 @@ fn execution_route_is_temporarily_blocked(error: &anyhow::Error) -> bool {
 /// Wasmtime components.
 struct EvaluatorLoaderService {
     context: Context,
-    run_context_cache: Arc<Cache<WorkerRunContextKey, Arc<WorkerRunContext>>>,
+    run_context_cache: Arc<Cache<WorkerRunContextKey, Arc<OnceCell<Arc<WorkerRunContext>>>>>,
 }
 
 impl EvaluatorLoaderService {
@@ -407,15 +430,15 @@ impl EvaluatorLoaderService {
         run_shard: i16,
         execution_db: &sqlx::PgPool,
     ) -> anyhow::Result<Arc<WorkerRunContext>> {
-        let context = self.context.clone();
-        let execution_db = execution_db.clone();
         let key = WorkerRunContextKey { run_id, run_shard };
-
-        let context_result = self
+        let cell = self
             .run_context_cache
-            .try_get_with::<_, anyhow::Error>(key, async move {
+            .get_with(key, async { Arc::new(OnceCell::new()) })
+            .await;
+        let context = cell
+            .get_or_try_init(|| async {
                 let Some(profile_snapshot) =
-                    run_snapshots::select_run_profile_snapshot(&execution_db, run_id, run_shard)
+                    run_snapshots::select_run_profile_snapshot(execution_db, run_id, run_shard)
                         .await?
                 else {
                     anyhow::bail!(
@@ -429,30 +452,17 @@ impl EvaluatorLoaderService {
                         anyhow::anyhow!("run '{}' profile is invalid: {}", run_id, err)
                     })?;
                 let evaluator_refs = execution_processing::evaluator_refs_from_profile(&profile)?;
-                let db = context.dbr().await?.control().await?;
+                let db = self.context.dbr().await?.control().await?;
                 let evaluator_catalog =
                     execution_processing::build_run_evaluator_catalog(db, &profile).await?;
-
-                Ok(Arc::new(WorkerRunContext {
+                Ok::<_, anyhow::Error>(Arc::new(WorkerRunContext {
                     profile,
                     evaluator_refs,
                     evaluator_catalog,
                 }))
             })
-            .await;
-
-        let context = match context_result {
-            Ok(context) => context,
-            Err(err) => {
-                return Err(anyhow::anyhow!(
-                    "run context load failed for run '{}' (single-flight): {}",
-                    run_id,
-                    err
-                ));
-            }
-        };
-
-        Ok(context)
+            .await?;
+        Ok(context.clone())
     }
 }
 
@@ -475,6 +485,12 @@ pub(crate) enum SubCommand {
 pub(crate) struct Command {
     #[command(flatten)]
     pub(crate) messaging: MessagingOptions,
+
+    #[command(flatten)]
+    pub(crate) circuit_breaker: CircuitBreakerOptions,
+
+    #[command(flatten)]
+    pub(crate) database_operation_timeout: DatabaseOperationTimeoutOptions,
 
     #[command(flatten)]
     pub(crate) wasm: WasmOptions,
@@ -574,11 +590,37 @@ async fn run_worker_cycle(
     run_worker_message(context, evaluator_loader, runtime, message).await
 }
 
+struct ChunkSettlementContext<'a> {
+    database_router: &'a crate::context::database::DatabaseRouter,
+    database_alias: &'a str,
+    db: &'a sqlx::PgPool,
+    mq: &'a crate::mq::Client,
+    message: &'a crate::mq::ConsumedMessage,
+    chunk: &'a crate::models::run_chunk::RunChunk,
+}
+
+impl<'a> ChunkSettlementContext<'a> {
+    fn new(
+        database_router: &'a crate::context::database::DatabaseRouter,
+        database_alias: &'a str,
+        db: &'a sqlx::PgPool,
+        mq: &'a crate::mq::Client,
+        message: &'a crate::mq::ConsumedMessage,
+        chunk: &'a crate::models::run_chunk::RunChunk,
+    ) -> Self {
+        Self {
+            database_router,
+            database_alias,
+            db,
+            mq,
+            message,
+            chunk,
+        }
+    }
+}
+
 async fn settle_retryable_chunk_failure(
-    db: &sqlx::PgPool,
-    mq: &crate::mq::Client,
-    message: &crate::mq::ConsumedMessage,
-    chunk: &crate::models::run_chunk::RunChunk,
+    settlement: ChunkSettlementContext<'_>,
     reason: &str,
     error_class: &str,
 ) -> anyhow::Result<RetrySettlement> {
@@ -586,47 +628,75 @@ async fn settle_retryable_chunk_failure(
     // processing, or terminal-transition errors. These consume the bounded
     // RabbitMQ retry budget and eventually fail the chunk if the worker still
     // owns the lease.
-    if mq.can_retry_worker_message(&message.raw) {
-        let released = chunk_processing::release_chunk_as_pending(db, chunk).await?;
+    if settlement
+        .mq
+        .can_retry_worker_message(&settlement.message.raw)
+    {
+        let released = settlement
+            .database_router
+            .run_database_operation(
+                settlement.database_alias,
+                "worker_release_failed_chunk",
+                chunk_processing::release_chunk_as_pending(settlement.db, settlement.chunk),
+            )
+            .await?;
         if released > 0 {
-            mq.retry_worker_message(&message.raw, reason, error_class)
+            settlement
+                .mq
+                .retry_worker_message(&settlement.message.raw, reason, error_class)
                 .await?;
             Ok(RetrySettlement::Retried)
         } else {
-            mq.ack(&message.raw).await?;
+            settlement.mq.ack(&settlement.message.raw).await?;
             Ok(RetrySettlement::AcknowledgedStale)
         }
     } else {
-        let failed = chunk_processing::mark_chunk_failed_and_refresh_summary(db, chunk).await?;
-        if failed > 0 {
-            mq.quarantine_worker_message(
-                &message.raw,
-                &format!("worker message retry budget exhausted: {}", reason),
-                error_class,
+        let failed = settlement
+            .database_router
+            .run_database_operation(
+                settlement.database_alias,
+                "worker_fail_exhausted_chunk",
+                chunk_processing::mark_chunk_failed_and_refresh_summary(
+                    settlement.db,
+                    settlement.chunk,
+                ),
             )
             .await?;
+        if failed > 0 {
+            settlement
+                .mq
+                .quarantine_worker_message(
+                    &settlement.message.raw,
+                    &format!("worker message retry budget exhausted: {}", reason),
+                    error_class,
+                )
+                .await?;
             Ok(RetrySettlement::FailedExhausted)
         } else {
-            mq.ack(&message.raw).await?;
+            settlement.mq.ack(&settlement.message.raw).await?;
             Ok(RetrySettlement::AcknowledgedStale)
         }
     }
 }
 
 async fn settle_chunk_waiting_for_execution_retry(
-    db: &sqlx::PgPool,
-    mq: &crate::mq::Client,
-    message: &crate::mq::ConsumedMessage,
-    chunk: &crate::models::run_chunk::RunChunk,
+    settlement: ChunkSettlementContext<'_>,
     reason: &str,
     next_retry_after: Option<chrono::DateTime<chrono::Utc>>,
 ) -> anyhow::Result<RetrySettlement> {
     // This settlement path is for planned execution retry waits. It releases
     // the chunk and delays redelivery without incrementing the worker-failure
     // retry count; the database retry_after field remains the source of truth.
-    let released = chunk_processing::release_chunk_as_pending(db, chunk).await?;
+    let released = settlement
+        .database_router
+        .run_database_operation(
+            settlement.database_alias,
+            "worker_release_retry_wait",
+            chunk_processing::release_chunk_as_pending(settlement.db, settlement.chunk),
+        )
+        .await?;
     if released == 0 {
-        mq.ack(&message.raw).await?;
+        settlement.mq.ack(&settlement.message.raw).await?;
         return Ok(RetrySettlement::AcknowledgedStale);
     }
 
@@ -638,10 +708,64 @@ async fn settle_chunk_waiting_for_execution_retry(
                 .max(1)
         })
         .unwrap_or(1);
-    mq.delay_worker_message(&message.raw, delay_seconds, reason, "execution_retry")
+    settlement
+        .mq
+        .delay_worker_message(
+            &settlement.message.raw,
+            delay_seconds,
+            reason,
+            "execution_retry",
+        )
         .await?;
 
     Ok(RetrySettlement::Delayed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkerDatabaseFailureDisposition {
+    delay_seconds: i64,
+}
+
+fn retry_delay_seconds(duration: Duration) -> i64 {
+    let rounded = duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() > 0));
+    i64::try_from(rounded).unwrap_or(i64::MAX).max(1)
+}
+
+fn contain_worker_database_error(
+    database_router: &crate::context::database::DatabaseRouter,
+    permit: crate::context::database::CircuitPermit,
+    error: &anyhow::Error,
+    claimed: bool,
+) -> Option<WorkerDatabaseFailureDisposition> {
+    // Database retries do not consume the worker's application-failure budget.
+    // Once claimed, the delivery must wait until its lease cannot still admit
+    // writes from this worker.
+    let (unavailable, transition) = database_router.record_database_operation_error(permit, error);
+    if !unavailable && !crate::context::database::is_database_contention(error) {
+        return None;
+    }
+
+    let circuit_delay = match transition {
+        Some(crate::context::database::CircuitTransition::Opened { retry_after }) => {
+            retry_delay_seconds(retry_after)
+        }
+        _ => WORKER_ROUTE_RETRY_DELAY_SECONDS,
+    };
+    let lease_delay = if claimed {
+        i64::from(CHUNK_PROCESSING_LEASE_SECONDS).saturating_add(5)
+    } else {
+        0
+    };
+    Some(WorkerDatabaseFailureDisposition {
+        delay_seconds: circuit_delay.max(lease_delay),
+    })
+}
+
+fn is_retryable_worker_database_error(error: &anyhow::Error) -> bool {
+    crate::context::database::is_database_unavailable(error)
+        || crate::context::database::is_database_contention(error)
 }
 
 async fn run_worker_message(
@@ -649,6 +773,97 @@ async fn run_worker_message(
     evaluator_loader: &EvaluatorLoaderService,
     runtime: WorkerRuntime,
     message: crate::mq::ConsumedMessage,
+) -> anyhow::Result<WorkerCycleOutcome> {
+    let Ok(payload) = serde_json::from_value::<ChunkReadyMessage>(message.payload.clone()) else {
+        let mut claimed = false;
+        return run_worker_message_admitted(
+            context,
+            evaluator_loader,
+            runtime,
+            &message,
+            &mut claimed,
+        )
+        .await;
+    };
+    let database_router = context.dbr().await?;
+    let permit = match database_router.acquire_database_operation(&payload.database_alias) {
+        Ok(permit) => permit,
+        Err(open) => {
+            let delay_seconds =
+                retry_delay_seconds(open.retry_after).max(WORKER_ROUTE_RETRY_DELAY_SECONDS);
+            context
+                .mq()
+                .await?
+                .delay_worker_message(
+                    &message.raw,
+                    delay_seconds,
+                    "execution database circuit is open",
+                    "execution_database_unavailable",
+                )
+                .await?;
+            info!(
+                database_alias = %payload.database_alias,
+                run_id = %payload.run_id,
+                run_shard = payload.run_shard,
+                chunk_id = %payload.chunk_id,
+                delay_seconds,
+                "delayed worker message while execution database circuit is open"
+            );
+            return Ok(WorkerCycleOutcome::Processed);
+        }
+    };
+
+    let mut claimed = false;
+    match run_worker_message_admitted(
+        context.clone(),
+        evaluator_loader,
+        runtime,
+        &message,
+        &mut claimed,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            database_router.record_database_operation_success(permit);
+            Ok(outcome)
+        }
+        Err(error) => {
+            let Some(disposition) =
+                contain_worker_database_error(database_router, permit, &error, claimed)
+            else {
+                return Err(error);
+            };
+            context
+                .mq()
+                .await?
+                .delay_worker_message(
+                    &message.raw,
+                    disposition.delay_seconds,
+                    &error.to_string(),
+                    "execution_database_unavailable",
+                )
+                .await?;
+            warn!(
+                database_alias = %payload.database_alias,
+                run_id = %payload.run_id,
+                run_shard = payload.run_shard,
+                chunk_id = %payload.chunk_id,
+                claimed,
+                delay_seconds = disposition.delay_seconds,
+                error = %error,
+                "contained worker execution database failure; delayed message"
+            );
+            Ok(WorkerCycleOutcome::Processed)
+        }
+    }
+}
+
+async fn run_worker_message_admitted(
+    context: Context,
+    evaluator_loader: &EvaluatorLoaderService,
+    runtime: WorkerRuntime,
+    message: &crate::mq::ConsumedMessage,
+    claimed_by_worker: &mut bool,
 ) -> anyhow::Result<WorkerCycleOutcome> {
     // --- Acquire shared services ---
     // Settlement paths use the message queue handle to keep ack/retry behavior
@@ -695,13 +910,17 @@ async fn run_worker_message(
     // avoiding a control-database read on the normal worker path.
     let database_router = context.dbr().await?;
     let hinted_route = match database_router
-        .execution_write_route(
-            crate::db::workflows::local_shard_admission::LocalShardRouteHint {
-                run_id: payload.run_id,
-                run_shard: payload.run_shard,
-                database_alias: payload.database_alias.clone(),
-                write_epoch: payload.write_epoch,
-            },
+        .run_database_operation(
+            &payload.database_alias,
+            "worker_execution_route",
+            database_router.execution_write_route(
+                crate::db::workflows::local_shard_admission::LocalShardRouteHint {
+                    run_id: payload.run_id,
+                    run_shard: payload.run_shard,
+                    database_alias: payload.database_alias.clone(),
+                    write_epoch: payload.write_epoch,
+                },
+            ),
         )
         .await
     {
@@ -729,12 +948,13 @@ async fn run_worker_message(
     // --- Claim chunk ownership ---
     // Duplicate, stale, cancelled, completed, or not-yet-running chunks are
     // acknowledged because the database refused ownership.
-    let (db, claimed) = match claim_hinted_chunk_with_route_refresh(
-        database_router,
-        &hinted_route,
-        payload.chunk_id,
-    )
-    .await
+    let (db, claimed) = match database_router
+        .run_database_operation(
+            &payload.database_alias,
+            "worker_chunk_claim",
+            claim_hinted_chunk_with_route_refresh(database_router, &hinted_route, payload.chunk_id),
+        )
+        .await
     {
         Ok(claimed) => claimed,
         Err(err) if execution_route_is_temporarily_blocked(&err) => {
@@ -771,6 +991,7 @@ async fn run_worker_message(
         );
         return Ok(WorkerCycleOutcome::Processed);
     };
+    *claimed_by_worker = true;
 
     debug!(
         run_id = %chunk.run_id,
@@ -784,12 +1005,21 @@ async fn run_worker_message(
     // --- Load run context and extend lease ---
     // The opaque claim token remains the authority for later writes while the
     // heartbeat advances its expiration deadline.
-    let run_context = evaluator_loader
-        .get_or_build_run_context(chunk.run_id, chunk.run_shard, db)
+    let run_context = database_router
+        .run_database_operation(
+            &payload.database_alias,
+            "worker_run_context_load",
+            evaluator_loader.get_or_build_run_context(chunk.run_id, chunk.run_shard, db),
+        )
         .await?;
 
-    let Some(extended_chunk) =
-        chunk_processing::extend_chunk_lease(db, &chunk, CHUNK_PROCESSING_LEASE_SECONDS).await?
+    let Some(extended_chunk) = database_router
+        .run_database_operation(
+            &payload.database_alias,
+            "worker_chunk_lease_extension",
+            chunk_processing::extend_chunk_lease(db, &chunk, CHUNK_PROCESSING_LEASE_SECONDS),
+        )
+        .await?
     else {
         mq.ack(&message.raw).await?;
         warn!(
@@ -808,7 +1038,13 @@ async fn run_worker_message(
         leased_until = ?chunk.leased_until,
         "extended chunk lease for processing budget"
     );
-    let heartbeat = ChunkHeartbeat::start(db, chunk.clone(), runtime.clone());
+    let heartbeat = ChunkHeartbeat::start(
+        context.clone(),
+        payload.database_alias.clone(),
+        db,
+        chunk.clone(),
+        runtime.clone(),
+    );
     let attempt_lease = execution_processing::AttemptLeaseContext {
         worker_id: runtime.worker_id,
         worker_host: runtime.worker_host.clone(),
@@ -835,11 +1071,18 @@ async fn run_worker_message(
         }
         Err(err) => {
             let chunk = heartbeat.stop().await;
+            if is_retryable_worker_database_error(&err) {
+                return Err(err);
+            }
             let settlement = settle_retryable_chunk_failure(
-                db,
-                mq,
-                &message,
-                &chunk,
+                ChunkSettlementContext::new(
+                    database_router,
+                    &payload.database_alias,
+                    db,
+                    mq,
+                    message,
+                    &chunk,
+                ),
                 &err.to_string(),
                 "evaluator_warmup",
             )
@@ -858,7 +1101,13 @@ async fn run_worker_message(
     // --- Load chunk case batch ---
     // Loading failure is retryable as long as this worker still owns the chunk
     // lease.
-    let batch_result = chunk_processing::load_chunk_case_batch(db, &chunk).await;
+    let batch_result = database_router
+        .run_database_operation(
+            &payload.database_alias,
+            "worker_case_batch_load",
+            chunk_processing::load_chunk_case_batch(db, &chunk),
+        )
+        .await;
     match batch_result {
         Ok(cases) => {
             let mut succeeded = 0usize;
@@ -870,6 +1119,7 @@ async fn run_worker_message(
             let processed = match execution_processing::process_case_batch_execution(
                 &context,
                 db,
+                &payload.database_alias,
                 &chunk,
                 &attempt_lease,
                 &run_context.profile,
@@ -881,11 +1131,18 @@ async fn run_worker_message(
                 Ok(processed) => processed,
                 Err(err) => {
                     let chunk = heartbeat.stop().await;
+                    if is_retryable_worker_database_error(&err) {
+                        return Err(err);
+                    }
                     let settlement = settle_retryable_chunk_failure(
-                        db,
-                        mq,
-                        &message,
-                        &chunk,
+                        ChunkSettlementContext::new(
+                            database_router,
+                            &payload.database_alias,
+                            db,
+                            mq,
+                            message,
+                            &chunk,
+                        ),
                         &err.to_string(),
                         "chunk_processing",
                     )
@@ -932,22 +1189,34 @@ async fn run_worker_message(
             // --- Apply guarded terminal transitions ---
             // Failures here are retryable worker failures because evidence may
             // have been written, but execution state was not advanced safely.
-            if let Err(err) = execution_processing::finalize_execution_terminal_transitions(
-                db,
-                chunk.run_id,
-                chunk.run_shard,
-                runtime.worker_id,
-                i32::try_from(run_context.profile.defaults.max_attempts)?,
-                &terminal_transitions,
-            )
-            .await
+            if let Err(err) = database_router
+                .run_database_operation(
+                    &payload.database_alias,
+                    "worker_terminal_transitions",
+                    execution_processing::finalize_execution_terminal_transitions(
+                        db,
+                        chunk.run_id,
+                        chunk.run_shard,
+                        runtime.worker_id,
+                        i32::try_from(run_context.profile.defaults.max_attempts)?,
+                        &terminal_transitions,
+                    ),
+                )
+                .await
             {
                 let chunk = heartbeat.stop().await;
+                if is_retryable_worker_database_error(&err) {
+                    return Err(err);
+                }
                 let settlement = settle_retryable_chunk_failure(
-                    db,
-                    mq,
-                    &message,
-                    &chunk,
+                    ChunkSettlementContext::new(
+                        database_router,
+                        &payload.database_alias,
+                        db,
+                        mq,
+                        message,
+                        &chunk,
+                    ),
                     &err.to_string(),
                     "terminal_transition",
                 )
@@ -965,13 +1234,18 @@ async fn run_worker_message(
             // --- Check for pending execution retries ---
             // Open retry work releases the chunk and delays the message until
             // the next retry window.
-            let chunk_state = execution_processing::summarize_chunk_execution_state(
-                db,
-                chunk.run_id,
-                chunk.run_shard,
-                &cases,
-            )
-            .await?;
+            let chunk_state = database_router
+                .run_database_operation(
+                    &payload.database_alias,
+                    "worker_execution_state_summary",
+                    execution_processing::summarize_chunk_execution_state(
+                        db,
+                        chunk.run_id,
+                        chunk.run_shard,
+                        &cases,
+                    ),
+                )
+                .await?;
             if chunk_state.open_execution_count > 0 {
                 let chunk = heartbeat.stop().await;
                 let reason = format!(
@@ -981,10 +1255,14 @@ async fn run_worker_message(
                     chunk_state.next_retry_after
                 );
                 let settlement = settle_chunk_waiting_for_execution_retry(
-                    db,
-                    mq,
-                    &message,
-                    &chunk,
+                    ChunkSettlementContext::new(
+                        database_router,
+                        &payload.database_alias,
+                        db,
+                        mq,
+                        message,
+                        &chunk,
+                    ),
                     &reason,
                     chunk_state.next_retry_after,
                 )
@@ -1005,8 +1283,13 @@ async fn run_worker_message(
             // All executions in the chunk are terminal, so complete the chunk
             // under the same lease token.
             let chunk = heartbeat.stop().await;
-            let completed =
-                chunk_processing::mark_chunk_completed_and_refresh_summary(db, &chunk).await?;
+            let completed = database_router
+                .run_database_operation(
+                    &payload.database_alias,
+                    "worker_chunk_completion",
+                    chunk_processing::mark_chunk_completed_and_refresh_summary(db, &chunk),
+                )
+                .await?;
             if completed == 0 {
                 mq.ack(&message.raw).await?;
                 warn!(
@@ -1034,11 +1317,18 @@ async fn run_worker_message(
         }
         Err(err) => {
             let chunk = heartbeat.stop().await;
+            if is_retryable_worker_database_error(&err) {
+                return Err(err);
+            }
             let settlement = settle_retryable_chunk_failure(
-                db,
-                mq,
-                &message,
-                &chunk,
+                ChunkSettlementContext::new(
+                    database_router,
+                    &payload.database_alias,
+                    db,
+                    mq,
+                    message,
+                    &chunk,
+                ),
                 &err.to_string(),
                 "case_batch_load",
             )
@@ -1106,16 +1396,31 @@ pub(crate) async fn claim_hinted_chunk_with_route_refresh(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use serde_json::json;
+    use sqlx::{
+        PgPool,
+        postgres::PgPoolOptions,
+    };
     use uuid::Uuid;
 
     use super::{
         ChunkReadyMessage,
         DEFAULT_WORKER_MAX_INFLIGHT_CHUNKS,
+        WORKER_ROUTE_RETRY_DELAY_SECONDS,
+        contain_worker_database_error,
         execution_route_is_temporarily_blocked,
         worker_stream_prefetch,
     };
-    use crate::context::database::ExecutionRouteError;
+    use crate::context::{
+        Context,
+        database::{
+            self,
+            ExecutionRouteError,
+        },
+        output::OutputFormat,
+    };
 
     #[test]
     fn default_worker_processes_one_chunk_at_a_time() {
@@ -1189,5 +1494,139 @@ mod tests {
         });
 
         assert!(execution_route_is_temporarily_blocked(&error));
+    }
+
+    #[tokio::test]
+    async fn unavailable_database_is_contained_to_its_worker_alias() {
+        let context = test_context("postgres://not-used");
+        let database_router = context.dbr().await.unwrap();
+        let permit = database_router
+            .acquire_database_operation("shard_001")
+            .unwrap();
+        let error = anyhow::Error::new(sqlx::Error::PoolTimedOut);
+
+        let disposition =
+            contain_worker_database_error(database_router, permit, &error, true).unwrap();
+
+        assert!(disposition.delay_seconds > WORKER_ROUTE_RETRY_DELAY_SECONDS);
+        assert!(
+            database_router
+                .acquire_database_operation("shard_001")
+                .is_err()
+        );
+        assert!(
+            database_router
+                .acquire_database_operation("shard_002")
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn non_database_error_remains_process_visible() {
+        let context = test_context("postgres://not-used");
+        let database_router = context.dbr().await.unwrap();
+        let permit = database_router
+            .acquire_database_operation("shard_001")
+            .unwrap();
+
+        assert!(
+            contain_worker_database_error(
+                database_router,
+                permit,
+                &anyhow::anyhow!("invariant failed"),
+                false,
+            )
+            .is_none()
+        );
+        assert!(
+            database_router
+                .acquire_database_operation("shard_001")
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_run_context_load_preserves_database_error_and_is_retryable() {
+        let context = test_context("postgres://not-used");
+        let loader = super::EvaluatorLoaderService::new(context);
+        let unavailable = PgPoolOptions::new()
+            .connect_lazy("postgres://vigilo@127.0.0.1/vigilo")
+            .unwrap();
+        unavailable.close().await;
+        let run_id = Uuid::now_v7();
+
+        for _ in 0..2 {
+            let error = loader
+                .get_or_build_run_context(run_id, 1, &unavailable)
+                .await
+                .unwrap_err();
+
+            assert!(database::is_database_unavailable(&error));
+        }
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for worker database containment tests"]
+    async fn failed_worker_database_does_not_block_healthy_database(pool: PgPool) {
+        let database_name = sqlx::query_scalar::<_, String>("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let mut database_url = url::Url::parse(&std::env::var("DATABASE_URL").unwrap()).unwrap();
+        database_url.set_path(&database_name);
+        let context = test_context(database_url.as_str());
+        let database_router = context.dbr().await.unwrap();
+        let unavailable = PgPoolOptions::new()
+            .connect_lazy("postgres://vigilo@127.0.0.1/vigilo")
+            .unwrap();
+        unavailable.close().await;
+        let error = sqlx::query("SELECT 1")
+            .execute(&unavailable)
+            .await
+            .unwrap_err();
+        let permit = database_router
+            .acquire_database_operation("shard_001")
+            .unwrap();
+
+        assert!(
+            contain_worker_database_error(
+                database_router,
+                permit,
+                &anyhow::Error::new(error),
+                false,
+            )
+            .is_some()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i32>("SELECT 1")
+                .fetch_one(database_router.control().await.unwrap())
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    fn test_context(database_url: &str) -> Context {
+        Context::new(
+            database::Config::new(
+                database_url.to_string(),
+                1,
+                Duration::from_secs(1),
+                database::CircuitBreakerConfig::new(
+                    true,
+                    1,
+                    Duration::from_secs(10),
+                    Duration::from_secs(10),
+                )
+                .unwrap(),
+                database::PlacementConfig::default_single_database(),
+            )
+            .with_operation_timeout(Some(
+                database::DatabaseOperationTimeoutConfig::new(Duration::from_secs(1)).unwrap(),
+            )),
+            Some("amqp://not-used".to_string()),
+            crate::context::wasm::Config::default(),
+            OutputFormat::Json,
+        )
     }
 }

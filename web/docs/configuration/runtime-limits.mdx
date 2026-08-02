@@ -22,7 +22,7 @@ flowchart LR
     root["All commands<br/>database client + output"]
     create["run create<br/>placement + creation + DB resilience"]
     coordinator["coordinator<br/>messaging + creation + DB resilience"]
-    worker["worker<br/>messaging + Wasm"]
+    worker["worker<br/>messaging + Wasm + DB resilience"]
     evaluator["setup / evaluator publish or test<br/>Wasm"]
 
     root --> create
@@ -65,23 +65,25 @@ See the [Glossary](/docs/glossary) for chunk, attempt, and broker-message terms.
 
 ## Database Failure Isolation
 
-Coordinator execution-database operations use one process-local circuit breaker
-per database alias. Repeated connection-level failures open only that alias's
-circuit. Durable creation, recovery, dispatch, finalization, and outbox work is
-left pending while the coordinator continues with healthy aliases. After the
+Coordinators and workers use one process-local circuit breaker per database
+alias. Repeated connection-level failures open only that alias's circuit.
+Durable coordinator work remains pending, and worker messages for that alias
+are delayed, while healthy aliases continue in the same process. After the
 cooldown, one half-open probe tests recovery. Explicit database and shard
 administration bypasses the breaker.
 
 Runtime pools also apply bounded PostgreSQL `statement_timeout` and
 `lock_timeout` settings. Coordinator placement operations have an outer
 wall-clock deadline, so a connected target that stops making progress cannot
-hold the placement sweep indefinitely. The statement timeout is 80% of the
-configured operation timeout; lock timeout is one quarter of the statement
+hold the placement sweep indefinitely. Worker claim, load, heartbeat,
+persistence, and settlement operations use the same deadline; agent calls,
+Wasm execution, and broker operations do not. The statement timeout is 80% of
+the configured operation timeout; lock timeout is one quarter of the statement
 timeout, capped at 5 seconds. A single setting keeps these limits ordered.
 
 ```mermaid
 flowchart LR
-    op["placement database operation"] --> outer["outer Tokio deadline<br/>30s default"]
+    op["coordinator or worker<br/>database operation"] --> outer["outer Tokio deadline<br/>30s default"]
     outer --> acquire["pool acquire<br/>10s default"]
     outer --> statement["PostgreSQL statement<br/>24s default"]
     statement --> lock["lock wait<br/>5s maximum"]
@@ -94,22 +96,31 @@ flowchart LR
 | Flag | Environment | Scope | Default | Purpose |
 | --- | --- | --- | ---: | --- |
 | `--database-acquire-timeout-seconds` | `VIGILO_DATABASE_ACQUIRE_TIMEOUT_SECONDS` | All commands | `10` | Maximum wait to acquire a PostgreSQL connection. |
-| `--database-operation-timeout-seconds` | `VIGILO_DATABASE_OPERATION_TIMEOUT_SECONDS` | `coordinator`, `run create` | `30` | Maximum wall-clock time for one retryable runtime database operation; derives the server statement and lock limits. |
-| `--database-circuit-breaker-enabled` | `VIGILO_DATABASE_CIRCUIT_BREAKER_ENABLED` | `coordinator`, `run create` | `true` | Enables process-local execution-database circuit breakers. |
-| `--database-circuit-failure-threshold` | `VIGILO_DATABASE_CIRCUIT_FAILURE_THRESHOLD` | `coordinator`, `run create` | `3` | Consecutive availability failures required to open an alias's circuit. |
-| `--database-circuit-initial-open-seconds` | `VIGILO_DATABASE_CIRCUIT_INITIAL_OPEN_SECONDS` | `coordinator`, `run create` | `10` | Initial open interval before one recovery probe is admitted. |
-| `--database-circuit-max-open-seconds` | `VIGILO_DATABASE_CIRCUIT_MAX_OPEN_SECONDS` | `coordinator`, `run create` | `120` | Maximum open interval after repeated failed probes. |
+| `--database-operation-timeout-seconds` | `VIGILO_DATABASE_OPERATION_TIMEOUT_SECONDS` | `coordinator`, `worker`, `run create` | `30` | Maximum wall-clock time for one retryable runtime database operation; derives the server statement and lock limits. |
+| `--database-circuit-breaker-enabled` | `VIGILO_DATABASE_CIRCUIT_BREAKER_ENABLED` | `coordinator`, `worker`, `run create` | `true` | Enables process-local execution-database circuit breakers. |
+| `--database-circuit-failure-threshold` | `VIGILO_DATABASE_CIRCUIT_FAILURE_THRESHOLD` | `coordinator`, `worker`, `run create` | `3` | Consecutive availability failures required to open an alias's circuit. |
+| `--database-circuit-initial-open-seconds` | `VIGILO_DATABASE_CIRCUIT_INITIAL_OPEN_SECONDS` | `coordinator`, `worker`, `run create` | `10` | Initial open interval before one recovery probe is admitted. |
+| `--database-circuit-max-open-seconds` | `VIGILO_DATABASE_CIRCUIT_MAX_OPEN_SECONDS` | `coordinator`, `worker`, `run create` | `120` | Maximum open interval after repeated failed probes. |
 
 I/O, TLS, protocol, connection-class, shutdown, target resource, pool
 acquisition timeout, statement timeout, and outer operation timeout failures
 affect the breaker. Route state, constraints, serialization failures, deadlocks,
 lock contention, and missing secrets do not. Cooldowns use process-local jitter,
-so coordinators do not all probe at the same instant.
+so processes do not all probe at the same instant.
 
 Outbox claim and settlement SQL uses the server limits. The outer database
 deadline deliberately excludes broker publication, so slow RabbitMQ delivery
 does not open a database circuit. Cancellation drops owned transactions;
 uncommitted dispatch cursors and creation work remain durable for retry.
+
+A worker checks the alias circuit before claiming a message. Availability
+timeouts and PostgreSQL contention delay only that message; they do not consume
+the bounded worker-failure retry budget or terminate the process. If the chunk
+was already claimed, redelivery is delayed past the processing lease so another
+worker cannot race the still-live claim. The lease token and attempt guards
+make replay idempotent. Failure to publish the delayed copy remains
+process-visible because acknowledging the original without a durable retry
+would lose work.
 
 ## Worker Chunk Concurrency
 

@@ -64,7 +64,7 @@ shard before invoking the single-shard move operation.
 | Database placement | Catalog entry for one PostgreSQL target, named by a database alias. |
 | Shard placement | Desired mapping from one used run shard to a database alias, lifecycle, route version, and write epoch. |
 | Database router | Process-local resolver that turns stored placement metadata into a PostgreSQL pool. |
-| Database circuit breaker | Process-local coordinator admission that temporarily skips one unavailable execution database alias without changing durable routing. |
+| Database circuit breaker | Process-local coordinator and worker admission that temporarily skips one unavailable database alias without changing durable routing. |
 | Execution route | Resolved shard placement plus its current execution database pool. |
 | Route version | Per-shard-placement generation incremented when its alias or status changes. |
 | Write epoch | Ownership generation incremented only when write ownership moves or is restored. |
@@ -130,11 +130,11 @@ metadata does not distribute or reload secrets.
 
 Placement pool configuration resolves the requested alias lazily. An unset
 secret for one placement therefore fails that placement without preventing a
-healthy alias from initializing. Coordinator runtime operations also pass
-through a process-local per-alias circuit breaker. Open circuits defer durable
-work for the unavailable alias while other aliases continue. Breaker state is
-neither shared between coordinators nor persisted, and explicit administrative
-commands bypass it.
+healthy alias from initializing. Coordinator and worker runtime operations also
+pass through a process-local per-alias circuit breaker. Open circuits defer
+durable work or delay worker messages for the unavailable alias while other
+aliases continue. Breaker state is neither shared between processes nor
+persisted, and explicit administrative commands bypass it.
 
 ## Logical Shards
 
@@ -215,6 +215,13 @@ Workers stay chunk-local:
   local run snapshot and case data, persists attempts/results/aggregates, and
   refreshes the shard summary in that execution placement.
 - Evaluator registry metadata remains a control-database read.
+- Database operations have bounded client and PostgreSQL deadlines. An
+  availability failure or lock conflict delays only the affected message and
+  does not consume its worker-failure retry budget. A claimed message waits
+  past its lease before redelivery; claim and attempt tokens fence stale work.
+- Agent calls, evaluator execution, and broker settlement stay outside the
+  database deadline. Broker failure remains process-visible so work is never
+  acknowledged without a durable retry or completed database state.
 
 Finalization fans in:
 
@@ -565,7 +572,8 @@ Implemented today:
   shard move, rebalance plan/apply resume/verify, route-version inspection, and
   prerequisite-copy verification. The runtime harness also verifies that an
   unavailable shard does not stop healthy dispatch, lease recovery, or outbox
-  publication.
+  publication. Database integration coverage separately verifies worker access
+  to a healthy alias after another alias fails.
 
 Intentionally deferred:
 

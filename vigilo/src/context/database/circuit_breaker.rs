@@ -343,6 +343,21 @@ pub(super) fn classify_error(error: &anyhow::Error) -> FailureImpact {
     }
 }
 
+pub(crate) fn is_database_contention(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<sqlx::Error>())
+        .and_then(|error| match error {
+            sqlx::Error::Database(error) => error.code(),
+            _ => None,
+        })
+        .is_some_and(|code| is_database_contention_code(Some(code.as_ref())))
+}
+
+pub(crate) fn is_database_unavailable(error: &anyhow::Error) -> bool {
+    classify_error(error) == FailureImpact::Unavailable
+}
+
 fn classify_database_error_code(code: Option<&str>) -> FailureImpact {
     let Some(code) = code else {
         return FailureImpact::Available;
@@ -357,6 +372,10 @@ fn classify_database_error_code(code: Option<&str>) -> FailureImpact {
     } else {
         FailureImpact::Available
     }
+}
+
+fn is_database_contention_code(code: Option<&str>) -> bool {
+    matches!(code, Some("40001" | "40P01" | "55P03"))
 }
 
 #[cfg(test)]
@@ -536,6 +555,11 @@ mod tests {
             ))),
             FailureImpact::Unavailable
         );
+        assert!(is_database_contention_code(Some("40001")));
+        assert!(is_database_contention_code(Some("40P01")));
+        assert!(is_database_contention_code(Some("55P03")));
+        assert!(!is_database_contention_code(Some("57014")));
+        assert!(!is_database_contention_code(Some("23505")));
     }
 
     #[test]

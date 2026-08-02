@@ -131,8 +131,8 @@ mod tests {
         let worker = root.find_subcommand("worker").unwrap();
         assert!(has_long(worker, "messaging-url"));
         assert!(has_long(worker, "wasm-timeout-ms"));
-        assert!(!has_long(worker, "database-circuit-failure-threshold"));
-        assert!(!has_long(worker, "database-operation-timeout-seconds"));
+        assert!(has_long(worker, "database-circuit-failure-threshold"));
+        assert!(has_long(worker, "database-operation-timeout-seconds"));
 
         let evaluator_test = root
             .find_subcommand("evaluator")

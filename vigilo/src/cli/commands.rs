@@ -98,6 +98,8 @@ impl Command {
             Self::Worker(command) => {
                 messaging_url = Some(command.messaging.messaging_url.clone());
                 wasm = command.wasm;
+                circuit_breaker = command.circuit_breaker;
+                database_operation_timeout = Some(command.database_operation_timeout.config()?);
             }
             Self::Setup(command) => {
                 placement = command.placement.clone();
