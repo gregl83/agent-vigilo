@@ -203,11 +203,16 @@ Retries are bounded by `defaults.max_attempts`. When the current attempt number 
 
 Before finalization, the coordinator recovers expired chunk leases for running runs. Recoverable chunks are reset to `pending`, their current running attempts are marked `stale`, and they receive a recovery-scoped `run.chunk.ready` outbox event record. Chunks that exceed the recovery limit are marked `failed`.
 
-The coordinator checks:
+The coordinator checks a bounded number of candidates per cycle:
 
 > Are all chunks terminal?
 
 `pending` or `leased` chunks keep a run out of finalization, including chunks waiting on execution retry windows. Once chunks are terminal, finalization rolls up terminal executions and treats missing execution coverage or failed chunks as a failed gate.
+
+A candidate with missing or non-terminal shard summaries is recorded as
+checked and rotated behind unchecked candidates. The coordinator continues to
+later candidates in the same cycle, preventing one slow shard from blocking
+unrelated ready runs.
 
 If all chunks are terminal:
 

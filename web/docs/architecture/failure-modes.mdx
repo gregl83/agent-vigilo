@@ -57,9 +57,11 @@ Each process keeps an independent circuit breaker per execution database alias.
 Connection-level failures open only the affected alias after the configured
 threshold. Coordinator creation, recovery, dispatch, finalization-summary, and
 outbox operations then skip that alias without consuming its durable work.
-Healthy aliases continue through the cycle. One half-open probe is admitted
-after a bounded, jittered cooldown; success closes the circuit and a repeated
-availability failure increases the cooldown up to its configured maximum.
+Workers delay only the affected alias's message without spending its ordinary
+failure retry budget. Healthy aliases continue through the coordinator cycle or
+worker process. One half-open probe is admitted after a bounded, jittered
+cooldown; success closes the circuit and a repeated availability failure
+increases the cooldown up to its configured maximum.
 
 Circuit state is not routing authority and is not stored in the control
 database. A restart begins closed, direct administration bypasses the breaker,

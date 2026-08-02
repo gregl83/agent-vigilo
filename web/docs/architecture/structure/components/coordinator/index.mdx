@@ -26,7 +26,10 @@ Describes the major internal responsibilities of the coordinator runtime.
 - Chunk lease recovery then runs before dispatch and finalization: expired worker chunk leases are either requeued with recovery-scoped chunk-ready outbox event records or marked failed after the recovery limit.
 - Dispatch claims an open `run_id + run_shard` cursor, selects one bounded chunk window from that shard, and inserts one `run.chunk.ready` outbox event record per selected chunk.
 - Already-running run dispatch is cursor-owned and takes only a compatible shared `runs` lock, allowing multiple coordinators to dispatch different shard cursors for the same run while cancellation and finalization retain exclusive lifecycle guards.
-- Finalization is coordinator-owned and lease guarded; workers persist execution outcomes but do not complete the run row.
+- Finalization is coordinator-owned and lease guarded. Each cycle inspects a
+  bounded candidate set, rotates blocked runs behind unchecked work, and can
+  finalize later ready runs; workers persist execution outcomes but do not
+  complete the run row.
 - Outbox publication is deliberately separate from state changes so committed ledger event records can be retried after broker or process failures.
 - Coordinator throughput knobs can tune cycle interval, creation-recovery batch
   size, chunk lease recovery batch size and limit, dispatch windows, outbox

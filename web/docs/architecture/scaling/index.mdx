@@ -226,7 +226,12 @@ Workers stay chunk-local:
 Finalization fans in:
 
 - Each execution placement maintains `run_shard_summaries`.
-- The coordinator reads routed summaries for the run.
+- The coordinator inspects a bounded number of candidates per cycle and reads
+  routed summaries for each run. A blocked candidate is moved behind unchecked
+  candidates, allowing a later ready run to finalize in the same cycle.
+  `--max-finalize-per-cycle` / `VIGILO_COORDINATOR_MAX_FINALIZE_PER_CYCLE`
+  bounds candidate inspections, not guaranteed successful finalizations; the
+  default is `64`.
 - The control database claims the run without waiting behind active dispatch
   lifecycle locks. The global outcome and `run.completed` event are written
   only while that coordinator still owns an unexpired finalization lease.
@@ -565,6 +570,9 @@ Implemented today:
   without discarding reusable connection pools.
 - Placement-isolated coordinator recovery, dispatch, finalization reads, and
   outbox publication with per-cycle failure classification and counters.
+- Bounded fair finalization scanning that rotates blocked runs and continues to
+  later ready candidates without weakening the control-database finalization
+  lease.
 - CI coverage for the black-box and runtime multi-database paths: run creation
   to `primary` and `shard_001`, recovery after a remote seed commit, route
   inspection, control-owned cursors, coordinator dispatch, worker execution,
@@ -580,7 +588,6 @@ Intentionally deferred:
 - Evaluator metadata replication to execution placements.
 - Broader canonical case-data routing and replication.
 - Runtime database-secret and connection-parameter refresh.
-- Fair multi-candidate finalization scanning.
 
 These are product and operations contracts, not hidden formulas. Until they are
 designed explicitly, routing remains stored, inspectable, and conservative.

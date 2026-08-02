@@ -1,4 +1,4 @@
-//! Process-local circuit breakers for coordinator execution-database work.
+//! Process-local circuit breakers for runtime execution-database work.
 //!
 //! Breakers are keyed by database alias and affect only runtime admission.
 //! Durable routing and work remain authoritative in PostgreSQL, and explicit

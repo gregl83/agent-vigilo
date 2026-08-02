@@ -149,7 +149,7 @@ pub(crate) struct Command {
     #[arg(long, env = "VIGILO_COORDINATOR_MAX_DISPATCH_PER_CYCLE", default_value_t = COORDINATOR_MAX_DISPATCH_PER_CYCLE, value_parser = clap::value_parser!(u64).range(1..=100_000))]
     pub max_dispatch_per_cycle: u64,
 
-    /// Maximum runs finalized per coordinator cycle
+    /// Maximum finalization candidates inspected per coordinator cycle
     #[arg(long, env = "VIGILO_COORDINATOR_MAX_FINALIZE_PER_CYCLE", default_value_t = COORDINATOR_MAX_FINALIZE_PER_CYCLE, value_parser = clap::value_parser!(u64).range(1..=100_000))]
     pub max_finalize_per_cycle: u64,
 
@@ -833,8 +833,8 @@ async fn finalize_ready_runs(
     config: &CoordinatorRuntimeConfig,
 ) -> anyhow::Result<PlacementPassResult<usize>> {
     // --- Finalization pass ---
-    // Repeatedly claim one finalizable run until the cycle limit is reached or
-    // no run has all chunks terminal.
+    // Inspect candidates until the cycle limit is reached or none remain.
+    // Blocked candidates rotate behind unchecked work for later cycles.
     debug!(coordinator_id = %coordinator_id, "finalizing ready runs");
 
     let mut finalized = 0usize;
