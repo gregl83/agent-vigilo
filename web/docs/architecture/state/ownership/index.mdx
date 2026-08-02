@@ -16,24 +16,20 @@ import ownershipDiagram from './diagram.mmd';
 
 # State Ownership
 
-Which process owns each state transition and which database guard prevents conflicting writers.
+Which process <GlossaryTerm term="owner">owns</GlossaryTerm> each state
+transition and which database guard prevents conflicting writers.
 
 <Mermaid value={ownershipDiagram} />
 
-## Terms On This Page
-
-| Term | Meaning here |
-| --- | --- |
-| Owner | Process that currently has the guarded authority to perform a state transition. |
-| Claim | Database transition that grants temporary authority over one work item. |
-| Lease | Claim with an expiry time; expiry permits recovery but does not by itself validate a stale write. |
-| Claim token | Opaque fencing value that must still match when a claim is renewed or settled. |
-| Row lock | PostgreSQL-enforced lock on selected rows for the duration of a transaction. |
-| Admission lock | Cooperative transaction-scoped advisory lock shared by normal shard writers and held exclusively by shard movement. |
-| Route CAS | Expected alias, lifecycle, and `route_version` used to serialize control-plane changes. |
-| Write epoch | Monotonic ownership token validated against local shard admission in the write transaction. |
-
-The [Glossary](/docs/glossary) provides the complete ownership and concurrency definitions.
+Database <GlossaryTerm term="claim">claims</GlossaryTerm> and
+<GlossaryTerm term="lease">leases</GlossaryTerm> divide work. A
+<GlossaryTerm term="claim-token">claim token</GlossaryTerm> fences settlement;
+a <GlossaryTerm term="row-lock">row lock</GlossaryTerm> serializes conflicting
+transactions; and the cooperative
+<GlossaryTerm term="admission-lock">admission lock</GlossaryTerm> excludes shard
+movement from normal writers. Control-plane changes use
+<GlossaryTerm term="route-cas">route CAS</GlossaryTerm>, while data-plane writes
+validate the <GlossaryTerm term="write-epoch">write epoch</GlossaryTerm>.
 
 ## Notes
 

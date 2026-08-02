@@ -22,30 +22,14 @@ This document describes how Agent Vigilo processes an evaluation run from start 
 
 At a high level, the system follows a fan-out / fan-in pattern:
 
-1. **Run** is created
-2. Dataset cases are grouped into shard-local **chunks**
-3. The coordinator dispatches chunks through outbox event records and RabbitMQ
-4. Workers process case **executions** through **attempts**
-5. Evaluators produce append-only findings
+1. A <GlossaryTerm term="run">**run**</GlossaryTerm> is created
+2. Dataset cases are grouped into shard-local <GlossaryTerm term="chunk">**chunks**</GlossaryTerm>
+3. The coordinator dispatches chunks through <GlossaryTerm term="outbox-event-record">outbox event records</GlossaryTerm> and RabbitMQ
+4. Workers process case <GlossaryTerm term="execution">**executions**</GlossaryTerm> through <GlossaryTerm term="attempt">**attempts**</GlossaryTerm>
+5. Evaluators produce append-only <GlossaryTerm term="finding">findings</GlossaryTerm>
 6. Execution aggregates are computed
 7. The **run** is finalized
-8. Its completion event record is published as a broker message
-
----
-
-## Core Concepts
-
-| Term | Meaning here |
-| --- | --- |
-| Run | Durable evaluation of one dataset version with one run profile and agent target. |
-| Chunk | Bounded range of dataset cases processed under one worker claim. |
-| Execution | Durable evaluation of one dataset case against the agent target. |
-| Attempt | One worker effort to complete an execution; retries create later attempts. |
-| Evaluator finding | Append-only normalized observation emitted by an evaluator invocation. |
-| Outbox event record | Durable database row inserted in the same transaction as a state change. |
-| Broker message | RabbitMQ message published from an outbox event record. |
-
-See the [Glossary](/docs/glossary) for routing, ownership, and scoring terms.
+8. Its completion event record is published as a <GlossaryTerm term="broker-message">broker message</GlossaryTerm>
 
 ---
 

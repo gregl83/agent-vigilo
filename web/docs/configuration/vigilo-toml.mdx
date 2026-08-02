@@ -12,19 +12,10 @@ keywords:
 
 # `Vigilo.toml` Reference
 
-`Vigilo.toml` tells `vigilo` how to prepare and publish an evaluator WebAssembly component. It lives beside the evaluator crate `Cargo.toml`.
-
-## Terms On This Page
-
-| Term | Meaning here |
-| --- | --- |
-| Package manifest | `Cargo.toml` file that supplies evaluator crate identity and version. |
-| Evaluator manifest | `Vigilo.toml` file that supplies artifact paths, WIT expectations, and publish metadata. |
-| WIT contract | Interface definition that the compiled evaluator component must implement. |
-| Build profile | Named artifact selection such as `dev` or `release`; distinct from an evaluation run profile. |
-| Evaluator identifier | Published `<namespace>/<name>:<version>` registry identity. |
-
-See the [Glossary](/docs/glossary) for evaluator and run terminology.
+The <GlossaryTerm term="evaluator-manifest">`Vigilo.toml` evaluator manifest</GlossaryTerm>
+tells `vigilo` how to prepare and publish an evaluator WebAssembly component.
+It lives beside the evaluator crate
+<GlossaryTerm term="package-manifest">`Cargo.toml` package manifest</GlossaryTerm>.
 
 ---
 
@@ -116,7 +107,9 @@ tier = "example"
 
 ## `[wit]`
 
-Optional but recommended. Declares the WIT contract implemented by the evaluator.
+Optional but recommended. Declares the
+<GlossaryTerm term="wit-contract">WIT contract</GlossaryTerm> implemented by the
+evaluator.
 
 ```toml
 [wit]
@@ -143,7 +136,8 @@ If `[wit]` is omitted, the evaluator can still be prepared, but registry interfa
 
 ## `[profile.<name>]`
 
-Required for every build profile you want to publish. Each profile maps a name to a compiled wasm artifact path.
+Required for every <GlossaryTerm term="build-profile">build profile</GlossaryTerm>
+you want to publish. Each profile maps a name to a compiled WASM artifact path.
 
 ```toml
 [profile.release]
@@ -176,7 +170,11 @@ Published evaluators use the strict identifier format:
 
 Current CLI publishing inserts into the built-in `vigilo` namespace and reads `name` and `version` from `Cargo.toml`.
 
-The selected profile chooses which artifact path to publish; it is not part of the evaluator identifier. Publishing changed content under an existing identifier is rejected. Bump `Cargo.toml` version before publishing changed evaluator behavior or contract shape.
+The selected profile chooses which artifact path to publish; it is not part of
+the <GlossaryTerm term="evaluator-identifier">evaluator identifier</GlossaryTerm>.
+Publishing changed content under an existing identifier is
+rejected. Bump the `Cargo.toml` version before publishing changed evaluator
+behavior or contract shape.
 
 ---
 

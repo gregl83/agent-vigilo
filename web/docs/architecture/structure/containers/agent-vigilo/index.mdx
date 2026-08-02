@@ -14,22 +14,12 @@ import containerDiagram from './diagram.mmd';
 
 # Agent Vigilo Containers
 
-This view shows the deployable runtime boundaries: the CLI, coordinator,
-workers, PostgreSQL database placements, RabbitMQ, and the external agent target
-being evaluated.
-
-## Terms On This Page
-
-| Term | Meaning here |
-| --- | --- |
-| Container | Independently runnable process or infrastructure service in this deployment view. |
-| Coordinator | Runtime process that advances orchestration and publishes outbox event records. |
-| Worker | Runtime process that claims chunks and executes case evaluations. |
-| Database placement | One PostgreSQL target that can serve control, execution, or both roles. |
-| Broker | RabbitMQ service that delivers published messages between coordinators and workers. |
-| Agent target | External HTTP service whose behavior is being evaluated. |
-
-See the [Glossary](/docs/glossary) for data ownership and messaging terms.
+This view shows each deployable <GlossaryTerm term="container">container</GlossaryTerm>:
+the CLI, <GlossaryTerm term="coordinator">coordinator</GlossaryTerm>,
+<GlossaryTerm term="worker">workers</GlossaryTerm>, PostgreSQL
+<GlossaryTerm term="database-placement">database placements</GlossaryTerm>, the
+RabbitMQ <GlossaryTerm term="broker">broker</GlossaryTerm>, and the external
+<GlossaryTerm term="agent-target">agent target</GlossaryTerm> being evaluated.
 
 <Mermaid value={containerDiagram} />
 

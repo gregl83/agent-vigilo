@@ -23,6 +23,7 @@
     "@iconify-json/fa6-solid": "^1.2.4",
     "@mdx-js/react": "^3.0.0",
     "@panzoom/panzoom": "^4.6.2",
+    "@radix-ui/react-popover": "^1.1.23",
     "clsx": "^2.0.0",
     "prism-react-renderer": "^2.3.0",
     "react": "^19.0.0",

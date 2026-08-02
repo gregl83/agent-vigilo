@@ -50,19 +50,6 @@ pool, not an aggregate process limit. A process that contacts several database
 aliases can own one pool per alias; size the setting against the database
 connection budget and number of processes.
 
-## Terms On This Page
-
-| Term | Meaning here |
-| --- | --- |
-| In-flight chunk | Chunk-ready broker delivery currently being processed by one worker process. |
-| Prefetch | RabbitMQ limit on unacknowledged deliveries reserved by one consumer. |
-| Chunk parallelism | Number of case executions processed concurrently inside one claimed chunk. |
-| Wasm store | Fresh Wasmtime execution state created for one evaluator invocation. |
-| Fuel | Deterministic Wasmtime instruction budget for one evaluator invocation. |
-| Evaluator semaphore | Process-local cap on concurrently active Wasm evaluator invocations. |
-
-See the [Glossary](/docs/glossary) for chunk, attempt, and broker-message terms.
-
 ## Database Failure Isolation
 
 Coordinators and workers use one process-local circuit breaker per database
@@ -124,7 +111,15 @@ would lose work.
 
 ## Worker Chunk Concurrency
 
-`vigilo worker start` processes chunk-ready broker messages with bounded per-process concurrency. The default keeps one chunk in flight per worker process, which matches the safest local/dev posture and scales horizontally by running more workers. Larger deployments can raise the limit to improve process utilization when chunks are uneven, agent calls are I/O-bound, or retry waits create tail latency.
+`vigilo worker start` processes chunk-ready broker messages with bounded
+per-process concurrency. The default keeps one
+<GlossaryTerm term="in-flight-chunk">chunk in flight</GlossaryTerm> per worker
+process, which matches the safest local development posture and scales
+horizontally by running more workers. RabbitMQ
+<GlossaryTerm term="prefetch">prefetch</GlossaryTerm> matches that limit so a
+worker does not reserve messages it cannot process. Larger deployments can
+raise the limit when chunks are uneven, agent calls are I/O-bound, or retry
+waits create tail latency.
 
 | Flag | Environment | Default | Purpose |
 | --- | --- | ---: | --- |
@@ -142,7 +137,9 @@ paging policy.
 | `--default-shard-database-alias` | `VIGILO_DEFAULT_SHARD_DATABASE_ALIAS` | `setup`, `run create` | `primary` | Default target for `single-default` assignment. |
 | `--shard-assignment-policy` | `VIGILO_SHARD_ASSIGNMENT_POLICY` | `setup`, `run create` | `single-default` | Placement policy used for newly created runs. |
 
-When increasing this value, size the database pool, agent endpoint capacity, and Wasm evaluator semaphore together. A practical upper-bound check is:
+When increasing this value, size the database pool, agent endpoint capacity,
+<GlossaryTerm term="chunk-parallelism">chunk parallelism</GlossaryTerm>, and
+Wasm evaluator concurrency together. A practical upper-bound check is:
 
 ```text
 max_inflight_chunks * case_parallelism_per_chunk <= agent/db concurrency budget
@@ -151,7 +148,14 @@ wasm_max_concurrent_evaluations <= CPU and memory budget
 
 ## Wasm Evaluator Isolation
 
-Each evaluator invocation runs in a fresh Wasmtime store with CPU, memory, table, instance, timeout, and logging limits. Workers also use a process-wide semaphore so many valid evaluators cannot exhaust host resources at the same time. These flags are scoped to `worker`, `setup`, `evaluator publish`, and `evaluator test`.
+Each evaluator invocation runs in a fresh
+<GlossaryTerm term="wasm-store">Wasmtime store</GlossaryTerm> with CPU, memory,
+table, instance, timeout, and logging limits.
+<GlossaryTerm term="fuel">Fuel</GlossaryTerm> bounds deterministic instruction
+use. Workers also use a process-wide
+<GlossaryTerm term="evaluator-semaphore">evaluator semaphore</GlossaryTerm> so
+valid evaluators cannot exhaust host resources. These flags are scoped to
+`worker`, `setup`, `evaluator publish`, and `evaluator test`.
 
 | Flag | Environment | Default | Purpose |
 | --- | --- | ---: | --- |

@@ -20,7 +20,9 @@ Instead of a one-off script that prints a score, Vigilo gives you a system for p
 
 ## Why It Is Different
 
-- **Evaluators are versioned artifacts.** Publish reusable WASM evaluators and refer to them by stable identifiers like `vigilo/sentiment-basic-en:0.1.0`.
+- **Evaluators are versioned artifacts.** Publish reusable
+  <GlossaryTerm term="evaluator">WASM evaluators</GlossaryTerm> and refer to them
+  by stable identifiers like `vigilo/sentiment-basic-en:0.1.0`.
 - **Runs are durable.** Profiles, datasets, chunks, attempts, evaluator results, summaries, and gate outcomes are stored in Postgres.
 - **Execution is distributed.** Coordinators create chunk-ready outbox event records that are published through RabbitMQ; workers claim the identified chunks, call the target agent, run evaluators, and persist normalized results.
 - **The CLI is automation-friendly.** Commands return structured output, support quiet mode, and expose watch/status/results/export flows for CI and agentic clients.
@@ -40,21 +42,11 @@ coordinator -> queue -> worker -> target agent -> WASM evaluators
 run outcome: completed/pass, completed/fail, running, cancelled, or failed
 ```
 
-A profile describes the agent, request format, evaluator set, aggregation, and gate rules. A dataset supplies the cases. Vigilo turns those files into a durable run that can be watched, queried, exported, and used as a deployment gate.
-
-## Terms On This Page
-
-| Term | Meaning here |
-| --- | --- |
-| Run profile | Versioned agent invocation, evaluator binding, scoring, and gate configuration. |
-| Dataset | Versioned collection of immutable evaluation cases. |
-| Run | One durable evaluation of a dataset with a run profile. |
-| Execution | Evaluation of one dataset case against the configured agent target. |
-| Attempt | One worker effort to complete an execution; retries create later attempts. |
-| Finding | One normalized observation emitted by an evaluator. |
-| Gate status | The run's policy outcome, separate from its operational status. |
-
-See the [Glossary](/docs/glossary) for canonical definitions used across the documentation.
+A <GlossaryTerm term="run-profile">profile</GlossaryTerm> describes the agent,
+request format, evaluator set, aggregation, and gate rules. A
+<GlossaryTerm term="dataset">dataset</GlossaryTerm> supplies the cases. Vigilo
+turns those files into a durable <GlossaryTerm term="run">run</GlossaryTerm>
+that can be watched, queried, exported, and used as a deployment gate.
 
 ## How Results Are Calculated
 
@@ -64,12 +56,15 @@ Vigilo calculates results in this order:
 finding score -> dimension_scores -> aggregate_score -> execution status -> run gate_status
 ```
 
-- Evaluators emit findings with a status, score, optional blocking flag, and source dimension.
+- Evaluators emit <GlossaryTerm term="finding">findings</GlossaryTerm> with a
+  status, score, optional blocking flag, and source dimension.
 - The run profile decides which dimension each evaluator contributes to.
 - `dimension_scores` are per-dimension scores.
 - `aggregate_score` is one total score for the execution, calculated across scored dimensions.
 - `defaults.min_execution_score` is an overall score gate for `aggregate_score`, not a per-dimension threshold.
-- An execution passes when `aggregate_score >= defaults.min_execution_score` and no hard blocking finding fails or errors.
+- An <GlossaryTerm term="execution">execution</GlossaryTerm> passes when
+  `aggregate_score >= defaults.min_execution_score` and no hard blocking
+  finding fails or errors.
 - A run passes when every expected execution has an aggregate, no chunk failed or was cancelled, and no execution failed or errored.
 
 A finding is blocking if the evaluator finding, evaluator binding, or dimension policy says `blocking: true`. Use blocking for hard requirements that should not be averaged away. `defaults.fail_on_any_blocking_failure` controls whether blocking failed findings hard-fail the execution; blocking errors always error the execution.
@@ -80,10 +75,12 @@ A finding is blocking if the evaluator finding, evaluator binding, or dimension 
 case attempt -> execution -> run -> gate
 ```
 
-- Attempts can fail because the agent call, evaluator runtime, persistence, or retry budget failed.
+- <GlossaryTerm term="attempt">Attempts</GlossaryTerm> can fail because the
+  agent call, evaluator runtime, persistence, or retry budget failed.
 - Executions can fail because the total `aggregate_score` is below the overall score gate or a hard blocking finding failed.
 - Runs can fail operationally because chunks failed, coverage is incomplete, aggregates are missing, or executions errored.
-- Gates fail when the run completes but `gate_status` is `fail`.
+- Gates fail when the run completes but its
+  <GlossaryTerm term="gate-status">`gate_status`</GlossaryTerm> is `fail`.
 
 ## Prerequisites
 

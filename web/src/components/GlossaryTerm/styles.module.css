@@ -1,0 +1,143 @@
+.trigger {
+  display: inline;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-bottom: 1px dotted currentColor;
+  border-radius: 0;
+  background: transparent;
+  color: var(--ifm-link-color);
+  font: inherit;
+  line-height: inherit;
+  text-align: inherit;
+  cursor: help;
+}
+
+.trigger:hover,
+.trigger:focus-visible,
+.trigger[data-state='open'] {
+  border-bottom-style: solid;
+  color: var(--ifm-link-hover-color);
+  outline: none;
+}
+
+.trigger:focus-visible {
+  box-shadow: 0 2px 0 var(--ifm-color-primary);
+}
+
+.content {
+  z-index: 1000;
+  width: min(22rem, calc(100vw - 2rem));
+  padding: 0.875rem 1rem;
+  border: 1px solid var(--ifm-color-emphasis-300);
+  border-radius: 8px;
+  background: var(--ifm-background-surface-color);
+  color: var(--ifm-font-color-base);
+  box-shadow: var(--ifm-global-shadow-md);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.header {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 0.4rem;
+}
+
+.title {
+  font-size: 0.95rem;
+}
+
+.close {
+  flex: 0 0 auto;
+  width: 1.75rem;
+  height: 1.75rem;
+  margin: -0.25rem -0.375rem 0 0;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--ifm-color-emphasis-700);
+  font: inherit;
+  font-size: 1.35rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.close:hover,
+.close:focus-visible {
+  background: var(--ifm-color-emphasis-100);
+  outline: 2px solid var(--ifm-color-primary);
+  outline-offset: 1px;
+}
+
+.definition,
+.scope {
+  margin: 0;
+}
+
+.scope {
+  margin-top: 0.5rem;
+  color: var(--ifm-color-emphasis-700);
+  font-size: 0.82rem;
+}
+
+.link {
+  display: inline-block;
+  margin-top: 0.65rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.arrow {
+  fill: var(--ifm-background-surface-color);
+}
+
+.glossaryList {
+  margin: 0 0 2rem;
+  border-top: 1px solid var(--ifm-color-emphasis-300);
+}
+
+.glossaryRow {
+  display: grid;
+  grid-template-columns: minmax(9rem, 0.7fr) minmax(14rem, 1.5fr) minmax(12rem, 1fr);
+  gap: 1rem;
+  padding: 0.85rem 0;
+  border-bottom: 1px solid var(--ifm-color-emphasis-300);
+}
+
+.glossaryTerm,
+.glossaryDefinition,
+.glossaryScope {
+  margin: 0;
+}
+
+.glossaryTerm {
+  font-weight: 650;
+  scroll-margin-top: calc(var(--ifm-navbar-height) + 1rem);
+}
+
+.glossaryScope {
+  color: var(--ifm-color-emphasis-700);
+  font-size: 0.9rem;
+}
+
+@media (max-width: 760px) {
+  .content {
+    max-height: min(70vh, 28rem);
+    overflow-y: auto;
+  }
+
+  .glossaryRow {
+    grid-template-columns: 1fr;
+    gap: 0.35rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .content {
+    animation: none;
+  }
+}

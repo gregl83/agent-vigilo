@@ -16,22 +16,19 @@ import overviewDiagram from './overview.mmd';
 
 # Architecture Flows
 
-Step-by-step views of how Vigilo commands move through runtime decisions and persistence boundaries.
+Step-by-step <GlossaryTerm term="command-flow">command flows</GlossaryTerm>
+show how Vigilo commands move through runtime decisions and persistence
+boundaries.
 
 For lifecycle and database guard views, see [State Management](/docs/architecture/state/).
 
-## Terms On This Page
-
-| Term | Meaning here |
-| --- | --- |
-| Command flow | Decisions and side effects produced by one CLI command. |
-| Coordinator cycle | One ordered iteration of recovery, dispatch, finalization, and publication work. |
-| Coordinator pass | One bounded stage within a coordinator cycle. |
-| Worker delivery | One broker delivery that identifies a chunk for a worker to claim. |
-| Outbox event record | Durable database record created with the state change it describes. |
-| Broker message | RabbitMQ message published from an outbox event record. |
-
-See the [Glossary](/docs/glossary) for ownership and routing terms used in the diagrams.
+A <GlossaryTerm term="coordinator-cycle">coordinator cycle</GlossaryTerm> is
+split into bounded <GlossaryTerm term="coordinator-pass">passes</GlossaryTerm>.
+State changes create
+<GlossaryTerm term="outbox-event-record">outbox event records</GlossaryTerm>
+that publish as <GlossaryTerm term="broker-message">broker messages</GlossaryTerm>;
+each <GlossaryTerm term="worker-delivery">worker delivery</GlossaryTerm>
+identifies a chunk to claim.
 
 ## Overview
 

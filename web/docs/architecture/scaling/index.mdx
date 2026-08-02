@@ -19,6 +19,12 @@ to additional PostgreSQL placements without changing coordinator or worker code.
 
 The design principle is simple: **control metadata decides where work should
 live; each execution database enforces whether a routed write is still valid.**
+A <GlossaryTerm term="database-router">database router</GlossaryTerm> follows
+the stored <GlossaryTerm term="shard-placement">shard placement</GlossaryTerm>
+to resolve an <GlossaryTerm term="execution-route">execution route</GlossaryTerm>.
+A process-local
+<GlossaryTerm term="database-circuit-breaker">circuit breaker</GlossaryTerm>
+isolates unavailable aliases without becoming routing authority.
 
 ## Routing At A Glance
 
@@ -38,11 +44,13 @@ flowchart LR
     target --> admission --> data
 ```
 
-- The system has 128 possible logical shard numbers, but a run uses only the
-  shards assigned to its chunks.
+- The system has 128 possible logical
+  <GlossaryTerm term="run-shard">run shards</GlossaryTerm>, but a run uses only
+  those assigned to its chunks.
 - Each used run shard has one shard-placement row and, after creation, one
-  dispatch cursor.
-- One dispatch operation claims one cursor, selects a bounded chunk window from
+  <GlossaryTerm term="dispatch-cursor">dispatch cursor</GlossaryTerm>.
+- One dispatch operation claims one cursor, selects a bounded
+  <GlossaryTerm term="chunk-dispatch-window">chunk window</GlossaryTerm> from
   that run shard, and inserts one `run.chunk.ready` outbox event record per
   selected chunk.
 - `run.started` is inserted at most once per run in the control database; it is
@@ -55,25 +63,6 @@ The run shard itself is not leased by normal dispatch. The coordinator claims
 the shard's dispatch cursor while it prepares one window. Rebalance is a
 separate workflow that claims one persisted rebalance item for a targeted run
 shard before invoking the single-shard move operation.
-
-## Terms On This Page
-
-| Term | Meaning here |
-| --- | --- |
-| Run shard | Stable logical segment identified by `run_id + run_shard`. |
-| Database placement | Catalog entry for one PostgreSQL target, named by a database alias. |
-| Shard placement | Desired mapping from one used run shard to a database alias, lifecycle, route version, and write epoch. |
-| Database router | Process-local resolver that turns stored placement metadata into a PostgreSQL pool. |
-| Database circuit breaker | Process-local coordinator and worker admission that temporarily skips one unavailable database alias without changing durable routing. |
-| Execution route | Resolved shard placement plus its current execution database pool. |
-| Route version | Per-shard-placement generation incremented when its alias or status changes. |
-| Write epoch | Ownership generation incremented only when write ownership moves or is restored. |
-| Local shard admission | Execution-database row that accepts or rejects a write epoch in the same local transaction as the write. |
-| Dispatch cursor | Control-database progress row claimed while preparing the next window for one run shard. |
-| Chunk dispatch window | Bounded set of pending chunks selected from one run shard in one dispatch operation. |
-| Admission lock | Cooperative advisory lock shared by normal shard writers and held exclusively by shard movement. |
-
-See the [Glossary](/docs/glossary) for full definitions and cardinality.
 
 ## Default Posture
 
@@ -107,8 +96,7 @@ Agent Vigilo separates database responsibility from database location.
 - An **execution database** owns high-volume run work: chunks, run snapshots,
   executions, attempts, aggregates, evaluator results, shard summaries, and
   chunk-ready outbox event records.
-- **Database placements** name PostgreSQL targets such as `primary` or
-  `shard_001`.
+- <GlossaryTerm term="database-placement">**Database placements**</GlossaryTerm> name PostgreSQL targets such as `primary` or `shard_001`.
 - **Shard placements** map one `run_id + run_shard` pair to a database
   placement.
 
@@ -206,9 +194,10 @@ Coordinator dispatch is route-constrained:
 Workers stay chunk-local:
 
 - Worker messages carry `run_id`, `run_shard`, `chunk_id`, `database_alias`, and
-  `write_epoch`.
+  a <GlossaryTerm term="write-epoch">`write_epoch`</GlossaryTerm>.
 - The worker resolves the hinted database pool locally and validates the
-  execution database's admission row in the chunk-claim transaction. A valid
+  execution database's <GlossaryTerm term="local-shard-admission">admission row</GlossaryTerm>
+  in the chunk-claim transaction. A valid
   hint requires no control-database route read. Rejected hints invalidate the
   route cache and perform one authoritative refresh.
 - After claiming, the worker loads the
@@ -432,12 +421,14 @@ stateDiagram-v2
 ```
 
 Worker claims, dispatch writes, and routed cancellation cleanup take the shared
-form of the shard advisory lock and validate the local admission state and
-`write_epoch` in their execution-database transaction. The lock is cooperative:
-every protected writer must explicitly acquire it. PostgreSQL does not infer
-which rows belong to the shard.
+form of the <GlossaryTerm term="admission-lock">shard advisory lock</GlossaryTerm>
+and validate the local admission state and `write_epoch` in
+their execution-database transaction. The lock is cooperative: every protected
+writer must explicitly acquire it. PostgreSQL does not infer which rows belong
+to the shard.
 
-`route_version` is the control-plane CAS token for lifecycle changes.
+<GlossaryTerm term="route-version">`route_version`</GlossaryTerm> is the
+control-plane CAS token for lifecycle changes.
 `write_epoch` is the data-plane ownership token carried by work. Movement keeps
 the epoch stable through `copying` and `draining`, closes the source at the next
 epoch before activating the target, then opens the target at that epoch. A

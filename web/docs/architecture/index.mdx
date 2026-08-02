@@ -12,20 +12,18 @@ keywords:
 
 # Architecture
 
-Agent Vigilo is a distributed AI evaluation runtime built around durable state, explicit worker/coordinator ownership, isolated WASM evaluators, and retry-safe event publication.
+Agent Vigilo is a distributed AI evaluation runtime built around durable state,
+explicit worker and coordinator ownership, isolated WASM evaluators, and
+retry-safe event publication.
 
-## Terms On This Page
-
-| Term | Meaning here |
-| --- | --- |
-| CLI | User and automation entry point for evaluator, run, shard, coordinator, and worker commands. |
-| Coordinator | Process that advances durable orchestration, recovery, dispatch, finalization, and outbox publication. |
-| Worker | Process that claims chunks, invokes the agent target and evaluators, and persists results. |
-| Control database | PostgreSQL role that owns global run and routing state. |
-| Execution database | PostgreSQL role that owns shard-local execution work and results. |
-| Broker | RabbitMQ transport that delivers published chunk-ready broker messages to workers. |
-
-See the [Glossary](/docs/glossary) for the complete vocabulary and term cardinality.
+The <GlossaryTerm term="vigilo-cli">CLI</GlossaryTerm> runs direct commands and
+the <GlossaryTerm term="coordinator">coordinator</GlossaryTerm> and
+<GlossaryTerm term="worker">worker</GlossaryTerm> service modes. The
+<GlossaryTerm term="control-database">control database</GlossaryTerm> owns
+global authority, while <GlossaryTerm term="execution-database">execution databases</GlossaryTerm>
+own shard-local work. RabbitMQ is the
+<GlossaryTerm term="broker">broker</GlossaryTerm> between coordinators and
+workers.
 
 ## Core Views
 

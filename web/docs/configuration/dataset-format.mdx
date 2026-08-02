@@ -12,27 +12,15 @@ keywords:
 
 # Dataset Format
 
-A dataset provides the set of test cases evaluated by a run profile.
+A <GlossaryTerm term="dataset">dataset</GlossaryTerm> provides the set of
+<GlossaryTerm term="case">test cases</GlossaryTerm> evaluated by a
+<GlossaryTerm term="run-profile">run profile</GlossaryTerm>.
 
 Use this dataset with:
 
 ```bash
 vigilo run validate --profile-file <profile.yaml> --dataset-file <dataset.yaml>
 ```
-
-## Terms On This Page
-
-| Term | Meaning here |
-| --- | --- |
-| Dataset | Versioned collection of evaluation cases. |
-| Case | Immutable input, optional expected output, and routing metadata. |
-| Input | Data sent to the configured agent target. |
-| Expected output | Optional oracle data available to evaluators, not sent to the target agent. |
-| Task type | Case label used by automatic run-profile matching. |
-| Case group | Optional explicit selection of a run-profile case group. |
-| Tags | Case labels used by `tags_any` and `tags_all` matching rules. |
-
-See the [Glossary](/docs/glossary) for related evaluation and runtime terms.
 
 ## File Format
 
@@ -78,12 +66,14 @@ cases:
 Fields:
 
 - `id` (UUID, required)
-- `task_type` (string, required)
-- `case_group` (string, optional): explicit run-profile case-group id to use for this case.
-- `input` (object/value, required)
-- `expected` (object/value, optional)
+- <GlossaryTerm term="task-type">`task_type`</GlossaryTerm> (string, required)
+- <GlossaryTerm term="case-group">`case_group`</GlossaryTerm> (string,
+  optional): explicit run-profile case-group ID to use for this case.
+- <GlossaryTerm term="input">`input`</GlossaryTerm> (object/value, required)
+- <GlossaryTerm term="expected-output">`expected`</GlossaryTerm> (object/value,
+  optional)
 - `context` (object/value, optional)
-- `tags` (string[], optional)
+- <GlossaryTerm term="tags">`tags`</GlossaryTerm> (string[], optional)
 - `metadata` (object, optional)
 
 ## Alignment with Run Profile

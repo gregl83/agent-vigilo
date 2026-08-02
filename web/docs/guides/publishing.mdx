@@ -13,21 +13,11 @@ keywords:
 
 # Publishing Evaluators
 
-This guide walks through building and publishing a Rust evaluator crate to the Agent Vigilo registry.
+This guide walks through building and
+<GlossaryTerm term="publish">publishing</GlossaryTerm> a Rust evaluator crate
+to the Agent Vigilo <GlossaryTerm term="evaluator-registry">registry</GlossaryTerm>.
 
 Need a build-first walkthrough before publishing? See [Creating Evaluators](./creating-evaluators.mdx), including the dedicated "Using Codex" section.
-
-## Terms On This Page
-
-| Term | Meaning here |
-| --- | --- |
-| Evaluator artifact | Compiled WASI Preview 2 WebAssembly component. |
-| Registry | Durable catalog of evaluator identity, metadata, contract, and artifact content. |
-| Evaluator identifier | Immutable `<namespace>/<name>:<version>` identity used by run profiles. |
-| Build profile | Named `Vigilo.toml` artifact path such as `dev` or `release`; it is not a run profile. |
-| Publish | Validate and insert a versioned evaluator artifact into the registry. |
-
-See the [Glossary](/docs/glossary) for evaluation terms used after publication.
 
 ---
 
@@ -45,7 +35,9 @@ Verify the installation:
 vigilo --version
 ```
 
-Evaluator publishing currently reads package identity from `Cargo.toml`, validates the declared WIT contract, and expects a prebuilt WASI Preview 2 WebAssembly component artifact.
+Evaluator publishing currently reads package identity from `Cargo.toml`,
+validates the declared WIT contract, and expects a prebuilt
+<GlossaryTerm term="evaluator-artifact">WASI Preview 2 WebAssembly component artifact</GlossaryTerm>.
 
 ---
 
@@ -80,13 +72,18 @@ See the [`Vigilo.toml` reference](../configuration/vigilo-toml.mdx) for all fiel
 
 ## Build
 
-Build the evaluator for WASI Preview 2:
+Build the evaluator for
+<GlossaryTerm term="wasi-preview-2">WASI Preview 2</GlossaryTerm>:
 
 ```bash
 cargo build --manifest-path evaluators/my-evaluator/Cargo.toml --target wasm32-wasip2 --release
 ```
 
-The `wasm` path in `Vigilo.toml` is resolved relative to Cargo's target directory for the evaluator package. For the default Cargo target directory, a release artifact normally lives under:
+The `wasm` path in `Vigilo.toml` is resolved relative to Cargo's target
+directory for the evaluator package. The selected
+<GlossaryTerm term="build-profile">build profile</GlossaryTerm> chooses this
+path. For the default Cargo target directory, a release artifact normally lives
+under:
 
 ```text
 target/wasm32-wasip2/release/<crate_name_with_underscores>.wasm
@@ -126,7 +123,9 @@ When you run `vigilo evaluator publish`, the following steps occur:
 6. The wasm artifact timestamp is compared with the Cargo manifest timestamp to catch stale builds.
 7. The wasm component is tagged with embedded package metadata, compiled with Wasmtime, hashed, and inserted into the registry.
 
-The published registry identity uses the strict evaluator identifier format:
+The published registry identity uses the strict
+<GlossaryTerm term="evaluator-identifier">evaluator identifier</GlossaryTerm>
+format:
 
 ```text
 <namespace>/<name>:<version>

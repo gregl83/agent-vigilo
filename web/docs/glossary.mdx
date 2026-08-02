@@ -12,110 +12,37 @@ keywords:
 
 # Glossary
 
-This page defines the terms used throughout the Agent Vigilo documentation.
-Page-specific terminology tables contain the small subset needed for that page;
-this glossary is the canonical reference when a term appears in multiple areas.
+This is the canonical vocabulary for Agent Vigilo documentation. Inline terms
+throughout the site open the same definitions and link back to their entries
+here.
 
-Code identifiers and stored values appear in backticks. For example, a run can
-have operational `status = completed` and policy `gate_status = fail` at the
-same time.
+Code identifiers and stored values appear in `code style`. For example, a run
+can have operational `status = completed` and policy `gate_status = fail` at
+the same time.
 
 ## Runtime Roles
 
-| Term | Meaning | Scope or cardinality |
-| --- | --- | --- |
-| Vigilo CLI | Command entry point for evaluator publishing, run management, shard administration, and runtime service modes. | A command can perform work directly or run a coordinator/worker process. |
-| Coordinator | Process that advances durable creation recovery, lease recovery, dispatch, finalization, and outbox publication. | Many coordinators can run concurrently because database claims divide work. |
-| Worker | Process that consumes chunk-ready broker messages, claims chunks, invokes the agent target and evaluators, and persists results. | Many workers can run concurrently; a chunk claim selects one current owner. |
-| Bounded work | Work limited by a configured item count, concurrency count, time budget, or retry budget. | Prevents one cycle, placement, chunk, or evaluator from consuming unlimited resources. |
+<GlossarySection section="runtime-roles" />
 
 ## Evaluation And Results
 
-| Term | Meaning | Scope or cardinality |
-| --- | --- | --- |
-| Agent target | The HTTP service or workflow whose behavior is being evaluated. It may wrap a model, prompt pipeline, or multi-step agent. | One versioned target configuration per run profile. |
-| Run profile | Versioned configuration for the agent target, evaluator bindings, scoring, persistence, retries, and gate behavior. | One profile snapshot per run. It is unrelated to a Cargo build profile. |
-| Dataset | A versioned collection of evaluation cases. | One dataset version per run. |
-| Case | One immutable input, optional expected output, and routing metadata from a dataset. | A case can be evaluated once in a run. |
-| Case group | A run-profile rule that selects evaluator bindings and aggregation policy for matching cases. | One explicit group or one or more automatically matched groups per case. |
-| Evaluator | A versioned WASM component that examines an agent output and emits findings. | Identified by `<namespace>/<name>:<version>`. |
-| Evaluator binding | A profile entry that connects an evaluator to a dimension, weight, blocking policy, and evaluator config. | Many bindings can apply to one case. |
-| Finding | One normalized evaluator observation with status, severity, score, evidence, and blocking metadata. | An evaluator invocation can emit multiple findings. |
-| Dimension | A profile-owned scoring bucket, such as `format` or `quality`. | Findings are grouped into dimensions before total scoring. |
-| Dimension score | The `min_score` or `weighted_mean` result for one dimension of one execution. | Zero or one score per configured dimension and execution. |
-| Aggregate score | The weighted total of an execution's dimension scores. | Zero or one total score per execution. |
-| Blocking finding | Finding that can fail or error an execution independently of its aggregate score, according to profile policy. | Blocking can come from the finding, evaluator binding, or dimension policy. |
-| Execution | The durable evaluation of one dataset case against the agent target. | One expected execution per case in a run. |
-| Attempt | One worker's effort to complete an execution. Retries create later attempts. | Many attempts can belong to one execution; only the current attempt is authoritative. |
-| Current attempt | Attempt id and attempt number that an execution currently authorizes to write terminal state. | Zero or one authoritative attempt per execution. |
-| Run | One durable evaluation of a dataset version with a run profile and agent target. | A run contains chunks and expected executions. |
-| Run status | Operational lifecycle state such as `creating`, `pending`, `running`, `completed`, `failed`, or `cancelled`. | One current value per run. |
-| Gate status | Policy outcome such as `unknown`, `pass`, or `fail`. | One current value per run; distinct from run status. |
+<GlossarySection section="evaluation-results" />
 
 ## Work And Routing
 
-| Term | Meaning | Scope or cardinality |
-| --- | --- | --- |
-| Chunk | A bounded range of dataset cases processed under one worker claim. | Many chunks per run; each chunk belongs to one run shard. |
-| Run shard | A stable logical segment numbered `0..127` and stored as `run_shard`. It keeps a chunk and its execution-owned rows together. | A run uses only the shards assigned to its chunks. |
-| Control database | The PostgreSQL role that owns global run state, placement metadata, dispatch cursors, creation plans, and control outbox records. | Exactly one active control-capable database placement. |
-| Execution database | A PostgreSQL role that owns shard-local chunks, snapshots, executions, attempts, results, summaries, and chunk-ready outbox records. | One or more shard-capable database placements. The control database may also serve this role. |
-| Database alias | A stable name such as `primary` or `shard_001` used instead of a connection URL. | One alias per database placement. |
-| Database placement | A catalog entry that maps a database alias to a secret environment-variable name, role, and status. | One row per configured PostgreSQL target. |
-| Database placement status | Admission lifecycle for a configured target: `active` accepts and serves shard ownership, `draining` serves existing ownership but accepts none, and `disabled` serves no runtime work. | One status per database placement. |
-| Placement drain | Guarded transition that stops new shard ownership before existing routes are moved away and the database placement is disabled. It does not move rows by itself. | One shard-only database placement at a time; shard moves or rebalance perform evacuation. |
-| Database router | The process-local `DatabaseRouter` that reads placement metadata and resolves control or execution pools. It does not choose a new shard assignment. | One lazily initialized router per Vigilo process. |
-| Shard placement | The control-plane mapping from `run_id + run_shard` to a database alias, lifecycle, route version, and write epoch. | One row per used run shard. |
-| Execution route | A resolved shard placement plus the PostgreSQL pool for its current database alias. | Resolved for one `run_id + run_shard`. |
-| Route version | A monotonically increasing control-plane CAS generation. Every alias or lifecycle change increments it so concurrent administrative transitions cannot both commit. | One current value per shard placement. It is not a global schema or deployment version. |
-| Write epoch | A monotonically increasing execution-ownership generation carried by routed work and validated in the destination database. | Changes only when ownership moves or is restored. |
-| Local shard admission | The execution-database authority row containing the accepted write epoch and `open`, `draining`, `prepared`, or `closed` state. | One row per locally known `run_id + run_shard`; validation occurs in the write transaction. |
-| Dispatch cursor | Control-database progress for dispatching one run shard. A coordinator claims it while preparing the next window; `drained` means no further dispatch is allowed or needed. | One cursor per used run shard after creation completes. |
-| Chunk dispatch window | Up to the configured number of pending chunks selected from one run shard in one dispatch operation. | One window can create one `run.chunk.ready` outbox record per selected chunk. |
-| Coordinator cycle | One ordered iteration of creation recovery, lease recovery, chunk dispatch, finalization, and outbox publication. | Repeats until shutdown for `coordinator start`; runs once for `coordinator once`. |
-| Coordinator pass | One bounded stage within a coordinator cycle, such as the dispatch pass or outbox publication pass. | A pass can visit multiple database aliases. |
-| Shard move | Targeted relocation of one `run_id + run_shard` route and its shard-owned rows to another database alias. | One run shard per move operation. |
-| Rebalance plan | Persisted set of targeted shard moves created for a capacity or placement-drain operation. | One plan contains many rebalance items. |
-| Rebalance item | Claimable plan item for moving one specific `run_id + run_shard`. | One shard move per item; concurrent apply processes can claim different items. |
+<GlossarySection section="work-routing" />
 
 ## Ownership And Concurrency
 
-| Term | Meaning | Scope or cardinality |
-| --- | --- | --- |
-| Claim | A successful transition that gives a process temporary authority over one work item. | Examples include a chunk claim, dispatch-cursor claim, outbox-delivery claim, or rebalance-item claim. |
-| Lease | Time-bounded claim authority that becomes recoverable after its deadline. Expiry alone does not stop a stale write; protected writes also validate ownership. | Stored with the claimed row or work item and renewed where supported. |
-| Claim token | An opaque value issued with a claim and required to settle or renew that exact claim. | A newer claim gets a different token, fencing the previous owner. |
-| Fencing token | A value whose equality proves that an owner or route is still current. Claim tokens and route versions are fencing values. | Checked on every protected mutation. |
-| Row lock | A PostgreSQL lock on selected table rows, usually held until the transaction ends. | PostgreSQL enforces conflicting row-lock modes. |
-| Admission lock | A transaction-scoped PostgreSQL advisory lock used cooperatively by shard writers. Normal writers take the shared form; shard movement takes the exclusive form. | One logical lock key per `run_id + run_shard`. PostgreSQL does not automatically apply it to related rows. |
-| Route fence | Expected database alias, placement status, and route version validated immediately before a routed write. | One expected fence per resolved execution route. |
-| Compare-and-swap | An update that succeeds only if stored values still equal the expected values. | Used to change a route or settle a claim without overwriting newer state. |
-| Recovery | Reassignment or repair after a lease expires or a durable workflow stops mid-operation. | Recovery preserves retry limits and invalidates stale owners. |
-| Stale attempt | An attempt that is no longer authoritative because its lease expired, its chunk was recovered, or a later attempt superseded it. | Retained for history but rejected as a current writer. |
+<GlossarySection section="ownership-concurrency" />
 
 ## Events And Messaging
 
-| Term | Meaning | Scope or cardinality |
-| --- | --- | --- |
-| Outbox event record | A durable row in `outbox_events`, inserted in the same database transaction as the state change it describes. | One logical event per unique `dedupe_key`. |
-| Outbox delivery row | Temporary publish work in `outbox_delivery_queue`. It is claimed, retried, and deleted after confirmed publication. | One active delivery row per unpublished outbox event record. |
-| Broker message | The RabbitMQ message created from an outbox event record after publication. | May be delivered more than once. |
-| Event type | The semantic name of an event, such as `run.started`, `run.chunk.ready`, or `run.completed`. | Stored on the outbox record and used for broker routing. |
-| Dedupe key | Stable identity for one logical outbox event record. It is also published as the AMQP message id. | Unique in the outbox ledger. |
-| At-least-once delivery | A delivery guarantee that permits redelivery after uncertain acknowledgement. | Consumers must use database claims and idempotency guards. |
-| Publisher confirm | RabbitMQ acknowledgement that a published broker message reached the broker. | Required before the outbox event record is marked published. |
-| Message settlement | Worker acknowledgement, delayed redelivery, or requeue decision for one broker delivery. | One settlement outcome per received delivery. |
+<GlossarySection section="events-messaging" />
 
 ## Evaluator Packaging
 
-| Term | Meaning | Scope or cardinality |
-| --- | --- | --- |
-| WIT | WebAssembly Interface Type definition used as the evaluator ABI source of truth. | `wit/evaluator.wit` defines canonical evaluator `input` and `output`. |
-| WASI Preview 2 | Component-oriented WASI target used by evaluator artifacts. | Rust target `wasm32-wasip2`. |
-| Evaluator artifact | Compiled WebAssembly component stored in the evaluator registry. | One immutable artifact content per evaluator identifier. |
-| Evaluator registry | Durable catalog of published evaluator identities, metadata, contracts, and artifact content. | Many versioned evaluators. |
-| Evaluator manifest | `Vigilo.toml` file describing artifact paths, WIT expectations, and publish metadata. | One per evaluator package. |
-| Build profile | Named artifact selection in `Vigilo.toml`, such as `dev` or `release`. | Selects a build output; it is not an evaluation run profile. |
+<GlossarySection section="evaluator-packaging" />
 
 ## Cardinality At A Glance
 
@@ -133,6 +60,6 @@ one run.started outbox record per run
 one broker message per publish attempt, with possible redelivery
 ```
 
-Multiple run shards can share one database alias. A coordinator pass therefore
-can report counts for several aliases even though each individual routed
-operation targets one database at a time.
+Multiple run shards can share one database alias. A coordinator pass can report
+counts for several aliases even though each routed operation targets one
+database at a time.

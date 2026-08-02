@@ -14,30 +14,21 @@ keywords:
 
 # Creating Evaluators
 
-This guide is the recommended path for creating a single evaluator crate that can be built to WASM and executed by Agent Vigilo.
-
-## Terms On This Page
-
-| Term | Meaning here |
-| --- | --- |
-| Evaluator | Versioned WASM component that accepts canonical `input` and returns canonical `output`. |
-| WIT | WebAssembly Interface Type contract in `wit/evaluator.wit`. |
-| World | WIT boundary that groups the evaluator's imported and exported interfaces. |
-| WASI Preview 2 | Component-target runtime interface selected by `wasm32-wasip2`. |
-| Finding | One normalized observation returned in `output.results`. |
-| Evaluator identifier | Published identity in `<namespace>/<name>:<version>` format. |
-
-See the [Glossary](/docs/glossary) for result and runtime terms.
+This guide is the recommended path for creating a single
+<GlossaryTerm term="evaluator">evaluator</GlossaryTerm> crate that can be built
+to WASM and executed by Agent Vigilo.
 
 ## What You Build
 
 A minimal evaluator crate should:
 
-- implement the evaluator world from `wit/evaluator.wit`
+- implement the evaluator <GlossaryTerm term="wit-world">world</GlossaryTerm>
+  from the canonical <GlossaryTerm term="wit">WIT</GlossaryTerm> contract
 - expose one evaluator entrypoint (`evaluate`)
 - accept the canonical evaluator `input`
 - return the canonical evaluator `output`
-- build as a `cdylib` for `wasm32-wasip2`
+- build as a `cdylib` for
+  <GlossaryTerm term="wasi-preview-2">`wasm32-wasip2`</GlossaryTerm>
 
 Use `evaluators/sentiment-basic-en` as the concrete reference implementation.
 
@@ -68,7 +59,8 @@ The reference evaluator uses `wit-bindgen`, imports `evaluator-world`, implement
 Keep the evaluator contract in sync with `wit/evaluator.wit`.
 
 - Read fields from `input` (run IDs, case, actual output, evaluator config)
-- Produce one or more findings in `output.results`
+- Produce one or more <GlossaryTerm term="finding">findings</GlossaryTerm> in
+  `output.results`
 - Use evaluator metadata in `output.evaluator`
 - Keep evaluator-specific diagnostics in `output.metadata_json`
 
@@ -93,6 +85,9 @@ Run a focused evaluator test against the published version using the sample inpu
 ```bash
 vigilo evaluator test 'vigilo/my-evaluator:0.1.0' --input-file evaluators/my-evaluator/example-input.json
 ```
+
+The quoted value is the published
+<GlossaryTerm term="evaluator-identifier">evaluator identifier</GlossaryTerm>.
 
 If you hit an interface conversion error, check that the published evaluator version matches the current WIT contract expected by the host.
 

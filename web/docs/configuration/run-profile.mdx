@@ -12,7 +12,9 @@ keywords:
 
 # Run Profile Configuration
 
-A run profile defines how evaluation should be performed across task types and case groups.
+A <GlossaryTerm term="run-profile">run profile</GlossaryTerm> defines how
+evaluation is performed across task types and
+<GlossaryTerm term="case-group">case groups</GlossaryTerm>.
 
 Use this profile with:
 
@@ -20,29 +22,20 @@ Use this profile with:
 vigilo run validate --profile-file <profile.yaml> --dataset-file <dataset.yaml>
 ```
 
-## Terms On This Page
-
-| Term | Meaning here |
-| --- | --- |
-| Run profile | Versioned configuration for the target agent, evaluators, scoring, persistence, and gate behavior. |
-| Case group | Rule that selects evaluator bindings and aggregation policy for matching dataset cases. |
-| Evaluator binding | Profile entry that assigns an evaluator to a dimension, weight, blocking policy, and config. |
-| Finding | One normalized result emitted by an evaluator invocation. |
-| Dimension score | Score calculated for one profile-owned aggregation bucket. |
-| Aggregate score | Weighted total of an execution's dimension scores. |
-| Gate status | Run-level policy result; it is distinct from operational run status. |
-
-See the [Glossary](/docs/glossary) for related evaluation and runtime terms.
-
 ## Result Calculation
 
 ```text
 finding score -> dimension_scores -> aggregate_score -> execution status -> run gate_status
 ```
 
-`dimension_scores` are per-dimension scores. `aggregate_score` is one total score for a single execution across all scored dimensions.
+<GlossaryTerm term="dimension-score">`dimension_scores`</GlossaryTerm> are
+per-dimension scores. <GlossaryTerm term="aggregate-score">`aggregate_score`</GlossaryTerm>
+is one total score for a single execution across all scored dimensions.
 
-The `dimension` on an evaluator binding is the profile-owned aggregation bucket. Evaluator-emitted dimensions are preserved as source metadata, but they do not choose the scoring bucket.
+The `dimension` on an
+<GlossaryTerm term="evaluator-binding">evaluator binding</GlossaryTerm> is the
+profile-owned aggregation bucket. Evaluator-emitted dimensions are preserved
+as source metadata, but they do not choose the scoring bucket.
 
 Dimension scores are calculated with:
 
@@ -54,10 +47,14 @@ Dimension scores are calculated with:
 An execution passes when:
 
 - `aggregate_score >= defaults.min_execution_score`
-- no hard blocking finding fails or errors
+- no hard blocking <GlossaryTerm term="finding">finding</GlossaryTerm> fails or
+  errors
 - at least one scoreable finding exists
 
-A run passes when every expected execution has an aggregate, no chunk failed or was cancelled, and no execution failed or errored. Check both `runs.status` for operational lifecycle and `runs.gate_status` for policy outcome; a terminal run is not necessarily a passing run.
+A run passes when every expected execution has an aggregate, no chunk failed or
+was cancelled, and no execution failed or errored. Check both `runs.status` for
+operational lifecycle and <GlossaryTerm term="gate-status">`runs.gate_status`</GlossaryTerm>
+for policy outcome; a terminal run is not necessarily a passing run.
 
 ## File Format
 
