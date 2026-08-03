@@ -36,6 +36,90 @@ pub(crate) struct FinalizationCandidateBacklog {
     pub(crate) oldest_candidate_lag_seconds: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FinalizationSummary {
+    expected_execution_count: i32,
+    terminal_execution_count: i32,
+    passed_execution_count: i32,
+    failed_execution_count: i32,
+    errored_execution_count: i32,
+    missing_aggregate_count: i32,
+    failed_chunk_count: i32,
+    cancelled_chunk_count: i32,
+    shard_summary_count: i32,
+    coverage_complete: bool,
+    has_terminal_chunk_failure: bool,
+    gate_status: &'static str,
+}
+
+fn summarize_for_finalization(
+    summaries: &[RunShardSummary],
+) -> anyhow::Result<Option<FinalizationSummary>> {
+    if summaries.is_empty() || summaries.iter().any(|summary| !summary.is_terminal()) {
+        return Ok(None);
+    }
+
+    let expected_execution_count = summaries
+        .iter()
+        .map(|summary| summary.expected_execution_count)
+        .sum::<i32>();
+    let terminal_execution_count = summaries
+        .iter()
+        .map(|summary| summary.terminal_execution_count)
+        .sum::<i32>();
+    let passed_execution_count = summaries
+        .iter()
+        .map(|summary| summary.passed_execution_count)
+        .sum::<i32>();
+    let failed_execution_count = summaries
+        .iter()
+        .map(|summary| summary.failed_execution_count)
+        .sum::<i32>();
+    let errored_execution_count = summaries
+        .iter()
+        .map(|summary| summary.errored_execution_count)
+        .sum::<i32>();
+    let missing_aggregate_count = summaries
+        .iter()
+        .map(|summary| summary.missing_aggregate_count)
+        .sum::<i32>();
+    let failed_chunk_count = summaries
+        .iter()
+        .map(|summary| summary.failed_chunk_count)
+        .sum::<i32>();
+    let cancelled_chunk_count = summaries
+        .iter()
+        .map(|summary| summary.cancelled_chunk_count)
+        .sum::<i32>();
+    let coverage_complete = terminal_execution_count >= expected_execution_count;
+    let has_terminal_chunk_failure = failed_chunk_count > 0 || cancelled_chunk_count > 0;
+    let gate_status = if has_terminal_chunk_failure
+        || failed_execution_count > 0
+        || errored_execution_count > 0
+        || missing_aggregate_count > 0
+        || !coverage_complete
+    {
+        "fail"
+    } else {
+        "pass"
+    };
+
+    Ok(Some(FinalizationSummary {
+        expected_execution_count,
+        terminal_execution_count,
+        passed_execution_count,
+        failed_execution_count,
+        errored_execution_count,
+        missing_aggregate_count,
+        failed_chunk_count,
+        cancelled_chunk_count,
+        shard_summary_count: i32::try_from(summaries.len())?,
+        coverage_complete,
+        has_terminal_chunk_failure,
+        gate_status,
+    }))
+}
+
 /// Selects the next run whose dispatch cursors are drained.
 ///
 /// Query behavior:
@@ -227,54 +311,8 @@ pub(crate) async fn finalize_claimed_run_from_summaries(
     coordinator_id: Uuid,
     summaries: &[RunShardSummary],
 ) -> anyhow::Result<Option<FinalizedRun>> {
-    if summaries.is_empty() || summaries.iter().any(|summary| !summary.is_terminal()) {
+    let Some(summary) = summarize_for_finalization(summaries)? else {
         return Ok(None);
-    }
-
-    let expected_execution_count = summaries
-        .iter()
-        .map(|summary| summary.expected_execution_count)
-        .sum::<i32>();
-    let terminal_execution_count = summaries
-        .iter()
-        .map(|summary| summary.terminal_execution_count)
-        .sum::<i32>();
-    let passed_execution_count = summaries
-        .iter()
-        .map(|summary| summary.passed_execution_count)
-        .sum::<i32>();
-    let failed_execution_count = summaries
-        .iter()
-        .map(|summary| summary.failed_execution_count)
-        .sum::<i32>();
-    let errored_execution_count = summaries
-        .iter()
-        .map(|summary| summary.errored_execution_count)
-        .sum::<i32>();
-    let missing_aggregate_count = summaries
-        .iter()
-        .map(|summary| summary.missing_aggregate_count)
-        .sum::<i32>();
-    let failed_chunk_count = summaries
-        .iter()
-        .map(|summary| summary.failed_chunk_count)
-        .sum::<i32>();
-    let cancelled_chunk_count = summaries
-        .iter()
-        .map(|summary| summary.cancelled_chunk_count)
-        .sum::<i32>();
-    let shard_summary_count = i32::try_from(summaries.len())?;
-    let coverage_complete = terminal_execution_count >= expected_execution_count;
-    let has_terminal_chunk_failure = failed_chunk_count > 0 || cancelled_chunk_count > 0;
-    let gate_status = if has_terminal_chunk_failure
-        || failed_execution_count > 0
-        || errored_execution_count > 0
-        || missing_aggregate_count > 0
-        || !coverage_complete
-    {
-        "fail"
-    } else {
-        "pass"
     };
 
     let finalized = sqlx::query_as::<_, FinalizedRun>(
@@ -368,18 +406,18 @@ pub(crate) async fn finalize_claimed_run_from_summaries(
         "#,
     )
     .bind(run_id)
-    .bind(gate_status)
-    .bind(expected_execution_count)
-    .bind(terminal_execution_count)
-    .bind(passed_execution_count)
-    .bind(failed_execution_count)
-    .bind(errored_execution_count)
-    .bind(missing_aggregate_count)
-    .bind(failed_chunk_count)
-    .bind(cancelled_chunk_count)
-    .bind(coverage_complete)
-    .bind(has_terminal_chunk_failure)
-    .bind(shard_summary_count)
+    .bind(summary.gate_status)
+    .bind(summary.expected_execution_count)
+    .bind(summary.terminal_execution_count)
+    .bind(summary.passed_execution_count)
+    .bind(summary.failed_execution_count)
+    .bind(summary.errored_execution_count)
+    .bind(summary.missing_aggregate_count)
+    .bind(summary.failed_chunk_count)
+    .bind(summary.cancelled_chunk_count)
+    .bind(summary.coverage_complete)
+    .bind(summary.has_terminal_chunk_failure)
+    .bind(summary.shard_summary_count)
     .bind(coordinator_id)
     .fetch_optional(db)
     .await?;
@@ -394,6 +432,69 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn finalization_waits_for_a_complete_terminal_summary_set() {
+        let run_id = Uuid::nil();
+
+        assert!(summarize_for_finalization(&[]).unwrap().is_none());
+        assert!(
+            summarize_for_finalization(&[terminal_summary(run_id, 0, "running")])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn finalization_combines_terminal_shard_counters() {
+        let run_id = Uuid::nil();
+        let mut first = terminal_summary(run_id, 1, "completed");
+        first.expected_execution_count = 2;
+        first.terminal_execution_count = 2;
+        first.passed_execution_count = 2;
+        let mut second = terminal_summary(run_id, 2, "completed");
+        second.failed_execution_count = 1;
+
+        let summary = summarize_for_finalization(&[first, second])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(summary.expected_execution_count, 3);
+        assert_eq!(summary.terminal_execution_count, 3);
+        assert_eq!(summary.passed_execution_count, 2);
+        assert_eq!(summary.failed_execution_count, 1);
+        assert_eq!(summary.shard_summary_count, 2);
+        assert_eq!(summary.gate_status, "fail");
+    }
+
+    #[test]
+    fn finalization_fails_for_each_incomplete_or_failed_signal() {
+        let run_id = Uuid::nil();
+        let cases = [
+            summary_with(run_id, |summary| summary.failed_execution_count = 1),
+            summary_with(run_id, |summary| summary.errored_execution_count = 1),
+            summary_with(run_id, |summary| summary.missing_aggregate_count = 1),
+            summary_with(run_id, |summary| summary.failed_chunk_count = 1),
+            summary_with(run_id, |summary| summary.cancelled_chunk_count = 1),
+            summary_with(run_id, |summary| summary.terminal_execution_count = 0),
+        ];
+
+        for summary in cases {
+            let decision = summarize_for_finalization(&[summary]).unwrap().unwrap();
+            assert_eq!(decision.gate_status, "fail");
+        }
+    }
+
+    #[test]
+    fn finalization_passes_with_complete_successful_coverage() {
+        let summary = terminal_summary(Uuid::nil(), 0, "completed");
+
+        let decision = summarize_for_finalization(&[summary]).unwrap().unwrap();
+
+        assert!(decision.coverage_complete);
+        assert!(!decision.has_terminal_chunk_failure);
+        assert_eq!(decision.gate_status, "pass");
+    }
 
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx finalization tests"]
@@ -699,6 +800,12 @@ mod tests {
             cancelled_chunk_count: 0,
             status: status.to_owned(),
         }
+    }
+
+    fn summary_with(run_id: Uuid, update: impl FnOnce(&mut RunShardSummary)) -> RunShardSummary {
+        let mut summary = terminal_summary(run_id, 0, "completed");
+        update(&mut summary);
+        summary
     }
 
     async fn seed_run(

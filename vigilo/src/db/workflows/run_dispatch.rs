@@ -120,6 +120,33 @@ pub(crate) enum RoutedDispatchError {
     ExecutionWrite(#[source] anyhow::Error),
 }
 
+fn validate_dispatch_snapshot_route(
+    route_run_id: Uuid,
+    route_run_shard: i16,
+    snapshot_run_id: Uuid,
+    snapshot_run_shard: i16,
+) -> Result<(), RoutedDispatchError> {
+    if snapshot_run_id != route_run_id || snapshot_run_shard != route_run_shard {
+        return Err(RoutedDispatchError::Invariant(anyhow::anyhow!(
+            "dispatch snapshot route mismatch: route {} shard {}, snapshot {} shard {}",
+            route_run_id,
+            route_run_shard,
+            snapshot_run_id,
+            snapshot_run_shard
+        )));
+    }
+
+    Ok(())
+}
+
+fn dispatch_cursor_status(has_remaining_chunks: bool) -> &'static str {
+    if has_remaining_chunks {
+        "open"
+    } else {
+        "drained"
+    }
+}
+
 /// Recovers expired worker chunk leases for prepared run snapshots.
 ///
 /// Recovered chunks are moved back to `pending` and receive a fresh
@@ -723,15 +750,12 @@ async fn dispatch_routed_run_window_with_transactions(
     route: &DispatchRoute,
     snapshot: &DispatchRunSnapshot,
 ) -> Result<Option<DispatchedRun>, RoutedDispatchError> {
-    if snapshot.run_id != route.run_id || snapshot.run_shard != route.run_shard {
-        return Err(RoutedDispatchError::Invariant(anyhow::anyhow!(
-            "dispatch snapshot route mismatch: route {} shard {}, snapshot {} shard {}",
-            route.run_id,
-            route.run_shard,
-            snapshot.run_id,
-            snapshot.run_shard
-        )));
-    }
+    validate_dispatch_snapshot_route(
+        route.run_id,
+        route.run_shard,
+        snapshot.run_id,
+        snapshot.run_shard,
+    )?;
 
     // Query outline:
     //
@@ -961,11 +985,7 @@ async fn dispatch_routed_run_window_with_transactions(
         .map_err(RoutedDispatchError::ExecutionWrite)?;
 
     if let Some(dispatched) = &dispatched {
-        let next_status = if dispatched.has_remaining_chunks {
-            "open"
-        } else {
-            "drained"
-        };
+        let next_status = dispatch_cursor_status(dispatched.has_remaining_chunks);
         sqlx::query(
             r#"
             UPDATE run_shard_dispatch_cursors
@@ -1015,6 +1035,26 @@ mod tests {
         run_cancel,
         run_finalize,
     };
+
+    #[test]
+    fn dispatch_snapshot_must_match_the_claimed_route() {
+        let run_id = Uuid::nil();
+        let other_run_id = Uuid::from_u128(1);
+
+        assert!(validate_dispatch_snapshot_route(run_id, 4, run_id, 4).is_ok());
+        for (snapshot_run_id, snapshot_run_shard) in [(other_run_id, 4), (run_id, 5)] {
+            assert!(matches!(
+                validate_dispatch_snapshot_route(run_id, 4, snapshot_run_id, snapshot_run_shard),
+                Err(RoutedDispatchError::Invariant(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn dispatch_cursor_stays_open_only_while_chunks_remain() {
+        assert_eq!(dispatch_cursor_status(true), "open");
+        assert_eq!(dispatch_cursor_status(false), "drained");
+    }
 
     // --- Fixtures and assertions ---
 

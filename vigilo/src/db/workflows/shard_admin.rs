@@ -4734,6 +4734,141 @@ mod tests {
         assert_eq!(bounded_page_len(&[], 10, 10), 0);
     }
 
+    #[test]
+    fn move_table_metadata_covers_prerequisites_and_shard_rows() {
+        assert_eq!(move_table_key_columns("case_blobs").unwrap(), ["case_hash"]);
+        assert_eq!(move_table_key_columns("runs").unwrap(), ["id"]);
+        assert_eq!(
+            move_table_key_columns("run_chunks").unwrap(),
+            ["run_id", "run_shard", "id"]
+        );
+        assert!(move_table_key_columns("unsupported").is_err());
+
+        let names = move_table_names().collect::<Vec<_>>();
+        assert_eq!(names.len(), PREREQUISITE_TABLES.len() + SHARD_TABLES.len());
+        assert_eq!(&names[..PREREQUISITE_TABLES.len()], PREREQUISITE_TABLES);
+    }
+
+    #[test]
+    fn move_key_sql_uses_stable_keys_and_column_types() {
+        assert_eq!(
+            move_key_expression("row", &["run_id", "run_shard"]),
+            "jsonb_build_array(to_jsonb(row.run_id), to_jsonb(row.run_shard))::text"
+        );
+        assert_eq!(
+            key_join_predicate("row", "dirty", &["run_id", "run_shard", "case_hash"]),
+            "row.run_id = (dirty.row_key->>'run_id')::uuid AND \
+             row.run_shard = (dirty.row_key->>'run_shard')::smallint AND \
+             row.case_hash = (dirty.row_key->>'case_hash')::text"
+        );
+    }
+
+    #[test]
+    fn prerequisite_normalization_ignores_only_mutable_fields() {
+        let normalized = normalized_prerequisite_row(
+            "runs",
+            serde_json::json!({
+                "id": Uuid::nil(),
+                "status": "running",
+                "summary": {"local": true},
+                "updated_at": "now",
+                "config_snapshot": {"stable": true}
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            normalized,
+            serde_json::json!({
+                "id": Uuid::nil(),
+                "config_snapshot": {"stable": true}
+            })
+        );
+        assert!(normalized_prerequisite_row("runs", serde_json::json!([])).is_err());
+        assert!(normalized_prerequisite_row("unsupported", serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn shard_admin_identifiers_reject_empty_or_whitespace_values() {
+        assert!(validate_non_empty("primary", "database alias").is_ok());
+        assert!(validate_non_empty("", "database alias").is_err());
+        assert!(validate_non_empty("  \t", "database alias").is_err());
+    }
+
+    #[test]
+    fn abort_route_accepts_each_in_progress_move_state() {
+        for status in [
+            SHARD_PLACEMENT_STATUS_COPYING,
+            SHARD_PLACEMENT_STATUS_DRAINING,
+            SHARD_PLACEMENT_STATUS_MOVING,
+        ] {
+            let placement = shard_placement("source", status, Some("target"));
+            assert!(
+                validate_abort_route(&placement, placement.run_id, 4, "source", "target").is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn abort_route_rejects_stale_or_mismatched_placement() {
+        for placement in [
+            shard_placement("source", SHARD_PLACEMENT_STATUS_ACTIVE, Some("target")),
+            shard_placement("other", SHARD_PLACEMENT_STATUS_COPYING, Some("target")),
+            shard_placement("source", SHARD_PLACEMENT_STATUS_COPYING, Some("other")),
+        ] {
+            assert!(
+                validate_abort_route(&placement, placement.run_id, 4, "source", "target").is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn completed_abort_reports_idempotent_source_placement() {
+        let placement = shard_placement("source", SHARD_PLACEMENT_STATUS_ACTIVE, None);
+
+        let outcome = completed_abort_outcome(
+            &placement,
+            placement.run_id,
+            placement.run_shard,
+            "source",
+            "target",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(!outcome.aborted);
+        assert_eq!(outcome.source_database_alias, "source");
+        assert_eq!(outcome.target_database_alias, "target");
+    }
+
+    #[test]
+    fn completed_abort_distinguishes_in_progress_and_completed_moves() {
+        let in_progress = shard_placement("source", SHARD_PLACEMENT_STATUS_COPYING, Some("target"));
+        assert!(
+            completed_abort_outcome(
+                &in_progress,
+                in_progress.run_id,
+                in_progress.run_shard,
+                "source",
+                "target"
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let completed = shard_placement("target", SHARD_PLACEMENT_STATUS_ACTIVE, None);
+        assert!(
+            completed_abort_outcome(
+                &completed,
+                completed.run_id,
+                completed.run_shard,
+                "source",
+                "target"
+            )
+            .is_err()
+        );
+    }
+
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
     async fn move_table_progress_is_compact_and_idempotent(pool: PgPool) {
@@ -7057,6 +7192,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rebalance_candidates_respect_capacity_and_topology_limits() {
+        let run_id = Uuid::nil();
+        let candidates = vec![
+            rebalance_candidate(run_id, 0, "primary", 1),
+            rebalance_candidate(run_id, 1, "primary", 1),
+            rebalance_candidate(run_id, 2, "primary", 1),
+        ];
+
+        assert!(
+            select_rebalance_candidates(
+                candidates.clone(),
+                &["primary".to_string()],
+                None,
+                "target",
+                10
+            )
+            .is_empty()
+        );
+        assert!(
+            select_rebalance_candidates(
+                candidates.clone(),
+                &["primary".to_string(), "target".to_string()],
+                None,
+                "target",
+                0
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            select_rebalance_candidates(
+                candidates,
+                &["primary".to_string(), "target".to_string()],
+                None,
+                "target",
+                1
+            )
+            .len(),
+            1
+        );
+    }
+
     fn rebalance_candidate(
         run_id: Uuid,
         run_shard: i16,
@@ -7068,6 +7245,25 @@ mod tests {
             run_shard,
             source_database_alias: source_database_alias.to_string(),
             route_version,
+        }
+    }
+
+    fn shard_placement(
+        database_alias: &str,
+        status: &str,
+        move_target_database_alias: Option<&str>,
+    ) -> ShardPlacement {
+        let timestamp = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        ShardPlacement {
+            run_id: Uuid::nil(),
+            run_shard: 4,
+            database_alias: database_alias.to_string(),
+            status: status.to_string(),
+            move_target_database_alias: move_target_database_alias.map(ToOwned::to_owned),
+            route_version: 2,
+            write_epoch: 1,
+            created_at: timestamp,
+            updated_at: timestamp,
         }
     }
 

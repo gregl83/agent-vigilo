@@ -47,7 +47,7 @@ pub(crate) struct CancelRunOutcome {
     pub(crate) outbox_events_enqueued: i64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CancellationCounts {
     chunks_cancelled: i64,
     executions_cancelled: i64,
@@ -62,7 +62,7 @@ impl CancellationCounts {
     }
 }
 
-#[derive(Debug, Clone, Default, sqlx::FromRow)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, sqlx::FromRow)]
 struct ExecutionProgressCounts {
     expected_execution_count: i64,
     execution_count: i64,
@@ -746,13 +746,15 @@ async fn cancel_execution_targets(
     Ok(combined)
 }
 
-fn fallback_progress(run: &Run, mut progress: ExecutionProgressCounts) -> ExecutionProgressCounts {
+fn fallback_progress(
+    control: ExecutionProgressCounts,
+    mut progress: ExecutionProgressCounts,
+) -> ExecutionProgressCounts {
     if progress.expected_execution_count == 0 {
-        progress.expected_execution_count = i64::from(run.expected_execution_count);
+        progress.expected_execution_count = control.expected_execution_count;
     }
 
     if progress.execution_count == 0 && progress.terminal_execution_count == 0 {
-        let control = ExecutionProgressCounts::from_control_run(run);
         progress.execution_count = control.execution_count;
         progress.terminal_execution_count = control.terminal_execution_count;
         progress.passed_execution_count = control.passed_execution_count;
@@ -770,7 +772,10 @@ async fn finalize_control_cancellation(
     execution_route_count: usize,
 ) -> anyhow::Result<CancelRunOutcome> {
     let counts = execution_outcome.counts;
-    let progress = fallback_progress(&state.run, execution_outcome.progress);
+    let progress = fallback_progress(
+        ExecutionProgressCounts::from_control_run(&state.run),
+        execution_outcome.progress,
+    );
     let shard_summary_count = execution_outcome.summaries.len();
 
     let mut tx = db.begin().await?;
@@ -913,11 +918,20 @@ pub(crate) async fn cancel_run(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ExecutionProgressCounts,
-        is_already_cancelled_status,
-        is_cancelable_status,
-        is_uncancelable_terminal_status,
+    use chrono::{
+        DateTime,
+        Utc,
+    };
+    use sqlx::{
+        PgPool,
+        postgres::PgPoolOptions,
+    };
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::{
+        context::database::ExecutionRoute,
+        models::shard_placement::ShardPlacement,
     };
 
     #[test]
@@ -945,43 +959,120 @@ mod tests {
 
     #[test]
     fn execution_progress_counts_adds_all_routed_totals() {
-        let mut first = ExecutionProgressCounts {
-            expected_execution_count: 10,
-            execution_count: 7,
-            terminal_execution_count: 6,
-            passed_execution_count: 4,
-            failed_execution_count: 1,
-            errored_execution_count: 1,
-            skipped_execution_count: 0,
-            missing_aggregate_count: 1,
-            chunk_count: 2,
-            completed_chunk_count: 1,
-            failed_chunk_count: 0,
-            cancelled_chunk_count: 1,
-            cancelled_execution_count: 2,
-        };
-        let second = ExecutionProgressCounts {
-            expected_execution_count: 5,
-            execution_count: 5,
-            terminal_execution_count: 5,
-            passed_execution_count: 3,
-            failed_execution_count: 1,
-            errored_execution_count: 1,
-            skipped_execution_count: 0,
-            missing_aggregate_count: 0,
-            chunk_count: 1,
-            completed_chunk_count: 0,
-            failed_chunk_count: 0,
-            cancelled_chunk_count: 1,
-            cancelled_execution_count: 1,
-        };
+        let mut first = progress_counts(1);
+        let second = progress_counts(2);
 
         first.add(&second);
 
-        assert_eq!(first.expected_execution_count, 15);
-        assert_eq!(first.terminal_execution_count, 11);
-        assert_eq!(first.passed_execution_count, 7);
-        assert_eq!(first.cancelled_chunk_count, 2);
-        assert_eq!(first.cancelled_execution_count, 3);
+        assert_eq!(first, progress_counts(3));
+    }
+
+    #[test]
+    fn cancellation_counts_adds_all_routed_totals() {
+        let mut total = CancellationCounts {
+            chunks_cancelled: 1,
+            executions_cancelled: 2,
+            attempts_cancelled: 3,
+        };
+
+        total.add(&CancellationCounts {
+            chunks_cancelled: 4,
+            executions_cancelled: 5,
+            attempts_cancelled: 6,
+        });
+
+        assert_eq!(
+            total,
+            CancellationCounts {
+                chunks_cancelled: 5,
+                executions_cancelled: 7,
+                attempts_cancelled: 9,
+            }
+        );
+    }
+
+    #[test]
+    fn fallback_progress_uses_control_counts_only_when_execution_data_is_absent() {
+        let control = ExecutionProgressCounts {
+            expected_execution_count: 10,
+            terminal_execution_count: 8,
+            passed_execution_count: 6,
+            failed_execution_count: 1,
+            errored_execution_count: 1,
+            ..ExecutionProgressCounts::default()
+        };
+
+        let fallback = fallback_progress(control.clone(), ExecutionProgressCounts::default());
+        assert_eq!(fallback.expected_execution_count, 10);
+        assert_eq!(fallback.terminal_execution_count, 8);
+        assert_eq!(fallback.passed_execution_count, 6);
+
+        let execution = ExecutionProgressCounts {
+            expected_execution_count: 4,
+            execution_count: 1,
+            terminal_execution_count: 0,
+            ..ExecutionProgressCounts::default()
+        };
+        assert_eq!(fallback_progress(control, execution.clone()), execution);
+    }
+
+    #[tokio::test]
+    async fn execution_routes_are_grouped_once_per_database_alias() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/vigilo")
+            .unwrap();
+        let run_id = Uuid::nil();
+        let targets = group_execution_routes(vec![
+            execution_route(&pool, run_id, 2, "shard_b"),
+            execution_route(&pool, run_id, 0, "shard_a"),
+            execution_route(&pool, run_id, 1, "shard_b"),
+        ]);
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].routes[0].placement.database_alias, "shard_a");
+        assert_eq!(targets[0].routes.len(), 1);
+        assert_eq!(targets[1].routes[0].placement.database_alias, "shard_b");
+        assert_eq!(targets[1].routes.len(), 2);
+    }
+
+    fn progress_counts(value: i64) -> ExecutionProgressCounts {
+        ExecutionProgressCounts {
+            expected_execution_count: value,
+            execution_count: value,
+            terminal_execution_count: value,
+            passed_execution_count: value,
+            failed_execution_count: value,
+            errored_execution_count: value,
+            skipped_execution_count: value,
+            missing_aggregate_count: value,
+            chunk_count: value,
+            completed_chunk_count: value,
+            failed_chunk_count: value,
+            cancelled_chunk_count: value,
+            cancelled_execution_count: value,
+        }
+    }
+
+    fn execution_route(
+        pool: &PgPool,
+        run_id: Uuid,
+        run_shard: i16,
+        database_alias: &str,
+    ) -> ExecutionRoute {
+        let timestamp = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        ExecutionRoute {
+            placement: ShardPlacement {
+                run_id,
+                run_shard,
+                database_alias: database_alias.to_string(),
+                status: "active".to_string(),
+                move_target_database_alias: None,
+                route_version: 1,
+                write_epoch: 1,
+                created_at: timestamp,
+                updated_at: timestamp,
+            },
+            pool: pool.clone(),
+        }
     }
 }

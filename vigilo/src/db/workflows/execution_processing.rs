@@ -2595,16 +2595,27 @@ mod tests {
         evaluation_plan_for_case,
         finalize_execution_terminal_transitions,
         make_test_case,
+        map_evaluation_dimension,
+        map_evaluation_status,
+        map_severity,
         matching_groups_for_case,
+        metadata_from_case_row,
         persist_completed_execution_results_batch,
+        persisted_case_expected_output,
         persisted_case_input_payload,
+        persisted_case_metadata,
+        persisted_case_tags,
         persisted_evaluator_evidence,
         persisted_evaluator_manifest,
         persisted_raw_evaluator_output,
     };
     use crate::{
         contracts::{
-            evaluator::EvaluationStatus,
+            evaluator::{
+                EvaluationDimension,
+                EvaluationStatus,
+                Severity,
+            },
             run::{
                 AgentHttpConfig,
                 AgentProfile,
@@ -3187,6 +3198,45 @@ mod tests {
     }
 
     #[test]
+    fn automatic_matching_merges_compatible_groups_without_duplicate_evaluators() {
+        let first = case_group(
+            "first",
+            "classification",
+            vec![],
+            "core/quality:1.0.0",
+            AggregationMethod::WeightedMean,
+        );
+        let mut second = first.clone();
+        second.id = "second".to_string();
+        let profile = run_profile(vec![first, second]);
+
+        let plan = evaluation_plan_for_case(&profile, &worker_case(None)).unwrap();
+
+        assert_eq!(plan.profile_group_id, "first,second");
+        assert_eq!(plan.evaluator_bindings.len(), 1);
+        assert_eq!(plan.aggregation.dimensions.len(), 1);
+    }
+
+    #[test]
+    fn automatic_matching_rejects_conflicting_duplicate_evaluator_bindings() {
+        let first = case_group(
+            "first",
+            "classification",
+            vec![],
+            "core/quality:1.0.0",
+            AggregationMethod::WeightedMean,
+        );
+        let mut second = first.clone();
+        second.id = "second".to_string();
+        second.evaluators[0].blocking = true;
+        let profile = run_profile(vec![first, second]);
+
+        let error = evaluation_plan_for_case(&profile, &worker_case(None)).unwrap_err();
+
+        assert!(error.to_string().contains("conflicting evaluator binding"));
+    }
+
+    #[test]
     fn make_test_case_preserves_case_group_for_evaluator_input() {
         let case = worker_case(Some("sentiment_classification"));
 
@@ -3199,16 +3249,41 @@ mod tests {
     }
 
     #[test]
-    fn summary_mode_redacts_execution_payload_snapshots() {
+    fn summary_mode_redacts_execution_case_snapshots() {
         let mut profile = routing_profile();
         profile.persistence.mode = PersistenceMode::Summary;
         let case = worker_case(Some("sentiment_classification"));
 
-        let persisted = persisted_case_input_payload(&profile, &case);
+        let input = persisted_case_input_payload(&profile, &case);
+        let expected = persisted_case_expected_output(&profile, &case);
+        let metadata = persisted_case_metadata(&profile, &case);
+        let tags = persisted_case_tags(&profile, &case.tags);
 
-        assert_eq!(persisted["redacted"], json!(true));
-        assert_eq!(persisted["field"], json!("input_payload"));
-        assert_eq!(persisted["case_hash"], json!("case-hash"));
+        assert_eq!(input["field"], json!("input_payload"));
+        assert_eq!(expected["field"], json!("expected_output"));
+        assert_eq!(metadata["field"], json!("case_metadata"));
+        assert_eq!(tags, json!([]));
+        for value in [&input, &expected, &metadata] {
+            assert_eq!(value["redacted"], json!(true));
+            assert_eq!(value["case_hash"], json!("case-hash"));
+        }
+    }
+
+    #[test]
+    fn full_mode_preserves_execution_case_snapshots() {
+        let profile = routing_profile();
+        let case = worker_case(Some("sentiment_classification"));
+
+        assert_eq!(
+            persisted_case_input_payload(&profile, &case),
+            case.input_payload
+        );
+        assert_eq!(
+            persisted_case_expected_output(&profile, &case),
+            case.expected_output
+        );
+        assert_eq!(persisted_case_metadata(&profile, &case), case.metadata);
+        assert_eq!(persisted_case_tags(&profile, &case.tags), case.tags);
     }
 
     #[test]
@@ -3238,9 +3313,35 @@ mod tests {
             &EvaluationStatus::Failed,
             json!({"raw": "kept"}),
         );
+        let error = persisted_raw_evaluator_output(
+            &profile.persistence,
+            &EvaluationStatus::Error,
+            json!({"raw": "kept"}),
+        );
 
         assert_eq!(passed["redacted"], json!(true));
         assert_eq!(failed, json!({"raw": "kept"}));
+        assert_eq!(error, json!({"raw": "kept"}));
+    }
+
+    #[test]
+    fn raw_output_none_policy_redacts_every_status() {
+        let mut profile = routing_profile();
+        profile.persistence.persist_raw_outputs = PersistRawOutputsMode::None;
+
+        for status in [
+            EvaluationStatus::Passed,
+            EvaluationStatus::Failed,
+            EvaluationStatus::Error,
+            EvaluationStatus::Skipped,
+        ] {
+            let raw = persisted_raw_evaluator_output(
+                &profile.persistence,
+                &status,
+                json!({"raw": "sensitive"}),
+            );
+            assert_eq!(raw["redacted"], json!(true));
+        }
     }
 
     #[test]
@@ -3275,6 +3376,48 @@ mod tests {
             raw["reason"],
             json!("persistence.persist_evaluator_evidence=false")
         );
+    }
+
+    #[test]
+    fn evaluator_case_metadata_must_be_an_object() {
+        assert!(metadata_from_case_row(&json!({"source": "fixture"})).is_ok());
+        assert!(metadata_from_case_row(&json!(["invalid"])).is_err());
+    }
+
+    #[test]
+    fn evaluator_persistence_mappings_cover_contract_variants() {
+        let dimensions = [
+            (EvaluationDimension::Correctness, "correctness"),
+            (EvaluationDimension::Format, "format"),
+            (EvaluationDimension::Safety, "safety"),
+            (EvaluationDimension::Quality, "quality"),
+            (EvaluationDimension::Latency, "latency"),
+            (EvaluationDimension::ToolUse, "tool_use"),
+            (EvaluationDimension::Calibration, "calibration"),
+            (EvaluationDimension::Other("custom".to_string()), "custom"),
+        ];
+        for (dimension, expected) in dimensions {
+            assert_eq!(map_evaluation_dimension(&dimension), expected);
+        }
+
+        for (status, expected) in [
+            (EvaluationStatus::Passed, "passed"),
+            (EvaluationStatus::Failed, "failed"),
+            (EvaluationStatus::Error, "error"),
+            (EvaluationStatus::Skipped, "skipped"),
+        ] {
+            assert_eq!(map_evaluation_status(&status), expected);
+        }
+
+        for (severity, expected) in [
+            (Severity::None, "none"),
+            (Severity::Low, "low"),
+            (Severity::Medium, "medium"),
+            (Severity::High, "high"),
+            (Severity::Critical, "critical"),
+        ] {
+            assert_eq!(map_severity(&severity), expected);
+        }
     }
 
     #[sqlx::test(migrations = "../migrations")]
