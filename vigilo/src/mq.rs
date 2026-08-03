@@ -177,13 +177,15 @@ impl Client {
     }
 
     fn is_reconnectable_anyhow_error(err: &anyhow::Error) -> bool {
-        let message = err.to_string().to_ascii_lowercase();
-        message.contains("invalid channel")
-            || message.contains("invalid connection")
-            || message.contains("io error")
-            || message.contains("heartbeat")
-            || message.contains("connection closed")
-            || message.contains("channel closed")
+        err.chain().any(|source| {
+            let message = source.to_string().to_ascii_lowercase();
+            message.contains("invalid channel")
+                || message.contains("invalid connection")
+                || message.contains("io error")
+                || message.contains("heartbeat")
+                || message.contains("connection closed")
+                || message.contains("channel closed")
+        })
     }
 
     /// Drops the cached broker session so the next operation reconnects and
@@ -673,7 +675,7 @@ impl Client {
     }
 
     fn retry_queue_for_attempt(&self, attempt: i32) -> String {
-        let index = usize::try_from(attempt.saturating_sub(1)).unwrap_or(usize::MAX);
+        let index = usize::try_from(attempt.max(1).saturating_sub(1)).unwrap_or(usize::MAX);
         let queue_name = WORKER_RETRY_BUCKETS
             .get(index)
             .or_else(|| WORKER_RETRY_BUCKETS.last())
@@ -855,21 +857,23 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{
+        io,
+        sync::{
+            Arc,
+            Mutex,
+        },
+    };
 
-    use super::Config;
+    use super::*;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn mq_config_preserves_default_topology_without_namespace() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::remove_var("VIGILO_MQ_NAMESPACE");
-        }
+        let config = config_with_namespace(None);
 
-        let config = Config::new("amqp://localhost".to_string());
-
+        assert_eq!(config.uri, "amqp://localhost");
         assert_eq!(config.exchange, "vigilo.events");
         assert_eq!(config.event_queue, "vigilo.events.domain");
         assert_eq!(config.worker_queue, "vigilo.worker");
@@ -879,12 +883,7 @@ mod tests {
 
     #[test]
     fn mq_config_scopes_topology_with_namespace() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var("VIGILO_MQ_NAMESPACE", "test-123");
-        }
-
-        let config = Config::new("amqp://localhost".to_string());
+        let config = config_with_namespace(Some(" test-123 "));
 
         assert_eq!(config.exchange, "vigilo.test-123.events");
         assert_eq!(config.event_queue, "vigilo.test-123.events.domain");
@@ -894,9 +893,232 @@ mod tests {
             config.worker_quarantine_queue,
             "vigilo.test-123.worker.quarantine"
         );
+    }
+
+    #[test]
+    fn mq_config_ignores_an_empty_namespace() {
+        let config = config_with_namespace(Some("  "));
+
+        assert_eq!(config.exchange, "vigilo.events");
+        assert_eq!(config.worker_queue, "vigilo.worker");
+    }
+
+    #[test]
+    fn reconnectable_lapin_errors_are_strictly_classified() {
+        for error in [
+            LapinError::InvalidChannel(7),
+            LapinError::IOError(Arc::new(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "reset",
+            ))),
+            LapinError::MissingHeartbeatError,
+        ] {
+            assert!(Client::is_reconnectable_lapin_error(&error));
+        }
+
+        assert!(!Client::is_reconnectable_lapin_error(
+            &LapinError::ChannelsLimitReached
+        ));
+    }
+
+    #[test]
+    fn reconnectable_anyhow_errors_include_wrapped_causes() {
+        for message in [
+            "invalid channel state",
+            "invalid connection state",
+            "IO error: reset",
+            "heartbeat timed out",
+            "connection closed",
+            "channel closed",
+        ] {
+            let error = anyhow::anyhow!(message).context("worker receive failed");
+            assert!(Client::is_reconnectable_anyhow_error(&error), "{message}");
+        }
+
+        let permanent = anyhow::anyhow!("publish was negatively acknowledged");
+        assert!(!Client::is_reconnectable_anyhow_error(&permanent));
+    }
+
+    #[test]
+    fn retry_count_handles_missing_malformed_and_negative_headers() {
+        let cases = [
+            (BasicProperties::default(), 0),
+            (properties_with_retry_value(AMQPValue::LongInt(3)), 3),
+            (properties_with_retry_value(AMQPValue::LongInt(-1)), 0),
+            (
+                properties_with_retry_value(AMQPValue::LongString(LongString::from("3"))),
+                0,
+            ),
+        ];
+
+        for (properties, expected) in cases {
+            assert_eq!(Client::retry_count(&properties), expected);
+        }
+    }
+
+    #[test]
+    fn worker_retry_budget_stops_at_the_configured_limit() {
+        let client = client();
+
+        for retry_count in [0, WORKER_MAX_RETRIES - 1] {
+            let message = raw_message(properties_with_retry_value(AMQPValue::LongInt(retry_count)));
+            assert!(client.can_retry_worker_message(&message));
+        }
+
+        for retry_count in [WORKER_MAX_RETRIES, WORKER_MAX_RETRIES + 1] {
+            let message = raw_message(properties_with_retry_value(AMQPValue::LongInt(retry_count)));
+            assert!(!client.can_retry_worker_message(&message));
+        }
+    }
+
+    #[test]
+    fn retry_attempts_use_bounded_exponential_buckets() {
+        let client = client();
+
+        for (attempt, expected) in [
+            (i32::MIN, "test.worker.retry.5s"),
+            (0, "test.worker.retry.5s"),
+            (1, "test.worker.retry.5s"),
+            (2, "test.worker.retry.10s"),
+            (8, "test.worker.retry.640s"),
+            (i32::MAX, "test.worker.retry.640s"),
+        ] {
+            assert_eq!(client.retry_queue_for_attempt(attempt), expected);
+        }
+    }
+
+    #[test]
+    fn explicit_delays_round_up_and_clamp_to_retry_buckets() {
+        let client = client();
+
+        for (delay_seconds, expected) in [
+            (i64::MIN, "test.worker.retry.5s"),
+            (5, "test.worker.retry.5s"),
+            (6, "test.worker.retry.10s"),
+            (320, "test.worker.retry.320s"),
+            (321, "test.worker.retry.640s"),
+            (i64::MAX, "test.worker.retry.640s"),
+        ] {
+            assert_eq!(
+                client.retry_queue_for_delay_seconds(delay_seconds),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn retry_properties_preserve_identity_and_record_failure_context() {
+        let first_failed_at = "2026-01-02T03:04:05Z";
+        let mut headers = FieldTable::default();
+        headers.insert(
+            "custom".into(),
+            AMQPValue::LongString(LongString::from("value")),
+        );
+        headers.insert(
+            HEADER_FIRST_FAILED_AT.into(),
+            AMQPValue::LongString(LongString::from(first_failed_at)),
+        );
+        let properties = BasicProperties::default()
+            .with_content_type("application/json".into())
+            .with_message_id("message-1".into())
+            .with_headers(headers);
+        let message = raw_message(properties);
+
+        let updated = Client::retry_properties(&message, 2, "agent unavailable", "transient");
+
+        assert_eq!(updated.content_type(), message.properties.content_type());
+        assert_eq!(updated.message_id(), message.properties.message_id());
+        assert_eq!(updated.delivery_mode(), &Some(2));
+        assert_eq!(long_string_header(&updated, "custom"), Some("value"));
+        assert_eq!(
+            long_string_header(&updated, HEADER_FIRST_FAILED_AT),
+            Some(first_failed_at)
+        );
+        assert_eq!(
+            header(&updated, HEADER_RETRY_COUNT),
+            Some(&AMQPValue::LongInt(2))
+        );
+        assert_eq!(
+            long_string_header(&updated, HEADER_LAST_ERROR),
+            Some("agent unavailable")
+        );
+        assert_eq!(
+            long_string_header(&updated, HEADER_ERROR_CLASS),
+            Some("transient")
+        );
+        assert_eq!(
+            long_string_header(&updated, HEADER_ORIGINAL_EXCHANGE),
+            Some("events")
+        );
+        assert_eq!(
+            long_string_header(&updated, HEADER_ORIGINAL_ROUTING_KEY),
+            Some(WORKER_ROUTING_KEY)
+        );
+        assert!(long_string_header(&updated, HEADER_LAST_FAILED_AT).is_some());
+    }
+
+    fn config_with_namespace(namespace: Option<&str>) -> Config {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original = std::env::var_os("VIGILO_MQ_NAMESPACE");
+        unsafe {
+            match namespace {
+                Some(namespace) => std::env::set_var("VIGILO_MQ_NAMESPACE", namespace),
+                None => std::env::remove_var("VIGILO_MQ_NAMESPACE"),
+            }
+        }
+
+        let config = Config::new("amqp://localhost".to_string());
 
         unsafe {
-            std::env::remove_var("VIGILO_MQ_NAMESPACE");
+            match original {
+                Some(original) => std::env::set_var("VIGILO_MQ_NAMESPACE", original),
+                None => std::env::remove_var("VIGILO_MQ_NAMESPACE"),
+            }
+        }
+        config
+    }
+
+    fn client() -> Client {
+        Client::new(Config {
+            uri: "amqp://localhost".to_string(),
+            exchange: "test.events".to_string(),
+            event_queue: "test.events.domain".to_string(),
+            worker_queue: "test.worker".to_string(),
+            worker_retry_exchange: "test.worker.retry".to_string(),
+            worker_quarantine_exchange: "test.worker.quarantine".to_string(),
+            worker_quarantine_queue: "test.worker.quarantine".to_string(),
+        })
+    }
+
+    fn properties_with_retry_value(value: AMQPValue) -> BasicProperties {
+        let mut headers = FieldTable::default();
+        headers.insert(HEADER_RETRY_COUNT.into(), value);
+        BasicProperties::default().with_headers(headers)
+    }
+
+    fn raw_message(properties: BasicProperties) -> RawConsumedMessage {
+        RawConsumedMessage {
+            delivery_tag: 1,
+            acker: Acker::default(),
+            body: br#"{"run_id":"run-1"}"#.to_vec(),
+            properties,
+            exchange: "events".to_string(),
+            routing_key: WORKER_ROUTING_KEY.to_string(),
+            redelivered: false,
+        }
+    }
+
+    fn header<'a>(properties: &'a BasicProperties, key: &str) -> Option<&'a AMQPValue> {
+        properties
+            .headers()
+            .as_ref()
+            .and_then(|headers| headers.inner().get(key))
+    }
+
+    fn long_string_header<'a>(properties: &'a BasicProperties, key: &str) -> Option<&'a str> {
+        match header(properties, key)? {
+            AMQPValue::LongString(value) => std::str::from_utf8(value.as_bytes()).ok(),
+            _ => None,
         }
     }
 }
