@@ -134,6 +134,21 @@ mod tests {
         assert_eq!(combined.max_score, Some(0.8));
     }
 
+    #[test]
+    fn combine_run_shard_summaries_handles_empty_and_unscored_results() {
+        let empty = combine_run_shard_summaries(&[]);
+        assert_eq!(empty.execution_count, 0);
+        assert_eq!(empty.average_score, None);
+        assert_eq!(empty.min_score, None);
+        assert_eq!(empty.max_score, None);
+
+        let unscored = combine_run_shard_summaries(&[summary(Uuid::nil(), 0, 1)]);
+        assert_eq!(unscored.execution_count, 1);
+        assert_eq!(unscored.average_score, None);
+        assert_eq!(unscored.min_score, None);
+        assert_eq!(unscored.max_score, None);
+    }
+
     fn summary(run_id: Uuid, run_shard: i16, execution_count: i32) -> RunShardSummary {
         RunShardSummary {
             run_id,

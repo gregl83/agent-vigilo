@@ -59,38 +59,37 @@ fn summarize_for_finalization(
         return Ok(None);
     }
 
-    let expected_execution_count = summaries
-        .iter()
-        .map(|summary| summary.expected_execution_count)
-        .sum::<i32>();
-    let terminal_execution_count = summaries
-        .iter()
-        .map(|summary| summary.terminal_execution_count)
-        .sum::<i32>();
-    let passed_execution_count = summaries
-        .iter()
-        .map(|summary| summary.passed_execution_count)
-        .sum::<i32>();
-    let failed_execution_count = summaries
-        .iter()
-        .map(|summary| summary.failed_execution_count)
-        .sum::<i32>();
-    let errored_execution_count = summaries
-        .iter()
-        .map(|summary| summary.errored_execution_count)
-        .sum::<i32>();
-    let missing_aggregate_count = summaries
-        .iter()
-        .map(|summary| summary.missing_aggregate_count)
-        .sum::<i32>();
-    let failed_chunk_count = summaries
-        .iter()
-        .map(|summary| summary.failed_chunk_count)
-        .sum::<i32>();
-    let cancelled_chunk_count = summaries
-        .iter()
-        .map(|summary| summary.cancelled_chunk_count)
-        .sum::<i32>();
+    let expected_execution_count =
+        checked_summary_total(summaries, "expected_execution_count", |summary| {
+            summary.expected_execution_count
+        })?;
+    let terminal_execution_count =
+        checked_summary_total(summaries, "terminal_execution_count", |summary| {
+            summary.terminal_execution_count
+        })?;
+    let passed_execution_count =
+        checked_summary_total(summaries, "passed_execution_count", |summary| {
+            summary.passed_execution_count
+        })?;
+    let failed_execution_count =
+        checked_summary_total(summaries, "failed_execution_count", |summary| {
+            summary.failed_execution_count
+        })?;
+    let errored_execution_count =
+        checked_summary_total(summaries, "errored_execution_count", |summary| {
+            summary.errored_execution_count
+        })?;
+    let missing_aggregate_count =
+        checked_summary_total(summaries, "missing_aggregate_count", |summary| {
+            summary.missing_aggregate_count
+        })?;
+    let failed_chunk_count = checked_summary_total(summaries, "failed_chunk_count", |summary| {
+        summary.failed_chunk_count
+    })?;
+    let cancelled_chunk_count =
+        checked_summary_total(summaries, "cancelled_chunk_count", |summary| {
+            summary.cancelled_chunk_count
+        })?;
     let coverage_complete = terminal_execution_count >= expected_execution_count;
     let has_terminal_chunk_failure = failed_chunk_count > 0 || cancelled_chunk_count > 0;
     let gate_status = if has_terminal_chunk_failure
@@ -118,6 +117,18 @@ fn summarize_for_finalization(
         has_terminal_chunk_failure,
         gate_status,
     }))
+}
+
+fn checked_summary_total(
+    summaries: &[RunShardSummary],
+    field: &str,
+    value: impl Fn(&RunShardSummary) -> i32,
+) -> anyhow::Result<i32> {
+    summaries.iter().try_fold(0i32, |total, summary| {
+        total.checked_add(value(summary)).ok_or_else(|| {
+            anyhow::anyhow!("run shard summary {field} total exceeds the supported i32 range")
+        })
+    })
 }
 
 /// Selects the next run whose dispatch cursors are drained.
@@ -494,6 +505,19 @@ mod tests {
         assert!(decision.coverage_complete);
         assert!(!decision.has_terminal_chunk_failure);
         assert_eq!(decision.gate_status, "pass");
+    }
+
+    #[test]
+    fn finalization_rejects_counter_overflow() {
+        let run_id = Uuid::nil();
+        let mut first = terminal_summary(run_id, 0, "completed");
+        first.expected_execution_count = i32::MAX;
+        first.terminal_execution_count = i32::MAX;
+        let second = terminal_summary(run_id, 1, "completed");
+
+        let error = summarize_for_finalization(&[first, second]).unwrap_err();
+
+        assert!(error.to_string().contains("expected_execution_count total"));
     }
 
     #[sqlx::test(migrations = "../migrations")]

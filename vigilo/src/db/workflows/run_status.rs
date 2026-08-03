@@ -189,6 +189,14 @@ mod tests {
         assert_eq!(progress.cancelled_chunk_count, 2);
     }
 
+    #[test]
+    fn combine_run_shard_progress_handles_empty_summaries() {
+        assert_eq!(
+            combine_run_shard_progress(&[]),
+            RunProgressSummary::default()
+        );
+    }
+
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx status tests"]
     async fn creation_failure_status_does_not_resolve_unseeded_routes(pool: sqlx::PgPool) {

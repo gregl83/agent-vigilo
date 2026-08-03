@@ -1451,6 +1451,41 @@ mod tests {
     }
 
     #[test]
+    fn placement_projection_plan_rejects_cross_placement_overlap() {
+        let cases = (0..3).map(projection_case).collect::<Vec<_>>();
+        let chunks = BTreeMap::from([
+            ("primary".to_string(), vec![projection_chunk(0, 0, 2)]),
+            ("shard_001".to_string(), vec![projection_chunk(1, 1, 3)]),
+        ]);
+
+        let error = build_placement_projections(Uuid::now_v7(), Uuid::now_v7(), &cases, &chunks)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("ordinal 1"));
+        assert!(error.to_string().contains("multiple execution placements"));
+    }
+
+    #[test]
+    fn placement_projection_plan_rejects_invalid_local_chunks() {
+        let cases = (0..2).map(projection_case).collect::<Vec<_>>();
+        let chunks = BTreeMap::from([("primary".to_string(), vec![projection_chunk(0, 1, 1)])]);
+
+        let error = build_placement_projections(Uuid::now_v7(), Uuid::now_v7(), &cases, &chunks)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("invalid ordinal range"));
+    }
+
+    #[test]
+    fn empty_projection_plan_is_valid_for_an_empty_dataset() {
+        let projections =
+            build_placement_projections(Uuid::now_v7(), Uuid::now_v7(), &[], &BTreeMap::new())
+                .unwrap();
+
+        assert!(projections.is_empty());
+    }
+
+    #[test]
     fn run_creation_config_has_bounded_defaults() {
         assert_eq!(
             Config::default(),

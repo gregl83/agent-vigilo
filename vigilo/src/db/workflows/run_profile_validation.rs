@@ -341,6 +341,7 @@ mod tests {
             RunProfile,
         },
         db::workflows::run_profile_validation::matching_groups_for_case,
+        models::evaluator::EvaluatorState,
     };
 
     fn profile() -> RunProfile {
@@ -390,19 +391,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn matching_groups_use_case_group_override_when_present() {
-        let profile = profile();
-        let case = DatasetCase {
-            id: Uuid::parse_str("018f1111-1111-7111-8111-111111111201").unwrap(),
-            task_type: "different".to_string(),
-            case_group: Some("classification".to_string()),
+    fn dataset_case(task_type: &str, case_group: Option<&str>, tags: &[&str]) -> DatasetCase {
+        DatasetCase {
+            id: Uuid::now_v7(),
+            task_type: task_type.to_string(),
+            case_group: case_group.map(str::to_string),
             input: serde_json::Value::Null,
             expected: None,
             context: None,
-            tags: vec![],
+            tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
             metadata: Default::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn matching_groups_use_case_group_override_when_present() {
+        let profile = profile();
+        let case = dataset_case("different", Some("classification"), &[]);
 
         let groups = matching_groups_for_case(&profile, &case);
         assert_eq!(groups.len(), 1);
@@ -412,20 +417,60 @@ mod tests {
     #[test]
     fn matching_groups_apply_task_type_and_tags() {
         let profile = profile();
-        let case = DatasetCase {
-            id: Uuid::parse_str("018f1111-1111-7111-8111-111111111202").unwrap(),
-            task_type: "classification".to_string(),
-            case_group: None,
-            input: serde_json::Value::Null,
-            expected: None,
-            context: None,
-            tags: vec!["smoke".to_string()],
-            metadata: Default::default(),
-        };
+        let case = dataset_case("classification", None, &["smoke"]);
 
         let groups = matching_groups_for_case(&profile, &case);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].id, "classification");
+    }
+
+    #[test]
+    fn matching_groups_reject_unknown_overrides_and_unmatched_predicates() {
+        let mut profile = profile();
+        profile.case_groups[0].applies_to.tags_all = vec!["required".to_string()];
+
+        for case in [
+            dataset_case("classification", Some("unknown"), &["smoke", "required"]),
+            dataset_case("generation", None, &["smoke", "required"]),
+            dataset_case("classification", None, &["required"]),
+            dataset_case("classification", None, &["smoke"]),
+        ] {
+            assert!(matching_groups_for_case(&profile, &case).is_empty());
+        }
+
+        let matching = dataset_case("classification", None, &["smoke", "required"]);
+        assert_eq!(matching_groups_for_case(&profile, &matching).len(), 1);
+    }
+
+    #[test]
+    fn valid_profile_has_no_static_config_issues() {
+        assert!(super::collect_static_profile_config_issues(&profile()).is_empty());
+    }
+
+    #[test]
+    fn profile_reports_all_invalid_scalar_configuration() {
+        let mut profile = profile();
+        profile.agent.provider = " ".to_string();
+        profile.agent.name = "".to_string();
+        profile.agent.http.url = "not a url".to_string();
+        profile.agent.http.method = "not a method".to_string();
+        profile.agent.http.timeout_secs = Some(0);
+        profile.defaults.max_attempts = 0;
+        profile.defaults.min_execution_score = f64::NAN;
+
+        let issues = super::collect_static_profile_config_issues(&profile).join("\n");
+
+        for expected in [
+            "agent.provider",
+            "agent.name",
+            "agent.http.url",
+            "agent.http.method",
+            "agent.http.timeout_secs",
+            "defaults.max_attempts",
+            "defaults.min_execution_score",
+        ] {
+            assert!(issues.contains(expected), "missing issue for {expected}");
+        }
     }
 
     #[test]
@@ -504,5 +549,49 @@ mod tests {
                 .iter()
                 .any(|issue| issue.contains("duplicate evaluator ref"))
         );
+    }
+
+    #[test]
+    fn profile_rejects_non_finite_weights() {
+        let mut profile = profile();
+        profile.case_groups[0].evaluators.push(EvaluatorBinding {
+            evaluator_ref: "core/json-schema:1.0.0".to_string(),
+            dimension: "format".to_string(),
+            blocking: true,
+            weight: f64::NAN,
+            config: serde_json::json!({}),
+        });
+        profile.case_groups[0].aggregation.dimensions.insert(
+            "quality".to_string(),
+            DimensionAggregation {
+                method: AggregationMethod::WeightedMean,
+                blocking: false,
+                weight: f64::INFINITY,
+            },
+        );
+
+        let issues = super::collect_static_profile_config_issues(&profile);
+
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|issue| issue.contains("weight"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn evaluator_runnable_states_match_worker_policy() {
+        for state in [
+            EvaluatorState::Active,
+            EvaluatorState::Deprecated,
+            EvaluatorState::Yanked,
+        ] {
+            assert!(super::is_runnable_state(&state));
+        }
+        for state in [EvaluatorState::Disabled, EvaluatorState::Removed] {
+            assert!(!super::is_runnable_state(&state));
+        }
     }
 }

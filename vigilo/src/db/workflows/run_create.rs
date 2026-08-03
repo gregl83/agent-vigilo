@@ -1058,4 +1058,58 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn shard_assignment_handles_empty_inputs() {
+        let shards = [0].into_iter().collect::<BTreeSet<_>>();
+
+        assert!(assign_run_shards_to_aliases(&shards, &[]).is_empty());
+        assert!(
+            assign_run_shards_to_aliases(&BTreeSet::new(), &["primary".to_string()]).is_empty()
+        );
+    }
+
+    #[test]
+    fn chunks_are_grouped_by_shard_assignment_in_input_order() {
+        let chunks = vec![chunk(1, 0), chunk(0, 1), chunk(1, 2)];
+        let assignments = vec![
+            RunShardPlacementAssignment {
+                run_shard: 0,
+                database_alias: "primary".to_string(),
+            },
+            RunShardPlacementAssignment {
+                run_shard: 1,
+                database_alias: "shard_001".to_string(),
+            },
+        ];
+
+        let grouped = group_chunks_by_assigned_alias(&chunks, &assignments).unwrap();
+
+        assert_eq!(
+            grouped["shard_001"]
+                .iter()
+                .map(|chunk| chunk.ordinal_start)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert_eq!(grouped["primary"][0].ordinal_start, 1);
+    }
+
+    #[test]
+    fn chunk_grouping_rejects_an_unassigned_shard() {
+        let error = group_chunks_by_assigned_alias(&[chunk(7, 0)], &[]).unwrap_err();
+
+        assert!(error.to_string().contains("run_shard 7"));
+    }
+
+    #[test]
+    fn seed_invariant_errors_are_distinguishable_from_other_failures() {
+        let invariant = seed_invariant_error("immutable seed mismatch");
+
+        assert!(is_seed_invariant_error(&invariant));
+        assert!(!is_seed_invariant_error(&anyhow::anyhow!(
+            "database unavailable"
+        )));
+        assert_eq!(invariant.to_string(), "immutable seed mismatch");
+    }
 }
