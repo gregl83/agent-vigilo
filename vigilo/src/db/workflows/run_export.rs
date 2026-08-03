@@ -261,3 +261,52 @@ pub(crate) async fn select_batch_for_executions(
         evaluator_results,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use sqlx::postgres::PgPoolOptions;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_execution_batch_does_not_touch_the_route_database() {
+        let route = closed_route().await;
+
+        let batch = select_batch_for_executions(&route, Uuid::nil(), Vec::new())
+            .await
+            .unwrap();
+
+        assert!(batch.executions.is_empty());
+        assert!(batch.attempts.is_empty());
+        assert!(batch.aggregates.is_empty());
+        assert!(batch.evaluator_results.is_empty());
+        assert_eq!(route.run_shard(), 7);
+        assert_eq!(route.database_alias(), "unavailable");
+    }
+
+    #[tokio::test]
+    async fn execution_page_propagates_an_unavailable_database() {
+        let route = closed_route().await;
+
+        let error = select_execution_batch(&route, Uuid::nil(), None, 100)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<sqlx::Error>(),
+            Some(sqlx::Error::PoolClosed)
+        ));
+    }
+
+    async fn closed_route() -> RunExportRoute {
+        let db = PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/vigilo")
+            .unwrap();
+        db.close().await;
+        RunExportRoute {
+            run_shard: 7,
+            database_alias: "unavailable".to_string(),
+            db,
+        }
+    }
+}

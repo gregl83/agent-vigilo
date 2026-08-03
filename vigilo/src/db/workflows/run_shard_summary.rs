@@ -38,8 +38,12 @@ pub(crate) struct RunShardSummary {
 
 impl RunShardSummary {
     pub(crate) fn is_terminal(&self) -> bool {
-        matches!(self.status.as_str(), "completed" | "failed")
+        is_terminal_summary_status(&self.status)
     }
+}
+
+fn is_terminal_summary_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed")
 }
 
 /// Reads the shard-local summary for one routed run shard.
@@ -359,6 +363,16 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn terminal_summary_statuses_are_strict_and_exhaustive() {
+        for terminal in ["completed", "failed"] {
+            assert!(is_terminal_summary_status(terminal));
+        }
+        for nonterminal in ["", "running", "pending", "cancelled", "Completed"] {
+            assert!(!is_terminal_summary_status(nonterminal));
+        }
+    }
 
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx summary tests"]
