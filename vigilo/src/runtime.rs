@@ -340,3 +340,146 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future,
+        sync::{
+            Arc,
+            atomic::{
+                AtomicUsize,
+                Ordering,
+            },
+        },
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn runner_reports_an_unexpected_normal_exit() {
+        let err = ServiceRunner::new("test-service")
+            .run(|_| async { Ok(()) })
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "test-service exited unexpectedly");
+    }
+
+    #[tokio::test]
+    async fn runner_preserves_service_failures() {
+        let err = ServiceRunner::new("test-service")
+            .run(|_| async { anyhow::bail!("tick failed") })
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "tick failed");
+    }
+
+    #[tokio::test]
+    async fn runner_adds_service_context_to_task_panics() {
+        let err = ServiceRunner::new("test-service")
+            .run(|_| async { panic!("service panic") })
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("test-service task panicked or was cancelled")
+        );
+    }
+
+    #[tokio::test]
+    async fn unthrottled_loop_stops_after_a_tick_failure() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tick_calls = Arc::clone(&calls);
+
+        let err = ServiceRunner::new("test-loop")
+            .run_loop(move || {
+                tick_calls.fetch_add(1, Ordering::SeqCst);
+                async { anyhow::bail!("loop failed") }
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "loop failed");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn throttled_loop_runs_its_first_tick_immediately() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tick_calls = Arc::clone(&calls);
+
+        let err = ServiceRunner::new("test-loop")
+            .tick_interval(Duration::from_secs(60))
+            .run_loop(move || {
+                tick_calls.fetch_add(1, Ordering::SeqCst);
+                async { anyhow::bail!("loop failed") }
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "loop failed");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn service_stop_wait_accepts_cooperative_completion() {
+        let mut task = tokio::spawn(async { Ok(()) });
+
+        wait_for_service_stop("test-service", &mut task, Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn service_stop_wait_preserves_cleanup_failures() {
+        let mut task = tokio::spawn(async { anyhow::bail!("cleanup failed") });
+
+        let err = wait_for_service_stop("test-service", &mut task, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "cleanup failed");
+    }
+
+    #[tokio::test]
+    async fn service_stop_wait_aborts_a_task_after_timeout() {
+        let mut task = tokio::spawn(async {
+            future::pending::<()>().await;
+            Ok(())
+        });
+
+        let err = wait_for_service_stop("test-service", &mut task, Duration::ZERO)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "test-service did not stop within 0ns");
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn runner_builders_preserve_configuration_and_callback() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hook_calls = Arc::clone(&calls);
+        let runner = ServiceRunner::new("test-service")
+            .shutdown_timeout(Duration::from_secs(7))
+            .tick_interval(Duration::from_secs(3))
+            .on_shutdown(move || async move {
+                hook_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+
+        assert_eq!(runner.service_name, "test-service");
+        assert_eq!(runner.shutdown_timeout, Duration::from_secs(7));
+        assert_eq!(runner.tick_interval, Some(Duration::from_secs(3)));
+        runner.shutdown_hook.call().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn default_shutdown_callback_is_a_noop() {
+        NoShutdownHook.call().await.unwrap();
+    }
+}

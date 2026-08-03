@@ -1147,3 +1147,575 @@ impl Context {
             .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        fs,
+        time::SystemTime,
+    };
+
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::{
+        evaluator_test_bindings::vigilo::evaluator::{
+            executor,
+            types as wit_types,
+        },
+        *,
+    };
+    use crate::{
+        contracts::evaluator::{
+            AgentOutput,
+            AgentTraceEvent,
+            TestCase,
+            ToolCall,
+        },
+        manifest::Package,
+    };
+
+    const TEST_WIT: &str = r#"
+        package vigilo:evaluator@0.1.0;
+
+        interface evaluator {}
+
+        world evaluator-world {
+            export evaluator;
+        }
+    "#;
+
+    fn minimal_wasm_module() -> Vec<u8> {
+        b"\0asm\x01\0\0\0".to_vec()
+    }
+
+    fn test_host(max_log_message_bytes: usize, max_log_messages: u32) -> EvaluatorTestHost {
+        EvaluatorTestHost {
+            table: ResourceTable::new(),
+            ctx: WasiCtxBuilder::new().build(),
+            limits: Config::default().store_limits().unwrap(),
+            max_log_message_bytes,
+            max_log_messages,
+            log_messages: 0,
+        }
+    }
+
+    fn evaluator_input() -> EvaluatorInput {
+        EvaluatorInput {
+            run_id: "run-1".to_string(),
+            execution_id: "execution-1".to_string(),
+            attempt_id: "attempt-1".to_string(),
+            case: TestCase {
+                id: "case-1".to_string(),
+                task_type: "classification".to_string(),
+                case_group: Some("sentiment".to_string()),
+                input: json!({"text": "hello"}),
+                expected: Some(json!({"label": "positive"})),
+                context: None,
+                tags: vec!["example".to_string()],
+                metadata: BTreeMap::from([("source".to_string(), json!("test"))]),
+            },
+            actual: AgentOutput {
+                text: Some("positive".to_string()),
+                structured: Some(json!({"label": "positive"})),
+                tool_calls: vec![ToolCall {
+                    name: "lookup".to_string(),
+                    arguments: json!({"id": 1}),
+                    result: Some(json!({"found": true})),
+                }],
+                trace: vec![AgentTraceEvent {
+                    kind: "tool_call".to_string(),
+                    name: Some("lookup".to_string()),
+                    payload: json!({"step": 1}),
+                }],
+                raw: json!({"provider": "test"}),
+                metadata: json!({"latency_ms": 12}),
+            },
+            evaluator_config: json!({"threshold": 0.8}),
+        }
+    }
+
+    fn wit_output() -> wit_types::Output {
+        wit_types::Output {
+            evaluator: wit_types::EvaluatorIdentity {
+                namespace: "vigilo".to_string(),
+                name: "example".to_string(),
+                version: "1.0.0".to_string(),
+                content_hash: Some("hash".to_string()),
+                interface_version: Some("0.1.0".to_string()),
+            },
+            results: vec![wit_types::EvaluatorFinding {
+                dimension: wit_types::EvaluationDimension::Other("style".to_string()),
+                status: wit_types::EvaluationStatus::Failed,
+                score: wit_types::Score::Range((0.4, 0.0, 1.0)),
+                blocking: true,
+                severity: wit_types::Severity::High,
+                failure_category: Some("tone".to_string()),
+                reason: Some("too terse".to_string()),
+                evidence_json: r#"{"span":"answer"}"#.to_string(),
+                tags: vec!["style".to_string()],
+            }],
+            metadata_json: r#"{"duration_ms":4}"#.to_string(),
+        }
+    }
+
+    fn manifest_wit(
+        package: &str,
+        version: &str,
+        world: &str,
+        interface: &str,
+        strict: bool,
+    ) -> Wit {
+        Wit {
+            path: "evaluator.wit".to_string(),
+            world: world.to_string(),
+            package: package.to_string(),
+            version: version.to_string(),
+            interface: interface.to_string(),
+            strict,
+        }
+    }
+
+    fn cargo_package_metadata() -> PackageMetadata {
+        PackageMetadata {
+            name: "example".to_string(),
+            version: "1.0.0".to_string(),
+            target_dir: PathBuf::from("target"),
+            modified: SystemTime::UNIX_EPOCH,
+            description: Some("Cargo description".to_string()),
+            tags: vec!["cargo".to_string()],
+            metadata: Some(json!({"owner": "cargo"})),
+        }
+    }
+
+    fn error_message<T>(result: anyhow::Result<T>) -> String {
+        match result {
+            Ok(_) => panic!("expected operation to fail"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn utf8_truncation_respects_character_boundaries() {
+        let cases = [
+            ("hello", 5, "hello"),
+            ("hello", 3, "hel"),
+            ("aéb", 2, "a"),
+            ("aéb", 3, "aé"),
+            ("hello", 0, ""),
+        ];
+
+        for (value, max_bytes, expected) in cases {
+            assert_eq!(truncate_utf8_bytes(value.to_string(), max_bytes), expected);
+        }
+    }
+
+    #[test]
+    fn evaluator_logs_enforce_message_and_byte_limits() {
+        let mut host = test_host(3, 2);
+
+        assert_eq!(
+            host.capped_log_message("hello".to_string()).as_deref(),
+            Some("hel")
+        );
+        assert_eq!(
+            host.capped_log_message("éé".to_string()).as_deref(),
+            Some("é")
+        );
+        assert_eq!(host.capped_log_message("ignored".to_string()), None);
+
+        let mut disabled = test_host(10, 0);
+        assert_eq!(disabled.capped_log_message("ignored".to_string()), None);
+    }
+
+    #[test]
+    fn evaluator_http_requests_are_rejected_until_policy_is_configured() {
+        let mut host = test_host(10, 1);
+        let request = executor::HttpRequest {
+            method: "GET".to_string(),
+            uri: "https://example.test".to_string(),
+            headers: Vec::new(),
+            body: None,
+            timeout_ms: None,
+        };
+
+        let err = executor::Host::send_http_request(&mut host, request).unwrap_err();
+
+        assert!(err.contains("outbound HTTP policy enforcement is not configured"));
+    }
+
+    #[test]
+    fn json_payload_parsing_accepts_blank_objects_and_labels_errors() {
+        assert_eq!(parse_json_payload("metadata", "  ").unwrap(), json!({}));
+        assert_eq!(
+            parse_json_payload("metadata", r#"{"ok":true}"#).unwrap(),
+            json!({"ok": true})
+        );
+
+        let err = parse_json_payload("evidence", "{").unwrap_err();
+        assert!(err.to_string().contains("invalid evidence JSON"));
+    }
+
+    #[test]
+    fn evaluator_input_mapping_preserves_structured_fields() {
+        let mapped = map_input_to_wit_input(evaluator_input()).unwrap();
+
+        assert_eq!(mapped.run_id, "run-1");
+        assert_eq!(mapped.test_case.case_group.as_deref(), Some("sentiment"));
+        assert_eq!(
+            parse_json_payload("input", &mapped.test_case.input_json).unwrap(),
+            json!({"text": "hello"})
+        );
+        assert_eq!(mapped.actual.tool_calls[0].name, "lookup");
+        assert_eq!(
+            parse_json_payload("arguments", &mapped.actual.tool_calls[0].arguments_json).unwrap(),
+            json!({"id": 1})
+        );
+        assert_eq!(mapped.actual.trace[0].kind, "tool_call");
+        assert_eq!(
+            parse_json_payload("config", &mapped.evaluator_config_json).unwrap(),
+            json!({"threshold": 0.8})
+        );
+    }
+
+    #[test]
+    fn wit_enum_mappings_cover_every_contract_variant() {
+        use wit_types::{
+            EvaluationDimension as WitDimension,
+            EvaluationStatus as WitStatus,
+            PreferenceOutcome as WitPreference,
+            Severity as WitSeverity,
+        };
+
+        let dimensions = [
+            (WitDimension::Correctness, EvaluationDimension::Correctness),
+            (WitDimension::Format, EvaluationDimension::Format),
+            (WitDimension::Safety, EvaluationDimension::Safety),
+            (WitDimension::Quality, EvaluationDimension::Quality),
+            (WitDimension::Latency, EvaluationDimension::Latency),
+            (WitDimension::ToolUse, EvaluationDimension::ToolUse),
+            (WitDimension::Calibration, EvaluationDimension::Calibration),
+            (
+                WitDimension::Other("custom".to_string()),
+                EvaluationDimension::Other("custom".to_string()),
+            ),
+        ];
+        for (input, expected) in dimensions {
+            assert_eq!(map_dimension(input), expected);
+        }
+
+        let statuses = [
+            (WitStatus::Passed, EvaluationStatus::Passed),
+            (WitStatus::Failed, EvaluationStatus::Failed),
+            (WitStatus::Error, EvaluationStatus::Error),
+            (WitStatus::Skipped, EvaluationStatus::Skipped),
+        ];
+        for (input, expected) in statuses {
+            assert_eq!(map_status(input), expected);
+        }
+
+        let severities = [
+            (WitSeverity::None, Severity::None),
+            (WitSeverity::Low, Severity::Low),
+            (WitSeverity::Medium, Severity::Medium),
+            (WitSeverity::High, Severity::High),
+            (WitSeverity::Critical, Severity::Critical),
+        ];
+        for (input, expected) in severities {
+            assert_eq!(map_severity(input), expected);
+        }
+
+        let preferences = [
+            (WitPreference::Preferred, PreferenceOutcome::Preferred),
+            (WitPreference::Tie, PreferenceOutcome::Tie),
+            (WitPreference::NotPreferred, PreferenceOutcome::NotPreferred),
+        ];
+        for (input, expected) in preferences {
+            assert_eq!(map_preference_outcome(input), expected);
+        }
+    }
+
+    #[test]
+    fn wit_score_mapping_covers_every_contract_variant() {
+        let cases = [
+            (
+                wit_types::Score::Binary(true),
+                Score::Binary { passed: true },
+            ),
+            (
+                wit_types::Score::Range((0.5, 0.0, 1.0)),
+                Score::Range {
+                    value: 0.5,
+                    min: 0.0,
+                    max: 1.0,
+                },
+            ),
+            (
+                wit_types::Score::Normalized(0.75),
+                Score::Normalized { value: 0.75 },
+            ),
+            (
+                wit_types::Score::SeverityMapped(wit_types::Severity::Medium),
+                Score::SeverityMapped {
+                    severity: Severity::Medium,
+                },
+            ),
+            (
+                wit_types::Score::Preference(wit_types::PreferenceOutcome::Tie),
+                Score::Preference {
+                    outcome: PreferenceOutcome::Tie,
+                },
+            ),
+            (wit_types::Score::Informational, Score::Informational),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                serde_json::to_value(map_score(input)).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn wit_output_mapping_preserves_findings_and_json_payloads() {
+        let output = map_wit_output_to_output(wit_output()).unwrap();
+
+        assert_eq!(output.evaluator.namespace, "vigilo");
+        assert_eq!(output.metadata, json!({"duration_ms": 4}));
+        assert_eq!(output.results.len(), 1);
+        let finding = &output.results[0];
+        assert_eq!(
+            finding.dimension,
+            EvaluationDimension::Other("style".to_string())
+        );
+        assert_eq!(finding.status, EvaluationStatus::Failed);
+        assert_eq!(finding.severity, Severity::High);
+        assert_eq!(finding.evidence, json!({"span": "answer"}));
+        assert!(finding.blocking);
+    }
+
+    #[test]
+    fn wit_output_mapping_labels_invalid_json_fields() {
+        let mut output = wit_output();
+        output.metadata_json = "{".to_string();
+        let err = map_wit_output_to_output(output).unwrap_err();
+        assert!(err.to_string().contains("invalid metadata-json JSON"));
+
+        let mut output = wit_output();
+        output.results[0].evidence_json = "{".to_string();
+        let err = map_wit_output_to_output(output).unwrap_err();
+        assert!(err.to_string().contains("invalid evidence-json JSON"));
+    }
+
+    #[test]
+    fn package_metadata_embedding_is_idempotent_and_rejects_conflicts() {
+        let original = minimal_wasm_module();
+        let embedded =
+            ensure_embedded_package_metadata(original.clone(), "example", "1.0.0").unwrap();
+        let metadata = read_embedded_package_metadata(&embedded).unwrap().unwrap();
+
+        assert_eq!(metadata.name, "example");
+        assert_eq!(metadata.version, "1.0.0");
+        assert!(embedded.len() > original.len());
+        assert_eq!(
+            ensure_embedded_package_metadata(embedded.clone(), "example", "1.0.0").unwrap(),
+            embedded
+        );
+
+        let err = ensure_embedded_package_metadata(embedded, "other", "1.0.0").unwrap_err();
+        assert!(err.to_string().contains("embedded vigilo.package mismatch"));
+    }
+
+    #[test]
+    fn malformed_embedded_package_metadata_is_rejected() {
+        let wasm = append_custom_section(
+            &minimal_wasm_module(),
+            PACKAGE_METADATA_SECTION,
+            b"not-json",
+        )
+        .unwrap();
+
+        let err = read_embedded_package_metadata(&wasm).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("failed to decode vigilo.package metadata")
+        );
+    }
+
+    #[test]
+    fn strict_wit_metadata_requires_the_declared_contract() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("evaluator.wit"), TEST_WIT).unwrap();
+        let valid = manifest_wit(
+            "vigilo:evaluator",
+            "0.1.0",
+            "evaluator-world",
+            "evaluator",
+            true,
+        );
+
+        let metadata = resolve_wit_metadata(dir.path(), Some(&valid)).unwrap();
+        assert_eq!(
+            metadata.interface_name.as_deref(),
+            Some("vigilo:evaluator/evaluator")
+        );
+        assert_eq!(metadata.interface_version.as_deref(), Some("0.1.0"));
+        assert_eq!(metadata.wit_world.as_deref(), Some("evaluator-world"));
+
+        let mismatches = [
+            (
+                "other:package",
+                "0.1.0",
+                "evaluator-world",
+                "evaluator",
+                "package mismatch",
+            ),
+            (
+                "vigilo:evaluator",
+                "9.0.0",
+                "evaluator-world",
+                "evaluator",
+                "version mismatch",
+            ),
+            (
+                "vigilo:evaluator",
+                "0.1.0",
+                "missing-world",
+                "evaluator",
+                "not found",
+            ),
+            (
+                "vigilo:evaluator",
+                "0.1.0",
+                "evaluator-world",
+                "missing-interface",
+                "is not exported",
+            ),
+        ];
+        for (package, version, world, interface, expected) in mismatches {
+            let wit = manifest_wit(package, version, world, interface, true);
+            let err = error_message(resolve_wit_metadata(dir.path(), Some(&wit)));
+            assert!(err.contains(expected), "expected '{expected}' in '{err}'");
+        }
+    }
+
+    #[test]
+    fn optional_wit_metadata_accepts_missing_or_non_strict_contracts() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("evaluator.wit"), TEST_WIT).unwrap();
+
+        let absent = resolve_wit_metadata(dir.path(), None).unwrap();
+        assert!(absent.interface_name.is_none());
+        assert!(absent.interface_version.is_none());
+        assert!(absent.wit_world.is_none());
+
+        let configured = manifest_wit("other:package", "9.0.0", "missing", "missing", false);
+        let metadata = resolve_wit_metadata(dir.path(), Some(&configured)).unwrap();
+        assert_eq!(
+            metadata.interface_name.as_deref(),
+            Some("other:package/missing")
+        );
+        assert_eq!(metadata.interface_version.as_deref(), Some("9.0.0"));
+        assert_eq!(metadata.wit_world.as_deref(), Some("missing"));
+    }
+
+    #[test]
+    fn wit_parser_rejects_files_without_a_package_declaration() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("evaluator.wit");
+        fs::write(&path, "world evaluator-world {}\n").unwrap();
+
+        let err = error_message(parse_wit_file(&path));
+
+        assert!(err.contains("missing package declaration"));
+    }
+
+    #[test]
+    fn evaluator_manifest_metadata_overrides_cargo_fallbacks() {
+        let fallback = Package {
+            manifest: "Cargo.toml".to_string(),
+            description: None,
+            tags: Vec::new(),
+            metadata: None,
+        };
+        let resolved = resolve_evaluator_metadata(&fallback, &cargo_package_metadata()).unwrap();
+        assert_eq!(resolved.description.as_deref(), Some("Cargo description"));
+        assert_eq!(resolved.tags, json!(["cargo"]));
+        assert_eq!(resolved.metadata, json!({"owner": "cargo"}));
+
+        let overrides = Package {
+            manifest: "Cargo.toml".to_string(),
+            description: Some("Manifest description".to_string()),
+            tags: vec!["manifest".to_string()],
+            metadata: Some(toml::from_str("owner = 'manifest'").unwrap()),
+        };
+        let resolved = resolve_evaluator_metadata(&overrides, &cargo_package_metadata()).unwrap();
+        assert_eq!(
+            resolved.description.as_deref(),
+            Some("Manifest description")
+        );
+        assert_eq!(resolved.tags, json!(["manifest"]));
+        assert_eq!(resolved.metadata, json!({"owner": "manifest"}));
+    }
+
+    #[test]
+    fn wasm_configuration_uses_bounded_defaults_and_deadlines() {
+        let defaults = Config::default();
+        defaults.store_limits().unwrap();
+        assert_eq!(defaults.max_memory_bytes, DEFAULT_MAX_MEMORY_BYTES);
+        assert_eq!(
+            defaults.max_concurrent_evaluations,
+            DEFAULT_MAX_CONCURRENT_EVALUATIONS
+        );
+
+        let mut config = defaults.clone();
+        config.timeout_ms = 11;
+        config.epoch_tick_interval_ms = 5;
+        assert_eq!(config.epoch_deadline_ticks(), 3);
+
+        config.timeout_ms = 0;
+        assert_eq!(config.epoch_deadline_ticks(), 0);
+    }
+
+    #[test]
+    fn runtime_identity_comes_from_the_engine_and_embedded_lockfile() {
+        let engine = Engine::default();
+        let fingerprint = get_engine_fingerprint(&engine);
+        let version = resolve_runtime_version().unwrap();
+
+        assert!(fingerprint.ends_with(&format!("-{ARCH}")));
+        assert!(!version.is_empty());
+        assert!(version.chars().next().unwrap().is_ascii_digit());
+    }
+
+    #[tokio::test]
+    async fn wasm_context_initializes_once_and_bounds_concurrency() {
+        let config = Config {
+            timeout_ms: 0,
+            max_concurrent_evaluations: 1,
+            ..Config::default()
+        };
+        let context = Context {
+            cell: OnceCell::new(),
+            config,
+        };
+
+        let first = context.get().await.unwrap();
+        let second = context.get().await.unwrap();
+        assert!(std::ptr::eq(first, second));
+
+        let permit = first.acquire_evaluation_permit().await.unwrap();
+        assert!(
+            first
+                .evaluation_semaphore
+                .clone()
+                .try_acquire_owned()
+                .is_err()
+        );
+        drop(permit);
+        let _permit = first.acquire_evaluation_permit().await.unwrap();
+    }
+}
