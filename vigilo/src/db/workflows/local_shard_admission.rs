@@ -266,6 +266,14 @@ where
             database_alias: hint.database_alias.clone(),
         })?;
 
+    validate_loaded_local_shard_admission(admission, hint, write_kind)
+}
+
+fn validate_loaded_local_shard_admission(
+    admission: LocalShardAdmission,
+    hint: &LocalShardRouteHint,
+    write_kind: LocalShardWriteKind,
+) -> anyhow::Result<LocalShardAdmission> {
     let state = admission.parsed_state()?;
     if admission.database_alias != hint.database_alias || admission.write_epoch != hint.write_epoch
     {
@@ -320,6 +328,129 @@ mod tests {
         assert!(!LocalShardAdmissionState::Prepared.allows_settlement());
         assert!(!LocalShardAdmissionState::Closed.allows_new_work());
         assert!(!LocalShardAdmissionState::Closed.allows_settlement());
+    }
+
+    #[test]
+    fn admission_states_round_trip_through_persisted_values() {
+        for state in [
+            LocalShardAdmissionState::Open,
+            LocalShardAdmissionState::Draining,
+            LocalShardAdmissionState::Prepared,
+            LocalShardAdmissionState::Closed,
+        ] {
+            assert_eq!(
+                LocalShardAdmissionState::try_from(state.as_str()).unwrap(),
+                state
+            );
+            assert_eq!(state.to_string(), state.as_str());
+        }
+
+        for invalid in ["", "OPEN", "unknown", " open"] {
+            assert!(LocalShardAdmissionState::try_from(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn loaded_admission_rejects_invalid_persisted_state() {
+        let hint = route_hint("primary", 3);
+        let error = validate_loaded_local_shard_admission(
+            admission("invalid", "primary", 3, None),
+            &hint,
+            LocalShardWriteKind::NewWork,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported local shard admission state")
+        );
+    }
+
+    #[test]
+    fn loaded_admission_rejects_stale_alias_or_epoch() {
+        let hint = route_hint("primary", 3);
+
+        for stale in [
+            admission("open", "shard_001", 3, None),
+            admission("open", "primary", 2, Some("shard_001")),
+            admission("open", "primary", 4, None),
+        ] {
+            let error =
+                validate_loaded_local_shard_admission(stale, &hint, LocalShardWriteKind::NewWork)
+                    .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<LocalShardAdmissionError>(),
+                Some(LocalShardAdmissionError::StaleWriteEpoch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn loaded_admission_applies_write_policy_after_route_validation() {
+        let hint = route_hint("primary", 3);
+        assert!(
+            validate_loaded_local_shard_admission(
+                admission("open", "primary", 3, None),
+                &hint,
+                LocalShardWriteKind::NewWork,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_loaded_local_shard_admission(
+                admission("draining", "primary", 3, Some("shard_001")),
+                &hint,
+                LocalShardWriteKind::Settlement,
+            )
+            .is_ok()
+        );
+
+        for (state, write_kind) in [
+            ("draining", LocalShardWriteKind::NewWork),
+            ("prepared", LocalShardWriteKind::NewWork),
+            ("prepared", LocalShardWriteKind::Settlement),
+            ("closed", LocalShardWriteKind::Settlement),
+        ] {
+            let error = validate_loaded_local_shard_admission(
+                admission(state, "primary", 3, Some("shard_001")),
+                &hint,
+                write_kind,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<LocalShardAdmissionError>(),
+                Some(LocalShardAdmissionError::RejectedState {
+                    redirect_database_alias: Some(alias),
+                    ..
+                }) if alias == "shard_001"
+            ));
+        }
+    }
+
+    fn route_hint(database_alias: &str, write_epoch: i64) -> LocalShardRouteHint {
+        LocalShardRouteHint {
+            run_id: Uuid::nil(),
+            run_shard: 7,
+            database_alias: database_alias.to_string(),
+            write_epoch,
+        }
+    }
+
+    fn admission(
+        state: &str,
+        database_alias: &str,
+        write_epoch: i64,
+        redirect_database_alias: Option<&str>,
+    ) -> LocalShardAdmission {
+        LocalShardAdmission {
+            run_id: Uuid::nil(),
+            run_shard: 7,
+            database_alias: database_alias.to_string(),
+            write_epoch,
+            state: state.to_string(),
+            redirect_database_alias: redirect_database_alias.map(ToOwned::to_owned),
+        }
     }
 
     #[sqlx::test(migrations = "../migrations")]

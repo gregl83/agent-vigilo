@@ -274,6 +274,13 @@ fn validate_chunk_case_ordinals(
     }
     let mut expected = ordinal_start;
     for actual in ordinals {
+        if expected == ordinal_end {
+            anyhow::bail!(
+                "chunk projection contains case ordinal {} after exclusive end {}",
+                actual,
+                ordinal_end
+            );
+        }
         if actual != expected {
             anyhow::bail!(
                 "chunk projection is incomplete: expected case ordinal {}, found {}",
@@ -445,6 +452,10 @@ fn require_chunk_lease_token(chunk: &RunChunk) -> anyhow::Result<Uuid> {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{
+        DateTime,
+        Utc,
+    };
     use sqlx::PgPool;
     use uuid::Uuid;
 
@@ -453,6 +464,7 @@ mod tests {
     #[test]
     fn chunk_projection_accepts_exact_contiguous_range() {
         validate_chunk_case_ordinals(4, 7, [4, 5, 6]).unwrap();
+        validate_chunk_case_ordinals(4, 4, []).unwrap();
     }
 
     #[test]
@@ -471,6 +483,57 @@ mod tests {
     fn chunk_projection_rejects_early_end() {
         let error = validate_chunk_case_ordinals(4, 7, [4, 5]).unwrap_err();
         assert!(error.to_string().contains("expected case ordinal 6"));
+    }
+
+    #[test]
+    fn chunk_projection_rejects_invalid_or_excess_ranges() {
+        let reversed = validate_chunk_case_ordinals(7, 4, []).unwrap_err();
+        assert!(reversed.to_string().contains("end 4 is before start 7"));
+
+        for ordinals in [vec![4, 4, 5], vec![4, 5, 6, 7]] {
+            assert!(validate_chunk_case_ordinals(4, 7, ordinals).is_err());
+        }
+    }
+
+    #[test]
+    fn chunk_projection_rejects_max_ordinal_without_overflowing() {
+        let error = validate_chunk_case_ordinals(i32::MAX, i32::MAX, [i32::MAX]).unwrap_err();
+
+        assert!(error.to_string().contains("after exclusive end"));
+    }
+
+    #[test]
+    fn chunk_operations_require_an_ownership_token() {
+        let lease_token = Uuid::from_u128(1);
+        assert_eq!(
+            require_chunk_lease_token(&chunk(Some(lease_token))).unwrap(),
+            lease_token
+        );
+
+        let chunk = chunk(None);
+        let error = require_chunk_lease_token(&chunk).unwrap_err();
+        assert!(error.to_string().contains(&chunk.id.to_string()));
+        assert!(error.to_string().contains(&chunk.run_id.to_string()));
+        assert!(error.to_string().contains("shard 4"));
+    }
+
+    fn chunk(lease_token: Option<Uuid>) -> RunChunk {
+        let timestamp = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        RunChunk {
+            write_epoch: 3,
+            id: Uuid::from_u128(2),
+            run_id: Uuid::from_u128(3),
+            run_shard: 4,
+            dataset_version_id: Uuid::from_u128(5),
+            profile_group_id: "default".to_string(),
+            ordinal_start: 0,
+            ordinal_end: 1,
+            status: "leased".to_string(),
+            lease_token,
+            leased_until: Some(timestamp),
+            created_at: timestamp,
+            updated_at: timestamp,
+        }
     }
 
     #[sqlx::test(migrations = "../migrations")]
