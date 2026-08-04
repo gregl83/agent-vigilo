@@ -94,8 +94,24 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run PostgreSQL-backed SQLx tests
-        run: cargo test -p vigilo --locked --bin vigilo -- --ignored --nocapture --test-threads=4
+        with:
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Run PostgreSQL-backed SQLx tests with coverage
+        run: >-
+          cargo llvm-cov -p vigilo --locked --bin vigilo
+          --ignore-filename-regex '[/\\]postgres_tests(\.rs|[/\\])'
+          --lcov --output-path lcov-sqlx.info
+          -- --ignored --nocapture --test-threads=4
+      - name: Upload SQLx coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov-sqlx.info
+          flags: rust-sqlx
+          name: rust-sqlx
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   migration-tests:
     name: Migration Tests
@@ -188,7 +204,7 @@ jobs:
           VIGILO_E2E_MULTI_DATABASE: "1"
 
   coverage:
-    name: Coverage
+    name: Unit Coverage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -198,13 +214,16 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate service-free Rust coverage report
-        run: cargo llvm-cov --workspace --locked --lib --bins --lcov --output-path lcov.info
+        run: >-
+          cargo llvm-cov --workspace --locked --lib --bins
+          --ignore-filename-regex '[/\\]vigilo[/\\]src[/\\]db[/\\](tables[/\\]|workflows[/\\].*[/\\](queries|postgres_tests)(\.rs|[/\\]))'
+          --lcov --output-path lcov.info
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
           files: lcov.info
-          flags: rust
-          name: rust-workspace
+          flags: rust-unit
+          name: rust-unit
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
 

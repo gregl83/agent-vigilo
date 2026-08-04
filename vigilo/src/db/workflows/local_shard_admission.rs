@@ -8,6 +8,14 @@ use sqlx::{
 };
 use uuid::Uuid;
 
+mod queries;
+
+pub(crate) use queries::{
+    select_local_shard_admission,
+    transition_local_shard_admission,
+    upsert_local_shard_admission,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalShardAdmissionState {
     Open,
@@ -95,29 +103,6 @@ impl LocalShardAdmission {
     }
 }
 
-pub(crate) async fn select_local_shard_admission<'e, E>(
-    executor: E,
-    run_id: Uuid,
-    run_shard: i16,
-) -> anyhow::Result<Option<LocalShardAdmission>>
-where
-    E: Executor<'e, Database = Postgres>,
-{
-    Ok(sqlx::query_as::<_, LocalShardAdmission>(
-        r#"
-        SELECT run_id, run_shard, database_alias, write_epoch, state,
-               redirect_database_alias
-        FROM local_shard_admissions
-        WHERE run_id = $1
-          AND run_shard = $2
-        "#,
-    )
-    .bind(run_id)
-    .bind(run_shard)
-    .fetch_optional(executor)
-    .await?)
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum LocalShardAdmissionError {
     #[error(
@@ -151,103 +136,6 @@ pub(crate) enum LocalShardAdmissionError {
         write_kind: &'static str,
         redirect_database_alias: Option<String>,
     },
-}
-
-pub(crate) async fn upsert_local_shard_admission<'e, E>(
-    executor: E,
-    draft: LocalShardAdmissionDraft,
-) -> anyhow::Result<LocalShardAdmission>
-where
-    E: Executor<'e, Database = Postgres>,
-{
-    let admission = sqlx::query_as::<_, LocalShardAdmission>(
-        r#"
-        INSERT INTO local_shard_admissions (
-            run_id, run_shard, database_alias, write_epoch, state,
-            redirect_database_alias
-        )
-        VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (run_id, run_shard) DO UPDATE
-        SET database_alias = EXCLUDED.database_alias,
-            write_epoch = EXCLUDED.write_epoch,
-            state = EXCLUDED.state,
-            redirect_database_alias = EXCLUDED.redirect_database_alias,
-            updated_at = now()
-        WHERE local_shard_admissions.write_epoch < EXCLUDED.write_epoch
-           OR (
-                local_shard_admissions.write_epoch = EXCLUDED.write_epoch
-                AND local_shard_admissions.database_alias = EXCLUDED.database_alias
-                AND local_shard_admissions.state = EXCLUDED.state
-           )
-        RETURNING run_id, run_shard, database_alias, write_epoch, state,
-                  redirect_database_alias
-        "#,
-    )
-    .bind(draft.run_id)
-    .bind(draft.run_shard)
-    .bind(&draft.database_alias)
-    .bind(draft.write_epoch)
-    .bind(draft.state.as_str())
-    .bind(&draft.redirect_database_alias)
-    .fetch_one(executor)
-    .await?;
-    Ok(admission)
-}
-
-/// Advances local authority monotonically, with explicit same-epoch states.
-pub(crate) async fn transition_local_shard_admission<'e, E>(
-    executor: E,
-    draft: LocalShardAdmissionDraft,
-    allowed_same_epoch_states: &[LocalShardAdmissionState],
-) -> anyhow::Result<LocalShardAdmission>
-where
-    E: Executor<'e, Database = Postgres>,
-{
-    let allowed_states = allowed_same_epoch_states
-        .iter()
-        .map(|state| state.as_str())
-        .collect::<Vec<_>>();
-    let admission = sqlx::query_as::<_, LocalShardAdmission>(
-        r#"
-        INSERT INTO local_shard_admissions (
-            run_id, run_shard, database_alias, write_epoch, state,
-            redirect_database_alias
-        )
-        VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (run_id, run_shard) DO UPDATE
-        SET database_alias = EXCLUDED.database_alias,
-            write_epoch = EXCLUDED.write_epoch,
-            state = EXCLUDED.state,
-            redirect_database_alias = EXCLUDED.redirect_database_alias,
-            updated_at = now()
-        WHERE local_shard_admissions.write_epoch < EXCLUDED.write_epoch
-           OR (
-                local_shard_admissions.write_epoch = EXCLUDED.write_epoch
-                AND local_shard_admissions.state = ANY($7::text[])
-           )
-        RETURNING run_id, run_shard, database_alias, write_epoch, state,
-                  redirect_database_alias
-        "#,
-    )
-    .bind(draft.run_id)
-    .bind(draft.run_shard)
-    .bind(&draft.database_alias)
-    .bind(draft.write_epoch)
-    .bind(draft.state.as_str())
-    .bind(&draft.redirect_database_alias)
-    .bind(allowed_states)
-    .fetch_optional(executor)
-    .await?
-    .ok_or_else(|| {
-        anyhow::anyhow!(
-            "local shard admission for run {} shard {} rejected transition to {} epoch {}",
-            draft.run_id,
-            draft.run_shard,
-            draft.state,
-            draft.write_epoch
-        )
-    })?;
-    Ok(admission)
 }
 
 pub(crate) async fn validate_local_shard_admission<'e, E>(
@@ -312,8 +200,10 @@ fn validate_loaded_local_shard_admission(
 }
 
 #[cfg(test)]
+#[path = "local_shard_admission/postgres_tests.rs"]
+mod postgres_tests;
+#[cfg(test)]
 mod tests {
-    use sqlx::PgPool;
     use uuid::Uuid;
 
     use super::*;
@@ -451,118 +341,5 @@ mod tests {
             state: state.to_string(),
             redirect_database_alias: redirect_database_alias.map(ToOwned::to_owned),
         }
-    }
-
-    #[sqlx::test(migrations = "../migrations")]
-    #[ignore = "requires a PostgreSQL DATABASE_URL for local shard admission tests"]
-    async fn stale_write_epoch_is_rejected_without_mutating_local_state(pool: PgPool) {
-        let run_id = Uuid::now_v7();
-        upsert_local_shard_admission(
-            &pool,
-            LocalShardAdmissionDraft {
-                run_id,
-                run_shard: 7,
-                database_alias: "primary".to_string(),
-                write_epoch: 2,
-                state: LocalShardAdmissionState::Open,
-                redirect_database_alias: None,
-            },
-        )
-        .await
-        .unwrap();
-
-        let error = validate_local_shard_admission(
-            &pool,
-            &LocalShardRouteHint {
-                run_id,
-                run_shard: 7,
-                database_alias: "primary".to_string(),
-                write_epoch: 1,
-            },
-            LocalShardWriteKind::NewWork,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(matches!(
-            error.downcast_ref::<LocalShardAdmissionError>(),
-            Some(LocalShardAdmissionError::StaleWriteEpoch {
-                expected_write_epoch: 1,
-                actual_write_epoch: 2,
-                ..
-            })
-        ));
-    }
-
-    #[sqlx::test(migrations = "../migrations")]
-    #[ignore = "requires a PostgreSQL DATABASE_URL for local shard admission tests"]
-    async fn draining_allows_settlement_but_rejects_new_work(pool: PgPool) {
-        let run_id = Uuid::now_v7();
-        let hint = LocalShardRouteHint {
-            run_id,
-            run_shard: 3,
-            database_alias: "primary".to_string(),
-            write_epoch: 4,
-        };
-        upsert_local_shard_admission(
-            &pool,
-            LocalShardAdmissionDraft {
-                run_id,
-                run_shard: 3,
-                database_alias: "primary".to_string(),
-                write_epoch: 4,
-                state: LocalShardAdmissionState::Draining,
-                redirect_database_alias: Some("shard_001".to_string()),
-            },
-        )
-        .await
-        .unwrap();
-
-        validate_local_shard_admission(&pool, &hint, LocalShardWriteKind::Settlement)
-            .await
-            .unwrap();
-        let error = validate_local_shard_admission(&pool, &hint, LocalShardWriteKind::NewWork)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<LocalShardAdmissionError>(),
-            Some(LocalShardAdmissionError::RejectedState { .. })
-        ));
-    }
-
-    #[sqlx::test(migrations = "../migrations")]
-    #[ignore = "requires a PostgreSQL DATABASE_URL for local shard admission tests"]
-    async fn same_epoch_transition_cannot_reopen_closed_owner(pool: PgPool) {
-        let run_id = Uuid::now_v7();
-        upsert_local_shard_admission(
-            &pool,
-            LocalShardAdmissionDraft {
-                run_id,
-                run_shard: 9,
-                database_alias: "primary".to_string(),
-                write_epoch: 8,
-                state: LocalShardAdmissionState::Closed,
-                redirect_database_alias: Some("shard_001".to_string()),
-            },
-        )
-        .await
-        .unwrap();
-
-        let error = transition_local_shard_admission(
-            &pool,
-            LocalShardAdmissionDraft {
-                run_id,
-                run_shard: 9,
-                database_alias: "primary".to_string(),
-                write_epoch: 8,
-                state: LocalShardAdmissionState::Open,
-                redirect_database_alias: None,
-            },
-            &[LocalShardAdmissionState::Open],
-        )
-        .await
-        .unwrap_err();
-
-        assert!(error.to_string().contains("rejected transition"));
     }
 }

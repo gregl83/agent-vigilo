@@ -1,0 +1,608 @@
+// PostgreSQL-backed workflow scenarios and fixtures.
+
+use serde_json::json;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+use super::{
+    AttemptLeaseContext,
+    CompletedExecutionPersistence,
+    ExecutionTerminalTransition,
+    allocate_execution_attempts_for_cases,
+    evaluation_plan_for_case,
+    finalize_execution_terminal_transitions,
+    persist_completed_execution_results_batch,
+    tests::{
+        case_group,
+        run_profile,
+        worker_case,
+    },
+};
+use crate::{
+    contracts::run::AggregationMethod,
+    db::workflows::run_dispatch,
+};
+
+struct SeededAttempt {
+    run_id: Uuid,
+    run_shard: i16,
+    chunk_id: Uuid,
+    chunk: crate::models::run_chunk::RunChunk,
+    case_id: Uuid,
+    execution_id: Uuid,
+    attempt_id: Uuid,
+    worker_id: Uuid,
+}
+
+async fn seed_running_attempt(
+    pool: &PgPool,
+    attempt_lease_seconds: i32,
+    chunk_lease_seconds: i32,
+) -> SeededAttempt {
+    let dataset_id = Uuid::now_v7();
+    let dataset_version_id = Uuid::now_v7();
+    let run_id = Uuid::now_v7();
+    let chunk_id = Uuid::now_v7();
+    let execution_id = Uuid::now_v7();
+    let attempt_id = Uuid::now_v7();
+    let case_id = Uuid::now_v7();
+    let worker_id = Uuid::now_v7();
+    let queue_message_id = Uuid::now_v7();
+    let run_shard = 0i16;
+
+    sqlx::query(
+        r#"
+            INSERT INTO dataset_versions (dataset_version_id, dataset_id, dataset_version)
+            VALUES ($1::uuid, $2::uuid, 'test')
+            "#,
+    )
+    .bind(dataset_version_id)
+    .bind(dataset_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+            INSERT INTO runs (
+                id,
+                run_key,
+                dataset_id,
+                dataset_version_id,
+                dataset_version,
+                evaluation_profile_id,
+                evaluation_profile_version,
+                profile_version_id,
+                profile_hash,
+                aggregation_policy_id,
+                aggregation_policy_version,
+                aggregation_policy_hash,
+                agent_provider,
+                agent_name,
+                prompt_config_id,
+                prompt_config_version,
+                status,
+                expected_execution_count,
+                started_at,
+                dispatched_at
+            )
+            VALUES (
+                $1::uuid,
+                $2,
+                $3::uuid,
+                $4::uuid,
+                'test',
+                'profile',
+                '1.0.0',
+                'profile-version',
+                'profile-hash',
+                'aggregation',
+                '1.0.0',
+                'aggregation-hash',
+                'example',
+                'agent',
+                'prompt',
+                '1.0.0',
+                'running'::run_status,
+                1,
+                now(),
+                now()
+            )
+            "#,
+    )
+    .bind(run_id)
+    .bind(format!("run-{run_id}"))
+    .bind(dataset_id)
+    .bind(dataset_version_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+            INSERT INTO run_snapshots (
+                run_id,
+                run_shard,
+                run_key,
+                dataset_id,
+                dataset_version_id,
+                dataset_version,
+                evaluation_profile_id,
+                evaluation_profile_version,
+                profile_version_id,
+                profile_hash,
+                aggregation_policy_id,
+                aggregation_policy_version,
+                aggregation_policy_hash,
+                agent_provider,
+                agent_name,
+                prompt_config_id,
+                prompt_config_version,
+                expected_execution_count
+            )
+            VALUES (
+                $1::uuid,
+                $2,
+                $3,
+                $4::uuid,
+                $5::uuid,
+                'test',
+                'profile',
+                '1.0.0',
+                'profile-version',
+                'profile-hash',
+                'aggregation',
+                '1.0.0',
+                'aggregation-hash',
+                'example',
+                'agent',
+                'prompt',
+                '1.0.0',
+                1
+            )
+            "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(format!("run-{run_id}"))
+    .bind(dataset_id)
+    .bind(dataset_version_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+            INSERT INTO local_shard_admissions (
+                run_id, run_shard, database_alias, write_epoch, state
+            )
+            VALUES ($1::uuid, $2, 'primary', 1, 'open')
+            "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+            INSERT INTO run_chunks (
+                id,
+                run_id,
+                run_shard,
+                dataset_version_id,
+                profile_group_id,
+                ordinal_start,
+                ordinal_end,
+                status,
+                lease_token,
+                leased_until,
+                dispatched_at
+            )
+            VALUES (
+                $1::uuid,
+                $2::uuid,
+                $3,
+                $4::uuid,
+                'default',
+                0,
+                1,
+                'leased',
+                gen_random_uuid(),
+                now() + ($5::int * interval '1 second'),
+                now()
+            )
+            "#,
+    )
+    .bind(chunk_id)
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(dataset_version_id)
+    .bind(chunk_lease_seconds)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let chunk = sqlx::query_as::<_, crate::models::run_chunk::RunChunk>(
+        r#"
+            SELECT
+                1::bigint AS write_epoch,
+                id, run_id, run_shard, dataset_version_id, profile_group_id,
+                ordinal_start, ordinal_end, status, lease_token, leased_until,
+                created_at, updated_at
+            FROM run_chunks
+            WHERE run_id = $1::uuid
+              AND run_shard = $2
+              AND id = $3::uuid
+            "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(chunk_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+            INSERT INTO executions (
+                id,
+                run_id,
+                run_shard,
+                chunk_id,
+                case_id,
+                case_hash,
+                profile_group_id,
+                task_type,
+                evaluation_profile_id,
+                evaluation_profile_version,
+                expected_evaluator_count,
+                status,
+                current_attempt_no,
+                started_at
+            )
+            VALUES (
+                $1::uuid,
+                $2::uuid,
+                $3,
+                $4::uuid,
+                $5::uuid,
+                'case-hash',
+                'default',
+                'classification',
+                'profile',
+                '1.0.0',
+                0,
+                'running'::execution_status,
+                1,
+                now()
+            )
+            "#,
+    )
+    .bind(execution_id)
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(chunk_id)
+    .bind(case_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+            INSERT INTO execution_attempts (
+                id,
+                execution_id,
+                run_id,
+                run_shard,
+                attempt_no,
+                status,
+                worker_id,
+                worker_host,
+                queue_message_id,
+                broker_message_id,
+                leased_until,
+                heartbeat_at,
+                started_at
+            )
+            VALUES (
+                $1::uuid,
+                $2::uuid,
+                $3::uuid,
+                $4,
+                1,
+                'running'::attempt_status,
+                $5::uuid,
+                'worker-a',
+                $6::uuid,
+                'broker-message',
+                now() + ($7::int * interval '1 second'),
+                now(),
+                now()
+            )
+            "#,
+    )
+    .bind(attempt_id)
+    .bind(execution_id)
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(worker_id)
+    .bind(queue_message_id)
+    .bind(attempt_lease_seconds)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+            UPDATE executions
+            SET current_attempt_id = $4::uuid
+            WHERE run_id = $1::uuid
+              AND run_shard = $2
+              AND id = $3::uuid
+            "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(execution_id)
+    .bind(attempt_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    SeededAttempt {
+        run_id,
+        run_shard,
+        chunk_id,
+        chunk,
+        case_id,
+        execution_id,
+        attempt_id,
+        worker_id,
+    }
+}
+
+async fn insert_passing_aggregate(pool: &PgPool, seed: &SeededAttempt) {
+    sqlx::query(
+        r#"
+            INSERT INTO execution_aggregates (
+                execution_id,
+                run_id,
+                run_shard,
+                attempt_id,
+                overall_status,
+                evaluator_result_count
+            )
+            VALUES (
+                $1::uuid,
+                $2::uuid,
+                $3,
+                $4::uuid,
+                'passed'::evaluation_status,
+                0
+            )
+            "#,
+    )
+    .bind(seed.execution_id)
+    .bind(seed.run_id)
+    .bind(seed.run_shard)
+    .bind(seed.attempt_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+async fn terminal_transition_rejects_expired_attempt_lease(pool: PgPool) {
+    let seed = seed_running_attempt(&pool, -5, 120).await;
+    insert_passing_aggregate(&pool, &seed).await;
+
+    let result = finalize_execution_terminal_transitions(
+        &pool,
+        seed.run_id,
+        seed.run_shard,
+        seed.worker_id,
+        1,
+        &[ExecutionTerminalTransition {
+            execution_id: seed.execution_id,
+            attempt_id: seed.attempt_id,
+            attempt_no: 1,
+            completed: true,
+            error_message: None,
+            requires_worker_lease: true,
+        }],
+    )
+    .await;
+
+    assert!(result.is_err());
+    let status = sqlx::query_scalar::<_, String>(
+        r#"
+            SELECT status::text
+            FROM execution_attempts
+            WHERE run_id = $1::uuid
+              AND run_shard = $2
+              AND id = $3::uuid
+            "#,
+    )
+    .bind(seed.run_id)
+    .bind(seed.run_shard)
+    .bind(seed.attempt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(status, "stale");
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+async fn expired_chunk_recovery_stales_attempt_and_requeues_chunk(pool: PgPool) {
+    let seed = seed_running_attempt(&pool, -5, -5).await;
+
+    let outcome = run_dispatch::recover_expired_chunk_leases(&pool, 3, 10)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.recovered_chunks, 1);
+    assert_eq!(outcome.failed_chunks, 0);
+
+    let (chunk_status, recovery_count) = sqlx::query_as::<_, (String, i32)>(
+        r#"
+            SELECT status, recovery_count
+            FROM run_chunks
+            WHERE run_id = $1::uuid
+              AND run_shard = $2
+              AND id = $3::uuid
+            "#,
+    )
+    .bind(seed.run_id)
+    .bind(seed.run_shard)
+    .bind(seed.chunk_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(chunk_status, "pending");
+    assert_eq!(recovery_count, 1);
+
+    let attempt_status = sqlx::query_scalar::<_, String>(
+        r#"
+            SELECT status::text
+            FROM execution_attempts
+            WHERE run_id = $1::uuid
+              AND run_shard = $2
+              AND id = $3::uuid
+            "#,
+    )
+    .bind(seed.run_id)
+    .bind(seed.run_shard)
+    .bind(seed.attempt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(attempt_status, "stale");
+
+    let requeued = sqlx::query_scalar::<_, i64>(
+        r#"
+            SELECT COUNT(*)::bigint
+            FROM outbox_events
+            WHERE event_type = 'run.chunk.ready'
+              AND aggregate_id = $1::uuid
+              AND dedupe_key = format(
+                    'run:%s:chunk:%s:ready:recovery:%s',
+                    $1::uuid,
+                    $2::uuid,
+                    1
+                  )
+            "#,
+    )
+    .bind(seed.run_id)
+    .bind(seed.chunk_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(requeued, 1);
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+async fn recovered_attempt_cannot_persist_late_results(pool: PgPool) {
+    let seed = seed_running_attempt(&pool, -5, -5).await;
+    run_dispatch::recover_expired_chunk_leases(&pool, 3, 10)
+        .await
+        .unwrap();
+    let completed = CompletedExecutionPersistence {
+        execution_id: seed.execution_id,
+        attempt_id: seed.attempt_id,
+        attempt_no: 1,
+        result_rows: Vec::new(),
+        overall_status: "passed".to_string(),
+        aggregate_score: Some(1.0),
+        evaluator_result_count: 0,
+        dimension_scores: json!({}),
+        blocking_failures: json!([]),
+        summary: json!({}),
+    };
+
+    let result =
+        persist_completed_execution_results_batch(&pool, &seed.chunk, seed.worker_id, &[completed])
+            .await;
+
+    assert!(result.is_err(), "a recovered attempt no longer owns writes");
+    let aggregate_count = sqlx::query_scalar::<_, i64>(
+        r#"
+            SELECT COUNT(*)::bigint
+            FROM execution_aggregates
+            WHERE run_id = $1::uuid
+              AND run_shard = $2
+              AND execution_id = $3::uuid
+            "#,
+    )
+    .bind(seed.run_id)
+    .bind(seed.run_shard)
+    .bind(seed.execution_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(aggregate_count, 0);
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+async fn recovered_chunk_token_cannot_allocate_a_new_attempt(pool: PgPool) {
+    let seed = seed_running_attempt(&pool, -5, -5).await;
+    run_dispatch::recover_expired_chunk_leases(&pool, 3, 10)
+        .await
+        .unwrap();
+    let mut profile = run_profile(vec![case_group(
+        "default",
+        "classification",
+        vec!["sentiment"],
+        "test/evaluator:1.0.0",
+        AggregationMethod::WeightedMean,
+    )]);
+    profile.defaults.max_attempts = 2;
+    let mut case = worker_case(None);
+    case.case_id = seed.case_id;
+    let plan = evaluation_plan_for_case(&profile, &case).unwrap();
+    let lease = AttemptLeaseContext {
+        worker_id: Uuid::now_v7(),
+        worker_host: Some("worker-b".to_string()),
+        queue_message_id: Uuid::now_v7(),
+        broker_message_id: None,
+        lease_seconds: 60,
+    };
+
+    let result = allocate_execution_attempts_for_cases(
+        &pool,
+        &seed.chunk,
+        &lease,
+        &profile,
+        &[case],
+        &[plan],
+    )
+    .await;
+
+    assert!(result.is_err(), "a recovered chunk token must be stale");
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("no longer owns a live lease")
+    );
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+async fn chunk_heartbeat_preserves_claim_token(pool: PgPool) {
+    let seed = seed_running_attempt(&pool, 60, 60).await;
+    let renewed =
+        crate::db::workflows::chunk_processing::extend_chunk_lease(&pool, &seed.chunk, 120)
+            .await
+            .unwrap()
+            .unwrap();
+
+    assert_eq!(renewed.lease_token, seed.chunk.lease_token);
+    assert!(renewed.leased_until > seed.chunk.leased_until);
+}

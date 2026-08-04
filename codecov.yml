@@ -16,8 +16,16 @@ comment:
   behavior: default
   require_changes: false
 
+ignore:
+  - "vigilo/src/db/workflows/**/postgres_tests.rs"
+  - "vigilo/src/db/workflows/**/postgres_tests/**"
+
 flags:
-  rust:
+  rust-unit:
     paths:
       - vigilo/src
       - evaluators/sentiment-basic-en/src
+  rust-sqlx:
+    paths:
+      - vigilo/src/db/tables
+      - vigilo/src/db/workflows

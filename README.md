@@ -85,7 +85,20 @@ messaging, and opt-in environment variables.
 
 The pre-commit hook runs nightly rustfmt only. The pre-push hook runs clippy, the service-free Rust tier, and the web typecheck. Database integration, migration, end-to-end, evaluator Wasm, and web production build checks run as separate required CI jobs.
 
-Coverage is generated in CI with `cargo llvm-cov` and uploaded to Codecov from the `Coverage` job. Configure the repository secret `CODECOV_TOKEN` in GitHub Actions for authenticated uploads.
+CI uploads separate `rust-unit` and `rust-sqlx` Codecov flags. Unit coverage is
+service-free and excludes SQL query modules, table helpers, and PostgreSQL test
+fixtures. SQLx coverage runs in the database integration job, includes
+production query and table code, and excludes only test fixture sources.
+
+Reproduce the reports locally with:
+
+```bash
+cargo llvm-cov --workspace --locked --lib --bins --ignore-filename-regex '[/\\]vigilo[/\\]src[/\\]db[/\\](tables[/\\]|workflows[/\\].*[/\\](queries|postgres_tests)(\.rs|[/\\]))' --lcov --output-path lcov-unit.info
+cargo llvm-cov -p vigilo --locked --bin vigilo --ignore-filename-regex '[/\\]postgres_tests(\.rs|[/\\])' --lcov --output-path lcov-sqlx.info -- --ignored --nocapture --test-threads=4
+```
+
+The second command requires `DATABASE_URL`. Configure the repository secret
+`CODECOV_TOKEN` for authenticated CI uploads.
 
 ## Project Status
 
