@@ -11,6 +11,7 @@ flowchart TD
 
     Loader[Build evaluator loader]
     Runner[Start worker service runner]
+    BrokerCircuit{Messaging circuit admits consumer creation?}
     Stream{Consumer stream open?}
     Event{Next worker event?}
     Decode{Delivery JSON valid?}
@@ -40,16 +41,18 @@ flowchart TD
 
     Start --> Loader
     Loader --> Runner
-    Runner --> Stream
+    Runner --> BrokerCircuit
 
-    Stream -- No --> ServiceFail
+    BrokerCircuit -- Open --> Reopen
+    BrokerCircuit -- Closed or probe --> Stream
+    Stream -- No --> Reopen
     Stream -- Yes --> Event
 
     Event -- Shutdown signal --> Shutdown
     Event -- Delivery received --> Decode
     Event -- Stream closed --> Reopen
 
-    Reopen --> Stream
+    Reopen --> BrokerCircuit
     Reopen -. Reopen fails .-> ServiceFail
 
     Decode -- No --> ServiceFail
@@ -107,6 +110,6 @@ flowchart TD
 
     class Start command
     class Success success
-    class Loader,Runner,Stream,Event,Decode,Payload,Claim,Context,Cases,Persist,CheckRetry,Delay,Complete,Ack,Release,Released,Requeue,Reopen,Shutdown,Stop system
+    class Loader,Runner,BrokerCircuit,Stream,Event,Decode,Payload,Claim,Context,Cases,Persist,CheckRetry,Delay,Complete,Ack,Release,Released,Requeue,Reopen,Shutdown,Stop system
     class Warm,Permit,Execute component
     class ServiceFail,ShutdownFail error

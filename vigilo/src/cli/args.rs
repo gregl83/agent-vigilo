@@ -9,17 +9,21 @@ use std::time::Duration;
 use clap::Args;
 
 use crate::{
+    circuit_breaker::{
+        Config as SharedCircuitBreakerConfig,
+        DEFAULT_FAILURE_THRESHOLD,
+        DEFAULT_INITIAL_OPEN,
+        DEFAULT_MAX_OPEN,
+    },
     context::{
         database::{
             CircuitBreakerConfig,
-            DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
-            DEFAULT_CIRCUIT_INITIAL_OPEN,
-            DEFAULT_CIRCUIT_MAX_OPEN,
             DatabaseOperationTimeoutConfig,
         },
         wasm,
     },
     db::workflows::run_creation,
+    mq,
 };
 
 pub(crate) const DEFAULT_DATABASE_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -30,6 +34,58 @@ pub(crate) struct MessagingOptions {
     /// Messaging URL (connection string)
     #[arg(long, env = "MESSAGING_URL")]
     pub(crate) messaging_url: String,
+
+    #[command(flatten)]
+    circuit_breaker: MessagingCircuitBreakerOptions,
+}
+
+impl MessagingOptions {
+    pub(crate) fn config(&self) -> anyhow::Result<mq::Config> {
+        Ok(mq::Config::new(self.messaging_url.clone())
+            .with_circuit_breaker(self.circuit_breaker.config()?))
+    }
+}
+
+/// Process-local messaging circuit-breaker policy.
+#[derive(Debug, Clone, Copy, Args)]
+struct MessagingCircuitBreakerOptions {
+    /// Whether the messaging circuit breaker is enabled
+    #[arg(long = "messaging-circuit-breaker-enabled", env = "VIGILO_MESSAGING_CIRCUIT_BREAKER_ENABLED", default_value_t = true, action = clap::ArgAction::Set)]
+    messaging_circuit_breaker_enabled: bool,
+
+    /// Consecutive availability failures before opening the messaging circuit
+    #[arg(long = "messaging-circuit-failure-threshold", env = "VIGILO_MESSAGING_CIRCUIT_FAILURE_THRESHOLD", default_value_t = DEFAULT_FAILURE_THRESHOLD, value_parser = clap::value_parser!(u32).range(1..=100))]
+    messaging_circuit_failure_threshold: u32,
+
+    /// Initial seconds the unavailable messaging circuit remains open
+    #[arg(long = "messaging-circuit-initial-open-seconds", env = "VIGILO_MESSAGING_CIRCUIT_INITIAL_OPEN_SECONDS", default_value_t = DEFAULT_INITIAL_OPEN.as_secs(), value_parser = clap::value_parser!(u64).range(1..=3600))]
+    messaging_circuit_initial_open_seconds: u64,
+
+    /// Maximum seconds the unavailable messaging circuit remains open
+    #[arg(long = "messaging-circuit-max-open-seconds", env = "VIGILO_MESSAGING_CIRCUIT_MAX_OPEN_SECONDS", default_value_t = DEFAULT_MAX_OPEN.as_secs(), value_parser = clap::value_parser!(u64).range(1..=86400))]
+    messaging_circuit_max_open_seconds: u64,
+}
+
+impl MessagingCircuitBreakerOptions {
+    fn config(self) -> anyhow::Result<SharedCircuitBreakerConfig> {
+        SharedCircuitBreakerConfig::new(
+            self.messaging_circuit_breaker_enabled,
+            self.messaging_circuit_failure_threshold,
+            Duration::from_secs(self.messaging_circuit_initial_open_seconds),
+            Duration::from_secs(self.messaging_circuit_max_open_seconds),
+        )
+    }
+}
+
+impl Default for MessagingCircuitBreakerOptions {
+    fn default() -> Self {
+        Self {
+            messaging_circuit_breaker_enabled: true,
+            messaging_circuit_failure_threshold: DEFAULT_FAILURE_THRESHOLD,
+            messaging_circuit_initial_open_seconds: DEFAULT_INITIAL_OPEN.as_secs(),
+            messaging_circuit_max_open_seconds: DEFAULT_MAX_OPEN.as_secs(),
+        }
+    }
 }
 
 /// Process-local execution-database circuit-breaker policy.
@@ -40,15 +96,15 @@ pub(crate) struct CircuitBreakerOptions {
     enabled: bool,
 
     /// Consecutive availability failures before opening a database circuit
-    #[arg(long = "database-circuit-failure-threshold", env = "VIGILO_DATABASE_CIRCUIT_FAILURE_THRESHOLD", default_value_t = DEFAULT_CIRCUIT_FAILURE_THRESHOLD, value_parser = clap::value_parser!(u32).range(1..=100))]
+    #[arg(long = "database-circuit-failure-threshold", env = "VIGILO_DATABASE_CIRCUIT_FAILURE_THRESHOLD", default_value_t = DEFAULT_FAILURE_THRESHOLD, value_parser = clap::value_parser!(u32).range(1..=100))]
     failure_threshold: u32,
 
     /// Initial seconds an unavailable database circuit remains open
-    #[arg(long = "database-circuit-initial-open-seconds", env = "VIGILO_DATABASE_CIRCUIT_INITIAL_OPEN_SECONDS", default_value_t = DEFAULT_CIRCUIT_INITIAL_OPEN.as_secs(), value_parser = clap::value_parser!(u64).range(1..=3600))]
+    #[arg(long = "database-circuit-initial-open-seconds", env = "VIGILO_DATABASE_CIRCUIT_INITIAL_OPEN_SECONDS", default_value_t = DEFAULT_INITIAL_OPEN.as_secs(), value_parser = clap::value_parser!(u64).range(1..=3600))]
     initial_open_seconds: u64,
 
     /// Maximum seconds an unavailable database circuit remains open
-    #[arg(long = "database-circuit-max-open-seconds", env = "VIGILO_DATABASE_CIRCUIT_MAX_OPEN_SECONDS", default_value_t = DEFAULT_CIRCUIT_MAX_OPEN.as_secs(), value_parser = clap::value_parser!(u64).range(1..=86400))]
+    #[arg(long = "database-circuit-max-open-seconds", env = "VIGILO_DATABASE_CIRCUIT_MAX_OPEN_SECONDS", default_value_t = DEFAULT_MAX_OPEN.as_secs(), value_parser = clap::value_parser!(u64).range(1..=86400))]
     max_open_seconds: u64,
 }
 
@@ -67,9 +123,9 @@ impl Default for CircuitBreakerOptions {
     fn default() -> Self {
         Self {
             enabled: true,
-            failure_threshold: DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
-            initial_open_seconds: DEFAULT_CIRCUIT_INITIAL_OPEN.as_secs(),
-            max_open_seconds: DEFAULT_CIRCUIT_MAX_OPEN.as_secs(),
+            failure_threshold: DEFAULT_FAILURE_THRESHOLD,
+            initial_open_seconds: DEFAULT_INITIAL_OPEN.as_secs(),
+            max_open_seconds: DEFAULT_MAX_OPEN.as_secs(),
         }
     }
 }

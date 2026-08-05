@@ -78,14 +78,19 @@ sequenceDiagram
         alt Placement operation succeeds
             ExecutionDB-->>Vigilo: Joined event payload batch
             loop Bounded outbox publish concurrency
-                Vigilo->>Queue: Publish persistent mandatory event
-                Queue-->>Vigilo: Confirmed publish or returned/nacked publish
-                alt Publish confirmed and claim token current
-                    Vigilo->>ExecutionDB: Mark ledger published and delete delivery row
-                else Publish failed or unroutable
+                Vigilo->>Vigilo: Acquire messaging circuit admission
+                alt Messaging circuit is open
                     Vigilo->>ExecutionDB: Reschedule delivery row for retry with claim token
-                else Claim token no longer current
-                    Vigilo->>Vigilo: Ignore stale publisher result
+                else Circuit is closed or half-open probe
+                    Vigilo->>Queue: Publish persistent mandatory event
+                    Queue-->>Vigilo: Confirmed publish or returned/nacked publish
+                    alt Publish confirmed and claim token current
+                        Vigilo->>ExecutionDB: Mark ledger published and delete delivery row
+                    else Publish failed or unroutable
+                        Vigilo->>ExecutionDB: Reschedule delivery row for retry with claim token
+                    else Claim token no longer current
+                        Vigilo->>Vigilo: Ignore stale publisher result
+                    end
                 end
             end
         else Placement operation fails

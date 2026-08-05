@@ -1,6 +1,6 @@
 ---
 title: Runtime Limits
-description: Operational limits for Agent Vigilo database pools, Wasm evaluator isolation, and worker concurrency.
+description: Operational limits for Agent Vigilo database and messaging resilience, Wasm evaluator isolation, and worker concurrency.
 keywords:
   - Agent Vigilo runtime limits
   - Wasm evaluator isolation
@@ -10,7 +10,7 @@ keywords:
 
 # Runtime Limits
 
-These settings bound database and evaluator resource use. They can be supplied
+These settings bound database, messaging, and evaluator resource use. They can be supplied
 as CLI flags or environment variables. Vigilo parses subsystem settings only
 for commands that consume that subsystem; unrelated configuration cannot block
 a database-only command.
@@ -108,6 +108,43 @@ worker cannot race the still-live claim. The lease token and attempt guards
 make replay idempotent. Failure to publish the delayed copy remains
 process-visible because acknowledging the original without a durable retry
 would lose work.
+
+## Messaging Failure Isolation
+
+Each coordinator or worker process owns one circuit for its configured message
+broker. Publish, one-shot receive, and consumer-creation attempts acquire
+admission before contacting RabbitMQ. Consecutive connection, channel, I/O, or
+heartbeat failures open the circuit. Calls then fail locally until one
+half-open probe is admitted after the bounded, jittered cooldown.
+
+Outbox events remain durable while the coordinator cannot publish them, and
+unacked worker deliveries remain available for redelivery. Long-running workers
+also retain their bounded 250 ms to 30 second consumer reconnect backoff; it
+paces the service loop while the circuit controls process-wide broker admission.
+Per-message retry queues and retry budgets remain independent because they
+govern processing outcomes, not broker availability.
+
+```mermaid
+flowchart LR
+    op["publish or consume operation"] --> circuit{"messaging circuit admits?"}
+    circuit -->|open| local["fail locally<br/>preserve durable or queued work"]
+    circuit -->|closed or probe| broker["RabbitMQ operation"]
+    broker -->|success or broker response| reset["reset failures or close probe"]
+    broker -->|connection / channel / I/O / heartbeat failure| failure["record availability failure"]
+    failure --> circuit
+```
+
+| Flag | Environment | Scope | Default | Purpose |
+| --- | --- | --- | ---: | --- |
+| `--messaging-circuit-breaker-enabled` | `VIGILO_MESSAGING_CIRCUIT_BREAKER_ENABLED` | `coordinator`, `worker` | `true` | Enables the process-local message-broker circuit breaker. |
+| `--messaging-circuit-failure-threshold` | `VIGILO_MESSAGING_CIRCUIT_FAILURE_THRESHOLD` | `coordinator`, `worker` | `3` | Consecutive broker availability failures required to open the circuit. |
+| `--messaging-circuit-initial-open-seconds` | `VIGILO_MESSAGING_CIRCUIT_INITIAL_OPEN_SECONDS` | `coordinator`, `worker` | `10` | Initial open interval before one recovery probe is admitted. |
+| `--messaging-circuit-max-open-seconds` | `VIGILO_MESSAGING_CIRCUIT_MAX_OPEN_SECONDS` | `coordinator`, `worker` | `120` | Maximum open interval after repeated failed probes. |
+
+Returned or negatively acknowledged publishes, malformed messages, and other
+application-level failures do not mark RabbitMQ unavailable. Circuit state is
+process-local and resets on restart; durable PostgreSQL state and RabbitMQ
+delivery state remain authoritative.
 
 ## Worker Chunk Concurrency
 

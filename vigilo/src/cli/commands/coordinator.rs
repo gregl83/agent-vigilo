@@ -1708,7 +1708,7 @@ mod placement {
                     database::CircuitBreakerConfig::default(),
                     database::PlacementConfig::default_single_database(),
                 ),
-                Some("amqp://not-used".to_string()),
+                Some(crate::mq::Config::new("amqp://not-used".to_string())),
                 crate::context::wasm::Config::default(),
                 crate::context::output::OutputFormat::Json,
             )
@@ -1726,7 +1726,7 @@ mod placement {
                 .with_operation_timeout(Some(
                     database::DatabaseOperationTimeoutConfig::new(timeout).unwrap(),
                 )),
-                Some("amqp://not-used".to_string()),
+                Some(crate::mq::Config::new("amqp://not-used".to_string())),
                 crate::context::wasm::Config::default(),
                 crate::context::output::OutputFormat::Json,
             )

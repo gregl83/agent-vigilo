@@ -18,8 +18,13 @@ sequenceDiagram
     User->>Vigilo: vigilo worker start
     activate Vigilo
     Vigilo->>Vigilo: Build evaluator loader and start worker service
-    Vigilo->>Queue: Open worker consumer stream
-    Queue-->>Vigilo: Delivery stream
+    Vigilo->>Vigilo: Acquire messaging circuit admission
+    alt Messaging circuit is open or connection fails
+        Vigilo->>Vigilo: Wait with bounded reconnect backoff and retry
+    else Circuit is closed or half-open probe
+        Vigilo->>Queue: Open worker consumer stream
+        Queue-->>Vigilo: Delivery stream
+    end
 
     loop Until shutdown or service failure
         alt Shutdown signal received
@@ -71,7 +76,9 @@ sequenceDiagram
                 Vigilo->>Queue: Requeue or acknowledge message
             end
         else Consumer stream closed
-            Vigilo->>Queue: Reopen worker consumer stream
+            Vigilo->>Vigilo: Invalidate session and wait with bounded backoff
+            Vigilo->>Vigilo: Acquire messaging circuit admission
+            Vigilo->>Queue: Reopen worker consumer stream when admitted
         else Delivery or service fails
             Vigilo-->>User: Service error
         end

@@ -35,7 +35,7 @@ use super::{
 };
 
 pub(crate) struct CommandContextConfig {
-    pub(crate) messaging_url: Option<String>,
+    pub(crate) messaging: Option<crate::mq::Config>,
     pub(crate) wasm: wasm::Config,
     pub(crate) circuit_breaker: CircuitBreakerConfig,
     pub(crate) database_operation_timeout:
@@ -83,7 +83,7 @@ impl Command {
         &self,
         control_database_alias: &str,
     ) -> anyhow::Result<CommandContextConfig> {
-        let mut messaging_url = None;
+        let mut messaging = None;
         let mut wasm = WasmOptions::default();
         let mut circuit_breaker = CircuitBreakerOptions::default();
         let mut database_operation_timeout = None;
@@ -91,12 +91,12 @@ impl Command {
 
         match self {
             Self::Coordinator(command) => {
-                messaging_url = Some(command.messaging.messaging_url.clone());
+                messaging = Some(command.messaging.config()?);
                 circuit_breaker = command.circuit_breaker;
                 database_operation_timeout = Some(command.database_operation_timeout.config()?);
             }
             Self::Worker(command) => {
-                messaging_url = Some(command.messaging.messaging_url.clone());
+                messaging = Some(command.messaging.config()?);
                 wasm = command.wasm;
                 circuit_breaker = command.circuit_breaker;
                 database_operation_timeout = Some(command.database_operation_timeout.config()?);
@@ -135,7 +135,7 @@ impl Command {
         }
 
         Ok(CommandContextConfig {
-            messaging_url,
+            messaging,
             wasm: wasm.config(),
             circuit_breaker: circuit_breaker.config()?,
             database_operation_timeout,

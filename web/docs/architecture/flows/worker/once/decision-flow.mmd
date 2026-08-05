@@ -10,6 +10,7 @@ flowchart TD
     Start([vigilo worker once])
 
     Loader[Build evaluator loader]
+    BrokerCircuit{Messaging circuit admits receive?}
     Consume{Worker message available?}
     Payload{Chunk-ready payload valid?}
     Claim{Chunk claimable?}
@@ -32,7 +33,9 @@ flowchart TD
     ServiceFail([Worker error])
 
     Start --> Loader
-    Loader --> Consume
+    Loader --> BrokerCircuit
+    BrokerCircuit -- Open --> ServiceFail
+    BrokerCircuit -- Closed or probe --> Consume
 
     Consume -- No --> Success
     Consume -- Yes --> Payload
@@ -86,6 +89,6 @@ flowchart TD
 
     class Start command
     class Success success
-    class Loader,Consume,Payload,Claim,Context,Cases,Persist,CheckRetry,Delay,Complete,Ack,Release,Released,Requeue system
+    class Loader,BrokerCircuit,Consume,Payload,Claim,Context,Cases,Persist,CheckRetry,Delay,Complete,Ack,Release,Released,Requeue system
     class Warm,Permit,Execute component
     class ServiceFail error

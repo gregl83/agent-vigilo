@@ -18,6 +18,7 @@ sequenceDiagram
     User->>Vigilo: vigilo worker once
     activate Vigilo
     Vigilo->>Vigilo: Build evaluator loader
+    Vigilo->>Vigilo: Acquire messaging circuit admission
     Vigilo->>Queue: Consume one worker message
     Queue-->>Vigilo: Chunk-ready broker message or no work
 

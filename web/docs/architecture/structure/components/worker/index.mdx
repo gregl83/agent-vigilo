@@ -33,6 +33,9 @@ Describes the major internal responsibilities of the worker runtime.
 - Execution terminal transitions are authority guarded by the current attempt id, attempt number, worker id, and attempt lease.
 - Workers reload chunk executions from the database on each pass; retry-scheduled executions run only after `retry_after` is due, and exhausted executions are failed instead of retried again.
 - Queue messages are acknowledged only after invalid, stale, or completed work is handled; recoverable chunk failures release the lease and use bounded retry buckets, while planned execution retry waits use delayed redelivery without consuming the failure retry budget.
+- Consumer creation and retry or quarantine publishing pass through one
+  process-local broker circuit. Consumer reopening also uses bounded backoff;
+  message retry budgets remain independent from broker availability.
 - Duplicate broker deliveries are expected under at-least-once messaging; chunk claims, attempt authority tokens, and evaluator-result uniqueness make processing idempotent at the persistence boundary.
 
 ## Related

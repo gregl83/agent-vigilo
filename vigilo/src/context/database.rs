@@ -29,9 +29,6 @@ pub(crate) use circuit_breaker::{
     CircuitOpen,
     CircuitPermit,
     CircuitTransition,
-    DEFAULT_FAILURE_THRESHOLD as DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
-    DEFAULT_INITIAL_OPEN as DEFAULT_CIRCUIT_INITIAL_OPEN,
-    DEFAULT_MAX_OPEN as DEFAULT_CIRCUIT_MAX_OPEN,
     DatabaseCircuitBreakers,
     is_database_contention,
     is_database_unavailable,
@@ -428,9 +425,10 @@ impl DatabaseRouter {
         permit: CircuitPermit,
         error: &anyhow::Error,
     ) -> (bool, Option<CircuitTransition>) {
-        let (impact, transition) =
-            self.circuit_breakers
-                .record_error(permit, Instant::now(), error);
+        let impact = circuit_breaker::classify_error(error);
+        let transition = self
+            .circuit_breakers
+            .record_failure(permit, Instant::now(), impact);
         (
             impact == circuit_breaker::FailureImpact::Unavailable,
             transition,

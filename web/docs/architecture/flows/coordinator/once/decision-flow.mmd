@@ -27,6 +27,7 @@ flowchart TD
     OutboxPlacement{Database placements remain?}
     ClaimOutbox[Claim publishable delivery rows]
     Events{Claimed delivery rows remain?}
+    BrokerCircuit{Messaging circuit admits publish?}
     Publish[Publish event to queue with bounded concurrency]
     PublishResult{Publish succeeded?}
     MarkPublished[Mark ledger published and delete delivery row]
@@ -86,9 +87,11 @@ flowchart TD
     ClaimOutbox --> Events
     ClaimOutbox -. Placement operation fails .-> OutboxIsolated
 
-    Events -- Yes --> Publish
+    Events -- Yes --> BrokerCircuit
     Events -- No --> OutboxPlacement
 
+    BrokerCircuit -- Open --> Reschedule
+    BrokerCircuit -- Closed or probe --> Publish
     Publish --> PublishResult
 
     PublishResult -- Yes --> MarkPublished
@@ -106,6 +109,6 @@ flowchart TD
 
     class Start command
     class Success success
-    class CoordinatorId,Database,RecoverCreation,RecoveryCatalog,RecoveryPlacement,Recover,RecoveryIsolated,DispatchClaim,DispatchRun,DispatchIsolated,FinalizeClaim,FinalizeRun,FinalizeIsolated,Messaging,OutboxCatalog,OutboxPlacement,ClaimOutbox,Events,PublishResult,MarkPublished,Reschedule,OutboxIsolated,Stats system
+    class CoordinatorId,Database,RecoverCreation,RecoveryCatalog,RecoveryPlacement,Recover,RecoveryIsolated,DispatchClaim,DispatchRun,DispatchIsolated,FinalizeClaim,FinalizeRun,FinalizeIsolated,Messaging,OutboxCatalog,OutboxPlacement,ClaimOutbox,Events,BrokerCircuit,PublishResult,MarkPublished,Reschedule,OutboxIsolated,Stats system
     class Publish component
     class ContextFail,RecoveryFail,DispatchFail,FinalizeFail,OutboxFail error

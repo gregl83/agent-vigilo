@@ -38,6 +38,9 @@ Describes the major internal responsibilities of the coordinator runtime.
 - Outbox publishers claim rows from the sharded `outbox_delivery_queue`, assign claim tokens, and publish joined ledger payloads as broker messages with bounded concurrency.
 - Confirmed publishes update `outbox_events` to `published` and delete the delivery row, keeping the hot queue limited to unfinished work.
 - RabbitMQ publishes use durable topology, persistent messages, mandatory routing, publisher confirms, and the outbox dedupe key as the AMQP message id.
+- Publish attempts pass through one process-local broker circuit. An open
+  circuit leaves durable delivery rows pending; one half-open publish probes
+  recovery after the configured cooldown.
 - Broker delivery remains at-least-once; exactly-once effects are enforced by database idempotency and authority checks.
 
 ## Related

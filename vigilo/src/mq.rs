@@ -2,11 +2,20 @@
 //!
 //! The client lazily opens a broker session with a publish channel, declares
 //! topology for each fresh session, and recreates the session after connection
-//! or channel loss. Long-lived worker consumers use their own channel while
-//! delivery acknowledgements use the message's channel-scoped acker.
+//! or channel loss. A process-local circuit breaker prevents repeated broker
+//! operations during outages and admits one recovery probe after its cooldown.
+//! Long-lived worker consumers use their own channel while delivery
+//! acknowledgements use the message's channel-scoped acker.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{
+        Duration,
+        Instant,
+    },
+};
 
+use anyhow::Context as _;
 use lapin::{
     BasicProperties,
     Channel,
@@ -35,13 +44,24 @@ use lapin::{
     },
 };
 use serde_json::Value;
+use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{
     debug,
+    info,
     warn,
 };
 use uuid::Uuid;
 
+use crate::circuit_breaker::{
+    CircuitBreakers,
+    CircuitPermit,
+    CircuitTransition,
+    Config as CircuitBreakerConfig,
+    FailureImpact,
+};
+
+const BROKER_CIRCUIT_KEY: &str = "rabbitmq";
 const WORKER_ROUTING_KEY: &str = "run.chunk.ready";
 const WORKER_MAX_RETRIES: i32 = 8;
 const WORKER_RETRY_BUCKETS: [(&str, i32); 8] = [
@@ -69,6 +89,7 @@ const HEADER_ORIGINAL_ROUTING_KEY: &str = "x-vigilo-original-routing-key";
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
     pub(crate) uri: String,
+    pub(crate) circuit_breaker_config: CircuitBreakerConfig,
     pub(crate) exchange: String,
     pub(crate) event_queue: String,
     pub(crate) worker_queue: String,
@@ -93,6 +114,7 @@ impl Config {
             let prefix = format!("vigilo.{}", namespace);
             return Self {
                 uri,
+                circuit_breaker_config: CircuitBreakerConfig::default(),
                 exchange: format!("{prefix}.events"),
                 event_queue: format!("{prefix}.events.domain"),
                 worker_queue: format!("{prefix}.worker"),
@@ -104,6 +126,7 @@ impl Config {
 
         Self {
             uri,
+            circuit_breaker_config: CircuitBreakerConfig::default(),
             exchange: "vigilo.events".to_string(),
             event_queue: "vigilo.events.domain".to_string(),
             worker_queue: "vigilo.worker".to_string(),
@@ -111,6 +134,14 @@ impl Config {
             worker_quarantine_exchange: "vigilo.worker.quarantine".to_string(),
             worker_quarantine_queue: "vigilo.worker.quarantine".to_string(),
         }
+    }
+
+    pub(crate) fn with_circuit_breaker(
+        mut self,
+        circuit_breaker_config: CircuitBreakerConfig,
+    ) -> Self {
+        self.circuit_breaker_config = circuit_breaker_config;
+        self
     }
 }
 
@@ -145,10 +176,33 @@ impl ConsumedMessage {
 /// The client owns connection setup and broker declarations so command code can
 /// work in terms of application events instead of `lapin` primitives. The
 /// cached session is invalidated after connection/channel loss and rebuilt by
-/// the next broker operation.
+/// the next admitted broker operation. The broker circuit covers publishing,
+/// one-shot consumption, and consumer creation; message retry policy remains
+/// independent.
 pub(crate) struct Client {
     config: Config,
+    circuit_breakers: CircuitBreakers,
     session: Mutex<Option<Arc<BrokerSession>>>,
+}
+
+#[derive(Debug, Error)]
+#[error("rabbitmq circuit is open; retry after {retry_after:?}")]
+struct BrokerCircuitOpen {
+    retry_after: Duration,
+}
+
+#[derive(Debug, Error)]
+enum PublishError {
+    #[error(
+        "rabbitmq publish was confirmed but returned unroutable for routing key '{routing_key}': {reason}"
+    )]
+    Returned { routing_key: String, reason: String },
+    #[error(
+        "rabbitmq publish was negatively acknowledged for routing key '{routing_key}': {reason}"
+    )]
+    Nacked { routing_key: String, reason: String },
+    #[error("rabbitmq publish confirmation was not requested")]
+    ConfirmationNotRequested,
 }
 
 struct BrokerSession {
@@ -159,13 +213,15 @@ struct BrokerSession {
 impl Client {
     /// Creates a client shell; no network connection is opened until first use.
     pub(crate) fn new(config: Config) -> Self {
+        let circuit_breakers = CircuitBreakers::new(config.circuit_breaker_config);
         Self {
             config,
+            circuit_breakers,
             session: Mutex::new(None),
         }
     }
 
-    fn is_reconnectable_lapin_error(err: &LapinError) -> bool {
+    fn is_unavailable_lapin_error(err: &LapinError) -> bool {
         matches!(
             err,
             LapinError::InvalidChannel(_)
@@ -176,16 +232,65 @@ impl Client {
         )
     }
 
-    fn is_reconnectable_anyhow_error(err: &anyhow::Error) -> bool {
-        err.chain().any(|source| {
-            let message = source.to_string().to_ascii_lowercase();
-            message.contains("invalid channel")
-                || message.contains("invalid connection")
-                || message.contains("io error")
-                || message.contains("heartbeat")
-                || message.contains("connection closed")
-                || message.contains("channel closed")
-        })
+    fn is_broker_unavailable(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<LapinError>())
+            .any(Self::is_unavailable_lapin_error)
+    }
+
+    fn acquire_broker_operation(
+        &self,
+        operation: &'static str,
+        now: Instant,
+    ) -> anyhow::Result<CircuitPermit> {
+        let permit = self
+            .circuit_breakers
+            .acquire(BROKER_CIRCUIT_KEY, now)
+            .map_err(|open| BrokerCircuitOpen {
+                retry_after: open.retry_after,
+            })?;
+        if permit.is_probe() {
+            info!(operation, "probing half-open rabbitmq circuit");
+        }
+        Ok(permit)
+    }
+
+    fn finish_broker_operation<T>(
+        &self,
+        operation: &'static str,
+        permit: CircuitPermit,
+        now: Instant,
+        result: anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        match result {
+            Ok(value) => {
+                if matches!(
+                    self.circuit_breakers.record_success(permit),
+                    Some(CircuitTransition::Closed)
+                ) {
+                    info!(operation, "closed rabbitmq circuit after successful probe");
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                let impact = if Self::is_broker_unavailable(&error) {
+                    FailureImpact::Unavailable
+                } else {
+                    FailureImpact::Available
+                };
+                if let Some(CircuitTransition::Opened { retry_after }) =
+                    self.circuit_breakers.record_failure(permit, now, impact)
+                {
+                    warn!(
+                        operation,
+                        retry_after_ms = retry_after.as_millis() as u64,
+                        "opened rabbitmq circuit after availability failures"
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Drops the cached broker session so the next operation reconnects and
@@ -212,17 +317,17 @@ impl Client {
         debug!("initializing rabbitmq connection");
         let connection = Connection::connect(&self.config.uri, ConnectionProperties::default())
             .await
-            .map_err(|err| anyhow::anyhow!("rabbitmq connection failed: {}", err))?;
+            .context("rabbitmq connection failed")?;
         let publish_channel = connection
             .create_channel()
             .await
-            .map_err(|err| anyhow::anyhow!("rabbitmq channel creation failed: {}", err))?;
+            .context("rabbitmq channel creation failed")?;
 
         self.declare_topology(&publish_channel).await?;
         publish_channel
             .confirm_select(ConfirmSelectOptions::default())
             .await
-            .map_err(|err| anyhow::anyhow!("rabbitmq confirm-select failed: {}", err))?;
+            .context("rabbitmq confirm-select failed")?;
 
         Ok(BrokerSession {
             connection,
@@ -250,7 +355,7 @@ impl Client {
                 FieldTable::default(),
             )
             .await
-            .map_err(|err| anyhow::anyhow!("rabbitmq exchange declaration failed: {}", err))?;
+            .context("rabbitmq exchange declaration failed")?;
 
         channel
             .queue_declare(
@@ -265,7 +370,7 @@ impl Client {
                 FieldTable::default(),
             )
             .await
-            .map_err(|err| anyhow::anyhow!("rabbitmq event queue declaration failed: {}", err))?;
+            .context("rabbitmq event queue declaration failed")?;
 
         channel
             .queue_bind(
@@ -276,7 +381,7 @@ impl Client {
                 FieldTable::default(),
             )
             .await
-            .map_err(|err| anyhow::anyhow!("rabbitmq event queue binding failed: {}", err))?;
+            .context("rabbitmq event queue binding failed")?;
 
         channel
             .queue_declare(
@@ -291,7 +396,7 @@ impl Client {
                 FieldTable::default(),
             )
             .await
-            .map_err(|err| anyhow::anyhow!("rabbitmq queue declaration failed: {}", err))?;
+            .context("rabbitmq queue declaration failed")?;
 
         channel
             .queue_bind(
@@ -302,7 +407,7 @@ impl Client {
                 FieldTable::default(),
             )
             .await
-            .map_err(|err| anyhow::anyhow!("rabbitmq queue binding failed: {}", err))?;
+            .context("rabbitmq queue binding failed")?;
 
         channel
             .exchange_declare(
@@ -318,9 +423,7 @@ impl Client {
                 FieldTable::default(),
             )
             .await
-            .map_err(|err| {
-                anyhow::anyhow!("rabbitmq worker retry exchange declaration failed: {}", err)
-            })?;
+            .context("rabbitmq worker retry exchange declaration failed")?;
 
         channel
             .queue_bind(
@@ -331,9 +434,7 @@ impl Client {
                 FieldTable::default(),
             )
             .await
-            .map_err(|err| {
-                anyhow::anyhow!("rabbitmq worker retry return binding failed: {}", err)
-            })?;
+            .context("rabbitmq worker retry return binding failed")?;
 
         for (queue_name, ttl_ms) in WORKER_RETRY_BUCKETS {
             let queue_name = self.retry_queue_name(queue_name);
@@ -361,11 +462,10 @@ impl Client {
                     retry_args,
                 )
                 .await
-                .map_err(|err| {
-                    anyhow::anyhow!(
-                        "rabbitmq worker retry queue declaration failed for '{}': {}",
-                        queue_name,
-                        err
+                .with_context(|| {
+                    format!(
+                        "rabbitmq worker retry queue declaration failed for '{}'",
+                        queue_name
                     )
                 })?;
 
@@ -378,11 +478,10 @@ impl Client {
                     FieldTable::default(),
                 )
                 .await
-                .map_err(|err| {
-                    anyhow::anyhow!(
-                        "rabbitmq worker retry queue binding failed for '{}': {}",
-                        queue_name,
-                        err
+                .with_context(|| {
+                    format!(
+                        "rabbitmq worker retry queue binding failed for '{}'",
+                        queue_name
                     )
                 })?;
         }
@@ -401,12 +500,7 @@ impl Client {
                 FieldTable::default(),
             )
             .await
-            .map_err(|err| {
-                anyhow::anyhow!(
-                    "rabbitmq worker quarantine exchange declaration failed: {}",
-                    err
-                )
-            })?;
+            .context("rabbitmq worker quarantine exchange declaration failed")?;
 
         channel
             .queue_declare(
@@ -421,12 +515,7 @@ impl Client {
                 FieldTable::default(),
             )
             .await
-            .map_err(|err| {
-                anyhow::anyhow!(
-                    "rabbitmq worker quarantine queue declaration failed: {}",
-                    err
-                )
-            })?;
+            .context("rabbitmq worker quarantine queue declaration failed")?;
 
         channel
             .queue_bind(
@@ -437,9 +526,7 @@ impl Client {
                 FieldTable::default(),
             )
             .await
-            .map_err(|err| {
-                anyhow::anyhow!("rabbitmq worker quarantine queue binding failed: {}", err)
-            })?;
+            .context("rabbitmq worker quarantine queue binding failed")?;
 
         Ok(())
     }
@@ -455,7 +542,7 @@ impl Client {
             .publish_bytes_with_properties_once(exchange, routing_key, body, properties.clone())
             .await;
         if let Err(err) = &publish_result
-            && Self::is_reconnectable_anyhow_error(err)
+            && Self::is_broker_unavailable(err)
         {
             warn!(
                 error = %err,
@@ -477,53 +564,52 @@ impl Client {
         body: &[u8],
         properties: BasicProperties,
     ) -> anyhow::Result<()> {
-        let session = self.get_or_connect_session().await?;
-        let channel = &session.publish_channel;
-        let confirmation = channel
-            .basic_publish(
-                exchange,
-                routing_key,
-                BasicPublishOptions {
-                    mandatory: true,
-                    ..BasicPublishOptions::default()
-                },
-                body,
-                properties,
-            )
-            .await
-            .map_err(|err| anyhow::anyhow!("rabbitmq publish failed: {}", err))?
-            .await
-            .map_err(|err| anyhow::anyhow!("rabbitmq publish confirmation failed: {}", err))?;
+        let operation = "publish";
+        let permit = self.acquire_broker_operation(operation, Instant::now())?;
+        let result = async {
+            let session = self.get_or_connect_session().await?;
+            let channel = &session.publish_channel;
+            let confirmation = channel
+                .basic_publish(
+                    exchange,
+                    routing_key,
+                    BasicPublishOptions {
+                        mandatory: true,
+                        ..BasicPublishOptions::default()
+                    },
+                    body,
+                    properties,
+                )
+                .await
+                .context("rabbitmq publish failed")?
+                .await
+                .context("rabbitmq publish confirmation failed")?;
 
-        match confirmation {
-            Confirmation::Ack(None) => Ok(()),
-            Confirmation::Ack(Some(returned)) => {
-                let route_error = returned
-                    .error()
-                    .map(|err| err.to_string())
-                    .unwrap_or_else(|| returned.reply_text.to_string());
-                anyhow::bail!(
-                    "rabbitmq publish was confirmed but returned unroutable for routing key '{}': {}",
-                    routing_key,
-                    route_error
-                );
-            }
-            Confirmation::Nack(returned) => {
-                let route_error = returned
-                    .as_deref()
-                    .and_then(|message| message.error())
-                    .map(|err| err.to_string())
-                    .unwrap_or_else(|| "broker negatively acknowledged publish".to_string());
-                anyhow::bail!(
-                    "rabbitmq publish was negatively acknowledged for routing key '{}': {}",
-                    routing_key,
-                    route_error
-                );
-            }
-            Confirmation::NotRequested => {
-                anyhow::bail!("rabbitmq publish confirmation was not requested");
+            match confirmation {
+                Confirmation::Ack(None) => Ok(()),
+                Confirmation::Ack(Some(returned)) => Err(PublishError::Returned {
+                    routing_key: routing_key.to_string(),
+                    reason: returned
+                        .error()
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| returned.reply_text.to_string()),
+                }
+                .into()),
+                Confirmation::Nack(returned) => Err(PublishError::Nacked {
+                    routing_key: routing_key.to_string(),
+                    reason: returned
+                        .as_deref()
+                        .and_then(|message| message.error())
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "broker negatively acknowledged publish".to_string()),
+                }
+                .into()),
+                Confirmation::NotRequested => Err(PublishError::ConfirmationNotRequested.into()),
             }
         }
+        .await;
+
+        self.finish_broker_operation(operation, permit, Instant::now(), result)
     }
 
     /// Publishes a JSON payload to the configured topic exchange.
@@ -533,8 +619,7 @@ impl Client {
         payload: &Value,
         message_id: &str,
     ) -> anyhow::Result<()> {
-        let body = serde_json::to_vec(payload)
-            .map_err(|err| anyhow::anyhow!("failed to serialize message payload: {}", err))?;
+        let body = serde_json::to_vec(payload).context("failed to serialize message payload")?;
 
         self.publish_bytes_with_properties(
             &self.config.exchange,
@@ -557,7 +642,7 @@ impl Client {
     ) -> anyhow::Result<Option<RawConsumedMessage>> {
         let consume_result = self.consume_worker_message_once().await;
         if let Err(err) = &consume_result
-            && Self::is_reconnectable_anyhow_error(err)
+            && Self::is_broker_unavailable(err)
         {
             warn!(
                 error = %err,
@@ -571,27 +656,29 @@ impl Client {
     }
 
     async fn consume_worker_message_once(&self) -> anyhow::Result<Option<RawConsumedMessage>> {
-        let session = self.get_or_connect_session().await?;
-        let channel = &session.publish_channel;
+        let operation = "basic_get";
+        let permit = self.acquire_broker_operation(operation, Instant::now())?;
+        let result = async {
+            let session = self.get_or_connect_session().await?;
+            let channel = &session.publish_channel;
+            let maybe_delivery = channel
+                .basic_get(&self.config.worker_queue, BasicGetOptions::default())
+                .await
+                .context("rabbitmq consume failed")?;
 
-        let maybe_delivery = channel
-            .basic_get(&self.config.worker_queue, BasicGetOptions::default())
-            .await
-            .map_err(|err| anyhow::anyhow!("rabbitmq consume failed: {}", err))?;
+            Ok(maybe_delivery.map(|delivery| RawConsumedMessage {
+                delivery_tag: delivery.delivery_tag,
+                acker: delivery.acker.clone(),
+                body: delivery.data.clone(),
+                properties: delivery.properties.clone(),
+                exchange: delivery.exchange.to_string(),
+                routing_key: delivery.routing_key.to_string(),
+                redelivered: delivery.redelivered,
+            }))
+        }
+        .await;
 
-        let Some(delivery) = maybe_delivery else {
-            return Ok(None);
-        };
-
-        Ok(Some(RawConsumedMessage {
-            delivery_tag: delivery.delivery_tag,
-            acker: delivery.acker.clone(),
-            body: delivery.data.clone(),
-            properties: delivery.properties.clone(),
-            exchange: delivery.exchange.to_string(),
-            routing_key: delivery.routing_key.to_string(),
-            redelivered: delivery.redelivered,
-        }))
+        self.finish_broker_operation(operation, permit, Instant::now(), result)
     }
 
     /// Creates a long-lived consumer stream for worker messages using `basic_consume`.
@@ -604,7 +691,7 @@ impl Client {
             .consume_worker_stream_once(consumer_tag_prefix, prefetch)
             .await;
         if let Err(err) = &stream_result
-            && Self::is_reconnectable_anyhow_error(err)
+            && Self::is_broker_unavailable(err)
         {
             warn!(
                 error = %err,
@@ -624,34 +711,42 @@ impl Client {
         consumer_tag_prefix: &str,
         prefetch: u16,
     ) -> anyhow::Result<lapin::Consumer> {
-        let session = self.get_or_connect_session().await?;
-        let channel =
-            session.connection.create_channel().await.map_err(|err| {
-                anyhow::anyhow!("rabbitmq consumer channel creation failed: {}", err)
-            })?;
-        self.declare_topology(&channel).await?;
-        channel
-            .basic_qos(prefetch, BasicQosOptions { global: false })
-            .await
-            .map_err(|err| anyhow::anyhow!("rabbitmq qos configuration failed: {}", err))?;
+        let operation = "create_consumer";
+        let permit = self.acquire_broker_operation(operation, Instant::now())?;
+        let result = async {
+            let session = self.get_or_connect_session().await?;
+            let channel = session
+                .connection
+                .create_channel()
+                .await
+                .context("rabbitmq consumer channel creation failed")?;
+            self.declare_topology(&channel).await?;
+            channel
+                .basic_qos(prefetch, BasicQosOptions { global: false })
+                .await
+                .context("rabbitmq qos configuration failed")?;
 
-        let consumer_tag = format!("{}-{}", consumer_tag_prefix, Uuid::now_v7());
-        channel
-            .basic_consume(
-                &self.config.worker_queue,
-                &consumer_tag,
-                BasicConsumeOptions::default(),
-                FieldTable::default(),
-            )
-            .await
-            .map_err(|err| anyhow::anyhow!("rabbitmq consumer creation failed: {}", err))
+            let consumer_tag = format!("{}-{}", consumer_tag_prefix, Uuid::now_v7());
+            channel
+                .basic_consume(
+                    &self.config.worker_queue,
+                    &consumer_tag,
+                    BasicConsumeOptions::default(),
+                    FieldTable::default(),
+                )
+                .await
+                .context("rabbitmq consumer creation failed")
+        }
+        .await;
+
+        self.finish_broker_operation(operation, permit, Instant::now(), result)
     }
 
     /// Acknowledges successful processing of one delivery.
     pub(crate) async fn ack(&self, message: &RawConsumedMessage) -> anyhow::Result<()> {
         match message.acker.ack(BasicAckOptions::default()).await {
             Ok(()) => Ok(()),
-            Err(err) if Self::is_reconnectable_lapin_error(&err) => {
+            Err(err) if Self::is_unavailable_lapin_error(&err) => {
                 warn!(
                     delivery_tag = message.delivery_tag,
                     error = %err,
@@ -660,7 +755,7 @@ impl Client {
                 self.invalidate_session().await;
                 Ok(())
             }
-            Err(err) => Err(anyhow::anyhow!("rabbitmq ack failed: {}", err)),
+            Err(error) => Err(anyhow::Error::new(error).context("rabbitmq ack failed")),
         }
     }
 
@@ -836,8 +931,8 @@ impl Client {
             "failed_at": now,
             "original_payload": original_payload,
         });
-        let body = serde_json::to_vec(&envelope)
-            .map_err(|err| anyhow::anyhow!("failed to serialize quarantine payload: {}", err))?;
+        let body =
+            serde_json::to_vec(&envelope).context("failed to serialize quarantine payload")?;
 
         self.publish_bytes_with_properties(
             &self.config.worker_quarantine_exchange,
@@ -904,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn reconnectable_lapin_errors_are_strictly_classified() {
+    fn lapin_availability_errors_are_strictly_classified() {
         for error in [
             LapinError::InvalidChannel(7),
             LapinError::IOError(Arc::new(io::Error::new(
@@ -913,16 +1008,18 @@ mod tests {
             ))),
             LapinError::MissingHeartbeatError,
         ] {
-            assert!(Client::is_reconnectable_lapin_error(&error));
+            assert!(Client::is_unavailable_lapin_error(&error));
         }
 
-        assert!(!Client::is_reconnectable_lapin_error(
+        assert!(!Client::is_unavailable_lapin_error(
             &LapinError::ChannelsLimitReached
         ));
     }
 
     #[test]
-    fn reconnectable_anyhow_errors_include_wrapped_causes() {
+    fn broker_unavailability_requires_a_typed_lapin_cause() {
+        assert!(Client::is_broker_unavailable(&broker_unavailable_error()));
+
         for message in [
             "invalid channel state",
             "invalid connection state",
@@ -932,11 +1029,132 @@ mod tests {
             "channel closed",
         ] {
             let error = anyhow::anyhow!(message).context("worker receive failed");
-            assert!(Client::is_reconnectable_anyhow_error(&error), "{message}");
+            assert!(!Client::is_broker_unavailable(&error), "{message}");
         }
 
-        let permanent = anyhow::anyhow!("publish was negatively acknowledged");
-        assert!(!Client::is_reconnectable_anyhow_error(&permanent));
+        let reachable = anyhow::Error::new(LapinError::ChannelsLimitReached)
+            .context("rabbitmq channel creation failed");
+        assert!(!Client::is_broker_unavailable(&reachable));
+    }
+
+    #[test]
+    fn availability_failures_open_the_messaging_circuit() {
+        let client = client_with_circuit_breaker(circuit_breaker_config());
+        let now = Instant::now();
+        let permit = client.acquire_broker_operation("publish", now).unwrap();
+
+        let result = client.finish_broker_operation::<()>(
+            "publish",
+            permit,
+            now,
+            Err(broker_unavailable_error()),
+        );
+
+        assert!(result.is_err());
+        let error = client.acquire_broker_operation("publish", now).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<BrokerCircuitOpen>()
+                .map(|open| open.retry_after),
+            Some(Duration::from_secs(10))
+        );
+        assert!(!Client::is_broker_unavailable(&error));
+    }
+
+    #[test]
+    fn permanent_broker_failures_do_not_open_the_messaging_circuit() {
+        let client = client_with_circuit_breaker(circuit_breaker_config());
+        let now = Instant::now();
+        let permit = client.acquire_broker_operation("publish", now).unwrap();
+
+        let result = client.finish_broker_operation::<()>(
+            "publish",
+            permit,
+            now,
+            Err(PublishError::Nacked {
+                routing_key: "run.completed".to_string(),
+                reason: "rejected".to_string(),
+            }
+            .into()),
+        );
+
+        assert!(result.is_err());
+        assert!(client.acquire_broker_operation("publish", now).is_ok());
+    }
+
+    #[test]
+    fn reachable_publish_failure_closes_a_half_open_circuit() {
+        let client = client_with_circuit_breaker(circuit_breaker_config());
+        let opened_at = Instant::now();
+        let permit = client
+            .acquire_broker_operation("publish", opened_at)
+            .unwrap();
+        let _ = client.finish_broker_operation::<()>(
+            "publish",
+            permit,
+            opened_at,
+            Err(broker_unavailable_error()),
+        );
+        let probe_at = opened_at + Duration::from_secs(10);
+        let probe = client
+            .acquire_broker_operation("publish", probe_at)
+            .unwrap();
+
+        let result = client.finish_broker_operation::<()>(
+            "publish",
+            probe,
+            probe_at,
+            Err(PublishError::Returned {
+                routing_key: "missing.route".to_string(),
+                reason: "no route".to_string(),
+            }
+            .into()),
+        );
+
+        assert!(result.is_err());
+        assert!(
+            !client
+                .acquire_broker_operation("publish", probe_at)
+                .unwrap()
+                .is_probe()
+        );
+    }
+
+    #[test]
+    fn successful_messaging_probe_restores_normal_admission() {
+        let client = client_with_circuit_breaker(circuit_breaker_config());
+        let opened_at = Instant::now();
+        let permit = client
+            .acquire_broker_operation("create_consumer", opened_at)
+            .unwrap();
+        let _ = client.finish_broker_operation::<()>(
+            "create_consumer",
+            permit,
+            opened_at,
+            Err(anyhow::Error::new(LapinError::MissingHeartbeatError)
+                .context("rabbitmq consumer creation failed")),
+        );
+        let probe_at = opened_at + Duration::from_secs(10);
+
+        let probe = client
+            .acquire_broker_operation("create_consumer", probe_at)
+            .unwrap();
+        assert!(probe.is_probe());
+        assert!(
+            client
+                .acquire_broker_operation("publish", probe_at)
+                .is_err()
+        );
+        client
+            .finish_broker_operation("create_consumer", probe, probe_at, Ok(()))
+            .unwrap();
+
+        assert!(
+            !client
+                .acquire_broker_operation("publish", probe_at)
+                .unwrap()
+                .is_probe()
+        );
     }
 
     #[test]
@@ -1078,9 +1296,28 @@ mod tests {
         config
     }
 
+    fn broker_unavailable_error() -> anyhow::Error {
+        anyhow::Error::new(LapinError::IOError(Arc::new(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "reset",
+        ))))
+        .context("rabbitmq operation failed")
+    }
+
     fn client() -> Client {
+        client_with_circuit_breaker(CircuitBreakerConfig::default())
+    }
+
+    fn circuit_breaker_config() -> CircuitBreakerConfig {
+        CircuitBreakerConfig::new(true, 1, Duration::from_secs(10), Duration::from_secs(40))
+            .unwrap()
+            .without_jitter()
+    }
+
+    fn client_with_circuit_breaker(circuit_breaker_config: CircuitBreakerConfig) -> Client {
         Client::new(Config {
             uri: "amqp://localhost".to_string(),
+            circuit_breaker_config,
             exchange: "test.events".to_string(),
             event_queue: "test.events.domain".to_string(),
             worker_queue: "test.worker".to_string(),

@@ -2,8 +2,8 @@
 //!
 //! Coordinator and worker commands request this context when they need broker
 //! access. Topology declaration, publish, consume, retry, and quarantine
-//! behavior belongs in `mq`; this module only owns process-scoped lazy
-//! construction from configuration.
+//! behavior, including broker circuit admission, belongs in `mq`; this module
+//! only owns process-scoped lazy construction from validated configuration.
 
 use tokio::sync::OnceCell;
 

@@ -24,6 +24,7 @@ use tracing_subscriber::{
 };
 
 mod agent_client;
+mod circuit_breaker;
 mod cli;
 use cli::{
     App,
@@ -87,7 +88,7 @@ async fn main() -> ExitCode {
                     command_context.placement,
                 )
                 .with_operation_timeout(command_context.database_operation_timeout),
-                command_context.messaging_url,
+                command_context.messaging,
                 command_context.wasm,
                 app.output_format,
             );

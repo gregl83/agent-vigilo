@@ -118,18 +118,25 @@ mod tests {
         assert!(root.get_arguments().all(|arg| {
             !matches!(
                 arg.get_long(),
-                Some("messaging-url" | "wasm-timeout-ms" | "database-circuit-failure-threshold")
+                Some(
+                    "messaging-url"
+                        | "messaging-circuit-failure-threshold"
+                        | "wasm-timeout-ms"
+                        | "database-circuit-failure-threshold"
+                )
             )
         }));
 
         let coordinator = root.find_subcommand("coordinator").unwrap();
         assert!(has_long(coordinator, "messaging-url"));
+        assert!(has_long(coordinator, "messaging-circuit-failure-threshold"));
         assert!(has_long(coordinator, "database-circuit-failure-threshold"));
         assert!(has_long(coordinator, "database-operation-timeout-seconds"));
         assert!(!has_long(coordinator, "wasm-timeout-ms"));
 
         let worker = root.find_subcommand("worker").unwrap();
         assert!(has_long(worker, "messaging-url"));
+        assert!(has_long(worker, "messaging-circuit-failure-threshold"));
         assert!(has_long(worker, "wasm-timeout-ms"));
         assert!(has_long(worker, "database-circuit-failure-threshold"));
         assert!(has_long(worker, "database-operation-timeout-seconds"));
@@ -167,7 +174,7 @@ mod tests {
                 .command
                 .context_config("primary")
                 .unwrap()
-                .messaging_url
+                .messaging
                 .is_none()
         );
 
@@ -181,15 +188,39 @@ mod tests {
             "start",
         ])
         .unwrap();
-        assert_eq!(
-            coordinator
-                .command
-                .context_config("primary")
-                .unwrap()
-                .messaging_url
-                .as_deref(),
-            Some("amqp://broker")
-        );
+        let messaging = coordinator
+            .command
+            .context_config("primary")
+            .unwrap()
+            .messaging
+            .unwrap();
+        assert_eq!(messaging.uri, "amqp://broker");
+    }
+
+    #[test]
+    fn messaging_circuit_configuration_rejects_an_invalid_open_range() {
+        let app = App::try_parse_from([
+            "vigilo",
+            "--database-url",
+            "postgres://control",
+            "coordinator",
+            "--messaging-url",
+            "amqp://broker",
+            "--messaging-circuit-initial-open-seconds",
+            "20",
+            "--messaging-circuit-max-open-seconds",
+            "10",
+            "start",
+        ])
+        .unwrap();
+
+        let error = app
+            .command
+            .context_config("primary")
+            .err()
+            .expect("invalid messaging circuit range must fail");
+
+        assert!(error.to_string().contains("maximum open duration"));
     }
 
     fn has_long(command: &clap::Command, name: &str) -> bool {

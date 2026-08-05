@@ -31,7 +31,7 @@ pub(crate) struct Context(Arc<ContextInner>);
 impl Context {
     pub fn new(
         database_config: database::Config,
-        mq_uri: Option<String>,
+        messaging_config: Option<crate::mq::Config>,
         wasm_config: wasm::Config,
         output_format: output::OutputFormat,
     ) -> Self {
@@ -44,7 +44,7 @@ impl Context {
                 cell: Default::default(),
             },
             mq: messaging::Context {
-                config: mq_uri.map(crate::mq::Config::new),
+                config: messaging_config,
                 cell: Default::default(),
             },
             out: output::Context {

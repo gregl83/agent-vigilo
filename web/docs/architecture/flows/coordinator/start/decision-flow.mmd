@@ -24,6 +24,7 @@ flowchart TD
     FinalizeIsolated[Defer run and continue cycle]
     Messaging{Messaging context available?}
     Outbox[Claim delivery queue batch and publish with bounded concurrency]
+    BrokerCircuit{Messaging circuit admits publish?}
     OutboxIsolated[Count placement failure and continue aliases]
     Wait[Wait for next tick]
     Shutdown[Cancel service loop]
@@ -68,7 +69,9 @@ flowchart TD
     Messaging -- No --> ContextFail
     Messaging -- Yes --> Outbox
 
-    Outbox --> Wait
+    Outbox --> BrokerCircuit
+    BrokerCircuit -- Open --> Wait
+    BrokerCircuit -- Closed or probe --> Wait
     Outbox -. Placement operation fails .-> OutboxIsolated
     Outbox -. Placement catalog fails .-> CycleFail
     OutboxIsolated --> Outbox
@@ -83,5 +86,5 @@ flowchart TD
 
     class Start command
     class Success success
-    class CoordinatorId,Runner,Event,Database,RecoverCreation,Circuit,CircuitSkip,Recover,RecoveryIsolated,Dispatch,DispatchIsolated,Finalize,FinalizeIsolated,Messaging,Outbox,OutboxIsolated,Wait,Shutdown,Stop system
+    class CoordinatorId,Runner,Event,Database,RecoverCreation,Circuit,CircuitSkip,Recover,RecoveryIsolated,Dispatch,DispatchIsolated,Finalize,FinalizeIsolated,Messaging,Outbox,BrokerCircuit,OutboxIsolated,Wait,Shutdown,Stop system
     class ContextFail,CycleFail,ShutdownFail error

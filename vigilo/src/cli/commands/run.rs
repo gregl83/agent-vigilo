@@ -1051,7 +1051,7 @@ mod tests {
                 crate::context::database::CircuitBreakerConfig::default(),
                 PlacementConfig::default_single_database(),
             ),
-            Some("not-used".to_string()),
+            Some(crate::mq::Config::new("not-used".to_string())),
             wasm::Config::default(),
             OutputFormat::Json,
         );
@@ -1280,7 +1280,7 @@ mod tests {
                 crate::context::database::CircuitBreakerConfig::default(),
                 PlacementConfig::default_single_database(),
             ),
-            Some("not-used".to_string()),
+            Some(crate::mq::Config::new("not-used".to_string())),
             wasm::Config::default(),
             OutputFormat::Json,
         );
@@ -1307,7 +1307,7 @@ mod tests {
                 crate::context::database::CircuitBreakerConfig::default(),
                 PlacementConfig::default_single_database(),
             ),
-            Some("not-used".to_string()),
+            Some(crate::mq::Config::new("not-used".to_string())),
             wasm::Config::default(),
             OutputFormat::Json,
         );

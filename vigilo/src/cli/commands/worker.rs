@@ -1624,7 +1624,7 @@ mod tests {
             .with_operation_timeout(Some(
                 database::DatabaseOperationTimeoutConfig::new(Duration::from_secs(1)).unwrap(),
             )),
-            Some("amqp://not-used".to_string()),
+            Some(crate::mq::Config::new("amqp://not-used".to_string())),
             crate::context::wasm::Config::default(),
             OutputFormat::Json,
         )
