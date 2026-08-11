@@ -468,7 +468,12 @@ async fn shard_move_replays_cross_database_updates_and_deletes() -> anyhow::Resu
         (SHARD_ALIAS.to_string(), 2, "open".to_string(), None)
     );
 
-    simulate_control_activated_before_target_open(&primary, &shard, run_id, 0).await?;
+    let expected_move_fence =
+        simulate_control_activated_before_target_open(&primary, &shard, run_id, 0).await?;
+    assert_eq!(
+        local_admission_move_fence(&shard, run_id, 0).await?,
+        Some(expected_move_fence)
+    );
     let retry_payload = run_vigilo(
         &config,
         PRIMARY_ALIAS,
@@ -934,6 +939,26 @@ async fn local_admission_state(
     .await?)
 }
 
+async fn local_admission_move_fence(
+    db: &PgPool,
+    run_id: Uuid,
+    run_shard: i16,
+) -> anyhow::Result<Option<(Uuid, i64, Uuid)>> {
+    Ok(sqlx::query_as(
+        r#"
+        SELECT move_id, move_claim_generation, move_claim_token
+        FROM local_shard_admissions
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+          AND state = 'prepared'
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .fetch_optional(db)
+    .await?)
+}
+
 async fn simulate_source_closed_before_control_activation(
     primary: &PgPool,
     run_id: Uuid,
@@ -1047,37 +1072,49 @@ async fn simulate_control_activated_before_target_open(
     target: &PgPool,
     run_id: Uuid,
     run_shard: i16,
-) -> anyhow::Result<()> {
-    sqlx::query(
-        r#"
-        UPDATE local_shard_admissions
-        SET state = 'prepared',
-            updated_at = now()
-        WHERE run_id = $1::uuid
-          AND run_shard = $2
-        "#,
-    )
-    .bind(run_id)
-    .bind(run_shard)
-    .execute(target)
-    .await?;
-    sqlx::query(
+) -> anyhow::Result<(Uuid, i64, Uuid)> {
+    let claim_token = Uuid::now_v7();
+    let (move_id, claim_generation) = sqlx::query_as::<_, (Uuid, i64)>(
         r#"
         UPDATE shard_move_operations
         SET status = 'active',
             phase = 'cutover',
+            claim_generation = claim_generation + 1,
+            claim_token = $3::uuid,
+            claimed_until = now() + interval '5 minutes',
             completed_at = NULL,
             updated_at = now()
         WHERE run_id = $1::uuid
           AND run_shard = $2
           AND status = 'completed'
+        RETURNING id, claim_generation
         "#,
     )
     .bind(run_id)
     .bind(run_shard)
-    .execute(primary)
+    .bind(claim_token)
+    .fetch_one(primary)
     .await?;
-    Ok(())
+    sqlx::query(
+        r#"
+        UPDATE local_shard_admissions
+        SET state = 'prepared',
+            move_id = $3::uuid,
+            move_claim_generation = $4,
+            move_claim_token = $5::uuid,
+            updated_at = now()
+        WHERE run_id = $1::uuid
+          AND run_shard = $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(move_id)
+    .bind(claim_generation)
+    .bind(claim_token)
+    .execute(target)
+    .await?;
+    Ok((move_id, claim_generation, claim_token))
 }
 
 async fn active_move_operation_count(
