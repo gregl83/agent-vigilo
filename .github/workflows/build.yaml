@@ -122,12 +122,23 @@ jobs:
           components: llvm-tools-preview
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Reset coverage data
+        run: cargo llvm-cov clean --workspace
+      - name: Migrate PostgreSQL template1 for SQLx test clones
+        run: >-
+          cargo llvm-cov run --no-report -p vigilo --locked --
+          setup --skip-evaluators
+        env:
+          DATABASE_URL: postgresql://postgres:password@localhost:5432/template1
       - name: Run PostgreSQL-backed SQLx tests with coverage
         run: >-
-          cargo llvm-cov -p vigilo --locked --bin vigilo
+          cargo llvm-cov --no-report -p vigilo --locked --bin vigilo
+          -- --ignored --nocapture --test-threads=4
+      - name: Generate SQLx coverage report
+        run: >-
+          cargo llvm-cov report
           --ignore-filename-regex '[/\\]postgres_tests(\.rs|[/\\])'
           --lcov --output-path lcov-sqlx.info
-          -- --ignored --nocapture --test-threads=4
       - name: Store SQLx coverage
         uses: actions/upload-artifact@v4
         with:

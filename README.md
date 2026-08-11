@@ -92,6 +92,12 @@ reflect code reached through unit, integration, and distributed runtime tests.
 Only PostgreSQL test fixture sources are excluded; production query and table
 modules remain in the coverage denominator.
 
+SQLx creates each isolated PostgreSQL test database with `CREATE DATABASE`,
+which clones PostgreSQL's built-in `template1` database. The PostgreSQL coverage
+job migrates `template1` once, so each test validates the recorded migrations
+instead of rebuilding every partition and index. The separate migration job
+still applies the complete migration set to an empty database.
+
 Accumulate the same reports locally after starting the services and setting the
 environment variables required by each tier:
 
