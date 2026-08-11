@@ -18,6 +18,8 @@ This file applies to evaluator crates under `evaluators/`.
 
 - Implement the current contract from `wit/evaluator.wit`.
 - Read canonical evaluator `input` fields and return canonical `output`.
+- Return one primary measurement or abstention and zero or more diagnostics;
+  evaluators must not implement dimension, threshold, weight, or blocking policy.
 - Do not introduce alternate envelope names for evaluator entrypoints.
 
 ## Build and Test Expectations

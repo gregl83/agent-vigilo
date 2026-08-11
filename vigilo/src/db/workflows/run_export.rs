@@ -10,7 +10,10 @@ use uuid::Uuid;
 use crate::{
     context::database,
     models::{
-        evaluator_result::EvaluatorResult,
+        evaluator_result::{
+            EvaluatorDiagnostic,
+            EvaluatorResult,
+        },
         execution::Execution,
         execution_aggregate::ExecutionAggregate,
         execution_attempt::ExecutionAttempt,
@@ -25,6 +28,7 @@ pub(crate) struct RunExportBatch {
     pub(crate) attempts: Vec<ExecutionAttempt>,
     pub(crate) aggregates: Vec<ExecutionAggregate>,
     pub(crate) evaluator_results: Vec<EvaluatorResult>,
+    pub(crate) evaluator_diagnostics: Vec<EvaluatorDiagnostic>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +93,7 @@ pub(crate) async fn select_batch_for_executions(
             attempts: Vec::new(),
             aggregates: Vec::new(),
             evaluator_results: Vec::new(),
+            evaluator_diagnostics: Vec::new(),
         });
     }
 
@@ -112,12 +117,23 @@ pub(crate) async fn select_batch_for_executions(
     } else {
         queries::select_evaluator_results(&route.db, run_id, route.run_shard, &attempt_ids).await?
     };
+    let result_ids = evaluator_results
+        .iter()
+        .map(|row| row.id)
+        .collect::<Vec<_>>();
+    let evaluator_diagnostics = if result_ids.is_empty() {
+        Vec::new()
+    } else {
+        queries::select_evaluator_diagnostics(&route.db, run_id, route.run_shard, &result_ids)
+            .await?
+    };
 
     Ok(RunExportBatch {
         executions,
         attempts,
         aggregates,
         evaluator_results,
+        evaluator_diagnostics,
     })
 }
 
@@ -139,6 +155,7 @@ mod tests {
         assert!(batch.attempts.is_empty());
         assert!(batch.aggregates.is_empty());
         assert!(batch.evaluator_results.is_empty());
+        assert!(batch.evaluator_diagnostics.is_empty());
         assert_eq!(route.run_shard(), 7);
         assert_eq!(route.database_alias(), "unavailable");
     }

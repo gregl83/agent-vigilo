@@ -44,16 +44,20 @@ case_groups:
       task_type: classification
 
     evaluators:
-      - ref: vigilo/sentiment-basic-en:0.1.0
-        # Required evaluators must return a valid score before aggregation.
+      - id: sentiment_score
+        ref: vigilo/sentiment-basic-en:0.1.0
+        # Required bindings must return one valid measurement before aggregation.
         required: true
-        # Profile-owned aggregation bucket. The evaluator also reports `quality`,
-        # but runtime aggregation uses this binding value as the authority.
+        # Profile-owned aggregation bucket.
         dimension: quality
         # This example uses the overall score gate rather than a hard blocker.
         blocking: false
         # Total contribution of this evaluator inside the quality dimension.
         weight: 1.0
+        normalization:
+          method: normalized
+        # Host-owned judgment threshold; evaluators do not pass or fail releases.
+        pass_threshold: 0.5
         config:
           mode: example
 
@@ -61,7 +65,7 @@ case_groups:
       dimensions:
         quality:
           method: weighted_mean
-          # Failed findings in this dimension are recorded but are not hard blockers.
+          # Failed host judgments in this dimension are not hard blockers.
           blocking: false
           # Quality contributes to the total execution aggregate_score.
           weight: 1.0

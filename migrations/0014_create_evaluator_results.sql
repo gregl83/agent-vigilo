@@ -1,59 +1,70 @@
 CREATE TABLE evaluator_results (
     id UUID NOT NULL DEFAULT gen_random_uuid(),
-
     run_id UUID NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
     run_shard SMALLINT NOT NULL CHECK (run_shard >= 0 AND run_shard < 128),
     execution_id UUID NOT NULL,
     attempt_id UUID NOT NULL,
 
+    binding_id TEXT NOT NULL CHECK (btrim(binding_id) <> ''),
     evaluator_id UUID NOT NULL,
-    finding_index INTEGER NOT NULL DEFAULT 0 CHECK (finding_index >= 0),
     evaluator_version TEXT NOT NULL,
     evaluator_profile_id TEXT NOT NULL,
     evaluator_profile_version TEXT NOT NULL,
-
-    -- optional interface/runtime versioning for WASM/WIT compatibility
     evaluator_interface_version TEXT,
     evaluator_runtime_version TEXT,
 
-    dimension TEXT NOT NULL,
-    status evaluation_status NOT NULL,
+    dimension TEXT NOT NULL CHECK (btrim(dimension) <> ''),
+    outcome evaluator_outcome NOT NULL,
+    judgment evaluation_status,
     blocking BOOLEAN NOT NULL DEFAULT false,
 
-    score_kind TEXT NOT NULL,
+    measurement_kind TEXT,
     raw_score DOUBLE PRECISION,
     raw_score_min DOUBLE PRECISION,
     raw_score_max DOUBLE PRECISION,
     normalized_score DOUBLE PRECISION,
+    pass_threshold DOUBLE PRECISION NOT NULL CHECK (pass_threshold >= 0.0 AND pass_threshold <= 1.0),
     weight DOUBLE PRECISION NOT NULL DEFAULT 1.0 CHECK (weight >= 0),
 
-    severity severity NOT NULL DEFAULT 'none',
-    failure_category TEXT,
-    reason TEXT,
-
-    evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_code TEXT,
+    error_message TEXT,
+    abstention_category TEXT,
+    abstention_reason TEXT,
     raw_evaluator_output JSONB NOT NULL DEFAULT '{}'::jsonb,
-
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT pk_evaluator_results PRIMARY KEY (run_id, run_shard, id),
     CONSTRAINT fk_evaluator_results_execution
         FOREIGN KEY (run_id, run_shard, execution_id)
-        REFERENCES executions(run_id, run_shard, id)
-        ON DELETE CASCADE,
+        REFERENCES executions(run_id, run_shard, id) ON DELETE CASCADE,
     CONSTRAINT fk_evaluator_results_attempt
         FOREIGN KEY (run_id, run_shard, attempt_id)
-        REFERENCES execution_attempts(run_id, run_shard, id)
-        ON DELETE CASCADE,
-    CONSTRAINT chk_normalized_score_range
-       CHECK (normalized_score IS NULL OR (normalized_score >= 0.0 AND normalized_score <= 1.0)),
-
-    CONSTRAINT uq_attempt_evaluator_finding UNIQUE (run_id, run_shard, attempt_id, evaluator_id, finding_index)
+        REFERENCES execution_attempts(run_id, run_shard, id) ON DELETE CASCADE,
+    CONSTRAINT chk_evaluator_result_normalized_score
+        CHECK (normalized_score IS NULL OR (normalized_score >= 0.0 AND normalized_score <= 1.0)),
+    CONSTRAINT chk_evaluator_result_outcome_shape CHECK (
+        (outcome = 'completed' AND judgment IN ('passed', 'failed')
+            AND measurement_kind IS NOT NULL AND normalized_score IS NOT NULL
+            AND error_code IS NULL AND error_message IS NULL
+            AND abstention_category IS NULL AND abstention_reason IS NULL)
+        OR
+        (outcome = 'error' AND judgment IS NULL AND measurement_kind IS NULL
+            AND normalized_score IS NULL AND error_code IS NOT NULL AND error_message IS NOT NULL
+            AND raw_score IS NULL AND raw_score_min IS NULL AND raw_score_max IS NULL
+            AND abstention_category IS NULL AND abstention_reason IS NULL)
+        OR
+        (outcome = 'abstained' AND judgment IS NULL AND measurement_kind IS NULL
+            AND normalized_score IS NULL AND raw_score IS NULL
+            AND raw_score_min IS NULL AND raw_score_max IS NULL
+            AND error_code IS NULL AND error_message IS NULL
+            AND abstention_category IS NOT NULL)
+    ),
+    CONSTRAINT uq_attempt_evaluator_binding
+        UNIQUE (run_id, run_shard, attempt_id, binding_id)
 ) PARTITION BY LIST (run_shard);
 
 DO $$
-DECLARE
-    partition_index INTEGER;
+DECLARE partition_index INTEGER;
 BEGIN
     FOR partition_index IN 0..127 LOOP
         EXECUTE format(
@@ -64,99 +75,22 @@ BEGIN
     END LOOP;
 END $$;
 
-CREATE INDEX idx_evaluator_results_run_execution_id ON evaluator_results(run_id, run_shard, execution_id);
-
-CREATE INDEX idx_evaluator_results_run_dimension ON evaluator_results(run_id, run_shard, dimension);
-
-CREATE INDEX idx_evaluator_results_run_status ON evaluator_results(run_id, run_shard, status);
-
-CREATE INDEX idx_evaluator_results_run_failure_category
-    ON evaluator_results(run_id, run_shard, failure_category);
-
-CREATE INDEX idx_evaluator_results_run_evaluator_id ON evaluator_results(run_id, run_shard, evaluator_id);
-
-CREATE INDEX idx_evaluator_results_run_attempt ON evaluator_results(run_id, run_shard, attempt_id);
+CREATE INDEX idx_evaluator_results_run_execution_id
+    ON evaluator_results(run_id, run_shard, execution_id);
+CREATE INDEX idx_evaluator_results_run_dimension
+    ON evaluator_results(run_id, run_shard, dimension);
+CREATE INDEX idx_evaluator_results_run_outcome
+    ON evaluator_results(run_id, run_shard, outcome);
+CREATE INDEX idx_evaluator_results_run_evaluator_id
+    ON evaluator_results(run_id, run_shard, evaluator_id);
+CREATE INDEX idx_evaluator_results_run_attempt
+    ON evaluator_results(run_id, run_shard, attempt_id);
 
 COMMENT ON TABLE evaluator_results IS
-    'Append-only records representing individual findings emitted by evaluators applied to execution attempts. These rows are list partitioned by run_shard and form the canonical evidence used for aggregation, scoring, and policy decisions.';
-
-COMMENT ON COLUMN evaluator_results.id IS
-    'Unique identifier for the evaluator result record.';
-
-COMMENT ON COLUMN evaluator_results.run_id IS
-    'Reference to the run this result belongs to. Included for query efficiency and aggregation.';
-
-COMMENT ON COLUMN evaluator_results.run_shard IS
-    'Logical shard inherited from the parent execution and source chunk.';
-
-COMMENT ON COLUMN evaluator_results.execution_id IS
-    'Reference to the execution this evaluator result is associated with.';
-
-COMMENT ON COLUMN evaluator_results.attempt_id IS
-    'Reference to the specific attempt that produced this evaluator result. Only results from the authoritative (non-stale) attempt should be used for aggregation.';
-
-COMMENT ON COLUMN evaluator_results.evaluator_id IS
-    'Identifier of the evaluator that produced this result.';
-
-COMMENT ON COLUMN evaluator_results.finding_index IS
-    'Zero-based ordinal of the finding within one evaluator invocation. Included in the idempotency key so one evaluator can emit multiple findings for the same attempt.';
-
-COMMENT ON COLUMN evaluator_results.evaluator_version IS
-    'Version of the evaluator used to produce this result, ensuring reproducibility.';
-
-COMMENT ON COLUMN evaluator_results.evaluator_profile_id IS
-    'Identifier of the evaluation profile that included this evaluator.';
-
-COMMENT ON COLUMN evaluator_results.evaluator_profile_version IS
-    'Version of the evaluation profile used for this evaluation.';
-
-COMMENT ON COLUMN evaluator_results.evaluator_interface_version IS
-    'Version of the evaluator interface contract implemented by this artifact, used for runtime compatibility checks.';
-
-COMMENT ON COLUMN evaluator_results.evaluator_runtime_version IS
-    'Version of the runtime or execution environment used to run the evaluator, if applicable.';
-
-COMMENT ON COLUMN evaluator_results.dimension IS
-    'Logical dimension this evaluator contributes to (e.g., correctness, safety, quality). Used for aggregation and scoring.';
-
-COMMENT ON COLUMN evaluator_results.status IS
-    'Result of the evaluator for this execution. Used as input to aggregation and policy decisions.';
-
-COMMENT ON COLUMN evaluator_results.blocking IS
-    'Indicates whether this finding is blocking after applying evaluator binding, dimension policy, and evaluator-emitted blocking metadata.';
-
-COMMENT ON COLUMN evaluator_results.score_kind IS
-    'Type of scoring produced by the evaluator (e.g., binary, scalar, categorical). Used to interpret raw and normalized scores.';
-
-COMMENT ON COLUMN evaluator_results.raw_score IS
-    'Raw score produced by the evaluator before normalization. Interpretation depends on score_kind.';
-
-COMMENT ON COLUMN evaluator_results.raw_score_min IS
-    'Minimum possible value of the raw score, if applicable. Used for normalization.';
-
-COMMENT ON COLUMN evaluator_results.raw_score_max IS
-    'Maximum possible value of the raw score, if applicable. Used for normalization.';
-
-COMMENT ON COLUMN evaluator_results.normalized_score IS
-    'Score normalized to a standard range (typically 0.0 to 1.0) for aggregation across heterogeneous evaluators.';
-
-COMMENT ON COLUMN evaluator_results.weight IS
-    'Weight assigned to this evaluator result during aggregation within its dimension.';
-
-COMMENT ON COLUMN evaluator_results.severity IS
-    'Severity level assigned by the evaluator to indicate the impact of a detected issue. Used in aggregation and policy decisions alongside evaluation_status.';
-
-COMMENT ON COLUMN evaluator_results.failure_category IS
-    'Optional categorical label describing the type of failure (e.g., hallucination, format_error, unsafe_content). Used for debugging and analysis.';
-
-COMMENT ON COLUMN evaluator_results.reason IS
-    'Human-readable explanation of the evaluator result, especially in failure cases.';
-
-COMMENT ON COLUMN evaluator_results.evidence IS
-    'Structured evidence supporting the evaluator decision, such as extracted spans, comparison data, or intermediate reasoning artifacts.';
-
-COMMENT ON COLUMN evaluator_results.raw_evaluator_output IS
-    'Raw output produced by the evaluator before normalization or interpretation. Useful for debugging and auditability.';
-
-COMMENT ON COLUMN evaluator_results.created_at IS
-    'Timestamp when the evaluator result was recorded.';
+    'One immutable invocation result per profile binding and execution attempt. Host-owned policy produces judgment and normalized_score.';
+COMMENT ON COLUMN evaluator_results.binding_id IS
+    'Stable profile binding identifier and invocation idempotency key.';
+COMMENT ON COLUMN evaluator_results.outcome IS
+    'Evaluator execution outcome. This is separate from the host-derived judgment.';
+COMMENT ON COLUMN evaluator_results.judgment IS
+    'Host-derived passed or failed judgment after normalization and pass_threshold.';

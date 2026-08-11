@@ -1,4 +1,4 @@
-package vigilo:evaluator@0.1.0;
+package vigilo:evaluator@1.0.0;
 
 // data types
 interface types {
@@ -51,24 +51,6 @@ interface types {
         interface-version: option<string>,
     }
 
-    variant evaluation-dimension {
-        correctness,
-        format,
-        safety,
-        quality,
-        latency,
-        tool-use,
-        calibration,
-        other(string),
-    }
-
-    enum evaluation-status {
-        passed,
-        failed,
-        error,
-        skipped,
-    }
-
     enum severity {
         none,
         low,
@@ -83,22 +65,32 @@ interface types {
         not-preferred,
     }
 
-    variant score {
-        binary(bool),
-        range(tuple<f64, f64, f64>),
-        normalized(f64),
-        severity-mapped(severity),
-        preference(preference-outcome),
-        informational,
+    record range-measurement {
+        value: f64,
+        min: f64,
+        max: f64,
     }
 
-    record evaluator-finding {
-        dimension: evaluation-dimension,
-        status: evaluation-status,
-        score: score,
-        blocking: bool,
+    variant measurement {
+        binary(bool),
+        range(range-measurement),
+        normalized(f64),
+        preference(preference-outcome),
+    }
+
+    record abstention {
+        category: string,
+        reason: option<string>,
+    }
+
+    variant evaluator-outcome {
+        completed(measurement),
+        abstained(abstention),
+    }
+
+    record diagnostic-finding {
         severity: severity,
-        failure-category: option<string>,
+        category: string,
         reason: option<string>,
         evidence-json: string,
         tags: list<string>,
@@ -106,8 +98,14 @@ interface types {
 
     record output {
         evaluator: evaluator-identity,
-        results: list<evaluator-finding>,
+        outcome: evaluator-outcome,
+        diagnostics: list<diagnostic-finding>,
         metadata-json: string,
+    }
+
+    record evaluator-error {
+        code: string,
+        message: string,
     }
 }
 
@@ -142,8 +140,8 @@ interface executor {
 
 // evaluator interface
 interface evaluator {
-    use types.{input, output};
-    evaluate: func(input: input) -> result<output, string>;
+    use types.{input, output, evaluator-error};
+    evaluate: func(input: input) -> result<output, evaluator-error>;
 }
 
 world evaluator-world {

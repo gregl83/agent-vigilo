@@ -26,9 +26,9 @@ At a high level, the system follows a fan-out / fan-in pattern:
 2. Dataset cases are grouped into shard-local <GlossaryTerm term="chunk">**chunks**</GlossaryTerm>
 3. The coordinator dispatches chunks through <GlossaryTerm term="outbox-event-record">outbox event records</GlossaryTerm> and RabbitMQ
 4. Workers process case <GlossaryTerm term="execution">**executions**</GlossaryTerm> through <GlossaryTerm term="attempt">**attempts**</GlossaryTerm>
-5. Evaluators produce append-only <GlossaryTerm term="finding">findings</GlossaryTerm>
+5. Evaluators return one primary measurement or abstention plus optional diagnostics
 6. Required <GlossaryTerm term="evaluator-completeness">evaluator completeness</GlossaryTerm> is verified
-7. Complete findings are aggregated
+7. Complete host-normalized binding results are aggregated
 8. The **run** is finalized
 9. Its completion event record is published as a <GlossaryTerm term="broker-message">broker message</GlossaryTerm>
 
@@ -117,21 +117,25 @@ After a successful agent response:
 - evaluators are executed
 - Wasm evaluator invocations acquire a worker-local semaphore permit
 - each evaluator runs in a fresh Wasmtime store with memory, table, instance, fuel, timeout, and log-message limits
-- each normalized evaluator finding is appended to evaluator_results
+- the profile binding normalizes a completed measurement and derives its judgment
+- one invocation row is appended to `evaluator_results`; diagnostics are appended to `evaluator_diagnostics`
 
-After all invocations settle, the worker compares their findings with the
-resolved evaluator manifest. Every required binding must have a valid score and
-must not have an error or skipped finding. Optional bindings are diagnostic and
+After all invocations settle, the worker compares their outcomes with the
+resolved evaluator manifest. Every required binding must have exactly one valid
+measurement and must not error or abstain. Optional bindings are diagnostic and
 do not participate in completeness, scores, or gates.
 
-Each evaluator finding records:
+Each evaluator invocation result records:
 
-- status (passed / failed / error / skipped)
-- severity
+- stable binding id and evaluator identity
+- execution outcome (completed / error / abstained)
+- host-derived judgment (passed / failed) for completed measurements
 - profile aggregation dimension
-- normalized score
-- evidence, unless `persistence.persist_evaluator_evidence: false`
+- raw and normalized measurement, host threshold, weight, and blocking policy
 - raw evaluator output according to `persistence.persist_raw_outputs`
+
+Each diagnostic records severity, category, reason, tags, and evidence. It has
+no dimension, score, judgment, weight, or blocking authority.
 
 When `persistence.mode: summary`, execution-level case payload snapshots and evaluator binding config are replaced with redaction markers. Dataset case blobs remain durable for retry execution and reproducibility.
 When `persistence.persist_evaluator_evidence: false`, raw evaluator output is also redacted because raw output may contain embedded evidence.
@@ -150,7 +154,7 @@ Once all evaluator invocations settle:
 - evaluator completeness is recorded in `execution_aggregates.summary`
 - incomplete required output produces `overall_status = error` with no dimension or aggregate score
 - complete required output is aggregated with the matching run profile policy
-- evaluator findings and the resulting aggregate are persisted together
+- invocation results, diagnostics, and the resulting aggregate are persisted together
 - execution is marked terminal
 
 ```text
@@ -283,7 +287,7 @@ pending → running → completed
 
 ### 1. Append-only evaluator results
 
-Evaluator findings are never updated, only inserted. This provides:
+Evaluator invocation results and diagnostics are never updated, only inserted. This provides:
 
 - auditability
 - reproducibility
@@ -292,7 +296,7 @@ Evaluator findings are never updated, only inserted. This provides:
 ### 2. Separation of state vs evidence
 
 - state tables (runs, executions, attempts) are mutable
-- evaluator results are immutable facts, with evidence/raw-output fields governed by the run profile persistence policy
+- evaluator invocation results and diagnostics are immutable facts, with evidence/raw-output fields governed by the run profile persistence policy
 
 ### 3. Idempotent finalization
 

@@ -22,8 +22,8 @@ use crate::{
     contracts::{
         aggregation::{
             AggregationBinding,
-            AggregationFinding,
-            aggregate_findings,
+            AggregationResult,
+            aggregate_results,
         },
         evaluator::EvaluationStatus,
         run::{
@@ -33,7 +33,10 @@ use crate::{
             RunDefaults,
         },
     },
-    db::workflows::run_dispatch,
+    db::{
+        tables::evaluator_results,
+        workflows::run_dispatch,
+    },
 };
 
 struct SeededAttempt {
@@ -45,6 +48,93 @@ struct SeededAttempt {
     execution_id: Uuid,
     attempt_id: Uuid,
     worker_id: Uuid,
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+async fn evaluator_invocation_and_diagnostics_persist_as_separate_rows(pool: PgPool) {
+    let seed = seed_running_attempt(&pool, 60, 120).await;
+    let row = evaluator_results::EvaluatorResultInsertRow {
+        run_id: seed.run_id,
+        run_shard: seed.run_shard,
+        execution_id: seed.execution_id,
+        attempt_id: seed.attempt_id,
+        binding_id: "quality_score".to_string(),
+        evaluator_id: Uuid::now_v7(),
+        evaluator_version: "1.0.0".to_string(),
+        evaluator_profile_id: "profile".to_string(),
+        evaluator_profile_version: "1.0.0".to_string(),
+        evaluator_interface_version: Some("1.0.0".to_string()),
+        evaluator_runtime_version: Some("test".to_string()),
+        dimension: "quality".to_string(),
+        outcome: "completed".to_string(),
+        judgment: Some("failed".to_string()),
+        blocking: true,
+        measurement_kind: Some("normalized".to_string()),
+        raw_score: Some(0.2),
+        raw_score_min: Some(0.0),
+        raw_score_max: Some(1.0),
+        normalized_score: Some(0.2),
+        pass_threshold: 0.8,
+        weight: 1.0,
+        error_code: None,
+        error_message: None,
+        abstention_category: None,
+        abstention_reason: None,
+        raw_evaluator_output: json!({"outcome": "completed"}),
+        diagnostics: vec![evaluator_results::EvaluatorDiagnosticInsertRow {
+            diagnostic_index: 0,
+            severity: "medium".to_string(),
+            category: "style".to_string(),
+            reason: Some("too terse".to_string()),
+            evidence: json!({"span": "answer"}),
+            tags: vec!["quality".to_string()],
+        }],
+    };
+
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(
+        evaluator_results::insert_evaluator_results_batch(&mut tx, std::slice::from_ref(&row))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        evaluator_results::insert_evaluator_results_batch(&mut tx, &[row])
+            .await
+            .unwrap(),
+        0
+    );
+    tx.commit().await.unwrap();
+
+    let persisted: (String, Option<String>, Option<f64>, i64) = sqlx::query_as(
+        r#"
+        SELECT er.outcome::text, er.judgment::text, er.normalized_score,
+               COUNT(ed.id)::bigint
+        FROM evaluator_results er
+        LEFT JOIN evaluator_diagnostics ed
+          ON ed.run_id = er.run_id AND ed.run_shard = er.run_shard
+         AND ed.evaluator_result_id = er.id
+        WHERE er.run_id = $1::uuid AND er.run_shard = $2 AND er.binding_id = $3
+        GROUP BY er.outcome, er.judgment, er.normalized_score
+        "#,
+    )
+    .bind(seed.run_id)
+    .bind(seed.run_shard)
+    .bind("quality_score")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        persisted,
+        (
+            "completed".to_string(),
+            Some("failed".to_string()),
+            Some(0.2),
+            1
+        )
+    );
 }
 
 async fn seed_running_attempt(
@@ -569,19 +659,19 @@ async fn incomplete_required_evaluator_persists_error_without_score(pool: PgPool
     let errored_evaluator_id = Uuid::now_v7();
     let bindings = [
         AggregationBinding {
-            evaluator_id: scored_evaluator_id,
+            binding_id: "scored".to_string(),
             required: true,
         },
         AggregationBinding {
-            evaluator_id: errored_evaluator_id,
+            binding_id: "errored".to_string(),
             required: true,
         },
     ];
-    let findings = [
-        AggregationFinding {
+    let results = [
+        AggregationResult {
+            binding_id: "scored".to_string(),
             evaluator_id: scored_evaluator_id,
             binding_dimension: "quality".to_string(),
-            source_dimension: Some("quality".to_string()),
             status: EvaluationStatus::Passed,
             normalized_score: Some(1.0),
             blocking: false,
@@ -589,10 +679,10 @@ async fn incomplete_required_evaluator_persists_error_without_score(pool: PgPool
             failure_category: None,
             reason: None,
         },
-        AggregationFinding {
+        AggregationResult {
+            binding_id: "errored".to_string(),
             evaluator_id: errored_evaluator_id,
             binding_dimension: "quality".to_string(),
-            source_dimension: None,
             status: EvaluationStatus::Error,
             normalized_score: None,
             blocking: false,
@@ -601,7 +691,7 @@ async fn incomplete_required_evaluator_persists_error_without_score(pool: PgPool
             reason: Some("test error".to_string()),
         },
     ];
-    let outcome = aggregate_findings(
+    let outcome = aggregate_results(
         &RunDefaults {
             max_attempts: 1,
             request_timeout_secs: 30,
@@ -622,7 +712,7 @@ async fn incomplete_required_evaluator_persists_error_without_score(pool: PgPool
         },
         seed.attempt_id,
         &bindings,
-        &findings,
+        &results,
     );
     let completed = CompletedExecutionPersistence {
         execution_id: seed.execution_id,
@@ -631,7 +721,7 @@ async fn incomplete_required_evaluator_persists_error_without_score(pool: PgPool
         result_rows: Vec::new(),
         overall_status: outcome.overall_status,
         aggregate_score: outcome.aggregate_score,
-        evaluator_result_count: i32::try_from(findings.len()).unwrap(),
+        evaluator_result_count: i32::try_from(results.len()).unwrap(),
         dimension_scores: outcome.dimension_scores,
         blocking_failures: outcome.blocking_failures,
         summary: outcome.summary,

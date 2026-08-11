@@ -28,17 +28,20 @@ Text values can be plain text or a JSON object containing a `text` field.
 The evaluator returns a structured `output` object:
 
 - `output.evaluator`: identity metadata (`namespace`, `name`, `version`)
-- `output.results`: findings array (this evaluator emits one finding)
+- `output.outcome`: one normalized sentiment measurement
+- `output.diagnostics`: supporting observations (this evaluator emits one)
 - `output.metadata_json`: JSON string with approach, language scope, and maturity hints
 
-The finding includes:
+The output includes:
 
-- `dimension`: `quality` as evaluator-reported source metadata. Run profiles choose the authoritative aggregation bucket with `evaluators[].dimension`.
-- `status`: `passed` for neutral/positive, `failed` for negative
-- `score`: normalized sentiment score (`1.0` positive, `0.5` neutral, `0.0` negative)
-- `severity`: `medium` for negative, otherwise `none`
+- `measurement`: normalized sentiment value (`1.0` positive, `0.5` neutral, `0.0` negative)
+- diagnostic `severity`: `medium` for negative, otherwise `none`
+- diagnostic `category`: `sentiment_classification`
 - `evidence_json`: JSON string with `label`, `score`, matches, and normalized text
 - `tags`: includes `basic` and `english-only` to make scope explicit
+
+The run profile owns normalization compatibility, pass threshold, dimension,
+weight, requiredness, and blocking behavior.
 
 ## Build
 

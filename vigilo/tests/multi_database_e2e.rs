@@ -666,7 +666,7 @@ async fn seed_sentiment_evaluator(primary: &PgPool) -> anyhow::Result<()> {
             $2,
             $3,
             'evaluator',
-            '0.1.0',
+            '1.0.0',
             'evaluator-world',
             'wasmtime',
             'integration',

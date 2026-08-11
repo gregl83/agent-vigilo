@@ -99,10 +99,10 @@ flowchart TD
     ExecutionProcessor -->|"Acquires active-evaluation permits from"| WasmSemaphore
     WasmSemaphore -->|"Admits bounded evaluator calls into"| EvaluatorExecutor
     EvaluatorExecutor -->|"Gets compiled components from"| EvaluatorLoader
-    EvaluatorExecutor -->|"Returns findings to"| CompletenessAggregator
+    EvaluatorExecutor -->|"Returns one measurement or abstention plus diagnostics to"| CompletenessAggregator
     ExecutionProcessor -->|"Provides the resolved binding plan to"| CompletenessAggregator
-    CompletenessAggregator -->|"Supplies findings and authoritative aggregate to"| ResultPersistence
-    ResultPersistence -->|"Appends results and upserts aggregates in <br> <small>[SQL/TCP]</small>"| Database
+    CompletenessAggregator -->|"Applies binding policy and supplies authoritative results to"| ResultPersistence
+    ResultPersistence -->|"Appends invocation results and diagnostics, then upserts aggregates in <br> <small>[SQL/TCP]</small>"| Database
     MessageHandler -->|"Applies terminal execution updates with"| TerminalTransitions
     TerminalTransitions -->|"Updates attempts and executions with authority checks in <br> <small>[SQL/TCP]</small>"| Database
 

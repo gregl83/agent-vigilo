@@ -1,7 +1,7 @@
 //! Evaluator test command implementation.
 //!
 //! Runs one registry evaluator against canonical evaluator `input` JSON and
-//! returns the evaluator `output` plus normalized findings. Disabled or removed
+//! returns the evaluator's native measurement and diagnostics. Disabled or removed
 //! evaluators cannot be tested, and test input must match the host-side
 //! evaluator execution contract.
 
@@ -60,8 +60,6 @@ pub(super) async fn exec(
 
     let evaluation_output = wasm.test_evaluator(&evaluator_record.wasm_bytes, parsed_input)?;
 
-    let normalized_results = evaluation_output.clone().normalize();
-
     let payload = json!({
         "data": {
             "namespace": evaluator_record.namespace,
@@ -69,7 +67,6 @@ pub(super) async fn exec(
             "version": evaluator_record.version,
             "state": evaluator_record.state,
             "output": evaluation_output,
-            "normalized_results": normalized_results,
         }
     });
 

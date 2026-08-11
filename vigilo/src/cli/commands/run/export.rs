@@ -5,6 +5,8 @@
 //! pagination must stay ordered by `(run_shard, execution_id)` so exports are
 //! deterministic and resumable internally.
 
+use std::collections::BTreeSet;
+
 use super::*;
 
 pub(super) fn run_export_payload(
@@ -14,6 +16,7 @@ pub(super) fn run_export_payload(
     attempts: &[ExecutionAttempt],
     aggregates: &[ExecutionAggregate],
     evaluator_results: &[EvaluatorResult],
+    evaluator_diagnostics: &[EvaluatorDiagnostic],
 ) -> Value {
     let mut attempts_by_execution: BTreeMap<(i16, Uuid), Vec<&ExecutionAttempt>> = BTreeMap::new();
     for attempt in attempts {
@@ -44,16 +47,24 @@ pub(super) fn run_export_payload(
                 .into_iter()
                 .flatten()
                 .map(|attempt| {
-                    let attempt_results = results_by_attempt
+                    let attempt_result_rows = results_by_attempt
                         .get(&(attempt.run_shard, attempt.id))
                         .into_iter()
                         .flatten()
-                        .map(|result| json!(result))
+                        .collect::<Vec<_>>();
+                    let result_ids = attempt_result_rows
+                        .iter()
+                        .map(|result| result.id)
+                        .collect::<BTreeSet<Uuid>>();
+                    let attempt_diagnostics = evaluator_diagnostics
+                        .iter()
+                        .filter(|diagnostic| result_ids.contains(&diagnostic.evaluator_result_id))
                         .collect::<Vec<_>>();
 
                     json!({
                         "attempt": attempt,
-                        "evaluator_results": attempt_results,
+                        "evaluator_results": attempt_result_rows,
+                        "evaluator_diagnostics": attempt_diagnostics,
                     })
                 })
                 .collect::<Vec<_>>();
@@ -149,6 +160,7 @@ pub(super) async fn exec(
             let mut all_attempts = Vec::new();
             let mut all_aggregates = Vec::new();
             let mut all_evaluator_results = Vec::new();
+            let mut all_evaluator_diagnostics = Vec::new();
 
             for route in &routes {
                 let mut cursor: Option<Uuid> = None;
@@ -173,6 +185,7 @@ pub(super) async fn exec(
                     all_attempts.extend(batch.attempts);
                     all_aggregates.extend(batch.aggregates);
                     all_evaluator_results.extend(batch.evaluator_results);
+                    all_evaluator_diagnostics.extend(batch.evaluator_diagnostics);
                 }
             }
 
@@ -183,6 +196,7 @@ pub(super) async fn exec(
                 &all_attempts,
                 &all_aggregates,
                 &all_evaluator_results,
+                &all_evaluator_diagnostics,
             );
             out.write_value(&payload)?;
         }
@@ -270,6 +284,14 @@ pub(super) async fn exec(
                             .or_default()
                             .push(result);
                     }
+                    let mut diagnostics_by_result: BTreeMap<Uuid, Vec<&EvaluatorDiagnostic>> =
+                        BTreeMap::new();
+                    for diagnostic in &batch.evaluator_diagnostics {
+                        diagnostics_by_result
+                            .entry(diagnostic.evaluator_result_id)
+                            .or_default()
+                            .push(diagnostic);
+                    }
 
                     // --- Emit execution group ---
                     // Emit one execution record followed by its aggregate,
@@ -330,6 +352,21 @@ pub(super) async fn exec(
                                     "evaluator_result": result,
                                 });
                                 out.write_line(serde_json::to_string(&result_line)?)?;
+                                for diagnostic in
+                                    diagnostics_by_result.get(&result.id).into_iter().flatten()
+                                {
+                                    let diagnostic_line = json!({
+                                        "type": "evaluator_diagnostic",
+                                        "run_id": run_id,
+                                        "run_shard": route.run_shard(),
+                                        "database_alias": route.database_alias(),
+                                        "execution_id": execution.id,
+                                        "attempt_id": attempt.id,
+                                        "evaluator_result_id": result.id,
+                                        "evaluator_diagnostic": diagnostic,
+                                    });
+                                    out.write_line(serde_json::to_string(&diagnostic_line)?)?;
+                                }
                             }
                         }
                     }

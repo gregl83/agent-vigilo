@@ -1,473 +1,132 @@
-//! Evaluator result table access.
-//!
-//! Evaluator results are the per-finding evidence rows for a single execution
-//! attempt. The batch insert path is used by execution processing and is kept
-//! chunked so large runs do not build oversized SQL statements.
+//! Batched persistence for evaluator invocations and diagnostic evidence.
 
-use sqlx::PgPool;
+use sqlx::{
+    Postgres,
+    QueryBuilder,
+    Transaction,
+};
 use uuid::Uuid;
 
-use crate::models::evaluator_result::{
-    EvaluatorResult,
-    EvaluatorResultDraft,
-    EvaluatorResultPatch,
-};
+const BATCH_CHUNK_SIZE: usize = 500;
 
-const EVALUATOR_RESULTS_BATCH_CHUNK_SIZE: usize = 500;
+#[derive(Debug, Clone)]
+pub(crate) struct EvaluatorDiagnosticInsertRow {
+    pub(crate) diagnostic_index: i32,
+    pub(crate) severity: String,
+    pub(crate) category: String,
+    pub(crate) reason: Option<String>,
+    pub(crate) evidence: serde_json::Value,
+    pub(crate) tags: Vec<String>,
+}
 
-/// Row shape used by the batch insert path.
-///
-/// This mirrors the persisted evaluator result columns and keeps execution
-/// processing from depending on the broader model draft type.
+/// One evaluator invocation plus its non-authoritative diagnostics.
 #[derive(Debug, Clone)]
 pub(crate) struct EvaluatorResultInsertRow {
     pub(crate) run_id: Uuid,
     pub(crate) run_shard: i16,
     pub(crate) execution_id: Uuid,
     pub(crate) attempt_id: Uuid,
+    pub(crate) binding_id: String,
     pub(crate) evaluator_id: Uuid,
-    pub(crate) finding_index: i32,
     pub(crate) evaluator_version: String,
     pub(crate) evaluator_profile_id: String,
     pub(crate) evaluator_profile_version: String,
     pub(crate) evaluator_interface_version: Option<String>,
     pub(crate) evaluator_runtime_version: Option<String>,
     pub(crate) dimension: String,
-    pub(crate) status: String,
+    pub(crate) outcome: String,
+    pub(crate) judgment: Option<String>,
     pub(crate) blocking: bool,
-    pub(crate) score_kind: String,
+    pub(crate) measurement_kind: Option<String>,
     pub(crate) raw_score: Option<f64>,
     pub(crate) raw_score_min: Option<f64>,
     pub(crate) raw_score_max: Option<f64>,
     pub(crate) normalized_score: Option<f64>,
+    pub(crate) pass_threshold: f64,
     pub(crate) weight: f64,
-    pub(crate) severity: String,
-    pub(crate) failure_category: Option<String>,
-    pub(crate) reason: Option<String>,
-    pub(crate) evidence: serde_json::Value,
+    pub(crate) error_code: Option<String>,
+    pub(crate) error_message: Option<String>,
+    pub(crate) abstention_category: Option<String>,
+    pub(crate) abstention_reason: Option<String>,
     pub(crate) raw_evaluator_output: serde_json::Value,
+    pub(crate) diagnostics: Vec<EvaluatorDiagnosticInsertRow>,
 }
 
-/// Inserts evaluator finding rows for an attempt in bounded batches.
-///
-/// Conflicts on `(run_id, run_shard, attempt_id, evaluator_id, finding_index)`
-/// are ignored to keep retries idempotent when the same authoritative attempt
-/// is observed again.
+/// Inserts invocation rows first, then diagnostics joined through the stable
+/// `(attempt_id, binding_id)` idempotency key in the same transaction.
 pub(crate) async fn insert_evaluator_results_batch(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut Transaction<'_, Postgres>,
     rows: &[EvaluatorResultInsertRow],
 ) -> anyhow::Result<u64> {
-    if rows.is_empty() {
-        return Ok(0);
-    }
-    let mut total_rows_affected = 0u64;
-
-    for chunk in rows.chunks(EVALUATOR_RESULTS_BATCH_CHUNK_SIZE) {
-        let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-            r#"
-            INSERT INTO evaluator_results (
-                run_id,
-                run_shard,
-                execution_id,
-                attempt_id,
-                evaluator_id,
-                finding_index,
-                evaluator_version,
-                evaluator_profile_id,
-                evaluator_profile_version,
-                evaluator_interface_version,
-                evaluator_runtime_version,
-                dimension,
-                status,
-                blocking,
-                score_kind,
-                raw_score,
-                raw_score_min,
-                raw_score_max,
-                normalized_score,
-                weight,
-                severity,
-                failure_category,
-                reason,
-                evidence,
-                raw_evaluator_output
-            )
-            "#,
+    let mut inserted = 0;
+    for chunk in rows.chunks(BATCH_CHUNK_SIZE) {
+        let mut query = QueryBuilder::<Postgres>::new(
+            "INSERT INTO evaluator_results (run_id, run_shard, execution_id, attempt_id, binding_id, evaluator_id, evaluator_version, evaluator_profile_id, evaluator_profile_version, evaluator_interface_version, evaluator_runtime_version, dimension, outcome, judgment, blocking, measurement_kind, raw_score, raw_score_min, raw_score_max, normalized_score, pass_threshold, weight, error_code, error_message, abstention_category, abstention_reason, raw_evaluator_output) ",
         );
-
-        qb.push_values(chunk, |mut b, row| {
+        query.push_values(chunk, |mut b, row| {
             b.push_bind(row.run_id)
                 .push_bind(row.run_shard)
                 .push_bind(row.execution_id)
                 .push_bind(row.attempt_id)
+                .push_bind(&row.binding_id)
                 .push_bind(row.evaluator_id)
-                .push_bind(row.finding_index)
                 .push_bind(&row.evaluator_version)
                 .push_bind(&row.evaluator_profile_id)
                 .push_bind(&row.evaluator_profile_version)
                 .push_bind(&row.evaluator_interface_version)
                 .push_bind(&row.evaluator_runtime_version)
                 .push_bind(&row.dimension)
-                .push_bind(&row.status)
+                .push_bind(&row.outcome)
+                .push_unseparated("::evaluator_outcome")
+                .push_bind(&row.judgment)
                 .push_unseparated("::evaluation_status")
                 .push_bind(row.blocking)
-                .push_bind(&row.score_kind)
+                .push_bind(&row.measurement_kind)
                 .push_bind(row.raw_score)
                 .push_bind(row.raw_score_min)
                 .push_bind(row.raw_score_max)
                 .push_bind(row.normalized_score)
+                .push_bind(row.pass_threshold)
                 .push_bind(row.weight)
-                .push_bind(&row.severity)
-                .push_unseparated("::severity")
-                .push_bind(&row.failure_category)
-                .push_bind(&row.reason)
-                .push_bind(&row.evidence)
+                .push_bind(&row.error_code)
+                .push_bind(&row.error_message)
+                .push_bind(&row.abstention_category)
+                .push_bind(&row.abstention_reason)
                 .push_bind(&row.raw_evaluator_output);
         });
-
-        qb.push(
-            r#"
-            ON CONFLICT (run_id, run_shard, attempt_id, evaluator_id, finding_index) DO NOTHING
-            "#,
-        );
-
-        let result = qb.build().execute(&mut **tx).await?;
-        total_rows_affected += result.rows_affected();
+        query.push(" ON CONFLICT (run_id, run_shard, attempt_id, binding_id) DO NOTHING");
+        inserted += query.build().execute(&mut **tx).await?.rows_affected();
     }
 
-    Ok(total_rows_affected)
-}
+    let diagnostics = rows
+        .iter()
+        .flat_map(|row| {
+            row.diagnostics
+                .iter()
+                .map(move |diagnostic| (row, diagnostic))
+        })
+        .collect::<Vec<_>>();
+    for chunk in diagnostics.chunks(BATCH_CHUNK_SIZE) {
+        let mut query = QueryBuilder::<Postgres>::new(
+            "WITH input (run_id, run_shard, attempt_id, binding_id, diagnostic_index, severity, category, reason, evidence, tags) AS (",
+        );
+        query.push_values(chunk, |mut b, (row, diagnostic)| {
+            b.push_bind(row.run_id)
+                .push_bind(row.run_shard)
+                .push_bind(row.attempt_id)
+                .push_bind(&row.binding_id)
+                .push_bind(diagnostic.diagnostic_index)
+                .push_bind(&diagnostic.severity)
+                .push_bind(&diagnostic.category)
+                .push_bind(&diagnostic.reason)
+                .push_bind(&diagnostic.evidence)
+                .push_bind(&diagnostic.tags);
+        });
+        query.push(
+            ") INSERT INTO evaluator_diagnostics (run_id, run_shard, evaluator_result_id, diagnostic_index, severity, category, reason, evidence, tags) SELECT i.run_id, i.run_shard, er.id, i.diagnostic_index, i.severity::severity, i.category, i.reason, i.evidence, i.tags FROM input i JOIN evaluator_results er ON er.run_id = i.run_id AND er.run_shard = i.run_shard AND er.attempt_id = i.attempt_id AND er.binding_id = i.binding_id ON CONFLICT (run_id, run_shard, evaluator_result_id, diagnostic_index) DO NOTHING",
+        );
+        query.build().execute(&mut **tx).await?;
+    }
 
-/// Inserts one evaluator finding row and returns the persisted model.
-pub(crate) async fn insert_evaluator_result(
-    db: &PgPool,
-    draft: &EvaluatorResultDraft,
-) -> anyhow::Result<EvaluatorResult> {
-    let result = sqlx::query_as::<_, EvaluatorResult>(
-        r#"
-        INSERT INTO evaluator_results (
-            run_id, run_shard, execution_id, attempt_id,
-            evaluator_id, finding_index, evaluator_version,
-            evaluator_profile_id, evaluator_profile_version,
-            evaluator_interface_version, evaluator_runtime_version,
-            dimension, status, blocking, score_kind,
-            raw_score, raw_score_min, raw_score_max,
-            normalized_score, weight, severity,
-            failure_category, reason
-        )
-        VALUES (
-            $1::uuid,
-            $2,
-            $3::uuid,
-            $4::uuid,
-            $5,
-            $6,
-            $7,
-            $8,
-            $9,
-            $10,
-            $11,
-            $12,
-            $13::evaluation_status,
-            $14,
-            $15,
-            $16,
-            $17,
-            $18,
-            $19,
-            $20,
-            $21::severity,
-            $22,
-            $23
-        )
-        RETURNING
-            id,
-            run_id,
-            run_shard,
-            execution_id,
-            attempt_id,
-            evaluator_id,
-            finding_index,
-            evaluator_version,
-            evaluator_profile_id,
-            evaluator_profile_version,
-            evaluator_interface_version,
-            evaluator_runtime_version,
-            dimension,
-            status::text as status,
-            blocking,
-            score_kind,
-            raw_score,
-            raw_score_min,
-            raw_score_max,
-            normalized_score,
-            weight,
-            severity::text as severity,
-            failure_category,
-            reason,
-            evidence,
-            raw_evaluator_output,
-            created_at
-        "#,
-    )
-    .bind(draft.run_id)
-    .bind(draft.run_shard)
-    .bind(draft.execution_id)
-    .bind(draft.attempt_id)
-    .bind(draft.evaluator_id)
-    .bind(draft.finding_index)
-    .bind(&draft.evaluator_version)
-    .bind(&draft.evaluator_profile_id)
-    .bind(&draft.evaluator_profile_version)
-    .bind(&draft.evaluator_interface_version)
-    .bind(&draft.evaluator_runtime_version)
-    .bind(&draft.dimension)
-    .bind(&draft.status)
-    .bind(draft.blocking)
-    .bind(&draft.score_kind)
-    .bind(draft.raw_score)
-    .bind(draft.raw_score_min)
-    .bind(draft.raw_score_max)
-    .bind(draft.normalized_score)
-    .bind(draft.weight)
-    .bind(&draft.severity)
-    .bind(&draft.failure_category)
-    .bind(&draft.reason)
-    .fetch_one(db)
-    .await?;
-
-    Ok(result)
-}
-
-/// Finds an evaluator result by run and shard-local primary key.
-pub(crate) async fn select_evaluator_result_by_id(
-    db: &PgPool,
-    run_id: Uuid,
-    run_shard: i16,
-    id: Uuid,
-) -> anyhow::Result<Option<EvaluatorResult>> {
-    let result = sqlx::query_as::<_, EvaluatorResult>(
-        r#"
-        SELECT
-            id,
-            run_id,
-            run_shard,
-            execution_id,
-            attempt_id,
-            evaluator_id,
-            finding_index,
-            evaluator_version,
-            evaluator_profile_id,
-            evaluator_profile_version,
-            evaluator_interface_version,
-            evaluator_runtime_version,
-            dimension,
-            status::text as status,
-            blocking,
-            score_kind,
-            raw_score,
-            raw_score_min,
-            raw_score_max,
-            normalized_score,
-            weight,
-            severity::text as severity,
-            failure_category,
-            reason,
-            evidence,
-            raw_evaluator_output,
-            created_at
-        FROM evaluator_results
-        WHERE run_id = $1::uuid
-          AND run_shard = $2
-          AND id = $3::uuid
-        "#,
-    )
-    .bind(run_id)
-    .bind(run_shard)
-    .bind(id)
-    .fetch_optional(db)
-    .await?;
-
-    Ok(result)
-}
-
-/// Lists all evaluator finding rows written for an execution attempt.
-pub(crate) async fn list_evaluator_results_by_attempt_id(
-    db: &PgPool,
-    run_id: Uuid,
-    run_shard: i16,
-    attempt_id: Uuid,
-) -> anyhow::Result<Vec<EvaluatorResult>> {
-    let results = sqlx::query_as::<_, EvaluatorResult>(
-        r#"
-        SELECT
-            id,
-            run_id,
-            run_shard,
-            execution_id,
-            attempt_id,
-            evaluator_id,
-            finding_index,
-            evaluator_version,
-            evaluator_profile_id,
-            evaluator_profile_version,
-            evaluator_interface_version,
-            evaluator_runtime_version,
-            dimension,
-            status::text as status,
-            blocking,
-            score_kind,
-            raw_score,
-            raw_score_min,
-            raw_score_max,
-            normalized_score,
-            weight,
-            severity::text as severity,
-            failure_category,
-            reason,
-            evidence,
-            raw_evaluator_output,
-            created_at
-        FROM evaluator_results
-        WHERE run_id = $1::uuid
-          AND run_shard = $2
-          AND attempt_id = $3::uuid
-        ORDER BY evaluator_id ASC, finding_index ASC, created_at ASC
-        "#,
-    )
-    .bind(run_id)
-    .bind(run_shard)
-    .bind(attempt_id)
-    .fetch_all(db)
-    .await?;
-
-    Ok(results)
-}
-
-/// Lists all evaluator results for a run ordered by execution and attempt.
-pub(crate) async fn list_evaluator_results_by_run_id(
-    db: &PgPool,
-    run_id: Uuid,
-) -> anyhow::Result<Vec<EvaluatorResult>> {
-    let results = sqlx::query_as::<_, EvaluatorResult>(
-        r#"
-        SELECT
-            id,
-            run_id,
-            run_shard,
-            execution_id,
-            attempt_id,
-            evaluator_id,
-            finding_index,
-            evaluator_version,
-            evaluator_profile_id,
-            evaluator_profile_version,
-            evaluator_interface_version,
-            evaluator_runtime_version,
-            dimension,
-            status::text as status,
-            blocking,
-            score_kind,
-            raw_score,
-            raw_score_min,
-            raw_score_max,
-            normalized_score,
-            weight,
-            severity::text as severity,
-            failure_category,
-            reason,
-            evidence,
-            raw_evaluator_output,
-            created_at
-        FROM evaluator_results
-        WHERE run_id = $1::uuid
-        ORDER BY execution_id ASC, attempt_id ASC, evaluator_id ASC, finding_index ASC, created_at ASC
-        "#,
-    )
-    .bind(run_id)
-    .fetch_all(db)
-    .await?;
-
-    Ok(results)
-}
-
-/// Updates the human-readable failure reason fields for an evaluator result.
-pub(crate) async fn update_evaluator_result_reason(
-    db: &PgPool,
-    run_id: Uuid,
-    run_shard: i16,
-    id: Uuid,
-    patch: &EvaluatorResultPatch,
-) -> anyhow::Result<Option<EvaluatorResult>> {
-    let result = sqlx::query_as::<_, EvaluatorResult>(
-        r#"
-        UPDATE evaluator_results
-        SET reason = $3,
-            failure_category = $4
-        WHERE run_id = $1::uuid
-          AND run_shard = $2
-          AND id = $5::uuid
-        RETURNING
-            id,
-            run_id,
-            run_shard,
-            execution_id,
-            attempt_id,
-            evaluator_id,
-            finding_index,
-            evaluator_version,
-            evaluator_profile_id,
-            evaluator_profile_version,
-            evaluator_interface_version,
-            evaluator_runtime_version,
-            dimension,
-            status::text as status,
-            blocking,
-            score_kind,
-            raw_score,
-            raw_score_min,
-            raw_score_max,
-            normalized_score,
-            weight,
-            severity::text as severity,
-            failure_category,
-            reason,
-            evidence,
-            raw_evaluator_output,
-            created_at
-        "#,
-    )
-    .bind(run_id)
-    .bind(run_shard)
-    .bind(&patch.reason)
-    .bind(&patch.failure_category)
-    .bind(id)
-    .fetch_optional(db)
-    .await?;
-
-    Ok(result)
-}
-
-/// Deletes an evaluator result by run and shard-local primary key.
-pub(crate) async fn delete_evaluator_result_by_id(
-    db: &PgPool,
-    run_id: Uuid,
-    run_shard: i16,
-    id: Uuid,
-) -> anyhow::Result<u64> {
-    let result = sqlx::query(
-        r#"
-        DELETE FROM evaluator_results
-        WHERE run_id = $1::uuid
-          AND run_shard = $2
-          AND id = $3::uuid
-        "#,
-    )
-    .bind(run_id)
-    .bind(run_shard)
-    .bind(id)
-    .execute(db)
-    .await?;
-
-    Ok(result.rows_affected())
+    Ok(inserted)
 }

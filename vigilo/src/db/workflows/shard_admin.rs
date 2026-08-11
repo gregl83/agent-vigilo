@@ -422,6 +422,10 @@ const SHARD_TABLES: &[ShardTable] = &[
         key_columns: &["run_id", "run_shard", "id"],
     },
     ShardTable {
+        name: "evaluator_diagnostics",
+        key_columns: &["run_id", "run_shard", "id"],
+    },
+    ShardTable {
         name: "run_shard_summaries",
         key_columns: &["run_id", "run_shard"],
     },

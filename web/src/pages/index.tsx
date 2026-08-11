@@ -37,7 +37,7 @@ function HomepageHeader() {
         </Heading>
         <p className={styles.heroSubtitle}>{siteConfig.tagline}</p>
         <p className={styles.heroText}>
-          Publish versioned WASM evaluators, turn findings into total aggregate scores,
+          Publish versioned WASM evaluators, turn measurements and profile policy into aggregate scores,
           and gate releases on explicit thresholds and blocking failures.
         </p>
         <div className={styles.buttons}>

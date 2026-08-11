@@ -113,25 +113,48 @@ pub(super) async fn select_evaluator_results(
         r#"
         SELECT
             er.id, er.run_id, er.run_shard, er.execution_id, er.attempt_id,
-            er.evaluator_id, er.finding_index, er.evaluator_version,
+            er.binding_id, er.evaluator_id, er.evaluator_version,
             er.evaluator_profile_id, er.evaluator_profile_version,
             er.evaluator_interface_version, er.evaluator_runtime_version,
-            er.dimension, er.status::text as status, er.blocking,
-            er.score_kind, er.raw_score, er.raw_score_min, er.raw_score_max,
-            er.normalized_score, er.weight, er.severity::text as severity,
-            er.failure_category, er.reason, er.evidence,
+            er.dimension, er.outcome::text as outcome,
+            er.judgment::text as judgment, er.blocking,
+            er.measurement_kind, er.raw_score, er.raw_score_min, er.raw_score_max,
+            er.normalized_score, er.pass_threshold, er.weight,
+            er.error_code, er.error_message, er.abstention_category, er.abstention_reason,
             er.raw_evaluator_output, er.created_at
         FROM evaluator_results er
         WHERE er.run_id = $1::uuid
           AND er.run_shard = $2
           AND er.attempt_id = ANY($3::uuid[])
-        ORDER BY er.execution_id, er.attempt_id, er.evaluator_id,
-                 er.finding_index, er.created_at, er.id
+        ORDER BY er.execution_id, er.attempt_id, er.binding_id, er.created_at, er.id
         "#,
     )
     .bind(run_id)
     .bind(run_shard)
     .bind(attempt_ids)
+    .fetch_all(db)
+    .await?)
+}
+
+pub(super) async fn select_evaluator_diagnostics(
+    db: &PgPool,
+    run_id: Uuid,
+    run_shard: i16,
+    result_ids: &[Uuid],
+) -> anyhow::Result<Vec<crate::models::evaluator_result::EvaluatorDiagnostic>> {
+    Ok(sqlx::query_as(
+        r#"
+        SELECT id, run_id, run_shard, evaluator_result_id, diagnostic_index,
+               severity::text AS severity, category, reason, evidence, tags, created_at
+        FROM evaluator_diagnostics
+        WHERE run_id = $1::uuid AND run_shard = $2
+          AND evaluator_result_id = ANY($3::uuid[])
+        ORDER BY evaluator_result_id, diagnostic_index
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(result_ids)
     .fetch_all(db)
     .await?)
 }

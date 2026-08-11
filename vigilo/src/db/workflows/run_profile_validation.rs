@@ -21,6 +21,7 @@ use crate::{
         },
         run::{
             DatasetCase,
+            NormalizationPolicy,
             RunDataset,
             RunProfile,
         },
@@ -123,6 +124,14 @@ pub(crate) async fn validate_profile_executability(
             issues.push(format!(
                 "case_group '{}' references evaluator '{}' in non-runnable state '{:?}'",
                 group_id, evaluator_ref, evaluator_record.state
+            ));
+            continue;
+        }
+
+        if evaluator_record.interface_version.as_deref() != Some("1.0.0") {
+            issues.push(format!(
+                "case_group '{}' references evaluator '{}' with interface version {:?}; expected 1.0.0",
+                group_id, evaluator_ref, evaluator_record.interface_version
             ));
             continue;
         }
@@ -230,8 +239,25 @@ fn collect_static_profile_config_issues(profile: &RunProfile) -> Vec<String> {
     }
 
     for group in &profile.case_groups {
-        let mut evaluator_refs = HashSet::new();
+        let mut binding_ids = HashSet::new();
         for binding in &group.evaluators {
+            if binding.id.trim().is_empty()
+                || !binding
+                    .id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+            {
+                issues.push(format!(
+                    "case_group '{}' evaluator binding id '{}' must contain only ASCII letters, numbers, '.', '_' or '-'",
+                    group.id, binding.id
+                ));
+            }
+            if !binding_ids.insert(binding.id.clone()) {
+                issues.push(format!(
+                    "case_group '{}' contains duplicate evaluator binding id '{}'",
+                    group.id, binding.id
+                ));
+            }
             if !binding.weight.is_finite() || binding.weight < 0.0 {
                 issues.push(format!(
                     "case_group '{}' evaluator '{}' weight must be finite and greater than or equal to 0.0",
@@ -239,10 +265,33 @@ fn collect_static_profile_config_issues(profile: &RunProfile) -> Vec<String> {
                 ));
             }
 
-            if !evaluator_refs.insert(binding.evaluator_ref.clone()) {
+            if binding.dimension.trim().is_empty() {
                 issues.push(format!(
-                    "case_group '{}' contains duplicate evaluator ref '{}'; split it into a separate versioned evaluator or case_group",
-                    group.id, binding.evaluator_ref
+                    "case_group '{}' evaluator binding '{}' dimension must not be empty",
+                    group.id, binding.id
+                ));
+            }
+
+            if !binding.pass_threshold.is_finite() || !(0.0..=1.0).contains(&binding.pass_threshold)
+            {
+                issues.push(format!(
+                    "case_group '{}' evaluator binding '{}' pass_threshold must be finite and between 0.0 and 1.0",
+                    group.id, binding.id
+                ));
+            }
+
+            if let NormalizationPolicy::Preference {
+                preferred,
+                tie,
+                not_preferred,
+            } = &binding.normalization
+                && [preferred, tie, not_preferred]
+                    .iter()
+                    .any(|value| !value.is_finite() || !(0.0..=1.0).contains(*value))
+            {
+                issues.push(format!(
+                    "case_group '{}' evaluator binding '{}' preference normalization values must be finite and between 0.0 and 1.0",
+                    group.id, binding.id
                 ));
             }
 
@@ -349,6 +398,7 @@ mod tests {
             DatasetCase,
             DimensionAggregation,
             EvaluatorBinding,
+            NormalizationPolicy,
             PersistRawOutputsMode,
             PersistenceMode,
             PersistenceSettings,
@@ -416,6 +466,20 @@ mod tests {
             context: None,
             tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
             metadata: Default::default(),
+        }
+    }
+
+    fn evaluator_binding(id: &str, evaluator_ref: &str) -> EvaluatorBinding {
+        EvaluatorBinding {
+            id: id.to_string(),
+            evaluator_ref: evaluator_ref.to_string(),
+            required: true,
+            dimension: "quality".to_string(),
+            blocking: false,
+            weight: 1.0,
+            normalization: NormalizationPolicy::Normalized,
+            pass_threshold: 0.5,
+            config: serde_json::json!({}),
         }
     }
 
@@ -506,17 +570,39 @@ mod tests {
     fn profile_rejects_negative_evaluator_weight() {
         let mut profile = profile();
         profile.case_groups[0].evaluators.push(EvaluatorBinding {
-            evaluator_ref: "core/json-schema:1.0.0".to_string(),
-            required: true,
             dimension: "format".to_string(),
             blocking: true,
             weight: -1.0,
-            config: serde_json::json!({}),
+            ..evaluator_binding("schema", "core/json-schema:1.0.0")
         });
 
         let issues = super::collect_static_profile_config_issues(&profile);
 
         assert!(issues.iter().any(|issue| issue.contains("weight")));
+    }
+
+    #[test]
+    fn profile_rejects_invalid_measurement_policy() {
+        let mut profile = profile();
+        profile.case_groups[0]
+            .evaluators
+            .push(evaluator_binding("quality", "core/quality:1.0.0"));
+        let binding = &mut profile.case_groups[0].evaluators[0];
+        binding.pass_threshold = 1.1;
+        binding.normalization = NormalizationPolicy::Preference {
+            preferred: 1.0,
+            tie: f64::NAN,
+            not_preferred: 0.0,
+        };
+
+        let issues = super::collect_static_profile_config_issues(&profile);
+
+        assert!(issues.iter().any(|issue| issue.contains("pass_threshold")));
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("preference normalization"))
+        );
     }
 
     #[test]
@@ -541,23 +627,15 @@ mod tests {
     }
 
     #[test]
-    fn profile_rejects_duplicate_evaluator_ref_within_group() {
+    fn profile_rejects_duplicate_binding_id_within_group() {
         let mut profile = profile();
         profile.case_groups[0].evaluators.push(EvaluatorBinding {
-            evaluator_ref: "core/json-schema:1.0.0".to_string(),
-            required: true,
             dimension: "format".to_string(),
             blocking: true,
-            weight: 1.0,
-            config: serde_json::json!({}),
+            ..evaluator_binding("schema", "core/json-schema:1.0.0")
         });
         profile.case_groups[0].evaluators.push(EvaluatorBinding {
-            evaluator_ref: "core/json-schema:1.0.0".to_string(),
-            required: true,
-            dimension: "quality".to_string(),
-            blocking: false,
-            weight: 1.0,
-            config: serde_json::json!({}),
+            ..evaluator_binding("schema", "core/json-schema:1.0.0")
         });
 
         let issues = super::collect_static_profile_config_issues(&profile);
@@ -565,7 +643,7 @@ mod tests {
         assert!(
             issues
                 .iter()
-                .any(|issue| issue.contains("duplicate evaluator ref"))
+                .any(|issue| issue.contains("duplicate evaluator binding id"))
         );
     }
 
@@ -573,12 +651,10 @@ mod tests {
     fn profile_rejects_non_finite_weights() {
         let mut profile = profile();
         profile.case_groups[0].evaluators.push(EvaluatorBinding {
-            evaluator_ref: "core/json-schema:1.0.0".to_string(),
-            required: true,
             dimension: "format".to_string(),
             blocking: true,
             weight: f64::NAN,
-            config: serde_json::json!({}),
+            ..evaluator_binding("schema", "core/json-schema:1.0.0")
         });
         profile.case_groups[0].aggregation.dimensions.insert(
             "quality".to_string(),
@@ -604,12 +680,10 @@ mod tests {
     fn profile_rejects_optional_evaluator_that_affects_policy() {
         let mut profile = profile();
         profile.case_groups[0].evaluators.push(EvaluatorBinding {
-            evaluator_ref: "core/diagnostic:1.0.0".to_string(),
             required: false,
             dimension: "diagnostic".to_string(),
-            blocking: false,
             weight: 1.0,
-            config: serde_json::json!({}),
+            ..evaluator_binding("diagnostic", "core/diagnostic:1.0.0")
         });
 
         let issues = super::collect_static_profile_config_issues(&profile);
@@ -626,20 +700,13 @@ mod tests {
         let mut profile = profile();
         profile.case_groups[0].evaluators.extend([
             EvaluatorBinding {
-                evaluator_ref: "core/scorer:1.0.0".to_string(),
-                required: true,
-                dimension: "quality".to_string(),
-                blocking: false,
-                weight: 1.0,
-                config: serde_json::json!({}),
+                ..evaluator_binding("scorer", "core/scorer:1.0.0")
             },
             EvaluatorBinding {
-                evaluator_ref: "core/diagnostic:1.0.0".to_string(),
                 required: false,
                 dimension: "diagnostic".to_string(),
-                blocking: false,
                 weight: 0.0,
-                config: serde_json::json!({}),
+                ..evaluator_binding("diagnostic", "core/diagnostic:1.0.0")
             },
         ]);
 

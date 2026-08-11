@@ -67,14 +67,15 @@ use super::super::manifest::{
     read_manifest,
 };
 use crate::contracts::evaluator::{
-    EvaluationDimension,
-    EvaluationStatus,
-    EvaluatorFinding,
+    Abstention,
+    DiagnosticFinding,
     EvaluatorIdentity,
     EvaluatorInput,
+    EvaluatorOutcome,
     EvaluatorOutput,
+    EvaluatorReportedError,
+    Measurement,
     PreferenceOutcome,
-    Score,
     Severity,
 };
 
@@ -249,38 +250,6 @@ fn map_input_to_wit_input(
     })
 }
 
-/// Map bound evaluator dimension to evaluation dimension type.
-fn map_dimension(
-    dimension: evaluator_test_bindings::vigilo::evaluator::types::EvaluationDimension,
-) -> EvaluationDimension {
-    use evaluator_test_bindings::vigilo::evaluator::types::EvaluationDimension as BindingDimension;
-
-    match dimension {
-        BindingDimension::Correctness => EvaluationDimension::Correctness,
-        BindingDimension::Format => EvaluationDimension::Format,
-        BindingDimension::Safety => EvaluationDimension::Safety,
-        BindingDimension::Quality => EvaluationDimension::Quality,
-        BindingDimension::Latency => EvaluationDimension::Latency,
-        BindingDimension::ToolUse => EvaluationDimension::ToolUse,
-        BindingDimension::Calibration => EvaluationDimension::Calibration,
-        BindingDimension::Other(value) => EvaluationDimension::Other(value),
-    }
-}
-
-/// Map bound evaluator status to evaluation status type.
-fn map_status(
-    status: evaluator_test_bindings::vigilo::evaluator::types::EvaluationStatus,
-) -> EvaluationStatus {
-    use evaluator_test_bindings::vigilo::evaluator::types::EvaluationStatus as BindingStatus;
-
-    match status {
-        BindingStatus::Passed => EvaluationStatus::Passed,
-        BindingStatus::Failed => EvaluationStatus::Failed,
-        BindingStatus::Error => EvaluationStatus::Error,
-        BindingStatus::Skipped => EvaluationStatus::Skipped,
-    }
-}
-
 /// Map bound evaluator severity to evaluation severity type.
 fn map_severity(severity: evaluator_test_bindings::vigilo::evaluator::types::Severity) -> Severity {
     use evaluator_test_bindings::vigilo::evaluator::types::Severity as BindingSeverity;
@@ -307,21 +276,23 @@ fn map_preference_outcome(
     }
 }
 
-/// Map bound evaluator score to evaluation score type.
-fn map_score(score: evaluator_test_bindings::vigilo::evaluator::types::Score) -> Score {
-    use evaluator_test_bindings::vigilo::evaluator::types::Score as BindingScore;
+/// Map a bound evaluator measurement without assigning policy semantics.
+fn map_measurement(
+    measurement: evaluator_test_bindings::vigilo::evaluator::types::Measurement,
+) -> Measurement {
+    use evaluator_test_bindings::vigilo::evaluator::types::Measurement as BindingMeasurement;
 
-    match score {
-        BindingScore::Binary(passed) => Score::Binary { passed },
-        BindingScore::Range((value, min, max)) => Score::Range { value, min, max },
-        BindingScore::Normalized(value) => Score::Normalized { value },
-        BindingScore::SeverityMapped(severity) => Score::SeverityMapped {
-            severity: map_severity(severity),
+    match measurement {
+        BindingMeasurement::Binary(value) => Measurement::Binary { value },
+        BindingMeasurement::Range(range) => Measurement::Range {
+            value: range.value,
+            min: range.min,
+            max: range.max,
         },
-        BindingScore::Preference(outcome) => Score::Preference {
+        BindingMeasurement::Normalized(value) => Measurement::Normalized { value },
+        BindingMeasurement::Preference(outcome) => Measurement::Preference {
             outcome: map_preference_outcome(outcome),
         },
-        BindingScore::Informational => Score::Informational,
     }
 }
 
@@ -331,17 +302,32 @@ fn map_wit_output_to_output(
 ) -> anyhow::Result<EvaluatorOutput> {
     let metadata = parse_json_payload("metadata-json", &output.metadata_json)?;
 
-    let results = output
-        .results
+    use evaluator_test_bindings::vigilo::evaluator::types::EvaluatorOutcome as BindingOutcome;
+
+    let outcome = match output.outcome {
+        BindingOutcome::Completed(measurement) => {
+            EvaluatorOutcome::Completed(map_measurement(measurement))
+        }
+        BindingOutcome::Abstained(abstention) => {
+            if abstention.category.trim().is_empty() {
+                anyhow::bail!("abstention category must not be empty");
+            }
+            EvaluatorOutcome::Abstained(Abstention {
+                category: abstention.category,
+                reason: abstention.reason,
+            })
+        }
+    };
+    let diagnostics = output
+        .diagnostics
         .into_iter()
         .map(|finding| {
-            Ok(EvaluatorFinding {
-                dimension: map_dimension(finding.dimension),
-                status: map_status(finding.status),
-                score: map_score(finding.score),
-                blocking: finding.blocking,
+            if finding.category.trim().is_empty() {
+                anyhow::bail!("diagnostic category must not be empty");
+            }
+            Ok(DiagnosticFinding {
                 severity: map_severity(finding.severity),
-                failure_category: finding.failure_category,
+                category: finding.category,
                 reason: finding.reason,
                 evidence: parse_json_payload("evidence-json", &finding.evidence_json)?,
                 tags: finding.tags,
@@ -357,7 +343,8 @@ fn map_wit_output_to_output(
             content_hash: output.evaluator.content_hash,
             interface_version: output.evaluator.interface_version,
         },
-        results,
+        outcome,
+        diagnostics,
         metadata,
     })
 }
@@ -1126,7 +1113,16 @@ impl Wasm {
             .vigilo_evaluator_evaluator()
             .call_evaluate(&mut store, &input)
             .map_err(|err| anyhow::anyhow!("evaluator trapped in wasm sandbox: {}", err))?
-            .map_err(|err| anyhow::anyhow!("evaluator returned error: {}", err))?;
+            .map_err(|err| {
+                anyhow::Error::new(EvaluatorReportedError {
+                    code: if err.code.trim().is_empty() {
+                        "invalid_evaluator_error".to_string()
+                    } else {
+                        err.code
+                    },
+                    message: err.message,
+                })
+            })?;
 
         map_wit_output_to_output(output)
     }
@@ -1177,7 +1173,7 @@ mod tests {
     };
 
     const TEST_WIT: &str = r#"
-        package vigilo:evaluator@0.1.0;
+        package vigilo:evaluator@1.0.0;
 
         interface evaluator {}
 
@@ -1243,15 +1239,18 @@ mod tests {
                 name: "example".to_string(),
                 version: "1.0.0".to_string(),
                 content_hash: Some("hash".to_string()),
-                interface_version: Some("0.1.0".to_string()),
+                interface_version: Some("1.0.0".to_string()),
             },
-            results: vec![wit_types::EvaluatorFinding {
-                dimension: wit_types::EvaluationDimension::Other("style".to_string()),
-                status: wit_types::EvaluationStatus::Failed,
-                score: wit_types::Score::Range((0.4, 0.0, 1.0)),
-                blocking: true,
+            outcome: wit_types::EvaluatorOutcome::Completed(wit_types::Measurement::Range(
+                wit_types::RangeMeasurement {
+                    value: 0.4,
+                    min: 0.0,
+                    max: 1.0,
+                },
+            )),
+            diagnostics: vec![wit_types::DiagnosticFinding {
                 severity: wit_types::Severity::High,
-                failure_category: Some("tone".to_string()),
+                category: "tone".to_string(),
                 reason: Some("too terse".to_string()),
                 evidence_json: r#"{"span":"answer"}"#.to_string(),
                 tags: vec!["style".to_string()],
@@ -1380,40 +1379,11 @@ mod tests {
     }
 
     #[test]
-    fn wit_enum_mappings_cover_every_contract_variant() {
+    fn wit_enum_mappings_cover_diagnostic_and_preference_variants() {
         use wit_types::{
-            EvaluationDimension as WitDimension,
-            EvaluationStatus as WitStatus,
             PreferenceOutcome as WitPreference,
             Severity as WitSeverity,
         };
-
-        let dimensions = [
-            (WitDimension::Correctness, EvaluationDimension::Correctness),
-            (WitDimension::Format, EvaluationDimension::Format),
-            (WitDimension::Safety, EvaluationDimension::Safety),
-            (WitDimension::Quality, EvaluationDimension::Quality),
-            (WitDimension::Latency, EvaluationDimension::Latency),
-            (WitDimension::ToolUse, EvaluationDimension::ToolUse),
-            (WitDimension::Calibration, EvaluationDimension::Calibration),
-            (
-                WitDimension::Other("custom".to_string()),
-                EvaluationDimension::Other("custom".to_string()),
-            ),
-        ];
-        for (input, expected) in dimensions {
-            assert_eq!(map_dimension(input), expected);
-        }
-
-        let statuses = [
-            (WitStatus::Passed, EvaluationStatus::Passed),
-            (WitStatus::Failed, EvaluationStatus::Failed),
-            (WitStatus::Error, EvaluationStatus::Error),
-            (WitStatus::Skipped, EvaluationStatus::Skipped),
-        ];
-        for (input, expected) in statuses {
-            assert_eq!(map_status(input), expected);
-        }
 
         let severities = [
             (WitSeverity::None, Severity::None),
@@ -1437,63 +1407,59 @@ mod tests {
     }
 
     #[test]
-    fn wit_score_mapping_covers_every_contract_variant() {
+    fn wit_measurement_mapping_covers_every_contract_variant() {
         let cases = [
             (
-                wit_types::Score::Binary(true),
-                Score::Binary { passed: true },
+                wit_types::Measurement::Binary(true),
+                Measurement::Binary { value: true },
             ),
             (
-                wit_types::Score::Range((0.5, 0.0, 1.0)),
-                Score::Range {
+                wit_types::Measurement::Range(wit_types::RangeMeasurement {
+                    value: 0.5,
+                    min: 0.0,
+                    max: 1.0,
+                }),
+                Measurement::Range {
                     value: 0.5,
                     min: 0.0,
                     max: 1.0,
                 },
             ),
             (
-                wit_types::Score::Normalized(0.75),
-                Score::Normalized { value: 0.75 },
+                wit_types::Measurement::Normalized(0.75),
+                Measurement::Normalized { value: 0.75 },
             ),
             (
-                wit_types::Score::SeverityMapped(wit_types::Severity::Medium),
-                Score::SeverityMapped {
-                    severity: Severity::Medium,
-                },
-            ),
-            (
-                wit_types::Score::Preference(wit_types::PreferenceOutcome::Tie),
-                Score::Preference {
+                wit_types::Measurement::Preference(wit_types::PreferenceOutcome::Tie),
+                Measurement::Preference {
                     outcome: PreferenceOutcome::Tie,
                 },
             ),
-            (wit_types::Score::Informational, Score::Informational),
         ];
 
         for (input, expected) in cases {
             assert_eq!(
-                serde_json::to_value(map_score(input)).unwrap(),
+                serde_json::to_value(map_measurement(input)).unwrap(),
                 serde_json::to_value(expected).unwrap()
             );
         }
     }
 
     #[test]
-    fn wit_output_mapping_preserves_findings_and_json_payloads() {
+    fn wit_output_mapping_preserves_measurement_diagnostics_and_json_payloads() {
         let output = map_wit_output_to_output(wit_output()).unwrap();
 
         assert_eq!(output.evaluator.namespace, "vigilo");
         assert_eq!(output.metadata, json!({"duration_ms": 4}));
-        assert_eq!(output.results.len(), 1);
-        let finding = &output.results[0];
-        assert_eq!(
-            finding.dimension,
-            EvaluationDimension::Other("style".to_string())
-        );
-        assert_eq!(finding.status, EvaluationStatus::Failed);
+        assert!(matches!(
+            output.outcome,
+            EvaluatorOutcome::Completed(Measurement::Range { value: 0.4, .. })
+        ));
+        assert_eq!(output.diagnostics.len(), 1);
+        let finding = &output.diagnostics[0];
         assert_eq!(finding.severity, Severity::High);
         assert_eq!(finding.evidence, json!({"span": "answer"}));
-        assert!(finding.blocking);
+        assert_eq!(finding.category, "tone");
     }
 
     #[test]
@@ -1504,9 +1470,17 @@ mod tests {
         assert!(err.to_string().contains("invalid metadata-json JSON"));
 
         let mut output = wit_output();
-        output.results[0].evidence_json = "{".to_string();
+        output.diagnostics[0].evidence_json = "{".to_string();
         let err = map_wit_output_to_output(output).unwrap_err();
         assert!(err.to_string().contains("invalid evidence-json JSON"));
+
+        let mut output = wit_output();
+        output.diagnostics[0].category = " ".to_string();
+        let err = map_wit_output_to_output(output).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("diagnostic category must not be empty")
+        );
     }
 
     #[test]
@@ -1551,7 +1525,7 @@ mod tests {
         fs::write(dir.path().join("evaluator.wit"), TEST_WIT).unwrap();
         let valid = manifest_wit(
             "vigilo:evaluator",
-            "0.1.0",
+            "1.0.0",
             "evaluator-world",
             "evaluator",
             true,
@@ -1562,13 +1536,13 @@ mod tests {
             metadata.interface_name.as_deref(),
             Some("vigilo:evaluator/evaluator")
         );
-        assert_eq!(metadata.interface_version.as_deref(), Some("0.1.0"));
+        assert_eq!(metadata.interface_version.as_deref(), Some("1.0.0"));
         assert_eq!(metadata.wit_world.as_deref(), Some("evaluator-world"));
 
         let mismatches = [
             (
                 "other:package",
-                "0.1.0",
+                "1.0.0",
                 "evaluator-world",
                 "evaluator",
                 "package mismatch",
@@ -1582,14 +1556,14 @@ mod tests {
             ),
             (
                 "vigilo:evaluator",
-                "0.1.0",
+                "1.0.0",
                 "missing-world",
                 "evaluator",
                 "not found",
             ),
             (
                 "vigilo:evaluator",
-                "0.1.0",
+                "1.0.0",
                 "evaluator-world",
                 "missing-interface",
                 "is not exported",

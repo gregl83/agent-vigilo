@@ -9,7 +9,7 @@ This example demonstrates a file-based run profile and dataset that target a loc
 
 The profile points at `http://agent_vigilo_agent:8080/v1/chat/completions`, the llama.cpp-backed agent service in `infra/dev/docker-compose.yml`. Workers send an OpenAI-compatible chat completions request and map the agent response into the evaluator `actual` envelope.
 
-The example uses one score-gated `quality` dimension. The profile binding `dimension` is the authoritative aggregation bucket; evaluator-emitted dimensions are retained as evaluator output evidence but do not override the profile. The run passes only when the weighted aggregate score is at least `defaults.min_execution_score`.
+The example uses one score-gated `quality` dimension. The stable profile binding owns normalization, threshold, dimension, weight, and blocking policy; the evaluator supplies only its measurement and diagnostics. The run passes only when the weighted aggregate score is at least `defaults.min_execution_score`.
 
 Each example dataset case sets `case_group: sentiment_classification`, which explicitly routes the case to the matching profile case group. If `case_group` is omitted, Vigilo falls back to `task_type` and tag matching.
 

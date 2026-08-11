@@ -119,6 +119,8 @@ where
             SELECT COUNT(*)::bigint FROM execution_aggregates WHERE run_id = $1::uuid AND run_shard = $2
             UNION ALL
             SELECT COUNT(*)::bigint FROM evaluator_results WHERE run_id = $1::uuid AND run_shard = $2
+            UNION ALL
+            SELECT COUNT(*)::bigint FROM evaluator_diagnostics WHERE run_id = $1::uuid AND run_shard = $2
         ) counts
         "#,
     )

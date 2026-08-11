@@ -88,6 +88,15 @@ CREATE TYPE severity AS ENUM (
 COMMENT ON TYPE severity IS
     'Indicates the magnitude or impact of an evaluator finding. Used to qualify failures or issues beyond simple pass/fail outcomes.';
 
+CREATE TYPE evaluator_outcome AS ENUM (
+  'completed',
+  'error',
+  'abstained'
+);
+
+COMMENT ON TYPE evaluator_outcome IS
+    'Execution outcome of one evaluator invocation, independent from the host-derived quality judgment.';
+
 CREATE TYPE outbox_status AS ENUM (
   'pending', -- Event has been created and is ready to be published, but has not yet been processed by the outbox publisher.
   'published', -- Event has been successfully delivered to the external system or message broker.

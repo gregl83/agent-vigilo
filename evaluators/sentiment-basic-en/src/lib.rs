@@ -12,11 +12,11 @@ use serde_json::json;
 use vigilo::evaluator::{
     executor,
     types::{
-        EvaluationDimension,
-        EvaluationStatus,
-        EvaluatorFinding,
+        DiagnosticFinding,
+        EvaluatorError,
         EvaluatorIdentity,
-        Score,
+        EvaluatorOutcome,
+        Measurement,
         Severity,
     },
 };
@@ -127,14 +127,17 @@ fn label_from_score(score: i32) -> &'static str {
 }
 
 impl Guest for Evaluator {
-    fn evaluate(input: Input) -> Result<Output, String> {
+    fn evaluate(input: Input) -> Result<Output, EvaluatorError> {
         executor::trace("sentiment evaluator started");
         executor::debug(&format!(
             "input ids run={} execution={} attempt={}",
             input.run_id, input.execution_id, input.attempt_id
         ));
 
-        let text = extract_text_from_input(&input)?;
+        let text = extract_text_from_input(&input).map_err(|message| EvaluatorError {
+            code: "invalid_input".to_string(),
+            message,
+        })?;
         let (score, positive_matches, negative_matches) = score_text(&text);
         let label = label_from_score(score);
 
@@ -154,12 +157,6 @@ impl Guest for Evaluator {
             _ => 0.0,
         };
 
-        let status = if label == "negative" {
-            EvaluationStatus::Failed
-        } else {
-            EvaluationStatus::Passed
-        };
-
         let severity = if label == "negative" {
             Severity::Medium
         } else {
@@ -172,15 +169,12 @@ impl Guest for Evaluator {
                 name: "sentiment-basic-en".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 content_hash: None,
-                interface_version: Some("0.1.0".to_string()),
+                interface_version: Some("1.0.0".to_string()),
             },
-            results: vec![EvaluatorFinding {
-                dimension: EvaluationDimension::Quality,
-                status,
-                score: Score::Normalized(normalized),
-                blocking: false,
+            outcome: EvaluatorOutcome::Completed(Measurement::Normalized(normalized)),
+            diagnostics: vec![DiagnosticFinding {
                 severity,
-                failure_category: None,
+                category: "sentiment_classification".to_string(),
                 reason: Some(format!(
                     "basic English-only lexicon sentiment evaluator labeled input as {label}"
                 )),

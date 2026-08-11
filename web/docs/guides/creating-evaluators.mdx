@@ -59,15 +59,18 @@ The reference evaluator uses `wit-bindgen`, imports `evaluator-world`, implement
 Keep the evaluator contract in sync with `wit/evaluator.wit`.
 
 - Read fields from `input` (run IDs, case, actual output, evaluator config)
-- Produce one or more <GlossaryTerm term="finding">findings</GlossaryTerm> in
-  `output.results`
-- For a required profile binding, produce at least one `passed` or `failed`
-  finding with a valid score. Empty, errored, skipped, or scoreless output makes
-  the execution incomplete and withholds authoritative scores.
+- Return exactly one primary <GlossaryTerm term="measurement">measurement</GlossaryTerm>
+  in `output.outcome.completed`, or explicitly return `output.outcome.abstained`.
+- Emit zero or more <GlossaryTerm term="finding">diagnostic findings</GlossaryTerm>
+  in `output.diagnostics`. Diagnostics provide evidence but cannot choose dimensions,
+  thresholds, weights, blocking behavior, or pass/fail policy.
+- Return `evaluator-error` when execution fails. Errors and abstentions from a
+  required binding make the execution incomplete and withhold authoritative scores.
 - Use evaluator metadata in `output.evaluator`
-- Keep evaluator-specific diagnostics in `output.metadata_json`
+- Keep invocation metadata in `output.metadata_json`
 
-If the WIT interface changes, rebuild and republish the evaluator under a new version before testing with that version.
+The release contract is `vigilo:evaluator@1.0.0`. Rebuild and republish evaluators
+when their implementation or declared interface version changes.
 
 ## Build and Test Loop
 

@@ -64,7 +64,10 @@ use crate::{
     models::{
         case_blob::CaseBlobDraft,
         dataset_version_case::DatasetVersionCaseDraft,
-        evaluator_result::EvaluatorResult,
+        evaluator_result::{
+            EvaluatorDiagnostic,
+            EvaluatorResult,
+        },
         execution::Execution,
         execution_aggregate::ExecutionAggregate,
         execution_attempt::ExecutionAttempt,
@@ -858,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregation_policy_hash_includes_evaluator_requiredness() {
+    fn aggregation_policy_hash_includes_all_binding_policy() {
         let mut profile: RunProfile =
             serde_yaml::from_str(include_str!("../../../../example/profile.yaml")).unwrap();
         let required_hash = compute_aggregation_policy_hash(&profile).unwrap();
@@ -867,8 +870,11 @@ mod tests {
         binding.blocking = false;
         binding.weight = 0.0;
         let optional_hash = compute_aggregation_policy_hash(&profile).unwrap();
+        profile.case_groups[0].evaluators[0].pass_threshold = 0.9;
+        let threshold_hash = compute_aggregation_policy_hash(&profile).unwrap();
 
         assert_ne!(required_hash, optional_hash);
+        assert_ne!(optional_hash, threshold_hash);
     }
 
     #[test]
@@ -1238,26 +1244,28 @@ mod tests {
             run_shard,
             execution_id,
             attempt_id,
+            binding_id: "quality_score".to_string(),
             evaluator_id: Uuid::now_v7(),
-            finding_index: 0,
             evaluator_version: "1.0.0".to_string(),
             evaluator_profile_id: "profile".to_string(),
             evaluator_profile_version: "v1".to_string(),
             evaluator_interface_version: Some("1.0".to_string()),
             evaluator_runtime_version: Some("1.0".to_string()),
             dimension: "quality".to_string(),
-            status: "passed".to_string(),
+            outcome: "completed".to_string(),
+            judgment: Some("passed".to_string()),
             blocking: true,
-            score_kind: "continuous".to_string(),
+            measurement_kind: Some("normalized".to_string()),
             raw_score: Some(1.0),
             raw_score_min: Some(0.0),
             raw_score_max: Some(1.0),
             normalized_score: Some(1.0),
+            pass_threshold: 0.8,
             weight: 1.0,
-            severity: "none".to_string(),
-            failure_category: None,
-            reason: Some("all checks passed".to_string()),
-            evidence: json!({"span": "ok"}),
+            error_code: None,
+            error_message: None,
+            abstention_category: None,
+            abstention_reason: None,
             raw_evaluator_output: json!({"result": "pass"}),
             created_at: now,
         }];
@@ -1269,6 +1277,7 @@ mod tests {
             &attempts,
             &aggregates,
             &evaluator_results,
+            &[],
         );
 
         assert_eq!(payload["meta"]["summary_only"], json!(false));

@@ -25,27 +25,27 @@ vigilo run validate --profile-file <profile.yaml> --dataset-file <dataset.yaml>
 ## Result Calculation
 
 ```text
-evaluator findings -> evaluator completeness -> dimension_scores -> aggregate_score -> execution status -> run gate_status
+evaluator outcome -> binding normalization and judgment -> evaluator completeness -> dimension_scores -> aggregate_score -> execution status -> run gate_status
 ```
 
 <GlossaryTerm term="dimension-score">`dimension_scores`</GlossaryTerm> are
 per-dimension scores. <GlossaryTerm term="aggregate-score">`aggregate_score`</GlossaryTerm>
 is one total score for a single execution across all scored dimensions.
 
-The `dimension` on an
-<GlossaryTerm term="evaluator-binding">evaluator binding</GlossaryTerm> is the
-profile-owned aggregation bucket. Evaluator-emitted dimensions are preserved
-as source metadata, but they do not choose the scoring bucket.
+The <GlossaryTerm term="evaluator-binding">evaluator binding</GlossaryTerm>
+owns the dimension, normalization method, pass threshold, requiredness, weight,
+and blocking behavior. Evaluators return measurements and diagnostics; they do
+not participate in release policy.
 
 Dimension scores are calculated with:
 
-- `weighted_mean`: weighted average of scoreable findings in that profile dimension.
-- `min_score`: lowest scoreable finding in that profile dimension.
+- `weighted_mean`: weighted average of completed binding scores in that profile dimension.
+- `min_score`: lowest completed binding score in that profile dimension.
 
 Before calculating either score, Vigilo checks
 <GlossaryTerm term="evaluator-completeness">evaluator completeness</GlossaryTerm>.
-Every required evaluator binding must return at least one valid `passed` or
-`failed` score and must not return an `error` or `skipped` finding. Incomplete
+Every required evaluator binding must return exactly one valid measurement that
+the host can normalize. Missing, duplicate, errored, abstained, or invalid output is incomplete. Incomplete
 required output produces `overall_status: error` and withholds both
 `dimension_scores` and `aggregate_score`, preventing the remaining weights from
 being renormalized into a misleading score.
@@ -56,9 +56,8 @@ An execution passes when:
 
 - `aggregate_score >= defaults.min_execution_score`
 - evaluator completeness is satisfied
-- no hard blocking <GlossaryTerm term="finding">finding</GlossaryTerm> fails or
-  errors
-- at least one scoreable finding exists
+- no host-derived blocking result fails
+- at least one scoreable binding result exists
 
 A run passes when every expected execution has an aggregate, no chunk failed or
 was cancelled, and no execution failed or errored. Check both `runs.status` for
@@ -114,7 +113,7 @@ defaults:
 
 - `max_attempts` (u32): hard limit for case execution attempts. Failed attempts below this limit are retried with bounded backoff; once the limit is reached, the execution is failed.
 - `request_timeout_secs` (u32)
-- `fail_on_any_blocking_failure` (bool): when `true`, any blocking failed finding fails the execution even if the total `aggregate_score` is above the threshold. When `false`, blocking failures are still recorded in `blocking_failures`, but the overall score gate determines pass/fail. Errors and skipped findings from required evaluators always make evaluator completeness fail.
+- `fail_on_any_blocking_failure` (bool): when `true`, any host-derived blocking failure fails the execution even if the total `aggregate_score` is above the threshold. Errors and abstentions from required bindings always make evaluator completeness fail.
 - `min_execution_score` (f64): finite value from `0.0` to `1.0`. This is the overall score gate for the total execution `aggregate_score`; it does not set per-dimension thresholds.
 
 ## `persistence`
@@ -127,8 +126,8 @@ persistence:
 ```
 
 - `mode` (enum): `full` | `summary`. `full` stores execution-level case snapshots and evaluator binding config on each execution. `summary` stores only summary-safe execution identity/routing fields and redacts execution `input_payload`, `expected_output`, `case_metadata`, tags, and evaluator binding `config` in the execution snapshot.
-- `persist_raw_outputs` (enum): `all` | `failures_only` | `none`. Controls `evaluator_results.raw_evaluator_output`. `all` retains every evaluator raw output, `failures_only` retains raw output only for failed or errored findings, and `none` stores a redaction marker for every finding.
-- `persist_evaluator_evidence` (bool): controls `evaluator_results.evidence`. When `false`, finding evidence is replaced with a redaction marker. Raw evaluator output is also redacted because it can contain the same evidence.
+- `persist_raw_outputs` (enum): `all` | `failures_only` | `none`. Controls `evaluator_results.raw_evaluator_output`; `failures_only` retains host-failed and errored invocation output.
+- `persist_evaluator_evidence` (bool): controls `evaluator_diagnostics.evidence`. When `false`, diagnostic evidence and raw evaluator output are redacted.
 
 These settings affect execution/result artifact retention. Dataset case blobs and dataset-version membership remain durable so workers can execute retries and runs remain reproducible by content hash. The run profile snapshot is also retained because workers load it to invoke the configured agent and evaluators.
 
@@ -218,21 +217,28 @@ Selection behavior:
 
 ```yaml
 evaluators:
-  - ref: core/json-schema:1.0.0
+  - id: response_schema
+    ref: core/json-schema:1.0.0
     required: true
     dimension: format
     blocking: true
     weight: 1.0
+    normalization:
+      method: binary
+    pass_threshold: 1.0
     config:
       schema:
         type: object
 ```
 
+- `id` (string): stable binding identifier using ASCII letters, numbers, `.`, `_`, or `-`. It is the invocation idempotency key and permits the same evaluator artifact to be bound more than once with different policy or config.
 - `ref` (string): fully qualified evaluator identifier `<namespace>/<name>:<version>`.
-- `required` (bool, default `true`): requires this binding to return a valid score before aggregation. `false` declares a diagnostic-only evaluator and requires `blocking: false` with `weight: 0.0`; optional findings are persisted but never affect authoritative scores or gates.
-- `dimension` (string): profile-owned aggregation bucket for this evaluator binding. This value controls the persisted result dimension and the `aggregation.dimensions` policy used for scoring. Evaluator-emitted dimensions remain available in raw evaluator output for audit, but they do not override the profile bucket.
-- `blocking` (bool): marks failed/error findings from this binding as blocking. The dimension policy and the evaluator finding may also declare blocking behavior; any of those sources makes the normalized finding blocking.
-- `weight` (f64): finite value greater than or equal to `0.0`. For `weighted_mean`, this is the binding's total contribution inside its dimension. When an evaluator emits multiple scoreable findings, the binding weight is divided across those findings so multi-finding evaluators do not become overweighted.
+- `required` (bool, default `true`): requires this binding to complete with a valid measurement. `false` declares a diagnostic-only binding and requires `blocking: false` with `weight: 0.0`.
+- `dimension` (string): profile-owned aggregation bucket.
+- `blocking` (bool): makes a host-derived failed judgment a hard blocking result.
+- `weight` (f64): finite value greater than or equal to `0.0`; the binding's contribution inside its dimension.
+- `normalization` (object): required host interpretation. Methods are `binary`, `normalized`, `range` with `direction: higher_is_better | lower_is_better`, or `preference` with explicit `preferred`, `tie`, and `not_preferred` values in `0.0..=1.0`. A mismatched or invalid measurement becomes an evaluator error.
+- `pass_threshold` (f64): required finite value in `0.0..=1.0`. The host derives `passed` when `normalized_score >= pass_threshold`; otherwise it derives `failed`.
 - `config` (object, optional)
 
 ### `aggregation.dimensions`
@@ -251,8 +257,8 @@ aggregation:
 ```
 
 - `method` (enum): `min_score` | `weighted_mean`
-- `blocking` (bool): marks failed/error findings in this dimension as blocking, even when the individual evaluator binding is non-blocking.
-- `weight` (f64): finite value greater than or equal to `0.0`. Dimension weights combine `dimension_scores` into the total execution `aggregate_score`; `0.0` means the dimension does not affect the total score, but blocking findings in that dimension can still fail the execution.
+- `blocking` (bool): makes failed binding judgments in this dimension blocking.
+- `weight` (f64): finite value greater than or equal to `0.0`. Dimension weights combine `dimension_scores` into the total execution `aggregate_score`; `0.0` means the dimension does not affect the total score, but blocking results in that dimension can still fail the execution.
 
 A common pattern is a hard format gate plus a scored quality dimension:
 
@@ -273,16 +279,16 @@ Here, `format` can fail the execution but does not change `aggregate_score`; `qu
 
 Aggregation behavior:
 
-- Findings are grouped by the profile binding `dimension`, not by the evaluator-emitted finding dimension.
+- Completed binding results are grouped by the profile binding `dimension`.
 - `weighted_mean` computes a weighted arithmetic mean inside each dimension using evaluator binding weights.
-- `min_score` uses the lowest normalized score among scoreable findings in that dimension.
+- `min_score` uses the lowest normalized binding score in that dimension.
 - `dimension_scores` are per-dimension scores.
 - `aggregate_score` is the total score for one execution across all scored dimensions.
 - `aggregate_score` combines dimension scores using `aggregation.dimensions.<dimension>.weight`.
 - Missing dimension policies default to `weighted_mean`, non-blocking, weight `1.0`.
-- `passed` and `failed` findings with valid normalized scores are scoreable.
-- A required evaluator that is missing, returns `error` or `skipped`, or returns no scoreable finding makes evaluator completeness fail. Vigilo records the reason in `execution_aggregates.summary.evaluator_completeness` and publishes no dimension or aggregate scores for that execution.
-- Optional evaluators are diagnostic only. Their findings remain available for reporting but never affect dimension scores, blocking failures, or the aggregate score.
+- Completed measurements receive a host-derived `passed` or `failed` judgment and are scoreable.
+- A required binding that is missing, duplicated, errored, abstained, or invalid makes evaluator completeness fail. Vigilo records the reason and publishes no dimension or aggregate scores for that execution.
+- Optional bindings are diagnostic only. Their results and diagnostics remain available for reporting but never affect scores or gates.
 - If an execution has no complete required score set, its aggregate status is `error`.
 - If multiple case groups match the same case, their dimension policies and duplicate evaluator bindings must be identical or non-overlapping; conflicting policies are rejected.
 
@@ -293,7 +299,7 @@ For every dataset case, Vigilo resolves an evaluation plan before invoking the t
 - the profile case group or groups applied to the case
 - the evaluator bindings to run
 - the evaluator-specific config passed into each evaluator
-- the profile-owned dimensions used for persisted findings
+- the profile-owned dimensions and binding policies used for persisted results
 - the aggregation policy used for the execution aggregate
 
 Resolution order:

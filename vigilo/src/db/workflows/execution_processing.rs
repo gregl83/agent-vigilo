@@ -42,14 +42,17 @@ use crate::{
     contracts::{
         aggregation::{
             AggregationBinding,
-            AggregationFinding,
-            aggregate_findings,
+            AggregationResult,
+            aggregate_results,
             evaluation_status_key,
         },
         evaluator::{
-            EvaluationDimension,
             EvaluationStatus,
             EvaluatorInput,
+            EvaluatorOutcome,
+            EvaluatorReportedError,
+            Measurement,
+            PreferenceOutcome,
             Severity,
             TestCase,
         },
@@ -58,6 +61,7 @@ use crate::{
             AggregationSettings,
             CaseGroupProfile,
             EvaluatorBinding,
+            NormalizationPolicy,
             PersistRawOutputsMode,
             PersistenceMode,
             PersistenceSettings,
@@ -92,10 +96,10 @@ fn jsonb_text(value: &serde_json::Value) -> String {
 
 #[derive(Debug)]
 struct EvaluatorExecutionRecord {
+    binding_id: String,
     evaluator_id: Uuid,
     status: EvaluationStatus,
     binding_dimension: String,
-    source_dimension: Option<String>,
     normalized_score: Option<f64>,
     blocking: bool,
     binding_weight: f64,
@@ -224,11 +228,14 @@ fn persisted_evaluator_manifest(
                 .iter()
                 .map(|binding| {
                     json!({
+                        "id": binding.id.clone(),
                         "ref": binding.evaluator_ref.clone(),
                         "required": binding.required,
                         "dimension": binding.dimension.clone(),
                         "blocking": binding.blocking,
                         "weight": binding.weight,
+                        "normalization": binding.normalization.clone(),
+                        "pass_threshold": binding.pass_threshold,
                         "config": redacted_payload("persistence.mode=summary"),
                     })
                 })
@@ -671,10 +678,13 @@ fn merge_aggregation_settings(
 }
 
 fn equivalent_evaluator_binding(left: &EvaluatorBinding, right: &EvaluatorBinding) -> bool {
-    left.required == right.required
+    left.evaluator_ref == right.evaluator_ref
+        && left.required == right.required
         && left.dimension == right.dimension
         && left.blocking == right.blocking
         && left.weight == right.weight
+        && left.normalization == right.normalization
+        && left.pass_threshold == right.pass_threshold
         && left.config == right.config
 }
 
@@ -705,18 +715,18 @@ fn evaluation_plan_for_case(
     let mut unique = BTreeMap::new();
     for group in matching_groups {
         for binding in &group.evaluators {
-            if let Some(existing) = unique.get(&binding.evaluator_ref) {
+            if let Some(existing) = unique.get(&binding.id) {
                 if !equivalent_evaluator_binding(existing, binding) {
                     anyhow::bail!(
-                        "case '{}' matched conflicting evaluator binding for '{}' across case_groups",
+                        "case '{}' matched conflicting evaluator binding id '{}' across case_groups",
                         case.case_id,
-                        binding.evaluator_ref
+                        binding.id
                     );
                 }
                 continue;
             }
 
-            unique.insert(binding.evaluator_ref.clone(), binding.clone());
+            unique.insert(binding.id.clone(), binding.clone());
         }
     }
 
@@ -756,19 +766,6 @@ fn map_evaluation_status(status: &EvaluationStatus) -> &'static str {
     evaluation_status_key(status)
 }
 
-fn map_evaluation_dimension(dimension: &EvaluationDimension) -> String {
-    match dimension {
-        EvaluationDimension::Correctness => "correctness".to_string(),
-        EvaluationDimension::Format => "format".to_string(),
-        EvaluationDimension::Safety => "safety".to_string(),
-        EvaluationDimension::Quality => "quality".to_string(),
-        EvaluationDimension::Latency => "latency".to_string(),
-        EvaluationDimension::ToolUse => "tool_use".to_string(),
-        EvaluationDimension::Calibration => "calibration".to_string(),
-        EvaluationDimension::Other(value) => value.clone(),
-    }
-}
-
 fn map_severity(severity: &Severity) -> &'static str {
     match severity {
         Severity::None => "none",
@@ -777,6 +774,72 @@ fn map_severity(severity: &Severity) -> &'static str {
         Severity::High => "high",
         Severity::Critical => "critical",
     }
+}
+
+fn normalize_measurement(
+    policy: &NormalizationPolicy,
+    measurement: &Measurement,
+) -> anyhow::Result<f64> {
+    let score = match (policy, measurement) {
+        (NormalizationPolicy::Binary, Measurement::Binary { value }) => {
+            if *value {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        (NormalizationPolicy::Range { direction }, Measurement::Range { value, min, max }) => {
+            if !value.is_finite() || !min.is_finite() || !max.is_finite() || max <= min {
+                anyhow::bail!("range measurement must have finite values and max greater than min");
+            }
+            if value < min || value > max {
+                anyhow::bail!("range measurement value must be within its declared bounds");
+            }
+            let normalized = (value - min) / (max - min);
+            match direction {
+                crate::contracts::run::ScoreDirection::HigherIsBetter => normalized,
+                crate::contracts::run::ScoreDirection::LowerIsBetter => 1.0 - normalized,
+            }
+        }
+        (NormalizationPolicy::Normalized, Measurement::Normalized { value }) => {
+            if !value.is_finite() || !(0.0..=1.0).contains(value) {
+                anyhow::bail!("normalized measurement must be finite and between 0.0 and 1.0");
+            }
+            *value
+        }
+        (
+            NormalizationPolicy::Preference {
+                preferred,
+                tie,
+                not_preferred,
+            },
+            Measurement::Preference { outcome },
+        ) => match outcome {
+            PreferenceOutcome::Preferred => *preferred,
+            PreferenceOutcome::Tie => *tie,
+            PreferenceOutcome::NotPreferred => *not_preferred,
+        },
+        _ => anyhow::bail!(
+            "measurement kind '{}' is incompatible with normalization policy",
+            measurement.kind()
+        ),
+    };
+
+    Ok(score)
+}
+
+fn interpret_measurement(
+    policy: &NormalizationPolicy,
+    pass_threshold: f64,
+    measurement: &Measurement,
+) -> anyhow::Result<(f64, EvaluationStatus)> {
+    let score = normalize_measurement(policy, measurement)?;
+    let status = if score >= pass_threshold {
+        EvaluationStatus::Passed
+    } else {
+        EvaluationStatus::Failed
+    };
+    Ok((score, status))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -831,16 +894,14 @@ async fn evaluate_case_execution(
         let aggregation_bindings = evaluator_bindings
             .iter()
             .map(|binding| {
-                let evaluator = evaluator_catalog
-                    .get(&binding.evaluator_ref)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "evaluator '{}' is missing from run evaluator catalog",
-                            binding.evaluator_ref
-                        )
-                    })?;
+                if !evaluator_catalog.contains_key(&binding.evaluator_ref) {
+                    return Err(anyhow::anyhow!(
+                        "evaluator '{}' is missing from run evaluator catalog",
+                        binding.evaluator_ref
+                    ));
+                }
                 Ok(AggregationBinding {
-                    evaluator_id: evaluator.evaluator_id,
+                    binding_id: binding.id.clone(),
                     required: binding.required,
                 })
             })
@@ -908,187 +969,250 @@ async fn evaluate_case_execution(
                         anyhow::anyhow!("evaluator blocking task join failed: {}", err)
                     })?;
 
-                    let mut records = Vec::new();
-                    let mut rows = Vec::new();
+                    let blocking = binding.blocking || dimension_policy_blocking;
+                    let base_row =
+                        |status: &EvaluationStatus| evaluator_results::EvaluatorResultInsertRow {
+                            run_id,
+                            run_shard,
+                            execution_id,
+                            attempt_id,
+                            binding_id: binding.id.clone(),
+                            evaluator_id: evaluator_entry.evaluator_id,
+                            evaluator_version: evaluator_entry.evaluator_version.clone(),
+                            evaluator_profile_id: profile_id.clone(),
+                            evaluator_profile_version: profile_version.clone(),
+                            evaluator_interface_version: evaluator_entry
+                                .evaluator_interface_version
+                                .clone(),
+                            evaluator_runtime_version: evaluator_entry
+                                .evaluator_runtime_version
+                                .clone(),
+                            dimension: binding.dimension.clone(),
+                            outcome: "error".to_string(),
+                            judgment: None,
+                            blocking,
+                            measurement_kind: None,
+                            raw_score: None,
+                            raw_score_min: None,
+                            raw_score_max: None,
+                            normalized_score: None,
+                            pass_threshold: binding.pass_threshold,
+                            weight: binding.weight,
+                            error_code: None,
+                            error_message: None,
+                            abstention_category: None,
+                            abstention_reason: None,
+                            raw_evaluator_output: persisted_raw_evaluator_output(
+                                &persistence,
+                                status,
+                                json!({}),
+                            ),
+                            diagnostics: Vec::new(),
+                        };
 
-                    match output {
+                    let (record, row) = match output {
                         Ok(evaluator_output) => {
                             let serialized_output = serde_json::to_value(&evaluator_output)?;
-                            let normalized = evaluator_output.normalize();
-
-                            if normalized.is_empty() {
+                            if evaluator_output.evaluator_identifier() != binding.evaluator_ref {
                                 let status = EvaluationStatus::Error;
-                                let failure_category = Some("empty_output".to_string());
-                                let reason = Some("evaluator returned no findings".to_string());
-                                rows.push(evaluator_results::EvaluatorResultInsertRow {
-                                    run_id,
-                                    run_shard,
-                                    execution_id,
-                                    attempt_id,
-                                    evaluator_id: evaluator_entry.evaluator_id,
-                                    finding_index: 0,
-                                    evaluator_version: evaluator_entry.evaluator_version.clone(),
-                                    evaluator_profile_id: profile_id.clone(),
-                                    evaluator_profile_version: profile_version.clone(),
-                                    evaluator_interface_version: evaluator_entry
-                                        .evaluator_interface_version
-                                        .clone(),
-                                    evaluator_runtime_version: evaluator_entry
-                                        .evaluator_runtime_version
-                                        .clone(),
-                                    dimension: binding.dimension.clone(),
-                                    status: map_evaluation_status(&status).to_string(),
-                                    blocking: binding.blocking || dimension_policy_blocking,
-                                    score_kind: "informational".to_string(),
-                                    raw_score: None,
-                                    raw_score_min: None,
-                                    raw_score_max: None,
-                                    normalized_score: None,
-                                    weight: binding.weight,
-                                    severity: "high".to_string(),
-                                    failure_category: failure_category.clone(),
-                                    reason: reason.clone(),
-                                    evidence: persisted_evaluator_evidence(&persistence, json!({})),
-                                    raw_evaluator_output: persisted_raw_evaluator_output(
-                                        &persistence,
-                                        &status,
-                                        serialized_output,
-                                    ),
-                                });
-                                records.push(EvaluatorExecutionRecord {
-                                    evaluator_id: evaluator_entry.evaluator_id,
-                                    status,
-                                    binding_dimension: binding.dimension,
-                                    source_dimension: None,
-                                    normalized_score: None,
-                                    blocking: binding.blocking || dimension_policy_blocking,
-                                    binding_weight: binding.weight,
-                                    failure_category,
-                                    reason,
-                                });
-                            } else {
-                                for (finding_index, finding) in normalized.into_iter().enumerate() {
-                                    let finding_index = i32::try_from(finding_index)?;
-                                    let status = finding.status;
-                                    let source_dimension =
-                                        map_evaluation_dimension(&finding.dimension);
-                                    let dimension = binding.dimension.clone();
-                                    let blocking = binding.blocking
-                                        || dimension_policy_blocking
-                                        || finding.blocking;
-                                    let severity = map_severity(&finding.severity).to_string();
-                                    let failure_category = finding.failure_category.clone();
-                                    let reason = finding.reason.clone();
-                                    let normalized_score = finding.normalized_score;
-
-                                    rows.push(evaluator_results::EvaluatorResultInsertRow {
-                                        run_id,
-                                        run_shard,
-                                        execution_id,
-                                        attempt_id,
-                                        evaluator_id: evaluator_entry.evaluator_id,
-                                        finding_index,
-                                        evaluator_version: evaluator_entry
-                                            .evaluator_version
-                                            .clone(),
-                                        evaluator_profile_id: profile_id.clone(),
-                                        evaluator_profile_version: profile_version.clone(),
-                                        evaluator_interface_version: evaluator_entry
-                                            .evaluator_interface_version
-                                            .clone(),
-                                        evaluator_runtime_version: evaluator_entry
-                                            .evaluator_runtime_version
-                                            .clone(),
-                                        dimension: dimension.clone(),
-                                        status: map_evaluation_status(&status).to_string(),
-                                        blocking,
-                                        score_kind: finding.score_kind,
-                                        raw_score: finding.raw_score,
-                                        raw_score_min: finding.raw_score_min,
-                                        raw_score_max: finding.raw_score_max,
-                                        normalized_score,
-                                        weight: binding.weight,
-                                        severity,
-                                        failure_category: failure_category.clone(),
-                                        reason: reason.clone(),
-                                        evidence: persisted_evaluator_evidence(
-                                            &persistence,
-                                            finding.evidence,
-                                        ),
-                                        raw_evaluator_output: persisted_raw_evaluator_output(
-                                            &persistence,
-                                            &status,
-                                            serialized_output.clone(),
-                                        ),
-                                    });
-                                    records.push(EvaluatorExecutionRecord {
+                                let reason = format!(
+                                    "evaluator reported identity '{}' but binding expected '{}'",
+                                    evaluator_output.evaluator_identifier(),
+                                    binding.evaluator_ref
+                                );
+                                let mut row = base_row(&status);
+                                row.error_code = Some("identity_mismatch".to_string());
+                                row.error_message = Some(reason.clone());
+                                row.raw_evaluator_output = persisted_raw_evaluator_output(
+                                    &persistence,
+                                    &status,
+                                    serialized_output,
+                                );
+                                (
+                                    EvaluatorExecutionRecord {
+                                        binding_id: binding.id.clone(),
                                         evaluator_id: evaluator_entry.evaluator_id,
                                         status,
-                                        binding_dimension: dimension,
-                                        source_dimension: Some(source_dimension),
-                                        normalized_score,
+                                        binding_dimension: binding.dimension.clone(),
+                                        normalized_score: None,
                                         blocking,
                                         binding_weight: binding.weight,
-                                        failure_category,
-                                        reason,
-                                    });
+                                        failure_category: Some("identity_mismatch".to_string()),
+                                        reason: Some(reason),
+                                    },
+                                    row,
+                                )
+                            } else {
+                                let diagnostics = evaluator_output
+                                    .diagnostics
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, diagnostic)| {
+                                        Ok(evaluator_results::EvaluatorDiagnosticInsertRow {
+                                            diagnostic_index: i32::try_from(index)?,
+                                            severity: map_severity(&diagnostic.severity)
+                                                .to_string(),
+                                            category: diagnostic.category.clone(),
+                                            reason: diagnostic.reason.clone(),
+                                            evidence: persisted_evaluator_evidence(
+                                                &persistence,
+                                                diagnostic.evidence.clone(),
+                                            ),
+                                            tags: diagnostic.tags.clone(),
+                                        })
+                                    })
+                                    .collect::<anyhow::Result<Vec<_>>>()?;
+
+                                match &evaluator_output.outcome {
+                                    EvaluatorOutcome::Completed(measurement) => {
+                                        match interpret_measurement(
+                                            &binding.normalization,
+                                            binding.pass_threshold,
+                                            measurement,
+                                        ) {
+                                            Ok((score, status)) => {
+                                                let (raw_score, raw_score_min, raw_score_max) =
+                                                    measurement.raw_parts();
+                                                let mut row = base_row(&status);
+                                                row.outcome = "completed".to_string();
+                                                row.judgment = Some(
+                                                    map_evaluation_status(&status).to_string(),
+                                                );
+                                                row.measurement_kind =
+                                                    Some(measurement.kind().to_string());
+                                                row.raw_score = raw_score;
+                                                row.raw_score_min = raw_score_min;
+                                                row.raw_score_max = raw_score_max;
+                                                row.normalized_score = Some(score);
+                                                row.raw_evaluator_output =
+                                                    persisted_raw_evaluator_output(
+                                                        &persistence,
+                                                        &status,
+                                                        serialized_output,
+                                                    );
+                                                row.diagnostics = diagnostics;
+                                                (
+                                                    EvaluatorExecutionRecord {
+                                                        binding_id: binding.id.clone(),
+                                                        evaluator_id: evaluator_entry.evaluator_id,
+                                                        status,
+                                                        binding_dimension: binding
+                                                            .dimension
+                                                            .clone(),
+                                                        normalized_score: Some(score),
+                                                        blocking,
+                                                        binding_weight: binding.weight,
+                                                        failure_category: None,
+                                                        reason: None,
+                                                    },
+                                                    row,
+                                                )
+                                            }
+                                            Err(err) => {
+                                                let status = EvaluationStatus::Error;
+                                                let reason = err.to_string();
+                                                let mut row = base_row(&status);
+                                                row.error_code =
+                                                    Some("invalid_measurement".to_string());
+                                                row.error_message = Some(reason.clone());
+                                                row.raw_evaluator_output =
+                                                    persisted_raw_evaluator_output(
+                                                        &persistence,
+                                                        &status,
+                                                        serialized_output,
+                                                    );
+                                                row.diagnostics = diagnostics;
+                                                (
+                                                    EvaluatorExecutionRecord {
+                                                        binding_id: binding.id.clone(),
+                                                        evaluator_id: evaluator_entry.evaluator_id,
+                                                        status,
+                                                        binding_dimension: binding
+                                                            .dimension
+                                                            .clone(),
+                                                        normalized_score: None,
+                                                        blocking,
+                                                        binding_weight: binding.weight,
+                                                        failure_category: Some(
+                                                            "invalid_measurement".to_string(),
+                                                        ),
+                                                        reason: Some(reason),
+                                                    },
+                                                    row,
+                                                )
+                                            }
+                                        }
+                                    }
+                                    EvaluatorOutcome::Abstained(abstention) => {
+                                        let status = EvaluationStatus::Abstained;
+                                        let mut row = base_row(&status);
+                                        row.outcome = "abstained".to_string();
+                                        row.abstention_category = Some(abstention.category.clone());
+                                        row.abstention_reason = abstention.reason.clone();
+                                        row.raw_evaluator_output = persisted_raw_evaluator_output(
+                                            &persistence,
+                                            &status,
+                                            serialized_output,
+                                        );
+                                        row.diagnostics = diagnostics;
+                                        (
+                                            EvaluatorExecutionRecord {
+                                                binding_id: binding.id.clone(),
+                                                evaluator_id: evaluator_entry.evaluator_id,
+                                                status,
+                                                binding_dimension: binding.dimension.clone(),
+                                                normalized_score: None,
+                                                blocking,
+                                                binding_weight: binding.weight,
+                                                failure_category: Some(abstention.category.clone()),
+                                                reason: abstention.reason.clone(),
+                                            },
+                                            row,
+                                        )
+                                    }
                                 }
                             }
                         }
                         Err(err) => {
                             let status = EvaluationStatus::Error;
-                            let failure_category = Some("evaluator_runtime_error".to_string());
-                            let reason = Some(err.to_string());
-                            rows.push(evaluator_results::EvaluatorResultInsertRow {
-                                run_id,
-                                run_shard,
-                                execution_id,
-                                attempt_id,
-                                evaluator_id: evaluator_entry.evaluator_id,
-                                finding_index: 0,
-                                evaluator_version: evaluator_entry.evaluator_version,
-                                evaluator_profile_id: profile_id,
-                                evaluator_profile_version: profile_version,
-                                evaluator_interface_version: evaluator_entry
-                                    .evaluator_interface_version,
-                                evaluator_runtime_version: evaluator_entry
-                                    .evaluator_runtime_version,
-                                dimension: binding.dimension.clone(),
-                                status: map_evaluation_status(&status).to_string(),
-                                blocking: binding.blocking || dimension_policy_blocking,
-                                score_kind: "informational".to_string(),
-                                raw_score: None,
-                                raw_score_min: None,
-                                raw_score_max: None,
-                                normalized_score: None,
-                                weight: binding.weight,
-                                severity: "high".to_string(),
-                                failure_category: failure_category.clone(),
-                                reason: reason.clone(),
-                                evidence: persisted_evaluator_evidence(&persistence, json!({})),
-                                raw_evaluator_output: persisted_raw_evaluator_output(
-                                    &persistence,
-                                    &status,
-                                    json!({
-                                        "error": err.to_string()
-                                    }),
-                                ),
-                            });
-                            records.push(EvaluatorExecutionRecord {
-                                evaluator_id: evaluator_entry.evaluator_id,
-                                status,
-                                binding_dimension: binding.dimension,
-                                source_dimension: None,
-                                normalized_score: None,
-                                blocking: binding.blocking || dimension_policy_blocking,
-                                binding_weight: binding.weight,
-                                failure_category,
-                                reason,
-                            });
+                            let reported = err.downcast_ref::<EvaluatorReportedError>();
+                            let error_code = reported
+                                .map(|error| error.code.clone())
+                                .unwrap_or_else(|| "evaluator_runtime_error".to_string());
+                            let failure_category = if reported.is_some() {
+                                "evaluator_error"
+                            } else {
+                                "evaluator_runtime_error"
+                            };
+                            let reason = reported
+                                .map(|error| error.message.clone())
+                                .unwrap_or_else(|| err.to_string());
+                            let mut row = base_row(&status);
+                            row.error_code = Some(error_code.clone());
+                            row.error_message = Some(reason.clone());
+                            row.raw_evaluator_output = persisted_raw_evaluator_output(
+                                &persistence,
+                                &status,
+                                json!({ "code": error_code, "error": reason }),
+                            );
+                            (
+                                EvaluatorExecutionRecord {
+                                    binding_id: binding.id.clone(),
+                                    evaluator_id: evaluator_entry.evaluator_id,
+                                    status,
+                                    binding_dimension: binding.dimension.clone(),
+                                    normalized_score: None,
+                                    blocking,
+                                    binding_weight: binding.weight,
+                                    failure_category: Some(failure_category.to_string()),
+                                    reason: Some(reason),
+                                },
+                                row,
+                            )
                         }
-                    }
+                    };
 
-                    Ok((index, records, rows))
+                    Ok((index, vec![record], vec![row]))
                 });
             }
 
@@ -1113,12 +1237,12 @@ async fn evaluate_case_execution(
     match evaluation_result {
         Ok((aggregation_bindings, records, result_rows)) => {
             let runtime_ms = runtime_started.elapsed().as_millis() as u64;
-            let aggregation_findings = records
+            let aggregation_results = records
                 .iter()
-                .map(|record| AggregationFinding {
+                .map(|record| AggregationResult {
+                    binding_id: record.binding_id.clone(),
                     evaluator_id: record.evaluator_id,
                     binding_dimension: record.binding_dimension.clone(),
-                    source_dimension: record.source_dimension.clone(),
                     status: record.status.clone(),
                     normalized_score: record.normalized_score,
                     blocking: record.blocking,
@@ -1127,12 +1251,12 @@ async fn evaluate_case_execution(
                     reason: record.reason.clone(),
                 })
                 .collect::<Vec<_>>();
-            let aggregate = aggregate_findings(
+            let aggregate = aggregate_results(
                 &run_profile.defaults,
                 aggregation,
                 attempt_id,
                 &aggregation_bindings,
-                &aggregation_findings,
+                &aggregation_results,
             );
 
             let evaluator_result_count = match i32::try_from(records.len()) {
@@ -1403,12 +1527,13 @@ mod tests {
 
     use super::{
         evaluation_plan_for_case,
+        interpret_measurement,
         make_test_case,
-        map_evaluation_dimension,
         map_evaluation_status,
         map_severity,
         matching_groups_for_case,
         metadata_from_case_row,
+        normalize_measurement,
         persisted_case_expected_output,
         persisted_case_input_payload,
         persisted_case_metadata,
@@ -1421,8 +1546,8 @@ mod tests {
     use crate::{
         contracts::{
             evaluator::{
-                EvaluationDimension,
                 EvaluationStatus,
+                Measurement,
                 Severity,
             },
             run::{
@@ -1434,6 +1559,7 @@ mod tests {
                 CaseGroupProfile,
                 DimensionAggregation,
                 EvaluatorBinding,
+                NormalizationPolicy,
                 PersistRawOutputsMode,
                 PersistenceMode,
                 PersistenceSettings,
@@ -1466,11 +1592,14 @@ mod tests {
 
     fn evaluator_binding(evaluator_ref: &str, dimension: &str) -> EvaluatorBinding {
         EvaluatorBinding {
+            id: evaluator_ref.replace(['/', ':'], "_"),
             evaluator_ref: evaluator_ref.to_string(),
             required: true,
             dimension: dimension.to_string(),
             blocking: false,
             weight: 1.0,
+            normalization: NormalizationPolicy::Normalized,
+            pass_threshold: 0.8,
             config: json!({"threshold": 0.8}),
         }
     }
@@ -1752,12 +1881,15 @@ mod tests {
         let manifest = persisted_evaluator_manifest(&profile, &plan.evaluator_bindings).unwrap();
 
         assert_eq!(manifest[0]["ref"], json!("vigilo/sentiment-basic-en:0.1.0"));
+        assert_eq!(manifest[0]["id"], json!("vigilo_sentiment-basic-en_0.1.0"));
         assert_eq!(manifest[0]["required"], json!(true));
+        assert_eq!(manifest[0]["pass_threshold"], json!(0.8));
+        assert_eq!(manifest[0]["normalization"]["method"], json!("normalized"));
         assert_eq!(manifest[0]["config"]["redacted"], json!(true));
     }
 
     #[test]
-    fn raw_output_policy_keeps_only_failed_or_error_findings_for_failures_only() {
+    fn raw_output_policy_keeps_only_failed_or_error_invocations_for_failures_only() {
         let mut profile = routing_profile();
         profile.persistence.persist_raw_outputs = PersistRawOutputsMode::FailuresOnly;
 
@@ -1791,7 +1923,7 @@ mod tests {
             EvaluationStatus::Passed,
             EvaluationStatus::Failed,
             EvaluationStatus::Error,
-            EvaluationStatus::Skipped,
+            EvaluationStatus::Abstained,
         ] {
             let raw = persisted_raw_evaluator_output(
                 &profile.persistence,
@@ -1844,25 +1976,11 @@ mod tests {
 
     #[test]
     fn evaluator_persistence_mappings_cover_contract_variants() {
-        let dimensions = [
-            (EvaluationDimension::Correctness, "correctness"),
-            (EvaluationDimension::Format, "format"),
-            (EvaluationDimension::Safety, "safety"),
-            (EvaluationDimension::Quality, "quality"),
-            (EvaluationDimension::Latency, "latency"),
-            (EvaluationDimension::ToolUse, "tool_use"),
-            (EvaluationDimension::Calibration, "calibration"),
-            (EvaluationDimension::Other("custom".to_string()), "custom"),
-        ];
-        for (dimension, expected) in dimensions {
-            assert_eq!(map_evaluation_dimension(&dimension), expected);
-        }
-
         for (status, expected) in [
             (EvaluationStatus::Passed, "passed"),
             (EvaluationStatus::Failed, "failed"),
             (EvaluationStatus::Error, "error"),
-            (EvaluationStatus::Skipped, "skipped"),
+            (EvaluationStatus::Abstained, "abstained"),
         ] {
             assert_eq!(map_evaluation_status(&status), expected);
         }
@@ -1876,5 +1994,47 @@ mod tests {
         ] {
             assert_eq!(map_severity(&severity), expected);
         }
+    }
+
+    #[test]
+    fn normalization_rejects_measurements_that_do_not_match_host_policy() {
+        let error = normalize_measurement(
+            &NormalizationPolicy::Binary,
+            &Measurement::Normalized { value: 1.0 },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("incompatible"));
+    }
+
+    #[test]
+    fn normalization_rejects_invalid_ranges_instead_of_clamping() {
+        let error = normalize_measurement(
+            &NormalizationPolicy::Range {
+                direction: crate::contracts::run::ScoreDirection::HigherIsBetter,
+            },
+            &Measurement::Range {
+                value: 2.0,
+                min: 0.0,
+                max: 1.0,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("within its declared bounds"));
+    }
+
+    #[test]
+    fn host_threshold_derives_judgment_from_measurement() {
+        let measurement = Measurement::Normalized { value: 0.8 };
+
+        assert_eq!(
+            interpret_measurement(&NormalizationPolicy::Normalized, 0.8, &measurement).unwrap(),
+            (0.8, EvaluationStatus::Passed)
+        );
+        assert_eq!(
+            interpret_measurement(&NormalizationPolicy::Normalized, 0.81, &measurement).unwrap(),
+            (0.8, EvaluationStatus::Failed)
+        );
     }
 }

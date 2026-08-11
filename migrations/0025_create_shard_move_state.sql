@@ -45,7 +45,8 @@ CREATE TABLE shard_move_table_progress (
     table_name TEXT NOT NULL CHECK (table_name IN (
         'case_blobs', 'dataset_versions', 'runs', 'run_shard_cases',
         'run_chunks', 'run_snapshots', 'executions', 'execution_attempts',
-        'execution_aggregates', 'evaluator_results', 'run_shard_summaries'
+        'execution_aggregates', 'evaluator_results', 'evaluator_diagnostics',
+        'run_shard_summaries'
     )),
     completed_page_count BIGINT NOT NULL CHECK (completed_page_count > 0),
     last_start_after_key TEXT,
@@ -71,7 +72,7 @@ CREATE TABLE shard_move_dirty_keys (
     table_name TEXT NOT NULL CHECK (table_name IN (
         'run_shard_cases', 'run_chunks', 'run_snapshots', 'executions',
         'execution_attempts', 'execution_aggregates', 'evaluator_results',
-        'run_shard_summaries'
+        'evaluator_diagnostics', 'run_shard_summaries'
     )),
     row_key JSONB NOT NULL,
     change_version BIGINT NOT NULL DEFAULT 1 CHECK (change_version > 0),
@@ -162,6 +163,12 @@ CREATE TRIGGER capture_evaluator_results_changes
 AFTER INSERT OR UPDATE OR DELETE ON evaluator_results
 FOR EACH ROW EXECUTE FUNCTION record_shard_move_dirty_key(
     'evaluator_results', 'run_id', 'run_shard', 'id'
+);
+
+CREATE TRIGGER capture_evaluator_diagnostics_changes
+AFTER INSERT OR UPDATE OR DELETE ON evaluator_diagnostics
+FOR EACH ROW EXECUTE FUNCTION record_shard_move_dirty_key(
+    'evaluator_diagnostics', 'run_id', 'run_shard', 'id'
 );
 
 CREATE TRIGGER capture_run_shard_summaries_changes

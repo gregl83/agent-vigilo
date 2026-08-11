@@ -201,6 +201,9 @@ pub(crate) struct AppliesTo {
 /// Evaluator binding configuration for one case-group entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct EvaluatorBinding {
+    /// Stable identifier for this binding within the profile.
+    pub(crate) id: String,
+
     /// Evaluator reference string as declared in profile payload.
     ///
     /// This is currently treated as an opaque identifier at parse time.
@@ -221,9 +224,41 @@ pub(crate) struct EvaluatorBinding {
     /// Relative weighting for this evaluator within its dimension.
     pub(crate) weight: f64,
 
+    /// Host-owned interpretation of the evaluator's measurement type.
+    pub(crate) normalization: NormalizationPolicy,
+
+    /// Minimum normalized score that yields a host `passed` judgment.
+    pub(crate) pass_threshold: f64,
+
     /// Evaluator-specific unstructured configuration payload.
     #[serde(default = "default_json_object")]
     pub(crate) config: Value,
+}
+
+/// Host-owned conversion from an evaluator measurement to a normalized score.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub(crate) enum NormalizationPolicy {
+    /// Converts `false` to zero and `true` to one.
+    Binary,
+    /// Linearly maps the evaluator-declared range to zero through one.
+    Range { direction: ScoreDirection },
+    /// Requires an already normalized zero-through-one value.
+    Normalized,
+    /// Maps preference outcomes using profile-owned values.
+    Preference {
+        preferred: f64,
+        tie: f64,
+        not_preferred: f64,
+    },
+}
+
+/// Direction used when normalizing range measurements.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ScoreDirection {
+    HigherIsBetter,
+    LowerIsBetter,
 }
 
 /// Aggregation policy for a case-group, keyed by dimension name.
@@ -342,10 +377,14 @@ case_groups:
     applies_to:
       task_type: classification
     evaluators:
-      - ref: core/json-schema:1.0.0
+      - id: json_schema
+        ref: core/json-schema:1.0.0
         dimension: format
         blocking: true
         weight: 1.0
+        normalization:
+          method: binary
+        pass_threshold: 1.0
         config:
           schema:
             type: object

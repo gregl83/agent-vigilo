@@ -22,11 +22,11 @@ It focuses on the parts of AI evaluation that become hard as systems grow: idemp
 - **Ship versioned evaluators**: publish WASI Preview 2 WebAssembly evaluators with strict WIT contracts.
 - **Protect the runtime**: Wasmtime fuel, memory, timeout, log, and concurrency limits isolate evaluator execution.
 - **Avoid lost events**: durable outbox ledger plus hot delivery queue, RabbitMQ publisher confirms, and idempotency keys.
-- **Gate deployments**: turn evaluator findings into dimension scores, total aggregate scores, and reproducible pass/fail decisions for agent releases.
+- **Gate deployments**: turn evaluator measurements and host-owned profile policy into dimension scores, total aggregate scores, and reproducible release decisions.
 
 ## How Results Are Calculated
 
-Evaluator findings are checked for required evaluator completeness before they are grouped into profile dimensions, combined into one execution `aggregate_score`, and checked against the overall score gate. Missing, errored, skipped, or unscored required evaluator output produces an errored execution aggregate with no score. An execution passes when completeness is satisfied, `aggregate_score >= min_execution_score`, and no hard blocking finding fails. A run passes only when every expected execution has an aggregate, no chunk failed or was cancelled, and no execution failed or errored.
+Each evaluator invocation returns one measurement or abstention plus optional diagnostics. The profile binding owns normalization, threshold, dimension, weight, requiredness, and blocking policy. Missing, errored, abstained, duplicated, or invalid required output produces an errored execution aggregate with no score. An execution passes when completeness is satisfied, `aggregate_score >= min_execution_score`, and no host-derived blocking result fails.
 
 A run can fail operationally because work did not complete, or complete with a failed gate because evaluation policy failed.
 

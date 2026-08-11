@@ -29,7 +29,7 @@ Chunk-ready broker messages are delivered at least once. A worker holds the Rabb
 
 ## Duplicate delivery
 
-Duplicate broker deliveries are allowed. Exactly-once effects are managed in the database: chunks can only be claimed from an open or expired lease, recovered chunk-ready outbox event records carry unique recovery dedupe keys, executions only accept terminal transitions from the current attempt id, attempt number, worker id, and live attempt lease, and evaluator findings are unique per run, attempt, evaluator, and finding index.
+Duplicate broker deliveries are allowed. Exactly-once effects are managed in the database: chunks can only be claimed from an open or expired lease, recovered chunk-ready outbox event records carry unique recovery dedupe keys, executions only accept terminal transitions from the current attempt id, attempt number, worker id, and live attempt lease, and evaluator invocation results are unique per run, attempt, and stable binding id. Diagnostics are unique by invocation result and diagnostic index.
 
 ## Stale shard route
 
