@@ -273,10 +273,25 @@ jobs:
           pattern: coverage-*
           path: coverage
           merge-multiple: true
+      - name: Install LCOV
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes lcov
+      - name: Merge Rust coverage reports
+        run: >-
+          lcov
+          --add-tracefile coverage/lcov-unit.info
+          --add-tracefile coverage/lcov-sqlx.info
+          --add-tracefile coverage/lcov-e2e.info
+          --output-file coverage/lcov-rust-all.info
+      - name: Enforce aggregate Rust coverage
+        run: >-
+          lcov --summary coverage/lcov-rust-all.info
+          --fail-under-lines 80
       - name: Upload aggregate coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
-          files: coverage/lcov-unit.info,coverage/lcov-sqlx.info,coverage/lcov-e2e.info
+          files: coverage/lcov-rust-all.info
           flags: rust-all
           name: rust-all
           disable_search: true
