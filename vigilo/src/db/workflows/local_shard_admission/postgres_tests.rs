@@ -17,6 +17,7 @@ async fn stale_write_epoch_is_rejected_without_mutating_local_state(pool: PgPool
             write_epoch: 2,
             state: LocalShardAdmissionState::Open,
             redirect_database_alias: None,
+            move_fence: None,
         },
     )
     .await
@@ -64,6 +65,7 @@ async fn draining_allows_settlement_but_rejects_new_work(pool: PgPool) {
             write_epoch: 4,
             state: LocalShardAdmissionState::Draining,
             redirect_database_alias: Some("shard_001".to_string()),
+            move_fence: None,
         },
     )
     .await
@@ -94,6 +96,7 @@ async fn same_epoch_transition_cannot_reopen_closed_owner(pool: PgPool) {
             write_epoch: 8,
             state: LocalShardAdmissionState::Closed,
             redirect_database_alias: Some("shard_001".to_string()),
+            move_fence: None,
         },
     )
     .await
@@ -108,6 +111,7 @@ async fn same_epoch_transition_cannot_reopen_closed_owner(pool: PgPool) {
             write_epoch: 8,
             state: LocalShardAdmissionState::Open,
             redirect_database_alias: None,
+            move_fence: None,
         },
         &[LocalShardAdmissionState::Open],
     )

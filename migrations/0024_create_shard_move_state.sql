@@ -16,6 +16,7 @@ CREATE TABLE shard_move_operations (
     copied_row_count BIGINT NOT NULL DEFAULT 0 CHECK (copied_row_count >= 0),
     copied_byte_count BIGINT NOT NULL DEFAULT 0 CHECK (copied_byte_count >= 0),
     error_message TEXT,
+    claim_generation BIGINT NOT NULL DEFAULT 0 CHECK (claim_generation >= 0),
     claim_token UUID,
     claimed_until TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -180,3 +181,6 @@ COMMENT ON TABLE shard_move_captures IS
 
 COMMENT ON TABLE shard_move_dirty_keys IS
     'Move-scoped keys changed after capture began. Replay rereads current source state instead of retaining payload history.';
+
+COMMENT ON COLUMN shard_move_operations.claim_generation IS
+    'Monotonic claimant generation. Every successful move claim increments it so a stale process cannot reinstall older target authority.';

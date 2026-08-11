@@ -5,6 +5,9 @@ CREATE TABLE local_shard_admissions (
     write_epoch BIGINT NOT NULL CHECK (write_epoch > 0),
     state TEXT NOT NULL CHECK (state IN ('open', 'draining', 'prepared', 'closed')),
     redirect_database_alias TEXT,
+    move_id UUID,
+    move_claim_generation BIGINT CHECK (move_claim_generation > 0),
+    move_claim_token UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
@@ -12,6 +15,20 @@ CREATE TABLE local_shard_admissions (
     CONSTRAINT ck_local_shard_admissions_redirect CHECK (
         redirect_database_alias IS NULL
         OR redirect_database_alias <> database_alias
+    ),
+    CONSTRAINT ck_local_shard_admissions_move_fence CHECK (
+        (
+            state = 'prepared'
+            AND move_id IS NOT NULL
+            AND move_claim_generation IS NOT NULL
+            AND move_claim_token IS NOT NULL
+        )
+        OR (
+            state <> 'prepared'
+            AND move_id IS NULL
+            AND move_claim_generation IS NULL
+            AND move_claim_token IS NULL
+        )
     )
 );
 
@@ -36,6 +53,15 @@ COMMENT ON COLUMN local_shard_admissions.state IS
 COMMENT ON COLUMN local_shard_admissions.redirect_database_alias IS
     'Informational move counterpart for diagnostics and stale-route errors. Workers still refresh authoritative routing from the control database.';
 
+COMMENT ON COLUMN local_shard_admissions.move_id IS
+    'Soft reference to the control-owned move operation preparing this target. Cross-database placement prevents a physical foreign key.';
+
+COMMENT ON COLUMN local_shard_admissions.move_claim_generation IS
+    'Monotonic move claimant generation installed on this prepared target.';
+
+COMMENT ON COLUMN local_shard_admissions.move_claim_token IS
+    'Opaque token authorizing target reset, copy, and replay writes for the installed move generation.';
+
 COMMENT ON COLUMN local_shard_admissions.created_at IS
     'Time this physical database first recorded local authority for the run shard.';
 
@@ -47,3 +73,6 @@ COMMENT ON CONSTRAINT pk_local_shard_admissions ON local_shard_admissions IS
 
 COMMENT ON CONSTRAINT ck_local_shard_admissions_redirect ON local_shard_admissions IS
     'Prevents a local admission from redirecting stale work back to the same configured database alias.';
+
+COMMENT ON CONSTRAINT ck_local_shard_admissions_move_fence ON local_shard_admissions IS
+    'Prepared targets require complete move authority; runtime admissions cannot retain mover authority.';

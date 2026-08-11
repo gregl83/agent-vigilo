@@ -12,7 +12,8 @@ pub(in crate::db::workflows::shard_admin) async fn select_latest_move_to_target(
         r#"
         SELECT id, run_id, run_shard, source_database_alias,
                target_database_alias, starting_route_version, status, phase,
-               target_reset_at, copied_row_count, copied_byte_count, claim_token
+               target_reset_at, copied_row_count, copied_byte_count,
+               claim_generation, claim_token
         FROM shard_move_operations
         WHERE run_id = $1::uuid
           AND run_shard = $2
@@ -170,7 +171,8 @@ pub(in crate::db::workflows::shard_admin) async fn claim_shard_move_operation(
         r#"
         SELECT id, run_id, run_shard, source_database_alias,
                target_database_alias, starting_route_version, status, phase,
-               target_reset_at, copied_row_count, copied_byte_count, claim_token
+               target_reset_at, copied_row_count, copied_byte_count,
+               claim_generation, claim_token
         FROM shard_move_operations
         WHERE run_id = $1::uuid
           AND run_shard = $2
@@ -206,7 +208,8 @@ pub(in crate::db::workflows::shard_admin) async fn claim_shard_move_operation(
             VALUES ($1::uuid, $2, $3, $4, $5)
             RETURNING id, run_id, run_shard, source_database_alias,
                       target_database_alias, starting_route_version, status, phase,
-                      target_reset_at, copied_row_count, copied_byte_count, claim_token
+                      target_reset_at, copied_row_count, copied_byte_count,
+                      claim_generation, claim_token
             "#,
         )
         .bind(current.run_id)
@@ -222,6 +225,7 @@ pub(in crate::db::workflows::shard_admin) async fn claim_shard_move_operation(
         r#"
         UPDATE shard_move_operations
         SET claim_token = $2::uuid,
+            claim_generation = claim_generation + 1,
             claimed_until = now() + make_interval(secs => $3),
             updated_at = now()
         WHERE id = $1::uuid
@@ -233,7 +237,8 @@ pub(in crate::db::workflows::shard_admin) async fn claim_shard_move_operation(
           )
         RETURNING id, run_id, run_shard, source_database_alias,
                   target_database_alias, starting_route_version, status, phase,
-                  target_reset_at, copied_row_count, copied_byte_count, claim_token
+                  target_reset_at, copied_row_count, copied_byte_count,
+                  claim_generation, claim_token
         "#,
     )
     .bind(operation.id)
@@ -668,7 +673,7 @@ pub(in crate::db::workflows::shard_admin) async fn select_current_rows_for_dirty
 }
 
 pub(in crate::db::workflows::shard_admin) async fn delete_target_rows_for_dirty_keys(
-    target_db: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     table: &str,
     key_columns: &[&str],
     keys: &[Value],
@@ -690,7 +695,7 @@ pub(in crate::db::workflows::shard_admin) async fn delete_target_rows_for_dirty_
     );
     sqlx::query(&sql)
         .bind(Json(Value::Array(keys.to_vec())))
-        .execute(target_db)
+        .execute(&mut **tx)
         .await?;
     Ok(())
 }
@@ -778,13 +783,10 @@ pub(in crate::db::workflows::shard_admin) async fn checkpoint_move_reports(
 /// reverse dependency order and take target-side exclusive admission so stale
 /// routed transactions cannot race the reset.
 pub(in crate::db::workflows::shard_admin) async fn reset_target_shard_rows(
-    target: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
     run_shard: i16,
 ) -> anyhow::Result<()> {
-    let mut tx = target.begin().await?;
-    crate::db::shard_write_fence::lock_exclusive(&mut tx, run_id, run_shard).await?;
-
     for table in SHARD_TABLES.iter().rev() {
         let sql = format!(
             "DELETE FROM {} WHERE run_id = $1::uuid AND run_shard = $2",
@@ -793,16 +795,14 @@ pub(in crate::db::workflows::shard_admin) async fn reset_target_shard_rows(
         sqlx::query(&sql)
             .bind(run_id)
             .bind(run_shard)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
     }
-
-    tx.commit().await?;
     Ok(())
 }
 
 pub(in crate::db::workflows::shard_admin) async fn copy_json_rows(
-    db: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     table: &str,
     rows: Vec<Value>,
 ) -> anyhow::Result<u64> {
@@ -811,8 +811,8 @@ pub(in crate::db::workflows::shard_admin) async fn copy_json_rows(
     }
 
     if table == "case_blobs" {
-        let copied = copy_case_blob_rows(db, rows.clone()).await?;
-        verify_prerequisite_rows(db, table, &rows).await?;
+        let copied = copy_case_blob_rows(tx, rows.clone()).await?;
+        verify_prerequisite_rows(tx, table, &rows).await?;
         return Ok(copied);
     }
 
@@ -827,15 +827,15 @@ pub(in crate::db::workflows::shard_admin) async fn copy_json_rows(
 
     let result = sqlx::query(&sql)
         .bind(Json(Value::Array(rows.clone())))
-        .execute(db)
+        .execute(&mut **tx)
         .await?;
 
-    verify_prerequisite_rows(db, table, &rows).await?;
+    verify_prerequisite_rows(tx, table, &rows).await?;
     Ok(result.rows_affected())
 }
 
 pub(in crate::db::workflows::shard_admin) async fn verify_prerequisite_rows(
-    db: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     table: &str,
     source_rows: &[Value],
 ) -> anyhow::Result<()> {
@@ -859,7 +859,7 @@ pub(in crate::db::workflows::shard_admin) async fn verify_prerequisite_rows(
     );
     let target_rows = sqlx::query_scalar::<_, Value>(&sql)
         .bind(Json(Value::Array(source_rows.to_vec())))
-        .fetch_all(db)
+        .fetch_all(&mut **tx)
         .await?;
     let normalize = |row: &Value| -> anyhow::Result<(String, Value)> {
         let key = row
@@ -887,7 +887,7 @@ pub(in crate::db::workflows::shard_admin) async fn verify_prerequisite_rows(
 }
 
 pub(in crate::db::workflows::shard_admin) async fn upsert_json_rows(
-    db: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     table: &str,
     key_columns: &[&str],
     rows: Vec<Value>,
@@ -905,7 +905,7 @@ pub(in crate::db::workflows::shard_admin) async fn upsert_json_rows(
         "#,
     )
     .bind(table)
-    .fetch_all(db)
+    .fetch_all(&mut **tx)
     .await?;
     if columns.is_empty() {
         anyhow::bail!("shard move target table {} was not found", table);
@@ -939,13 +939,13 @@ pub(in crate::db::workflows::shard_admin) async fn upsert_json_rows(
     );
     let result = sqlx::query(&sql)
         .bind(Json(Value::Array(rows)))
-        .execute(db)
+        .execute(&mut **tx)
         .await?;
     Ok(result.rows_affected())
 }
 
 pub(in crate::db::workflows::shard_admin) async fn copy_case_blob_rows(
-    db: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     rows: Vec<Value>,
 ) -> anyhow::Result<u64> {
     let result = sqlx::query(
@@ -976,7 +976,7 @@ pub(in crate::db::workflows::shard_admin) async fn copy_case_blob_rows(
         "#,
     )
     .bind(Json(Value::Array(rows)))
-    .execute(db)
+    .execute(&mut **tx)
     .await?;
 
     Ok(result.rows_affected())

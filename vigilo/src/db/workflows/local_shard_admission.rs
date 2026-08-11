@@ -11,6 +11,7 @@ use uuid::Uuid;
 mod queries;
 
 pub(crate) use queries::{
+    install_local_shard_move_fence,
     select_local_shard_admission,
     transition_local_shard_admission,
     upsert_local_shard_admission,
@@ -71,6 +72,14 @@ pub(crate) struct LocalShardAdmissionDraft {
     pub(crate) write_epoch: i64,
     pub(crate) state: LocalShardAdmissionState,
     pub(crate) redirect_database_alias: Option<String>,
+    pub(crate) move_fence: Option<LocalShardMoveFence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LocalShardMoveFence {
+    pub(crate) move_id: Uuid,
+    pub(crate) claim_generation: i64,
+    pub(crate) claim_token: Uuid,
 }
 
 #[derive(Debug, Clone)]
@@ -95,11 +104,22 @@ pub(crate) struct LocalShardAdmission {
     pub(crate) write_epoch: i64,
     state: String,
     pub(crate) redirect_database_alias: Option<String>,
+    move_id: Option<Uuid>,
+    move_claim_generation: Option<i64>,
+    move_claim_token: Option<Uuid>,
 }
 
 impl LocalShardAdmission {
     pub(crate) fn parsed_state(&self) -> anyhow::Result<LocalShardAdmissionState> {
         LocalShardAdmissionState::try_from(self.state.as_str())
+    }
+
+    pub(crate) fn move_fence(&self) -> Option<LocalShardMoveFence> {
+        Some(LocalShardMoveFence {
+            move_id: self.move_id?,
+            claim_generation: self.move_claim_generation?,
+            claim_token: self.move_claim_token?,
+        })
     }
 }
 
@@ -136,6 +156,64 @@ pub(crate) enum LocalShardAdmissionError {
         write_kind: &'static str,
         redirect_database_alias: Option<String>,
     },
+    #[error(
+        "stale shard mover for run {run_id} shard {run_shard} on {database_alias}; expected move {expected_move_id} generation {expected_generation} token {expected_token}, local authority is {actual_authority}"
+    )]
+    StaleMoveClaim {
+        run_id: Uuid,
+        run_shard: i16,
+        database_alias: String,
+        expected_move_id: Uuid,
+        expected_generation: i64,
+        expected_token: Uuid,
+        actual_authority: String,
+    },
+}
+
+pub(crate) async fn validate_local_shard_move_fence<'e, E>(
+    executor: E,
+    run_id: Uuid,
+    run_shard: i16,
+    database_alias: &str,
+    write_epoch: i64,
+    expected: LocalShardMoveFence,
+) -> anyhow::Result<LocalShardAdmission>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let admission = select_local_shard_admission(executor, run_id, run_shard)
+        .await?
+        .ok_or_else(|| LocalShardAdmissionError::Missing {
+            run_id,
+            run_shard,
+            database_alias: database_alias.to_string(),
+        })?;
+    let actual = admission.move_fence();
+    if admission.database_alias != database_alias
+        || admission.write_epoch != write_epoch
+        || admission.parsed_state()? != LocalShardAdmissionState::Prepared
+        || actual != Some(expected)
+    {
+        return Err(LocalShardAdmissionError::StaleMoveClaim {
+            run_id,
+            run_shard,
+            database_alias: database_alias.to_string(),
+            expected_move_id: expected.move_id,
+            expected_generation: expected.claim_generation,
+            expected_token: expected.claim_token,
+            actual_authority: actual.map_or_else(
+                || "none".to_string(),
+                |actual| {
+                    format!(
+                        "move {} generation {} token {}",
+                        actual.move_id, actual.claim_generation, actual.claim_token
+                    )
+                },
+            ),
+        }
+        .into());
+    }
+    Ok(admission)
 }
 
 pub(crate) async fn validate_local_shard_admission<'e, E>(
@@ -340,6 +418,9 @@ mod tests {
             write_epoch,
             state: state.to_string(),
             redirect_database_alias: redirect_database_alias.map(ToOwned::to_owned),
+            move_id: None,
+            move_claim_generation: None,
+            move_claim_token: None,
         }
     }
 }

@@ -829,6 +829,7 @@ impl DatabaseRouter {
                     write_epoch: hint.write_epoch,
                     state: LocalShardAdmissionState::Open,
                     redirect_database_alias: None,
+                    move_fence: None,
                 },
             )
             .await?;
@@ -923,6 +924,7 @@ impl DatabaseRouter {
                         write_epoch: hint.write_epoch,
                         state,
                         redirect_database_alias: route.placement.move_target_database_alias.clone(),
+                        move_fence: None,
                     },
                 )
                 .await?;
@@ -1752,6 +1754,7 @@ mod tests {
                 write_epoch: stale_route.placement.write_epoch,
                 state: LocalShardAdmissionState::Draining,
                 redirect_database_alias: Some("shard_001".to_string()),
+                move_fence: None,
             },
         )
         .await
@@ -1822,6 +1825,7 @@ mod tests {
                 write_epoch: 2,
                 state: LocalShardAdmissionState::Open,
                 redirect_database_alias: None,
+                move_fence: None,
             },
         )
         .await
@@ -2043,6 +2047,7 @@ mod tests {
                 write_epoch: 1,
                 state: LocalShardAdmissionState::Open,
                 redirect_database_alias: None,
+                move_fence: None,
             },
         )
         .await

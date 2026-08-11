@@ -604,6 +604,7 @@ async fn seed_execution_placement(
                 write_epoch: 1,
                 state: LocalShardAdmissionState::Open,
                 redirect_database_alias: None,
+                move_fence: None,
             },
         )
         .await?;
