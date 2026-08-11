@@ -1428,10 +1428,15 @@ case_groups:
     applies_to:
       task_type: classification
     evaluators:
-      - ref: {evaluator_ref}
+      - id: sentiment
+        ref: {evaluator_ref}
+        required: true
         dimension: quality
         blocking: true
         weight: 1.0
+        normalization:
+          method: normalized
+        pass_threshold: 0.5
     aggregation:
       dimensions:
         quality:

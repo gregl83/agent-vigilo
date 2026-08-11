@@ -534,6 +534,9 @@ async fn seed_evaluator(primary: &PgPool) -> anyhow::Result<()> {
             content_hash,
             wasm_bytes,
             wasm_size_bytes,
+            interface_name,
+            interface_version,
+            wit_world,
             runtime,
             runtime_version,
             runtime_fingerprint,
@@ -546,6 +549,9 @@ async fn seed_evaluator(primary: &PgPool) -> anyhow::Result<()> {
             'multi-database-routing-json-schema',
             decode('', 'hex'),
             0,
+            'evaluator',
+            '1.0.0',
+            'evaluator-world',
             'wasmtime',
             'integration',
             'integration',
@@ -555,6 +561,9 @@ async fn seed_evaluator(primary: &PgPool) -> anyhow::Result<()> {
         SET content_hash = EXCLUDED.content_hash,
             wasm_bytes = EXCLUDED.wasm_bytes,
             wasm_size_bytes = EXCLUDED.wasm_size_bytes,
+            interface_name = EXCLUDED.interface_name,
+            interface_version = EXCLUDED.interface_version,
+            wit_world = EXCLUDED.wit_world,
             runtime = EXCLUDED.runtime,
             runtime_version = EXCLUDED.runtime_version,
             runtime_fingerprint = EXCLUDED.runtime_fingerprint,
@@ -747,10 +756,15 @@ case_groups:
     applies_to:
       task_type: classification
     evaluators:
-      - ref: test/json-schema:1.0.0
+      - id: response_schema
+        ref: test/json-schema:1.0.0
+        required: true
         dimension: format
         blocking: true
         weight: 1.0
+        normalization:
+          method: binary
+        pass_threshold: 1.0
     aggregation:
       dimensions:
         format:
