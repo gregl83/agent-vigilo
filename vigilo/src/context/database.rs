@@ -63,6 +63,7 @@ use crate::{
     models::{
         database_placement::{
             DATABASE_PLACEMENT_STATUS_ACTIVE,
+            DATABASE_PLACEMENT_STATUS_PROVISIONING,
             DEFAULT_DATABASE_URL_ENV,
             DatabasePlacement,
         },
@@ -492,6 +493,27 @@ impl DatabaseRouter {
         let started = Instant::now();
         let alias = normalize_alias(alias.to_string(), "database alias")?;
         let placement = self.require_active_placement(&alias).await?;
+        require_shard_capable_placement(&placement)?;
+
+        self.resolve_placement_pool(&placement, started).await
+    }
+
+    /// Returns a pool for one shard placement undergoing readiness verification.
+    pub(crate) async fn provisioning_database(&self, alias: &str) -> anyhow::Result<PgPool> {
+        let started = Instant::now();
+        let alias = normalize_alias(alias.to_string(), "database alias")?;
+        let db = self.control().await?;
+        let placement = database_placements::select_database_placement(db, &alias)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("database placement alias {} was not found", alias))?;
+
+        if placement.status != DATABASE_PLACEMENT_STATUS_PROVISIONING {
+            anyhow::bail!(
+                "database placement alias {} has status {}, which is not awaiting activation",
+                alias,
+                placement.status
+            );
+        }
         require_shard_capable_placement(&placement)?;
 
         self.resolve_placement_pool(&placement, started).await
@@ -1107,12 +1129,12 @@ impl DatabaseRouter {
             "VIGILO_DEFAULT_SHARD_DATABASE_ALIAS",
         )?;
 
-        let disabled_routes =
-            database_placements::count_shard_placements_on_disabled_databases(db).await?;
-        if disabled_routes > 0 {
+        let unserviceable_routes =
+            database_placements::count_shard_placements_on_unserviceable_databases(db).await?;
+        if unserviceable_routes > 0 {
             anyhow::bail!(
-                "{} shard placement row(s) route to disabled database placements",
-                disabled_routes
+                "{} shard placement row(s) route to provisioning or disabled database placements",
+                unserviceable_routes
             );
         }
 

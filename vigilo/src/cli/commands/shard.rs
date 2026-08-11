@@ -19,7 +19,10 @@ use tracing::{
 };
 use uuid::Uuid;
 
-use super::Executable;
+use super::{
+    Executable,
+    args::DatabaseOperationTimeoutOptions,
+};
 use crate::{
     context::Context,
     db::workflows::shard_admin,
@@ -113,7 +116,7 @@ pub(crate) enum DatabaseSubCommand {
     /// List database placements
     List,
 
-    /// Register an active shard database placement
+    /// Register a shard database placement for readiness verification
     #[command(alias = "add")]
     Register {
         /// Stable placement alias
@@ -126,6 +129,12 @@ pub(crate) enum DatabaseSubCommand {
         /// Add the placement even when database_url_env is not set in this process
         #[arg(long, default_value_t = false)]
         defer_env_validation: bool,
+    },
+
+    /// Verify and activate a registered shard database placement
+    Activate {
+        /// Stable placement alias
+        alias: String,
     },
 
     /// Stop new ownership unless an in-flight move targets this placement
@@ -240,6 +249,9 @@ pub(crate) enum RebalanceSubCommand {
     after_help = "Tip: draining stops new ownership but does not move existing shards. Use `vigilo rebalance` to evacuate the database before disabling it."
 )]
 pub(crate) struct DatabaseCommand {
+    #[command(flatten)]
+    pub(crate) database_operation_timeout: DatabaseOperationTimeoutOptions,
+
     #[command(subcommand)]
     pub(crate) command: DatabaseSubCommand,
 }
@@ -478,6 +490,15 @@ async fn exec_database_command(
                 &placement,
                 !defer_env_validation,
             ))?;
+        }
+        DatabaseSubCommand::Activate { alias } => {
+            let outcome = shard_admin::activate_database_placement(database_router, &alias).await?;
+            info!(
+                database_alias = %outcome.placement.alias,
+                changed = outcome.changed,
+                "activated shard database placement"
+            );
+            out.write_value(&database_activated_payload(&outcome))?;
         }
         DatabaseSubCommand::Disable { alias } => {
             let placement =
@@ -756,6 +777,20 @@ fn database_registered_payload(placement: &DatabasePlacement, env_validated: boo
         "meta": {
             "created": true,
             "env_validated": env_validated,
+            "activation_required": true,
+        }
+    })
+}
+
+fn database_activated_payload(outcome: &shard_admin::DatabasePlacementActivationOutcome) -> Value {
+    json!({
+        "data": {
+            "database_placement": &outcome.placement,
+        },
+        "meta": {
+            "changed": outcome.changed,
+            "readiness_verified": outcome.readiness_verified,
+            "migration_count": outcome.migration_count,
         }
     })
 }
@@ -940,6 +975,7 @@ mod tests {
             DATABASE_PLACEMENT_ROLE_SHARD,
             DATABASE_PLACEMENT_STATUS_ACTIVE,
             DATABASE_PLACEMENT_STATUS_DRAINING,
+            DATABASE_PLACEMENT_STATUS_PROVISIONING,
         },
         shard_placement::SHARD_PLACEMENT_STATUS_ACTIVE,
     };
@@ -1031,6 +1067,16 @@ mod tests {
                 target,
                 ..
             } if from.as_deref() == Some("primary") && target == "shard_001"
+        ));
+    }
+
+    #[test]
+    fn database_activate_command_matches_lifecycle_shape() {
+        let cli = DatabaseTestCli::try_parse_from(["vigilo", "activate", "shard_001"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            DatabaseSubCommand::Activate { alias } if alias == "shard_001"
         ));
     }
 
@@ -1228,6 +1274,49 @@ mod tests {
             payload["data"]["database_placements"][0]["alias"],
             json!("shard_001")
         );
+    }
+
+    #[test]
+    fn database_registered_payload_requires_activation() {
+        let placement = DatabasePlacement {
+            alias: "shard_001".to_string(),
+            database_url_env: "VIGILO_SHARD_001_DATABASE_URL".to_string(),
+            role: DATABASE_PLACEMENT_ROLE_SHARD.to_string(),
+            status: DATABASE_PLACEMENT_STATUS_PROVISIONING.to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let payload = database_registered_payload(&placement, true);
+
+        assert_eq!(payload["meta"]["activation_required"], json!(true));
+        assert_eq!(
+            payload["data"]["database_placement"]["status"],
+            json!("provisioning")
+        );
+    }
+
+    #[test]
+    fn database_activated_payload_reports_verified_transition() {
+        let outcome = shard_admin::DatabasePlacementActivationOutcome {
+            placement: DatabasePlacement {
+                alias: "shard_001".to_string(),
+                database_url_env: "VIGILO_SHARD_001_DATABASE_URL".to_string(),
+                role: DATABASE_PLACEMENT_ROLE_SHARD.to_string(),
+                status: DATABASE_PLACEMENT_STATUS_ACTIVE.to_string(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            changed: true,
+            readiness_verified: true,
+            migration_count: Some(25),
+        };
+
+        let payload = database_activated_payload(&outcome);
+
+        assert_eq!(payload["meta"]["changed"], json!(true));
+        assert_eq!(payload["meta"]["readiness_verified"], json!(true));
+        assert_eq!(payload["meta"]["migration_count"], json!(25));
     }
 
     #[test]

@@ -1,6 +1,10 @@
 // PostgreSQL-backed workflow scenarios and fixtures.
 
-use sqlx::PgPool;
+use sqlx::{
+    PgPool,
+    Postgres,
+    migrate::MigrateDatabase,
+};
 use tokio::sync::OnceCell;
 
 use super::*;
@@ -87,6 +91,25 @@ async fn isolated_database_url(pool: &PgPool) -> String {
         url::Url::parse(&std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap()).unwrap();
     database_url.set_path(&database_name);
     database_url.to_string()
+}
+
+async fn create_migrated_target_database() -> (String, String) {
+    let database_name = format!("vigilo_activation_{}", Uuid::now_v7().simple());
+    let mut database_url =
+        url::Url::parse(&std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap()).unwrap();
+    database_url.set_path(&database_name);
+    let database_url = database_url.to_string();
+
+    Postgres::create_database(&database_url).await.unwrap();
+    let pool = PgPool::connect(&database_url).await.unwrap();
+    sqlx::migrate!("../migrations").run(&pool).await.unwrap();
+    pool.close().await;
+
+    (database_name, database_url)
+}
+
+async fn drop_target_database(database_url: &str) {
+    Postgres::drop_database(database_url).await.unwrap();
 }
 
 async fn seed_rebalance_operation(pool: &PgPool, item_count: usize) -> (Uuid, Vec<(Uuid, i16)>) {

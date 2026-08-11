@@ -60,13 +60,9 @@ services:
             'shard_001',
             'VIGILO_SHARD_001_DATABASE_URL',
             'shard',
-            'active'
+            'provisioning'
           )
-          ON CONFLICT (alias) DO UPDATE
-          SET database_url_env = EXCLUDED.database_url_env,
-              role = EXCLUDED.role,
-              status = EXCLUDED.status,
-              updated_at = now();
+          ON CONFLICT (alias) DO NOTHING;
         "
     environment:
       DATABASE_URL: ${VIGILO_CONTAINER_DATABASE_URL:-postgresql://postgres:password@postgres:5432/agent_vigilo}
@@ -74,6 +70,26 @@ services:
       setup:
         condition: service_completed_successfully
       setup-shard-001:
+        condition: service_completed_successfully
+    networks:
+      - agent_vigilo_network
+    restart: "no"
+
+  activate-shard-001:
+    image: rust:latest
+    working_dir: /workspace
+    command:
+      ["cargo", "run", "-p", "vigilo", "--", "database", "activate", "shard_001"]
+    environment:
+      DATABASE_URL: ${VIGILO_CONTAINER_DATABASE_URL:-postgresql://postgres:password@postgres:5432/agent_vigilo}
+      VIGILO_SHARD_001_DATABASE_URL: ${VIGILO_CONTAINER_SHARD_001_DATABASE_URL:-postgresql://postgres:password@postgres-shard-001:5432/agent_vigilo}
+    volumes:
+      - ../../:/workspace
+      - agent_vigilo_cargo_registry:/usr/local/cargo/registry
+      - agent_vigilo_cargo_git:/usr/local/cargo/git
+      - agent_vigilo_target:/workspace/target
+    depends_on:
+      configure-shard-001:
         condition: service_completed_successfully
     networks:
       - agent_vigilo_network
@@ -87,14 +103,14 @@ services:
     environment:
       VIGILO_SHARD_001_DATABASE_URL: ${VIGILO_CONTAINER_SHARD_001_DATABASE_URL:-postgresql://postgres:password@postgres-shard-001:5432/agent_vigilo}
     depends_on:
-      configure-shard-001:
+      activate-shard-001:
         condition: service_completed_successfully
 
   worker:
     environment:
       VIGILO_SHARD_001_DATABASE_URL: ${VIGILO_CONTAINER_SHARD_001_DATABASE_URL:-postgresql://postgres:password@postgres-shard-001:5432/agent_vigilo}
     depends_on:
-      configure-shard-001:
+      activate-shard-001:
         condition: service_completed_successfully
 
 volumes:

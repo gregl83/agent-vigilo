@@ -2,8 +2,8 @@
 //!
 //! These helpers keep shard topology guardrails behind the database workflow
 //! boundary. CLI commands call them to list database placements, add shard
-//! databases, drain or disable shard databases, assign empty run shards, and
-//! move or restore shard-owned routes between placements.
+//! databases, verify and activate their targets, drain or disable shard
+//! databases, assign empty run shards, and move or restore shard-owned routes.
 
 use std::collections::BTreeMap;
 
@@ -51,6 +51,7 @@ use crate::{
             DATABASE_PLACEMENT_STATUS_ACTIVE,
             DATABASE_PLACEMENT_STATUS_DISABLED,
             DATABASE_PLACEMENT_STATUS_DRAINING,
+            DATABASE_PLACEMENT_STATUS_PROVISIONING,
             DatabasePlacement,
         },
         run_chunk::RUN_SHARD_COUNT,
@@ -73,6 +74,21 @@ pub(crate) struct ShardPlacementSetOutcome {
     pub(crate) placement: ShardPlacement,
     pub(crate) previous_database_alias: Option<String>,
     pub(crate) changed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DatabasePlacementActivationOutcome {
+    pub(crate) placement: DatabasePlacement,
+    pub(crate) changed: bool,
+    pub(crate) readiness_verified: bool,
+    pub(crate) migration_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+struct MigrationFingerprint {
+    version: i64,
+    description: String,
+    checksum: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -504,9 +520,188 @@ pub(crate) async fn add_shard_database_placement(
         alias,
         database_url_env,
         DATABASE_PLACEMENT_ROLE_SHARD,
-        DATABASE_PLACEMENT_STATUS_ACTIVE,
+        DATABASE_PLACEMENT_STATUS_PROVISIONING,
     )
     .await
+}
+
+/// Verifies a registered target and atomically makes it eligible for routing.
+///
+/// Target I/O runs before the placement row is locked. The final control
+/// transaction rechecks the lifecycle and catalog references so slow readiness
+/// probes never block unrelated topology work or expose an unchecked target.
+pub(crate) async fn activate_database_placement(
+    database_router: &database::DatabaseRouter,
+    alias: &str,
+) -> anyhow::Result<DatabasePlacementActivationOutcome> {
+    validate_non_empty(alias, "database alias")?;
+
+    let control_db = database_router.control().await?;
+    let snapshot = database_placements::select_database_placement(control_db, alias)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("database placement alias {} was not found", alias))?;
+
+    if snapshot.status == DATABASE_PLACEMENT_STATUS_ACTIVE {
+        return Ok(DatabasePlacementActivationOutcome {
+            placement: snapshot,
+            changed: false,
+            readiness_verified: false,
+            migration_count: None,
+        });
+    }
+    require_provisioning_shard_placement(&snapshot)?;
+
+    let migration_count = database_router
+        .run_database_operation(alias, "database_activation", async {
+            verify_database_placement_readiness(database_router, &snapshot).await
+        })
+        .await?;
+
+    let mut tx = control_db.begin().await?;
+    let current = database_placements::select_database_placement_for_update(&mut tx, alias)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("database placement alias {} was not found", alias))?;
+
+    if current.status == DATABASE_PLACEMENT_STATUS_ACTIVE {
+        tx.commit().await?;
+        return Ok(DatabasePlacementActivationOutcome {
+            placement: current,
+            changed: false,
+            readiness_verified: true,
+            migration_count: Some(migration_count),
+        });
+    }
+    require_provisioning_shard_placement(&current)?;
+    if current.database_url_env != snapshot.database_url_env || current.role != snapshot.role {
+        anyhow::bail!(
+            "database placement alias {} changed while readiness was being verified; retry activation",
+            alias
+        );
+    }
+
+    let references = select_database_placement_references(&mut tx, alias).await?;
+    if references.route_count + references.creation_count + references.rebalance_count > 0 {
+        anyhow::bail!(
+            "database placement alias {} gained control-plane references while provisioning; remove them before activation",
+            alias
+        );
+    }
+
+    let placement = database_placements::update_database_placement_status(
+        &mut tx,
+        alias,
+        DATABASE_PLACEMENT_STATUS_ACTIVE,
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("database placement alias {} was not found", alias))?;
+    tx.commit().await?;
+
+    Ok(DatabasePlacementActivationOutcome {
+        placement,
+        changed: true,
+        readiness_verified: true,
+        migration_count: Some(migration_count),
+    })
+}
+
+fn require_provisioning_shard_placement(placement: &DatabasePlacement) -> anyhow::Result<()> {
+    if !placement.is_shard_capable() {
+        anyhow::bail!(
+            "database placement alias {} has role {}, which cannot store shard ownership",
+            placement.alias,
+            placement.role
+        );
+    }
+    if placement.status != DATABASE_PLACEMENT_STATUS_PROVISIONING {
+        anyhow::bail!(
+            "database placement alias {} has status {} and cannot be activated",
+            placement.alias,
+            placement.status
+        );
+    }
+    Ok(())
+}
+
+async fn verify_database_placement_readiness(
+    database_router: &database::DatabaseRouter,
+    placement: &DatabasePlacement,
+) -> anyhow::Result<usize> {
+    let control_db = database_router.control().await?;
+    let target_db = database_router
+        .provisioning_database(&placement.alias)
+        .await?;
+    let target_identity = select_database_identity(&target_db).await?;
+
+    for existing in database_placements::list_serviceable_database_placements(control_db).await? {
+        let existing_db = database_router.placement(&existing.alias).await?;
+        if select_database_identity(&existing_db).await? == target_identity {
+            anyhow::bail!(
+                "database placement alias {} resolves to the same PostgreSQL database as serviceable placement {}",
+                placement.alias,
+                existing.alias
+            );
+        }
+    }
+
+    let control_migrations = select_migration_fingerprints(control_db).await?;
+    let target_migrations = select_migration_fingerprints(&target_db).await?;
+    if target_migrations != control_migrations {
+        anyhow::bail!(
+            "database placement alias {} schema migrations do not match the control database",
+            placement.alias
+        );
+    }
+
+    let has_admissions = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM local_shard_admissions LIMIT 1)",
+    )
+    .fetch_one(&target_db)
+    .await?;
+    if has_admissions {
+        anyhow::bail!(
+            "database placement alias {} already contains local shard ownership",
+            placement.alias
+        );
+    }
+
+    verify_target_writable(&target_db, &placement.alias).await?;
+    Ok(target_migrations.len())
+}
+
+async fn select_migration_fingerprints(db: &PgPool) -> anyhow::Result<Vec<MigrationFingerprint>> {
+    sqlx::query_as(
+        r#"
+        SELECT version, description, checksum
+        FROM _sqlx_migrations
+        WHERE success
+        ORDER BY version
+        "#,
+    )
+    .fetch_all(db)
+    .await
+    .map_err(Into::into)
+}
+
+async fn verify_target_writable(db: &PgPool, alias: &str) -> anyhow::Result<()> {
+    let mut tx = db.begin().await?;
+    sqlx::query(
+        r#"
+        INSERT INTO local_shard_admissions (
+            run_id,
+            run_shard,
+            database_alias,
+            write_epoch,
+            state
+        )
+        VALUES ($1, 0, $2, 1, 'closed')
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(alias)
+    .execute(&mut *tx)
+    .await?;
+    tx.rollback().await?;
+    Ok(())
 }
 
 pub(crate) async fn disable_database_placement(
@@ -546,29 +741,28 @@ pub(crate) async fn disable_database_placement(
 
     reject_inflight_move_target(&mut *tx, alias).await?;
 
-    let (route_count, creation_count, rebalance_count) =
-        select_database_disable_references(&mut tx, alias).await?;
-    if route_count > 0 {
+    let references = select_database_placement_references(&mut tx, alias).await?;
+    if references.route_count > 0 {
         anyhow::bail!(
             "database placement alias {} still owns {} shard route(s); move every route before disabling it",
             alias,
-            route_count
+            references.route_count
         );
     }
 
-    if creation_count > 0 {
+    if references.creation_count > 0 {
         anyhow::bail!(
             "database placement alias {} is referenced by {} creating run placement(s)",
             alias,
-            creation_count
+            references.creation_count
         );
     }
 
-    if rebalance_count > 0 {
+    if references.rebalance_count > 0 {
         anyhow::bail!(
             "database placement alias {} is referenced by {} unfinished rebalance item(s)",
             alias,
-            rebalance_count
+            references.rebalance_count
         );
     }
 
@@ -627,6 +821,14 @@ pub(crate) async fn drain_database_placement(
     if existing.status == DATABASE_PLACEMENT_STATUS_DRAINING {
         tx.commit().await?;
         return Ok(existing);
+    }
+
+    if existing.status != DATABASE_PLACEMENT_STATUS_ACTIVE {
+        anyhow::bail!(
+            "database placement alias {} has status {}; it must be active before it can be drained",
+            alias,
+            existing.status
+        );
     }
 
     let placement = database_placements::update_database_placement_status(

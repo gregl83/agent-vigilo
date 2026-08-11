@@ -1,8 +1,9 @@
 //! Database placement persistence models.
 //!
-//! Database placements are the routing catalog for future multi-database
-//! deployments. The default deployment seeds one `primary` placement that uses
-//! `DATABASE_URL` for both control-database and shard-local data.
+//! Database placements are the routing catalog for multi-database deployments.
+//! The default deployment seeds one `primary` placement that uses `DATABASE_URL`
+//! for both control-database and shard-local data. Additional targets remain
+//! non-routable until their readiness is verified during activation.
 
 use chrono::{
     DateTime,
@@ -19,6 +20,7 @@ pub(crate) const DEFAULT_DATABASE_URL_ENV: &str = "DATABASE_URL";
 pub(crate) const DATABASE_PLACEMENT_ROLE_CONTROL: &str = "control";
 pub(crate) const DATABASE_PLACEMENT_ROLE_SHARD: &str = "shard";
 pub(crate) const DATABASE_PLACEMENT_ROLE_CONTROL_AND_SHARD: &str = "control_and_shard";
+pub(crate) const DATABASE_PLACEMENT_STATUS_PROVISIONING: &str = "provisioning";
 pub(crate) const DATABASE_PLACEMENT_STATUS_ACTIVE: &str = "active";
 pub(crate) const DATABASE_PLACEMENT_STATUS_DRAINING: &str = "draining";
 pub(crate) const DATABASE_PLACEMENT_STATUS_DISABLED: &str = "disabled";
@@ -32,7 +34,7 @@ pub(crate) struct DatabasePlacement {
     pub(crate) database_url_env: String,
     /// Placement role: control, shard, or control_and_shard.
     pub(crate) role: String,
-    /// Placement status: active, draining, or disabled.
+    /// Placement status: provisioning, active, draining, or disabled.
     pub(crate) status: String,
     /// Time this placement row was inserted.
     pub(crate) created_at: DateTime<Utc>,
@@ -97,6 +99,14 @@ mod tests {
     #[test]
     fn disabled_placement_serves_no_shard_ownership() {
         let placement = shard_placement(DATABASE_PLACEMENT_STATUS_DISABLED);
+
+        assert!(!placement.can_serve_owned_shards());
+        assert!(!placement.accepts_new_shards());
+    }
+
+    #[test]
+    fn provisioning_placement_serves_no_shard_ownership() {
+        let placement = shard_placement(DATABASE_PLACEMENT_STATUS_PROVISIONING);
 
         assert!(!placement.can_serve_owned_shards());
         assert!(!placement.accepts_new_shards());

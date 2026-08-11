@@ -257,11 +257,11 @@ pub(crate) async fn list_serviceable_shard_database_aliases(
     Ok(aliases)
 }
 
-/// Counts shard placement rows that route to a disabled database placement.
+/// Counts shard placement rows that route to an unserviceable database placement.
 ///
-/// Disabled targets cannot own routes. Draining targets remain valid owners
-/// while their routes are evacuated.
-pub(crate) async fn count_shard_placements_on_disabled_databases(
+/// Provisioning and disabled targets cannot own routes. Draining targets remain
+/// valid owners while their routes are evacuated.
+pub(crate) async fn count_shard_placements_on_unserviceable_databases(
     db: &PgPool,
 ) -> anyhow::Result<i64> {
     let count = sqlx::query_scalar::<_, i64>(
@@ -270,7 +270,7 @@ pub(crate) async fn count_shard_placements_on_disabled_databases(
         FROM shard_placements sp
         JOIN database_placements dp
           ON dp.alias = sp.database_alias
-        WHERE dp.status = 'disabled'
+        WHERE dp.status NOT IN ('active', 'draining')
         "#,
     )
     .fetch_one(db)
@@ -295,7 +295,8 @@ mod tests {
             VALUES
                 ('shard_001', 'VIGILO_SHARD_001_DATABASE_URL', 'shard', 'active'),
                 ('shard_002', 'VIGILO_SHARD_002_DATABASE_URL', 'shard', 'disabled'),
-                ('shard_003', 'VIGILO_SHARD_003_DATABASE_URL', 'shard', 'draining')
+                ('shard_003', 'VIGILO_SHARD_003_DATABASE_URL', 'shard', 'draining'),
+                ('shard_004', 'VIGILO_SHARD_004_DATABASE_URL', 'shard', 'provisioning')
             "#,
         )
         .execute(&pool)
@@ -319,7 +320,8 @@ mod tests {
             VALUES
                 ('shard_001', 'VIGILO_SHARD_001_DATABASE_URL', 'shard', 'active'),
                 ('shard_002', 'VIGILO_SHARD_002_DATABASE_URL', 'shard', 'disabled'),
-                ('shard_003', 'VIGILO_SHARD_003_DATABASE_URL', 'shard', 'draining')
+                ('shard_003', 'VIGILO_SHARD_003_DATABASE_URL', 'shard', 'draining'),
+                ('shard_004', 'VIGILO_SHARD_004_DATABASE_URL', 'shard', 'provisioning')
             "#,
         )
         .execute(&pool)
@@ -415,5 +417,40 @@ mod tests {
             aliases,
             vec!["primary".to_string(), "shard_001".to_string()]
         );
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx placement tests"]
+    async fn count_shard_placements_on_unserviceable_databases_includes_provisioning(pool: PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO database_placements (alias, database_url_env, role, status)
+            VALUES
+                ('shard_001', 'VIGILO_SHARD_001_DATABASE_URL', 'shard', 'provisioning'),
+                ('shard_002', 'VIGILO_SHARD_002_DATABASE_URL', 'shard', 'disabled')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            INSERT INTO shard_placements (run_id, run_shard, database_alias, status)
+            VALUES
+                ($1, 0, 'shard_001', 'active'),
+                ($1, 1, 'shard_002', 'active')
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let count = count_shard_placements_on_unserviceable_databases(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 2);
     }
 }

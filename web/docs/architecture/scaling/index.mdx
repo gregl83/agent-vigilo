@@ -105,10 +105,12 @@ role `shard` and store execution data. Environment variables hold connection
 secrets; the placement catalog in PostgreSQL is the routing authority.
 
 Placement status and role are checked in the control database when routes and
-placement pools are resolved. An `active` placement accepts new shard ownership. A `draining`
-placement rejects new ownership but remains serviceable for shards it already
-owns, including dispatch, workers, recovery, reads, outbox publication, and
-movement away from the placement. A `disabled` placement is not serviceable.
+placement pools are resolved. A `provisioning` placement is registered but
+cannot receive or serve ownership until activation verifies its target. An
+`active` placement accepts new shard ownership. A `draining` placement rejects
+new ownership but remains serviceable for shards it already owns, including
+dispatch, workers, recovery, reads, outbox publication, and movement away from
+the placement. A `disabled` placement is not serviceable.
 
 Connection secrets remain process configuration. A newly added alias is
 discovered and cached on first use when its referenced environment variable was
@@ -273,13 +275,24 @@ explicit future contract, not hidden routing behavior.
 
 ## Operating Placements
 
-Add a shard-capable placement by deploying the secret env var and registering
-the placement:
+Add a shard-capable placement by migrating its target, deploying the secret env
+var to every Vigilo process, registering it, and then activating it:
 
-```text
-VIGILO_SHARD_001_DATABASE_URL=postgres://...
+```bash
+export VIGILO_SHARD_001_DATABASE_URL=postgres://...
+DATABASE_URL="$VIGILO_SHARD_001_DATABASE_URL" vigilo setup --skip-evaluators
 vigilo database register shard_001 --database-url-env VIGILO_SHARD_001_DATABASE_URL
+vigilo database activate shard_001
 ```
+
+Registration creates a non-routable `provisioning` catalog row. Activation is
+bounded by `--database-operation-timeout-seconds` (default `30`) and verifies
+that the target is reachable, writable, empty of local shard ownership, on the
+same successful migration set as the control database, and physically distinct
+from every active or draining placement. A failed check leaves the placement in
+`provisioning`; fix the target and retry the idempotent activation command.
+Activation validates the secret available to that command process, so deploy
+the same environment variable to coordinators and workers before activating.
 
 Set the default for future run shards:
 
@@ -305,20 +318,29 @@ receive or serve shard ownership. It does not move any shard rows itself.
 
 ```mermaid
 stateDiagram-v2
+    state "Provisioning<br/>registered, not routable" as provisioning
     state "Active<br/>accepts and serves ownership" as active
     state "Draining<br/>serves existing ownership only" as draining
     state "Disabled<br/>serves no runtime work" as disabled
 
-    [*] --> active: database register
+    [*] --> provisioning: database register
+    provisioning --> active: database activate<br/>readiness verified
     active --> draining: database drain
     draining --> disabled: database disable
 ```
 
 | Database status | New run shard | Assignment or move target | Existing owned shard |
 | --- | --- | --- | --- |
+| `provisioning` | Rejected | Rejected | Blocked |
 | `active` | Allowed | Allowed | Served |
 | `draining` | Rejected | Rejected | Served |
 | `disabled` | Rejected | Rejected | Blocked |
+
+Activation performs target I/O before taking the placement lifecycle lock, then
+rechecks the registered role, environment reference, and absence of routing
+references while atomically changing `provisioning` to `active`. This keeps slow
+network checks outside the control transaction without exposing an unchecked
+target. Concurrent activation attempts are idempotent.
 
 New-ownership writes take a shared row lock on the target placement through
 route commit. Drain and disable take an exclusive row lock on the same catalog
@@ -557,7 +579,7 @@ Implemented today:
 - Single-database default with a seeded `primary` placement.
 - 128 logical shards and partitioned execution tables.
 - Stored database and shard placement catalogs.
-- Active, draining, and disabled database-placement lifecycle with atomic
+- Provisioning, active, draining, and disabled database-placement lifecycle with atomic
   new-ownership admission and guarded disable.
 - Recoverable routed run creation, dispatch, worker processing, lease recovery,
   outbox publication, shard summaries, finalization, cancellation, live

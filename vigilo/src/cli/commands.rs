@@ -131,7 +131,10 @@ impl Command {
                     database_operation_timeout = Some(database_operation_timeout_options.config()?);
                 }
             }
-            Self::Database(_) | Self::Rebalance(_) | Self::Shard(_) => {}
+            Self::Database(command) => {
+                database_operation_timeout = Some(command.database_operation_timeout.config()?);
+            }
+            Self::Rebalance(_) | Self::Shard(_) => {}
         }
 
         Ok(CommandContextConfig {
@@ -249,6 +252,7 @@ mod tests {
                 "--database-url-env",
                 "VIGILO_SHARD_001_DATABASE_URL",
             ],
+            &["vigilo", "database", "activate", "shard_001"],
             &["vigilo", "database", "drain", "shard_001"],
             &["vigilo", "database", "disable", "shard_001"],
             &[
@@ -381,7 +385,7 @@ mod tests {
         );
         assert_eq!(
             visible_subcommands(database),
-            ["list", "register", "drain", "disable"]
+            ["list", "register", "activate", "drain", "disable"]
         );
         assert_eq!(
             visible_subcommands(rebalance),

@@ -2,7 +2,7 @@ CREATE TABLE database_placements (
     alias TEXT PRIMARY KEY,
     database_url_env TEXT NOT NULL,
     role TEXT NOT NULL CHECK (role IN ('control', 'shard', 'control_and_shard')),
-    status TEXT NOT NULL CHECK (status IN ('active', 'draining', 'disabled')),
+    status TEXT NOT NULL CHECK (status IN ('provisioning', 'active', 'draining', 'disabled')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -28,7 +28,7 @@ COMMENT ON COLUMN database_placements.role IS
     'Placement role. control stores authoritative run metadata and routing catalog rows, shard stores shard-local execution data, and control_and_shard stores both in the same database. Only one active control-capable placement is allowed.';
 
 COMMENT ON COLUMN database_placements.status IS
-    'Placement lifecycle. Active placements may receive new ownership, draining placements serve existing ownership while it is evacuated, and disabled placements serve no runtime work.';
+    'Placement lifecycle. Provisioning placements await readiness verification, active placements may receive new ownership, draining placements serve existing ownership while it is evacuated, and disabled placements serve no runtime work.';
 
 COMMENT ON INDEX uq_database_placements_single_active_control IS
     'Ensures there is at most one active placement with control-plane authority. Multiple active shard-only placements are allowed.';

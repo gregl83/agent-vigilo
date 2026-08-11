@@ -2,28 +2,60 @@
 
 use super::super::*;
 
-pub(in crate::db::workflows::shard_admin) async fn select_database_disable_references(
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub(in crate::db::workflows::shard_admin) struct DatabaseIdentity {
+    database_name: String,
+    server_address: Option<String>,
+    server_port: Option<i32>,
+    postmaster_started_at: DateTime<Utc>,
+}
+
+const DATABASE_IDENTITY_SQL: &str = r#"
+    SELECT
+        current_database() AS database_name,
+        inet_server_addr()::text AS server_address,
+        inet_server_port() AS server_port,
+        pg_postmaster_start_time() AS postmaster_started_at
+"#;
+
+pub(in crate::db::workflows::shard_admin) async fn select_database_identity(
+    db: &PgPool,
+) -> anyhow::Result<DatabaseIdentity> {
+    sqlx::query_as(DATABASE_IDENTITY_SQL)
+        .fetch_one(db)
+        .await
+        .map_err(Into::into)
+}
+
+#[derive(Debug, Clone, Copy, sqlx::FromRow)]
+pub(in crate::db::workflows::shard_admin) struct DatabasePlacementReferences {
+    pub(in crate::db::workflows::shard_admin) route_count: i64,
+    pub(in crate::db::workflows::shard_admin) creation_count: i64,
+    pub(in crate::db::workflows::shard_admin) rebalance_count: i64,
+}
+
+pub(in crate::db::workflows::shard_admin) async fn select_database_placement_references(
     tx: &mut Transaction<'_, Postgres>,
     alias: &str,
-) -> anyhow::Result<(i64, i64, i64)> {
+) -> anyhow::Result<DatabasePlacementReferences> {
     sqlx::query_as(
         r#"
         SELECT
             (SELECT COUNT(*)::bigint
              FROM shard_placements
-             WHERE database_alias = $1),
+             WHERE database_alias = $1) AS route_count,
             (SELECT COUNT(*)::bigint
              FROM run_creation_placements creation
              JOIN runs run ON run.id = creation.run_id
              WHERE creation.database_alias = $1
-               AND run.status = 'creating'::run_status),
+               AND run.status = 'creating'::run_status) AS creation_count,
             (SELECT COUNT(*)::bigint
              FROM shard_rebalance_items item
              JOIN shard_rebalance_operations operation
                ON operation.id = item.operation_id
              WHERE operation.status IN ('planned', 'running')
                AND item.status IN ('pending', 'running')
-               AND ($1 = item.source_database_alias OR $1 = item.target_database_alias))
+               AND ($1 = item.source_database_alias OR $1 = item.target_database_alias)) AS rebalance_count
         "#,
     )
     .bind(alias)
@@ -135,21 +167,10 @@ pub(in crate::db::workflows::shard_admin) async fn databases_share_identity(
     source: &mut Transaction<'_, Postgres>,
     target: &PgPool,
 ) -> anyhow::Result<bool> {
-    type DatabaseIdentity = (String, Option<String>, Option<i32>, DateTime<Utc>);
-
-    let sql = r#"
-        SELECT
-            current_database(),
-            inet_server_addr()::text,
-            inet_server_port(),
-            pg_postmaster_start_time()
-    "#;
-    let source_identity = sqlx::query_as::<_, DatabaseIdentity>(sql)
+    let source_identity = sqlx::query_as::<_, DatabaseIdentity>(DATABASE_IDENTITY_SQL)
         .fetch_one(&mut **source)
         .await?;
-    let target_identity = sqlx::query_as::<_, DatabaseIdentity>(sql)
-        .fetch_one(target)
-        .await?;
+    let target_identity = select_database_identity(target).await?;
 
     Ok(source_identity == target_identity)
 }
