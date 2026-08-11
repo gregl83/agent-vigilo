@@ -85,20 +85,28 @@ messaging, and opt-in environment variables.
 
 The pre-commit hook runs nightly rustfmt only. The pre-push hook runs clippy, the service-free Rust tier, and the web typecheck. Database integration, migration, end-to-end, evaluator Wasm, and web production build checks run as separate required CI jobs.
 
-CI uploads separate `rust-unit` and `rust-sqlx` Codecov flags. Unit coverage is
-service-free and excludes SQL query modules, table helpers, and PostgreSQL test
-fixtures. SQLx coverage runs in the database integration job, includes
-production query and table code, and excludes only test fixture sources.
+The service-free, PostgreSQL, and end-to-end jobs collect coverage in parallel
+while running their existing test tiers. A final job uploads all three reports
+under the `rust-all` Codecov flag, so project coverage and the repository badge
+reflect code reached through unit, integration, and distributed runtime tests.
+Only PostgreSQL test fixture sources are excluded; production query and table
+modules remain in the coverage denominator.
 
-Reproduce the reports locally with:
+Accumulate the same reports locally after starting the services and setting the
+environment variables required by each tier:
 
 ```bash
-cargo llvm-cov --workspace --locked --lib --bins --ignore-filename-regex '[/\\]vigilo[/\\]src[/\\]db[/\\](tables[/\\]|workflows[/\\].*[/\\](queries|postgres_tests)(\.rs|[/\\]))' --lcov --output-path lcov-unit.info
-cargo llvm-cov -p vigilo --locked --bin vigilo --ignore-filename-regex '[/\\]postgres_tests(\.rs|[/\\])' --lcov --output-path lcov-sqlx.info -- --ignored --nocapture --test-threads=4
+cargo llvm-cov clean --workspace
+cargo llvm-cov --no-report --workspace --locked --lib --bins
+cargo llvm-cov --no-report -p vigilo --locked --bin vigilo -- --ignored --nocapture --test-threads=4
+cargo llvm-cov --no-report -p vigilo --locked --test multi_database_routing -- --nocapture
+VIGILO_E2E_MULTI_DATABASE=1 cargo llvm-cov --no-report -p vigilo --locked --test multi_database_e2e -- --nocapture
+cargo llvm-cov report --ignore-filename-regex '[/\\]postgres_tests(\.rs|[/\\])' --lcov --output-path lcov.info
 ```
 
-The second command requires `DATABASE_URL`. Configure the repository secret
-`CODECOV_TOKEN` for authenticated CI uploads.
+The integration commands require the database, messaging, evaluator Wasm, and
+test agent dependencies described above. Configure the repository secret
+`CODECOV_TOKEN` for the aggregate CI upload.
 
 ## Project Status
 

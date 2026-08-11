@@ -21,11 +21,8 @@ ignore:
   - "vigilo/src/db/workflows/**/postgres_tests/**"
 
 flags:
-  rust-unit:
+  rust-all:
     paths:
       - vigilo/src
       - evaluators/sentiment-basic-en/src
-  rust-sqlx:
-    paths:
-      - vigilo/src/db/tables
-      - vigilo/src/db/workflows
+    carryforward: false
