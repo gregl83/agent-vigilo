@@ -30,6 +30,8 @@ transactions; and the cooperative
 movement from normal writers. Control-plane changes use
 <GlossaryTerm term="route-cas">route CAS</GlossaryTerm>, while data-plane writes
 validate the <GlossaryTerm term="write-epoch">write epoch</GlossaryTerm>.
+Prepared shard-move targets additionally validate the move ID, monotonic claim
+generation, and opaque claim token in the target mutation transaction.
 
 ## Notes
 
@@ -45,6 +47,9 @@ validate the <GlossaryTerm term="write-epoch">write epoch</GlossaryTerm>.
   idempotent seed checks, shared run-state locks, chunk and attempt leases,
   conflict keys, current-attempt checks, worker ownership checks, and outbox
   delivery claim tokens prevent stale writes.
+- Shard-move takeover installs a higher generation under exclusive target
+  admission. In-flight target writes finish before takeover; later writes from
+  an older generation are rejected before mutation.
 
 ## Related
 

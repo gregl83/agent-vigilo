@@ -1,4 +1,8 @@
 //! Execution-local shard write admission.
+//!
+//! Runtime authority is fenced by route epoch and lifecycle state. A prepared
+//! move target additionally requires the exact move ID, monotonic claim
+//! generation, and opaque claim token in every target mutation transaction.
 
 use std::fmt;
 

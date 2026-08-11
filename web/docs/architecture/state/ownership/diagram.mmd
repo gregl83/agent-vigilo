@@ -30,7 +30,7 @@ flowchart TD
     GuardCreation[Creation ledger and coordinator lease]
     GuardRun[Run status and lifecycle lease]
     GuardDispatch[Run-shard dispatch cursor]
-    GuardAdmission[Local shard admission and write epoch]
+    GuardAdmission[Local shard admission, write epoch, and mover fence]
     GuardChunk[Chunk status and worker lease]
     GuardAttempt[Current attempt id and attempt number]
     GuardOutbox[Outbox dedupe key and delivery claim token]

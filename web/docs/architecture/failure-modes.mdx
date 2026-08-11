@@ -46,6 +46,10 @@ resume while the source is still open; a locally draining source is never
 reopened when control still reports `copying`; a closed source can finish
 control activation; and an active target route repairs a target admission that
 was not opened before the mover exited.
+Reclaiming an expired move increments its control generation and installs that
+generation with the new claim token under exclusive target admission. Once
+installed, target transactions from the expired coordinator fail before
+mutation, even if that coordinator resumes after the new mover writes.
 
 ## Outbox publisher crash
 

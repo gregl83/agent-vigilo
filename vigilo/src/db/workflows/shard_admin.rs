@@ -1300,9 +1300,10 @@ pub(crate) async fn cancel_shard_rebalance(
 ///
 /// `copying` stays dispatchable while durable pages and captured mutations are
 /// replayed. `draining` rejects new work while admitted leases finish.
-/// `moving` holds the exclusive fence only for final replay and activation.
-/// The persisted operation, target, checkpoints, and route versions make
-/// retries resumable and prevent concurrent redirection.
+/// `moving` holds the exclusive source fence only for final replay and
+/// activation.
+/// The persisted operation, monotonic target claimant fence, checkpoints, and
+/// route versions make retries resumable and reject stale target writers.
 pub(crate) async fn move_shard_placement(
     database_router: &database::DatabaseRouter,
     run_id: Uuid,

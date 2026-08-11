@@ -1,8 +1,9 @@
 //! Transaction-scoped admission locks for execution-owned shard writes.
 //!
-//! Claims, dispatch, and routed cancellation cleanup take the shared lock.
-//! Shard movement takes the exclusive lock, changes the control route, and
-//! checks for previously admitted work before copying. PostgreSQL releases
+//! Runtime claims, settlement, and admitted mover writes take the shared lock.
+//! Shard movement takes the exclusive lock for source lifecycle transitions
+//! and target authority installation. Target writes validate the installed
+//! move generation and token while holding the shared lock. PostgreSQL releases
 //! either lock with the transaction, including rollback and connection loss.
 
 use sqlx::{

@@ -36,7 +36,7 @@ flowchart LR
     breaker["Database circuit breaker<br/>process-local by alias"]
     message["Chunk-ready route hint<br/>alias + write_epoch"]
     target[("Execution database")]
-    admission["Local shard admission<br/>state + write_epoch"]
+    admission["Local shard admission<br/>state + write_epoch + mover fence"]
     data["Chunks, executions, results,<br/>summaries, and outbox"]
 
     control --> route --> router --> breaker --> target
@@ -402,19 +402,20 @@ changes are rejected until creation reaches `pending` or `failed`. Rebalance
 plans omit creating runs for the same reason.
 
 The move briefly fences the source to enable source-local dirty-key capture,
-then changes the route from `active` to `copying`. This state remains
-dispatchable while the target is reset once and copied in durable
-row-and-byte-bounded pages.
+then changes the route from `active` to `copying`. It installs the current
+move ID, monotonic claim generation, and opaque claim token on the prepared
+target before resetting or copying data. `copying` remains dispatchable while
+the target is copied in durable row-and-byte-bounded pages.
 
 ```mermaid
 stateDiagram-v2
     [*] --> active
-    active --> copying: capture mutations and reserve target
-    copying --> copying: checkpointed backfill and replay
+    active --> copying: capture mutations, reserve target, install target fence
+    copying --> copying: fenced backfill and replay
     copying --> draining: backfill complete and catch-up bounded
     draining --> draining: admitted work remains
     draining --> moving: active work reaches zero
-    moving --> active: final replay and activate target
+    moving --> active: final replay, activate target, clear target fence
     copying --> active: abort
     draining --> active: abort
     moving --> active: abort
@@ -434,6 +435,12 @@ the epoch stable through `copying` and `draining`, closes the source at the next
 epoch before activating the target, then opens the target at that epoch. A
 crash can therefore leave a retryable no-writer gap, but never two admitted
 writers.
+The move claim generation is the target-writer fencing token. Every target
+reset, copy, replay, or delete transaction holds shard admission and validates
+the exact move ID, generation, and token before mutation. Installing a newer
+generation takes exclusive target admission, waits for in-flight writes, and
+prevents an expired coordinator from reinstalling or writing with older
+authority.
 The source transaction that changes a shard row also upserts its key into the
 move journal. Replay rereads current source state: existing rows are upserted
 in dependency order and missing rows are deleted in reverse dependency order.
@@ -441,13 +448,15 @@ A version-guarded journal delete leaves a key pending when it changes during
 replay.
 
 One compact page-count/cursor checkpoint per moved table lives in control
-storage. Capture state and dirty keys live on the source. Because the target
-page commits before its checkpoint, a lost acknowledgement replays at most one
-idempotent page without growing control metadata per page. After backfill,
+storage. Capture state and dirty keys live on the source; mover authority lives
+on the prepared target admission. Because the fenced target page commits before
+its checkpoint, a lost acknowledgement replays at most one idempotent page
+without growing control metadata per page. A rejected target write cannot
+advance its control checkpoint. After backfill,
 a bounded catch-up cycle keeps the route in dispatchable `copying` when too
 many dirty keys remain. After the backlog is bounded, `draining` stops new work
-while admitted work settles. The exclusive fence is held only for final replay,
-an empty-journal check, and route activation.
+while admitted work settles. The exclusive source fence is held only for final
+replay, an empty-journal check, and route activation.
 
 After claim admission commits, an opaque chunk claim token and renewable
 deadline carry worker authority. Attempt allocation and result persistence lock

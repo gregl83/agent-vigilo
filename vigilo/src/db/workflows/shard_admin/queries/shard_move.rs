@@ -780,8 +780,8 @@ pub(in crate::db::workflows::shard_admin) async fn checkpoint_move_reports(
 /// Removes only the target's non-authoritative rows for one run shard.
 ///
 /// Source ownership remains unchanged while this commits. Deletes run in
-/// reverse dependency order and take target-side exclusive admission so stale
-/// routed transactions cannot race the reset.
+/// reverse dependency order. The caller must hold target-side exclusive
+/// admission and validate the current move fence in this transaction.
 pub(in crate::db::workflows::shard_admin) async fn reset_target_shard_rows(
     tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
