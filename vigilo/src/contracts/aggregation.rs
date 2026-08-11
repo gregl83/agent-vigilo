@@ -2,9 +2,12 @@
 //!
 //! This module is intentionally persistence-free. Runtime workers pass
 //! profile-resolved bindings and normalized findings in, and receive the exact
-//! aggregate fields persisted to `execution_aggregates`.
+//! completeness and aggregate fields persisted to `execution_aggregates`.
 
-use std::collections::BTreeMap;
+use std::collections::{
+    BTreeMap,
+    BTreeSet,
+};
 
 use serde_json::json;
 use uuid::Uuid;
@@ -18,6 +21,12 @@ use crate::contracts::{
         RunDefaults,
     },
 };
+
+#[derive(Debug, Clone)]
+pub(crate) struct AggregationBinding {
+    pub(crate) evaluator_id: Uuid,
+    pub(crate) required: bool,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct AggregationFinding {
@@ -68,12 +77,111 @@ fn scoreable_status(status: &EvaluationStatus) -> bool {
     matches!(status, EvaluationStatus::Passed | EvaluationStatus::Failed)
 }
 
+fn valid_normalized_score(finding: &AggregationFinding) -> bool {
+    scoreable_status(&finding.status)
+        && finding
+            .normalized_score
+            .is_some_and(|score| score.is_finite() && (0.0..=1.0).contains(&score))
+}
+
+fn evaluator_completeness(
+    bindings: &[AggregationBinding],
+    findings: &[AggregationFinding],
+) -> (bool, serde_json::Value, BTreeSet<Uuid>) {
+    let mut expected = BTreeMap::new();
+    let mut duplicate_binding_count = 0usize;
+    for binding in bindings {
+        if expected
+            .insert(binding.evaluator_id, binding.required)
+            .is_some()
+        {
+            duplicate_binding_count += 1;
+        }
+    }
+
+    let mut findings_by_evaluator = BTreeMap::<Uuid, Vec<&AggregationFinding>>::new();
+    for finding in findings {
+        findings_by_evaluator
+            .entry(finding.evaluator_id)
+            .or_default()
+            .push(finding);
+    }
+
+    let required_evaluator_ids = expected
+        .iter()
+        .filter_map(|(evaluator_id, required)| required.then_some(*evaluator_id))
+        .collect::<BTreeSet<_>>();
+    let unexpected_evaluator_ids = findings_by_evaluator
+        .keys()
+        .filter(|evaluator_id| !expected.contains_key(evaluator_id))
+        .copied()
+        .collect::<Vec<_>>();
+    let mut required_scored_count = 0usize;
+    let mut required_error_count = 0usize;
+    let mut required_skipped_count = 0usize;
+    let mut required_missing_count = 0usize;
+    let mut required_unscored_count = 0usize;
+    let mut incomplete_evaluator_ids = Vec::new();
+
+    for evaluator_id in &required_evaluator_ids {
+        let Some(evaluator_findings) = findings_by_evaluator.get(evaluator_id) else {
+            required_missing_count += 1;
+            incomplete_evaluator_ids.push(*evaluator_id);
+            continue;
+        };
+
+        if evaluator_findings
+            .iter()
+            .any(|finding| finding.status == EvaluationStatus::Error)
+        {
+            required_error_count += 1;
+            incomplete_evaluator_ids.push(*evaluator_id);
+        } else if evaluator_findings
+            .iter()
+            .any(|finding| finding.status == EvaluationStatus::Skipped)
+        {
+            required_skipped_count += 1;
+            incomplete_evaluator_ids.push(*evaluator_id);
+        } else if evaluator_findings
+            .iter()
+            .any(|finding| valid_normalized_score(finding))
+        {
+            required_scored_count += 1;
+        } else {
+            required_unscored_count += 1;
+            incomplete_evaluator_ids.push(*evaluator_id);
+        }
+    }
+
+    let complete = !required_evaluator_ids.is_empty()
+        && duplicate_binding_count == 0
+        && unexpected_evaluator_ids.is_empty()
+        && required_scored_count == required_evaluator_ids.len();
+    let summary = json!({
+        "complete": complete,
+        "expected_binding_count": bindings.len(),
+        "required_binding_count": required_evaluator_ids.len(),
+        "optional_binding_count": expected.len() - required_evaluator_ids.len(),
+        "required_scored_count": required_scored_count,
+        "required_error_count": required_error_count,
+        "required_skipped_count": required_skipped_count,
+        "required_missing_count": required_missing_count,
+        "required_unscored_count": required_unscored_count,
+        "duplicate_binding_count": duplicate_binding_count,
+        "unexpected_evaluator_count": unexpected_evaluator_ids.len(),
+        "incomplete_evaluator_ids": incomplete_evaluator_ids,
+        "unexpected_evaluator_ids": unexpected_evaluator_ids,
+    });
+
+    (complete, summary, required_evaluator_ids)
+}
+
 fn dimension_score(accumulator: &DimensionAccumulator<'_>) -> Option<f64> {
     let scoreable = accumulator
         .findings
         .iter()
         .filter_map(|(_, finding)| {
-            if scoreable_status(&finding.status) {
+            if valid_normalized_score(finding) {
                 finding.normalized_score.map(|score| (*finding, score))
             } else {
                 None
@@ -127,10 +235,16 @@ pub(crate) fn aggregate_findings(
     defaults: &RunDefaults,
     settings: &AggregationSettings,
     attempt_id: Uuid,
+    bindings: &[AggregationBinding],
     findings: &[AggregationFinding],
 ) -> AggregationOutcome {
+    let (completeness_is_valid, completeness, required_evaluator_ids) =
+        evaluator_completeness(bindings, findings);
     let mut dimensions = BTreeMap::<String, DimensionAccumulator<'_>>::new();
     for (index, finding) in findings.iter().enumerate() {
+        if !required_evaluator_ids.contains(&finding.evaluator_id) {
+            continue;
+        }
         let policy = settings
             .dimensions
             .get(&finding.binding_dimension)
@@ -149,14 +263,16 @@ pub(crate) fn aggregate_findings(
     let mut dimension_scores = serde_json::Map::new();
     let mut weighted_dimension_sum = 0.0;
     let mut dimension_weight_sum = 0.0;
-    for (dimension, accumulator) in &dimensions {
-        let Some(score) = dimension_score(accumulator) else {
-            continue;
-        };
-        dimension_scores.insert(dimension.clone(), json!(score));
-        if accumulator.policy.weight > 0.0 {
-            weighted_dimension_sum += score * accumulator.policy.weight;
-            dimension_weight_sum += accumulator.policy.weight;
+    if completeness_is_valid {
+        for (dimension, accumulator) in &dimensions {
+            let Some(score) = dimension_score(accumulator) else {
+                continue;
+            };
+            dimension_scores.insert(dimension.clone(), json!(score));
+            if accumulator.policy.weight > 0.0 {
+                weighted_dimension_sum += score * accumulator.policy.weight;
+                dimension_weight_sum += accumulator.policy.weight;
+            }
         }
     }
 
@@ -170,6 +286,9 @@ pub(crate) fn aggregate_findings(
         .iter()
         .enumerate()
         .filter(|(_, finding)| {
+            if !required_evaluator_ids.contains(&finding.evaluator_id) {
+                return false;
+            }
             let dimension_blocking = dimensions
                 .get(&finding.binding_dimension)
                 .map(|accumulator| accumulator.policy.blocking)
@@ -194,18 +313,11 @@ pub(crate) fn aggregate_findings(
         .collect::<Vec<_>>();
 
     let has_blocking_failure = !blocking_failures.is_empty();
-    let has_blocking_error = findings.iter().any(|finding| {
-        let dimension_blocking = dimensions
-            .get(&finding.binding_dimension)
-            .map(|accumulator| accumulator.policy.blocking)
-            .unwrap_or(false);
-        (finding.blocking || dimension_blocking) && finding.status == EvaluationStatus::Error
+    let has_scoreable_finding = findings.iter().any(|finding| {
+        required_evaluator_ids.contains(&finding.evaluator_id) && valid_normalized_score(finding)
     });
-    let has_scoreable_finding = findings
-        .iter()
-        .any(|finding| scoreable_status(&finding.status) && finding.normalized_score.is_some());
 
-    let overall_status = if has_blocking_error {
+    let overall_status = if !completeness_is_valid {
         "error"
     } else if defaults.fail_on_any_blocking_failure && has_blocking_failure {
         "failed"
@@ -240,6 +352,7 @@ pub(crate) fn aggregate_findings(
             "result_count": findings.len(),
             "overall_status": overall_status,
             "result_status_counts": result_status_counts,
+            "evaluator_completeness": completeness,
         }),
     }
 }
@@ -247,6 +360,25 @@ pub(crate) fn aggregate_findings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn aggregate_findings(
+        defaults: &RunDefaults,
+        settings: &AggregationSettings,
+        attempt_id: Uuid,
+        findings: &[AggregationFinding],
+    ) -> AggregationOutcome {
+        let bindings = findings
+            .iter()
+            .map(|finding| finding.evaluator_id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|evaluator_id| AggregationBinding {
+                evaluator_id,
+                required: true,
+            })
+            .collect::<Vec<_>>();
+        super::aggregate_findings(defaults, settings, attempt_id, &bindings, findings)
+    }
 
     fn defaults() -> RunDefaults {
         RunDefaults {
@@ -593,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn nonblocking_error_is_recorded_but_does_not_auto_error_when_policy_passes() {
+    fn required_nonblocking_error_withholds_scores() {
         let outcome = aggregate_findings(
             &defaults(),
             &settings(vec![(
@@ -623,12 +755,17 @@ mod tests {
             ],
         );
 
-        assert_eq!(outcome.aggregate_score, Some(1.0));
-        assert_eq!(outcome.overall_status, "passed");
+        assert_eq!(outcome.aggregate_score, None);
+        assert_eq!(outcome.dimension_scores, json!({}));
+        assert_eq!(outcome.overall_status, "error");
+        assert_eq!(
+            outcome.summary["evaluator_completeness"]["required_error_count"],
+            1
+        );
     }
 
     #[test]
-    fn skipped_and_informational_findings_do_not_affect_score() {
+    fn required_skipped_finding_withholds_scores() {
         let outcome = aggregate_findings(
             &defaults(),
             &settings(vec![(
@@ -658,8 +795,152 @@ mod tests {
             ],
         );
 
-        assert_eq!(outcome.aggregate_score, Some(0.9));
+        assert_eq!(outcome.aggregate_score, None);
+        assert_eq!(outcome.dimension_scores, json!({}));
+        assert_eq!(outcome.overall_status, "error");
+        assert_eq!(
+            outcome.summary["evaluator_completeness"]["required_skipped_count"],
+            1
+        );
+    }
+
+    #[test]
+    fn missing_required_evaluator_withholds_scores() {
+        let scored_evaluator_id = Uuid::nil();
+        let missing_evaluator_id = Uuid::from_u128(1);
+        let bindings = [
+            AggregationBinding {
+                evaluator_id: scored_evaluator_id,
+                required: true,
+            },
+            AggregationBinding {
+                evaluator_id: missing_evaluator_id,
+                required: true,
+            },
+        ];
+        let outcome = super::aggregate_findings(
+            &defaults(),
+            &settings(vec![(
+                "quality",
+                AggregationMethod::WeightedMean,
+                false,
+                1.0,
+            )]),
+            Uuid::nil(),
+            &bindings,
+            &[finding(
+                scored_evaluator_id,
+                "quality",
+                EvaluationStatus::Passed,
+                Some(1.0),
+                false,
+                1.0,
+            )],
+        );
+
+        assert_eq!(outcome.aggregate_score, None);
+        assert_eq!(outcome.overall_status, "error");
+        assert_eq!(
+            outcome.summary["evaluator_completeness"]["required_missing_count"],
+            1
+        );
+        assert_eq!(
+            outcome.summary["evaluator_completeness"]["incomplete_evaluator_ids"],
+            json!([missing_evaluator_id])
+        );
+    }
+
+    #[test]
+    fn optional_diagnostic_error_does_not_affect_score() {
+        let required_evaluator_id = Uuid::nil();
+        let optional_evaluator_id = Uuid::from_u128(1);
+        let bindings = [
+            AggregationBinding {
+                evaluator_id: required_evaluator_id,
+                required: true,
+            },
+            AggregationBinding {
+                evaluator_id: optional_evaluator_id,
+                required: false,
+            },
+        ];
+        let outcome = super::aggregate_findings(
+            &defaults(),
+            &settings(vec![(
+                "quality",
+                AggregationMethod::WeightedMean,
+                false,
+                1.0,
+            )]),
+            Uuid::nil(),
+            &bindings,
+            &[
+                finding(
+                    required_evaluator_id,
+                    "quality",
+                    EvaluationStatus::Passed,
+                    Some(1.0),
+                    false,
+                    1.0,
+                ),
+                finding(
+                    optional_evaluator_id,
+                    "diagnostic",
+                    EvaluationStatus::Error,
+                    None,
+                    true,
+                    0.0,
+                ),
+            ],
+        );
+
+        assert_eq!(outcome.aggregate_score, Some(1.0));
         assert_eq!(outcome.overall_status, "passed");
+        assert_eq!(
+            outcome.summary["evaluator_completeness"]["optional_binding_count"],
+            1
+        );
+        assert_eq!(outcome.blocking_failures, json!([]));
+    }
+
+    #[test]
+    fn score_and_error_from_one_required_evaluator_is_incomplete() {
+        let evaluator_id = Uuid::nil();
+        let outcome = aggregate_findings(
+            &defaults(),
+            &settings(vec![(
+                "quality",
+                AggregationMethod::WeightedMean,
+                false,
+                1.0,
+            )]),
+            Uuid::nil(),
+            &[
+                finding(
+                    evaluator_id,
+                    "quality",
+                    EvaluationStatus::Passed,
+                    Some(1.0),
+                    false,
+                    1.0,
+                ),
+                finding(
+                    evaluator_id,
+                    "quality",
+                    EvaluationStatus::Error,
+                    None,
+                    false,
+                    1.0,
+                ),
+            ],
+        );
+
+        assert_eq!(outcome.aggregate_score, None);
+        assert_eq!(outcome.overall_status, "error");
+        assert_eq!(
+            outcome.summary["evaluator_completeness"]["required_error_count"],
+            1
+        );
     }
 
     #[test]

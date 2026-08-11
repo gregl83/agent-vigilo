@@ -32,6 +32,7 @@ flowchart TD
     AgentClient["fa:fa-brain <br/> <b>Agent Invocation Client</b> <br/> <small>[Component: Rust / HTTP]</small> <br/> <small>Sends evaluator-safe case input to the configured target and normalizes agent output.</small>"]:::component
     WasmSemaphore["fa:fa-gauge-high <br/> <b>Wasm Evaluation Semaphore</b> <br/> <small>[Component: Rust / Tokio]</small> <br/> <small>Caps active evaluator invocations across the worker process.</small>"]:::component
     EvaluatorExecutor["fa:fa-microchip <br/> <b>Evaluator Runtime Executor</b> <br/> <small>[Component: Rust / Wasmtime]</small> <br/> <small>Runs WIT-backed evaluator components in fresh stores with memory, fuel, timeout, and log limits.</small>"]:::component
+    CompletenessAggregator["fa:fa-list-check <br/> <b>Completeness & Aggregation</b> <br/> <small>[Component: Rust]</small> <br/> <small>Verifies required evaluator scores before calculating authoritative dimension and aggregate scores.</small>"]:::component
     ResultPersistence["fa:fa-database <br/> <b>Result Persistence Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Appends evaluator results and upserts aggregates with child-row authority checks.</small>"]:::component
     TerminalTransitions["fa:fa-shield-halved <br/> <b>Terminal Transition Guard</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Marks attempts completed, retry-scheduled, or terminal only when current-attempt and live-lease authority still match.</small>"]:::component
 
@@ -52,6 +53,7 @@ flowchart TD
         AgentClient
         WasmSemaphore
         EvaluatorExecutor
+        CompletenessAggregator
         ResultPersistence
         TerminalTransitions
     end
@@ -97,7 +99,9 @@ flowchart TD
     ExecutionProcessor -->|"Acquires active-evaluation permits from"| WasmSemaphore
     WasmSemaphore -->|"Admits bounded evaluator calls into"| EvaluatorExecutor
     EvaluatorExecutor -->|"Gets compiled components from"| EvaluatorLoader
-    ExecutionProcessor -->|"Persists completed case evidence through"| ResultPersistence
+    EvaluatorExecutor -->|"Returns findings to"| CompletenessAggregator
+    ExecutionProcessor -->|"Provides the resolved binding plan to"| CompletenessAggregator
+    CompletenessAggregator -->|"Supplies findings and authoritative aggregate to"| ResultPersistence
     ResultPersistence -->|"Appends results and upserts aggregates in <br> <small>[SQL/TCP]</small>"| Database
     MessageHandler -->|"Applies terminal execution updates with"| TerminalTransitions
     TerminalTransitions -->|"Updates attempts and executions with authority checks in <br> <small>[SQL/TCP]</small>"| Database

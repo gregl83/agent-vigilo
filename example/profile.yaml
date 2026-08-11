@@ -45,6 +45,8 @@ case_groups:
 
     evaluators:
       - ref: vigilo/sentiment-basic-en:0.1.0
+        # Required evaluators must return a valid score before aggregation.
+        required: true
         # Profile-owned aggregation bucket. The evaluator also reports `quality`,
         # but runtime aggregation uses this binding value as the authority.
         dimension: quality

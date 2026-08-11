@@ -26,7 +26,7 @@ It focuses on the parts of AI evaluation that become hard as systems grow: idemp
 
 ## How Results Are Calculated
 
-Evaluator findings are normalized to scores, grouped into profile dimensions, combined into one execution `aggregate_score`, and checked against the overall score gate. An execution passes when `aggregate_score >= min_execution_score` and no hard blocking finding fails or errors. A run passes only when every expected execution has an aggregate, no chunk failed or was cancelled, and no execution failed or errored.
+Evaluator findings are checked for required evaluator completeness before they are grouped into profile dimensions, combined into one execution `aggregate_score`, and checked against the overall score gate. Missing, errored, skipped, or unscored required evaluator output produces an errored execution aggregate with no score. An execution passes when completeness is satisfied, `aggregate_score >= min_execution_score`, and no hard blocking finding fails. A run passes only when every expected execution has an aggregate, no chunk failed or was cancelled, and no execution failed or errored.
 
 A run can fail operationally because work did not complete, or complete with a failed gate because evaluation policy failed.
 

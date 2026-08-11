@@ -41,6 +41,7 @@ use crate::{
     context::Context,
     contracts::{
         aggregation::{
+            AggregationBinding,
             AggregationFinding,
             aggregate_findings,
             evaluation_status_key,
@@ -224,6 +225,7 @@ fn persisted_evaluator_manifest(
                 .map(|binding| {
                     json!({
                         "ref": binding.evaluator_ref.clone(),
+                        "required": binding.required,
                         "dimension": binding.dimension.clone(),
                         "blocking": binding.blocking,
                         "weight": binding.weight,
@@ -669,7 +671,8 @@ fn merge_aggregation_settings(
 }
 
 fn equivalent_evaluator_binding(left: &EvaluatorBinding, right: &EvaluatorBinding) -> bool {
-    left.dimension == right.dimension
+    left.required == right.required
+        && left.dimension == right.dimension
         && left.blocking == right.blocking
         && left.weight == right.weight
         && left.config == right.config
@@ -808,6 +811,7 @@ async fn evaluate_case_execution(
     let attempt_no = allocation.attempt_no;
 
     let evaluation_result: anyhow::Result<(
+        Vec<AggregationBinding>,
         Vec<EvaluatorExecutionRecord>,
         Vec<evaluator_results::EvaluatorResultInsertRow>,
     )> = async {
@@ -823,6 +827,24 @@ async fn evaluate_case_execution(
         )
         .await
         .map_err(|err| anyhow::anyhow!("agent invocation failed: {}", err))?;
+
+        let aggregation_bindings = evaluator_bindings
+            .iter()
+            .map(|binding| {
+                let evaluator = evaluator_catalog
+                    .get(&binding.evaluator_ref)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "evaluator '{}' is missing from run evaluator catalog",
+                            binding.evaluator_ref
+                        )
+                    })?;
+                Ok(AggregationBinding {
+                    evaluator_id: evaluator.evaluator_id,
+                    required: binding.required,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         let mut ordered_records = BTreeMap::new();
         let mut ordered_rows = BTreeMap::new();
@@ -1081,6 +1103,7 @@ async fn evaluate_case_execution(
         }
 
         Ok((
+            aggregation_bindings,
             ordered_records.into_values().flatten().collect(),
             ordered_rows.into_values().flatten().collect(),
         ))
@@ -1088,7 +1111,7 @@ async fn evaluate_case_execution(
     .await;
 
     match evaluation_result {
-        Ok((records, result_rows)) => {
+        Ok((aggregation_bindings, records, result_rows)) => {
             let runtime_ms = runtime_started.elapsed().as_millis() as u64;
             let aggregation_findings = records
                 .iter()
@@ -1108,6 +1131,7 @@ async fn evaluate_case_execution(
                 &run_profile.defaults,
                 aggregation,
                 attempt_id,
+                &aggregation_bindings,
                 &aggregation_findings,
             );
 
@@ -1443,6 +1467,7 @@ mod tests {
     fn evaluator_binding(evaluator_ref: &str, dimension: &str) -> EvaluatorBinding {
         EvaluatorBinding {
             evaluator_ref: evaluator_ref.to_string(),
+            required: true,
             dimension: dimension.to_string(),
             blocking: false,
             weight: 1.0,
@@ -1727,6 +1752,7 @@ mod tests {
         let manifest = persisted_evaluator_manifest(&profile, &plan.evaluator_bindings).unwrap();
 
         assert_eq!(manifest[0]["ref"], json!("vigilo/sentiment-basic-en:0.1.0"));
+        assert_eq!(manifest[0]["required"], json!(true));
         assert_eq!(manifest[0]["config"]["redacted"], json!(true));
     }
 

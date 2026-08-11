@@ -266,12 +266,19 @@ fn compute_aggregation_policy_hash(profile: &RunProfile) -> anyhow::Result<Strin
         .map(|group| {
             json!({
                 "id": group.id,
+                "evaluators": group.evaluators,
                 "aggregation": group.aggregation,
             })
         })
         .collect::<Vec<_>>();
 
-    hash_json(&json!({ "case_groups": groups }))
+    hash_json(&json!({
+        "defaults": {
+            "fail_on_any_blocking_failure": profile.defaults.fail_on_any_blocking_failure,
+            "min_execution_score": profile.defaults.min_execution_score,
+        },
+        "case_groups": groups,
+    }))
 }
 
 /// Builds run chunk drafts from total case count and requested chunk size.
@@ -791,6 +798,7 @@ mod tests {
         build_chunks,
         cancel,
         canonical_json,
+        compute_aggregation_policy_hash,
         export,
         is_terminal_run_status,
         parse_run_id,
@@ -815,6 +823,7 @@ mod tests {
         contracts::run::{
             DatasetCase,
             RunDataset,
+            RunProfile,
         },
         models::{
             evaluator_result::EvaluatorResult,
@@ -846,6 +855,20 @@ mod tests {
         let canonical = canonical_json(&value);
         let encoded = serde_json::to_string(&canonical).unwrap();
         assert_eq!(encoded, "{\"a\":{\"c\":2,\"d\":1},\"b\":1}");
+    }
+
+    #[test]
+    fn aggregation_policy_hash_includes_evaluator_requiredness() {
+        let mut profile: RunProfile =
+            serde_yaml::from_str(include_str!("../../../../example/profile.yaml")).unwrap();
+        let required_hash = compute_aggregation_policy_hash(&profile).unwrap();
+        let binding = &mut profile.case_groups[0].evaluators[0];
+        binding.required = false;
+        binding.blocking = false;
+        binding.weight = 0.0;
+        let optional_hash = compute_aggregation_policy_hash(&profile).unwrap();
+
+        assert_ne!(required_hash, optional_hash);
     }
 
     #[test]

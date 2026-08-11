@@ -21,6 +21,10 @@ fn default_post_method() -> String {
     "POST".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Run profile used by `vigilo run validate`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RunProfile {
@@ -203,6 +207,11 @@ pub(crate) struct EvaluatorBinding {
     #[serde(rename = "ref")]
     pub(crate) evaluator_ref: String,
 
+    /// Whether this evaluator must produce a valid score for aggregation.
+    /// Optional bindings are diagnostic-only and cannot affect score or policy.
+    #[serde(default = "default_true")]
+    pub(crate) required: bool,
+
     /// Aggregation/reporting dimension this evaluator contributes to.
     pub(crate) dimension: String,
 
@@ -359,6 +368,7 @@ case_groups:
             profile.case_groups[0].evaluators[0].evaluator_ref,
             "core/json-schema:1.0.0"
         );
+        assert!(profile.case_groups[0].evaluators[0].required);
     }
 
     #[test]

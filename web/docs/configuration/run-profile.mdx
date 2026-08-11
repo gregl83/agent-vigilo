@@ -25,7 +25,7 @@ vigilo run validate --profile-file <profile.yaml> --dataset-file <dataset.yaml>
 ## Result Calculation
 
 ```text
-finding score -> dimension_scores -> aggregate_score -> execution status -> run gate_status
+evaluator findings -> evaluator completeness -> dimension_scores -> aggregate_score -> execution status -> run gate_status
 ```
 
 <GlossaryTerm term="dimension-score">`dimension_scores`</GlossaryTerm> are
@@ -42,11 +42,20 @@ Dimension scores are calculated with:
 - `weighted_mean`: weighted average of scoreable findings in that profile dimension.
 - `min_score`: lowest scoreable finding in that profile dimension.
 
+Before calculating either score, Vigilo checks
+<GlossaryTerm term="evaluator-completeness">evaluator completeness</GlossaryTerm>.
+Every required evaluator binding must return at least one valid `passed` or
+`failed` score and must not return an `error` or `skipped` finding. Incomplete
+required output produces `overall_status: error` and withholds both
+`dimension_scores` and `aggregate_score`, preventing the remaining weights from
+being renormalized into a misleading score.
+
 `aggregate_score` is the weighted average of `dimension_scores` using dimension weights. `defaults.min_execution_score` is an overall score gate for that total; it is not a per-dimension threshold. Dimensions with `weight: 0.0` do not affect `aggregate_score`, but can still block when `blocking: true`.
 
 An execution passes when:
 
 - `aggregate_score >= defaults.min_execution_score`
+- evaluator completeness is satisfied
 - no hard blocking <GlossaryTerm term="finding">finding</GlossaryTerm> fails or
   errors
 - at least one scoreable finding exists
@@ -105,7 +114,7 @@ defaults:
 
 - `max_attempts` (u32): hard limit for case execution attempts. Failed attempts below this limit are retried with bounded backoff; once the limit is reached, the execution is failed.
 - `request_timeout_secs` (u32)
-- `fail_on_any_blocking_failure` (bool): when `true`, any blocking failed finding fails the execution even if the total `aggregate_score` is above the threshold. When `false`, blocking failures are still recorded in `blocking_failures`, but the overall score gate determines pass/fail. Blocking errors always error the execution.
+- `fail_on_any_blocking_failure` (bool): when `true`, any blocking failed finding fails the execution even if the total `aggregate_score` is above the threshold. When `false`, blocking failures are still recorded in `blocking_failures`, but the overall score gate determines pass/fail. Errors and skipped findings from required evaluators always make evaluator completeness fail.
 - `min_execution_score` (f64): finite value from `0.0` to `1.0`. This is the overall score gate for the total execution `aggregate_score`; it does not set per-dimension thresholds.
 
 ## `persistence`
@@ -210,6 +219,7 @@ Selection behavior:
 ```yaml
 evaluators:
   - ref: core/json-schema:1.0.0
+    required: true
     dimension: format
     blocking: true
     weight: 1.0
@@ -219,6 +229,7 @@ evaluators:
 ```
 
 - `ref` (string): fully qualified evaluator identifier `<namespace>/<name>:<version>`.
+- `required` (bool, default `true`): requires this binding to return a valid score before aggregation. `false` declares a diagnostic-only evaluator and requires `blocking: false` with `weight: 0.0`; optional findings are persisted but never affect authoritative scores or gates.
 - `dimension` (string): profile-owned aggregation bucket for this evaluator binding. This value controls the persisted result dimension and the `aggregation.dimensions` policy used for scoring. Evaluator-emitted dimensions remain available in raw evaluator output for audit, but they do not override the profile bucket.
 - `blocking` (bool): marks failed/error findings from this binding as blocking. The dimension policy and the evaluator finding may also declare blocking behavior; any of those sources makes the normalized finding blocking.
 - `weight` (f64): finite value greater than or equal to `0.0`. For `weighted_mean`, this is the binding's total contribution inside its dimension. When an evaluator emits multiple scoreable findings, the binding weight is divided across those findings so multi-finding evaluators do not become overweighted.
@@ -269,8 +280,10 @@ Aggregation behavior:
 - `aggregate_score` is the total score for one execution across all scored dimensions.
 - `aggregate_score` combines dimension scores using `aggregation.dimensions.<dimension>.weight`.
 - Missing dimension policies default to `weighted_mean`, non-blocking, weight `1.0`.
-- `passed` and `failed` findings with normalized scores are scoreable. `skipped` and informational findings do not affect score.
-- If an execution has no scoreable findings, its aggregate status is `error`.
+- `passed` and `failed` findings with valid normalized scores are scoreable.
+- A required evaluator that is missing, returns `error` or `skipped`, or returns no scoreable finding makes evaluator completeness fail. Vigilo records the reason in `execution_aggregates.summary.evaluator_completeness` and publishes no dimension or aggregate scores for that execution.
+- Optional evaluators are diagnostic only. Their findings remain available for reporting but never affect dimension scores, blocking failures, or the aggregate score.
+- If an execution has no complete required score set, its aggregate status is `error`.
 - If multiple case groups match the same case, their dimension policies and duplicate evaluator bindings must be identical or non-overlapping; conflicting policies are rejected.
 
 ## Evaluation Plan Resolution
@@ -294,7 +307,7 @@ Resolution order:
 7. All automatically matching groups contribute evaluator bindings and aggregation settings.
 8. Duplicate evaluator refs and duplicate dimension policies across matching groups must be identical; conflicting policies are rejected.
 
-The resolved plan is snapshotted on the execution through `evaluator_manifest`, `expected_evaluator_count`, and `profile_group_id`. Dataset `case_group` is also retained in evaluator input so evaluators can inspect the original routing label.
+The resolved plan is snapshotted on the execution through `evaluator_manifest`, `expected_evaluator_count`, and `profile_group_id`. The manifest retains each binding's `required` policy even in summary persistence mode. Dataset `case_group` is also retained in evaluator input so evaluators can inspect the original routing label.
 
 ## Full Example
 

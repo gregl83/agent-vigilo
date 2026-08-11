@@ -19,7 +19,7 @@ import decisionFlowDiagram from './decision-flow.mmd';
 
 How `vigilo run results` loads a run and returns a summary-only results response.
 
-Results summarize execution aggregates: per-dimension `dimension_scores`, total execution `aggregate_score`, blocking failure counts, and pass/fail/error execution counts. A completed run can still have `gate_status: fail`.
+Results summarize execution aggregates: evaluator completeness, per-dimension `dimension_scores`, total execution `aggregate_score`, blocking failure counts, and pass/fail/error execution counts. Incomplete required evaluator output is reported as an errored aggregate without scores. A completed run can still have `gate_status: fail`.
 
 ## Execution Flow
 

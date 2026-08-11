@@ -61,6 +61,9 @@ Keep the evaluator contract in sync with `wit/evaluator.wit`.
 - Read fields from `input` (run IDs, case, actual output, evaluator config)
 - Produce one or more <GlossaryTerm term="finding">findings</GlossaryTerm> in
   `output.results`
+- For a required profile binding, produce at least one `passed` or `failed`
+  finding with a valid score. Empty, errored, skipped, or scoreless output makes
+  the execution incomplete and withholds authoritative scores.
 - Use evaluator metadata in `output.evaluator`
 - Keep evaluator-specific diagnostics in `output.metadata_json`
 

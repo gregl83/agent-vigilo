@@ -19,7 +19,20 @@ use super::{
     },
 };
 use crate::{
-    contracts::run::AggregationMethod,
+    contracts::{
+        aggregation::{
+            AggregationBinding,
+            AggregationFinding,
+            aggregate_findings,
+        },
+        evaluator::EvaluationStatus,
+        run::{
+            AggregationMethod,
+            AggregationSettings,
+            DimensionAggregation,
+            RunDefaults,
+        },
+    },
     db::workflows::run_dispatch,
 };
 
@@ -546,6 +559,110 @@ async fn recovered_attempt_cannot_persist_late_results(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(aggregate_count, 0);
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
+async fn incomplete_required_evaluator_persists_error_without_score(pool: PgPool) {
+    let seed = seed_running_attempt(&pool, 60, 120).await;
+    let scored_evaluator_id = Uuid::now_v7();
+    let errored_evaluator_id = Uuid::now_v7();
+    let bindings = [
+        AggregationBinding {
+            evaluator_id: scored_evaluator_id,
+            required: true,
+        },
+        AggregationBinding {
+            evaluator_id: errored_evaluator_id,
+            required: true,
+        },
+    ];
+    let findings = [
+        AggregationFinding {
+            evaluator_id: scored_evaluator_id,
+            binding_dimension: "quality".to_string(),
+            source_dimension: Some("quality".to_string()),
+            status: EvaluationStatus::Passed,
+            normalized_score: Some(1.0),
+            blocking: false,
+            binding_weight: 1.0,
+            failure_category: None,
+            reason: None,
+        },
+        AggregationFinding {
+            evaluator_id: errored_evaluator_id,
+            binding_dimension: "quality".to_string(),
+            source_dimension: None,
+            status: EvaluationStatus::Error,
+            normalized_score: None,
+            blocking: false,
+            binding_weight: 1.0,
+            failure_category: Some("evaluator_runtime_error".to_string()),
+            reason: Some("test error".to_string()),
+        },
+    ];
+    let outcome = aggregate_findings(
+        &RunDefaults {
+            max_attempts: 1,
+            request_timeout_secs: 30,
+            fail_on_any_blocking_failure: true,
+            min_execution_score: 0.8,
+        },
+        &AggregationSettings {
+            dimensions: [(
+                "quality".to_string(),
+                DimensionAggregation {
+                    method: AggregationMethod::WeightedMean,
+                    blocking: false,
+                    weight: 1.0,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+        seed.attempt_id,
+        &bindings,
+        &findings,
+    );
+    let completed = CompletedExecutionPersistence {
+        execution_id: seed.execution_id,
+        attempt_id: seed.attempt_id,
+        attempt_no: 1,
+        result_rows: Vec::new(),
+        overall_status: outcome.overall_status,
+        aggregate_score: outcome.aggregate_score,
+        evaluator_result_count: i32::try_from(findings.len()).unwrap(),
+        dimension_scores: outcome.dimension_scores,
+        blocking_failures: outcome.blocking_failures,
+        summary: outcome.summary,
+    };
+
+    persist_completed_execution_results_batch(&pool, &seed.chunk, seed.worker_id, &[completed])
+        .await
+        .unwrap();
+
+    let (overall_status, aggregate_score, dimension_scores, summary) =
+        sqlx::query_as::<_, (String, Option<f64>, serde_json::Value, serde_json::Value)>(
+            r#"
+            SELECT overall_status::text, aggregate_score, dimension_scores, summary
+            FROM execution_aggregates
+            WHERE run_id = $1::uuid
+              AND run_shard = $2
+              AND execution_id = $3::uuid
+            "#,
+        )
+        .bind(seed.run_id)
+        .bind(seed.run_shard)
+        .bind(seed.execution_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(overall_status, "error");
+    assert_eq!(aggregate_score, None);
+    assert_eq!(dimension_scores, json!({}));
+    assert_eq!(summary["evaluator_completeness"]["required_error_count"], 1);
+    assert_eq!(summary["evaluator_completeness"]["complete"], false);
 }
 
 #[sqlx::test(migrations = "../migrations")]

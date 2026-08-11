@@ -245,6 +245,21 @@ fn collect_static_profile_config_issues(profile: &RunProfile) -> Vec<String> {
                     group.id, binding.evaluator_ref
                 ));
             }
+
+            if !binding.required && (binding.blocking || binding.weight != 0.0) {
+                issues.push(format!(
+                    "case_group '{}' optional evaluator '{}' must be non-blocking with weight 0.0",
+                    group.id, binding.evaluator_ref
+                ));
+            }
+        }
+
+        if !group.evaluators.is_empty() && !group.evaluators.iter().any(|binding| binding.required)
+        {
+            issues.push(format!(
+                "case_group '{}' must contain at least one required evaluator",
+                group.id
+            ));
         }
 
         for (dimension, policy) in &group.aggregation.dimensions {
@@ -492,6 +507,7 @@ mod tests {
         let mut profile = profile();
         profile.case_groups[0].evaluators.push(EvaluatorBinding {
             evaluator_ref: "core/json-schema:1.0.0".to_string(),
+            required: true,
             dimension: "format".to_string(),
             blocking: true,
             weight: -1.0,
@@ -529,6 +545,7 @@ mod tests {
         let mut profile = profile();
         profile.case_groups[0].evaluators.push(EvaluatorBinding {
             evaluator_ref: "core/json-schema:1.0.0".to_string(),
+            required: true,
             dimension: "format".to_string(),
             blocking: true,
             weight: 1.0,
@@ -536,6 +553,7 @@ mod tests {
         });
         profile.case_groups[0].evaluators.push(EvaluatorBinding {
             evaluator_ref: "core/json-schema:1.0.0".to_string(),
+            required: true,
             dimension: "quality".to_string(),
             blocking: false,
             weight: 1.0,
@@ -556,6 +574,7 @@ mod tests {
         let mut profile = profile();
         profile.case_groups[0].evaluators.push(EvaluatorBinding {
             evaluator_ref: "core/json-schema:1.0.0".to_string(),
+            required: true,
             dimension: "format".to_string(),
             blocking: true,
             weight: f64::NAN,
@@ -579,6 +598,54 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn profile_rejects_optional_evaluator_that_affects_policy() {
+        let mut profile = profile();
+        profile.case_groups[0].evaluators.push(EvaluatorBinding {
+            evaluator_ref: "core/diagnostic:1.0.0".to_string(),
+            required: false,
+            dimension: "diagnostic".to_string(),
+            blocking: false,
+            weight: 1.0,
+            config: serde_json::json!({}),
+        });
+
+        let issues = super::collect_static_profile_config_issues(&profile);
+
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("must be non-blocking with weight 0.0"))
+        );
+    }
+
+    #[test]
+    fn profile_accepts_optional_diagnostic_evaluator() {
+        let mut profile = profile();
+        profile.case_groups[0].evaluators.extend([
+            EvaluatorBinding {
+                evaluator_ref: "core/scorer:1.0.0".to_string(),
+                required: true,
+                dimension: "quality".to_string(),
+                blocking: false,
+                weight: 1.0,
+                config: serde_json::json!({}),
+            },
+            EvaluatorBinding {
+                evaluator_ref: "core/diagnostic:1.0.0".to_string(),
+                required: false,
+                dimension: "diagnostic".to_string(),
+                blocking: false,
+                weight: 0.0,
+                config: serde_json::json!({}),
+            },
+        ]);
+
+        let issues = super::collect_static_profile_config_issues(&profile);
+
+        assert!(issues.is_empty(), "unexpected issues: {issues:?}");
     }
 
     #[test]

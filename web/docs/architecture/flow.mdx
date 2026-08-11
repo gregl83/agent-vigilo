@@ -27,9 +27,10 @@ At a high level, the system follows a fan-out / fan-in pattern:
 3. The coordinator dispatches chunks through <GlossaryTerm term="outbox-event-record">outbox event records</GlossaryTerm> and RabbitMQ
 4. Workers process case <GlossaryTerm term="execution">**executions**</GlossaryTerm> through <GlossaryTerm term="attempt">**attempts**</GlossaryTerm>
 5. Evaluators produce append-only <GlossaryTerm term="finding">findings</GlossaryTerm>
-6. Execution aggregates are computed
-7. The **run** is finalized
-8. Its completion event record is published as a <GlossaryTerm term="broker-message">broker message</GlossaryTerm>
+6. Required <GlossaryTerm term="evaluator-completeness">evaluator completeness</GlossaryTerm> is verified
+7. Complete findings are aggregated
+8. The **run** is finalized
+9. Its completion event record is published as a <GlossaryTerm term="broker-message">broker message</GlossaryTerm>
 
 ---
 
@@ -118,6 +119,11 @@ After a successful agent response:
 - each evaluator runs in a fresh Wasmtime store with memory, table, instance, fuel, timeout, and log-message limits
 - each normalized evaluator finding is appended to evaluator_results
 
+After all invocations settle, the worker compares their findings with the
+resolved evaluator manifest. Every required binding must have a valid score and
+must not have an error or skipped finding. Optional bindings are diagnostic and
+do not participate in completeness, scores, or gates.
+
 Each evaluator finding records:
 
 - status (passed / failed / error / skipped)
@@ -139,9 +145,12 @@ execution.status = retry_scheduled (if retryable)
 
 ### 5. Execution Completion
 
-Once all evaluator results are persisted:
+Once all evaluator invocations settle:
 
-- execution aggregate is computed from the matching run profile aggregation policy
+- evaluator completeness is recorded in `execution_aggregates.summary`
+- incomplete required output produces `overall_status = error` with no dimension or aggregate score
+- complete required output is aggregated with the matching run profile policy
+- evaluator findings and the resulting aggregate are persisted together
 - execution is marked terminal
 
 ```text

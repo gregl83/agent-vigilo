@@ -53,21 +53,22 @@ that can be watched, queried, exported, and used as a deployment gate.
 Vigilo calculates results in this order:
 
 ```text
-finding score -> dimension_scores -> aggregate_score -> execution status -> run gate_status
+evaluator findings -> evaluator completeness -> dimension_scores -> aggregate_score -> execution status -> run gate_status
 ```
 
 - Evaluators emit <GlossaryTerm term="finding">findings</GlossaryTerm> with a
   status, score, optional blocking flag, and source dimension.
 - The run profile decides which dimension each evaluator contributes to.
+- Every required evaluator must produce a valid score before any dimension or aggregate score is published.
 - `dimension_scores` are per-dimension scores.
 - `aggregate_score` is one total score for the execution, calculated across scored dimensions.
 - `defaults.min_execution_score` is an overall score gate for `aggregate_score`, not a per-dimension threshold.
 - An <GlossaryTerm term="execution">execution</GlossaryTerm> passes when
-  `aggregate_score >= defaults.min_execution_score` and no hard blocking
+  evaluator completeness is satisfied, `aggregate_score >= defaults.min_execution_score`, and no hard blocking
   finding fails or errors.
 - A run passes when every expected execution has an aggregate, no chunk failed or was cancelled, and no execution failed or errored.
 
-A finding is blocking if the evaluator finding, evaluator binding, or dimension policy says `blocking: true`. Use blocking for hard requirements that should not be averaged away. `defaults.fail_on_any_blocking_failure` controls whether blocking failed findings hard-fail the execution; blocking errors always error the execution.
+A finding is blocking if the evaluator finding, evaluator binding, or dimension policy says `blocking: true`. Use blocking for valid model-quality failures that should not be averaged away. `defaults.fail_on_any_blocking_failure` controls whether blocking failed findings hard-fail the execution. Missing, errored, skipped, or unscored required evaluator output fails evaluator completeness regardless of blocking policy.
 
 ## Where Failure Happens
 
@@ -77,7 +78,7 @@ case attempt -> execution -> run -> gate
 
 - <GlossaryTerm term="attempt">Attempts</GlossaryTerm> can fail because the
   agent call, evaluator runtime, persistence, or retry budget failed.
-- Executions can fail because the total `aggregate_score` is below the overall score gate or a hard blocking finding failed.
+- Executions can fail because evaluator completeness is not satisfied, the total `aggregate_score` is below the overall score gate, or a hard blocking finding failed.
 - Runs can fail operationally because chunks failed, coverage is incomplete, aggregates are missing, or executions errored.
 - Gates fail when the run completes but its
   <GlossaryTerm term="gate-status">`gate_status`</GlossaryTerm> is `fail`.

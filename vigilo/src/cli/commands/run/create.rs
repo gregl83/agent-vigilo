@@ -105,7 +105,7 @@ pub(super) async fn exec(
         profile_version_id: profile_version_id.clone(),
         profile_hash: profile_hash.clone(),
         aggregation_policy_id: "profile_case_group_aggregation".to_string(),
-        aggregation_policy_version: "v3".to_string(),
+        aggregation_policy_version: "v4".to_string(),
         aggregation_policy_hash: aggregation_policy_hash.clone(),
         agent_provider: agent.provider.clone(),
         agent_name: agent.name.clone(),
