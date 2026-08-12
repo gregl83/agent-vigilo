@@ -26,6 +26,7 @@ pub(crate) struct RunShardSummary {
     pub(crate) score_sum: f64,
     pub(crate) min_score: Option<f64>,
     pub(crate) max_score: Option<f64>,
+    pub(crate) scorecard: serde_json::Value,
     pub(crate) failed_chunk_count: i32,
     pub(crate) cancelled_chunk_count: i32,
     pub(crate) status: String,

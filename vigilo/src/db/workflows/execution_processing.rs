@@ -213,7 +213,22 @@ fn persisted_case_metadata(
 fn persisted_case_tags(profile: &RunProfile, tags: &serde_json::Value) -> serde_json::Value {
     match &profile.persistence.mode {
         PersistenceMode::Full => tags.clone(),
-        PersistenceMode::Summary => serde_json::Value::Array(Vec::new()),
+        PersistenceMode::Summary => {
+            let required = profile
+                .scorecard
+                .gates
+                .iter()
+                .flat_map(|gate| gate.tags_all.iter().map(String::as_str))
+                .collect::<std::collections::BTreeSet<_>>();
+            serde_json::Value::Array(
+                tags.as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|tag| tag.as_str().is_some_and(|tag| required.contains(tag)))
+                    .cloned()
+                    .collect(),
+            )
+        }
     }
 }
 
@@ -1548,6 +1563,7 @@ mod tests {
                 PersistenceSettings,
                 RunDefaults,
                 RunProfile,
+                ScorecardGate,
             },
         },
         db::workflows::chunk_processing::WorkerCaseBatchItem,
@@ -1645,6 +1661,7 @@ mod tests {
                 persist_raw_outputs: PersistRawOutputsMode::All,
                 persist_evaluator_evidence: true,
             },
+            scorecard: Default::default(),
             agent: AgentProfile {
                 provider: "example".to_string(),
                 name: "agent".to_string(),
@@ -1843,6 +1860,30 @@ mod tests {
             assert_eq!(value["redacted"], json!(true));
             assert_eq!(value["case_hash"], json!("case-hash"));
         }
+    }
+
+    #[test]
+    fn summary_mode_retains_only_scorecard_tags() {
+        let mut profile = routing_profile();
+        profile.persistence.mode = PersistenceMode::Summary;
+        profile.scorecard.gates.push(ScorecardGate {
+            id: "release".to_string(),
+            dimension: "quality".to_string(),
+            binding_id: None,
+            case_group: None,
+            tags_all: vec!["release".to_string()],
+            min_mean_score: Some(0.8),
+            score_threshold: None,
+            min_pass_rate: None,
+            min_coverage: None,
+            max_error_rate: None,
+            max_abstention_rate: None,
+        });
+
+        assert_eq!(
+            persisted_case_tags(&profile, &json!(["private", "release"])),
+            json!(["release"])
+        );
     }
 
     #[test]

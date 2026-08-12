@@ -43,10 +43,16 @@ async fn finalize_claimed_run_from_summaries_combines_terminal_shards(pool: PgPo
 
     let summaries = vec![first_summary, second_summary];
 
-    let finalized = finalize_claimed_run_from_summaries(&pool, run_id, coordinator_id, &summaries)
-        .await
-        .unwrap()
-        .unwrap();
+    let finalized = finalize_claimed_run_from_summaries(
+        &pool,
+        run_id,
+        coordinator_id,
+        "aggregation-hash",
+        &summaries,
+    )
+    .await
+    .unwrap()
+    .unwrap();
 
     assert_eq!(finalized.id, run_id);
     assert_eq!(finalized.gate_status, "fail");
@@ -84,6 +90,18 @@ async fn finalize_claimed_run_from_summaries_combines_terminal_shards(pool: PgPo
     assert_eq!(row.errored_execution_count, 0);
     assert_eq!(row.summary["shard_summary_count"], Value::from(2));
     assert_eq!(row.summary["coverage_complete"], Value::from(true));
+
+    let (policy_hash, shard_count, scorecard_passed) =
+        sqlx::query_as::<_, (String, i32, bool)>(
+            "SELECT aggregation_policy_hash, shard_count, passed FROM run_scorecards WHERE run_id = $1::uuid",
+        )
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(policy_hash, "aggregation-hash");
+    assert_eq!(shard_count, 2);
+    assert!(scorecard_passed);
 
     let cursor_status = sqlx::query_scalar::<_, String>(
         r#"
@@ -129,9 +147,15 @@ async fn finalize_claimed_run_from_summaries_waits_for_running_summary(pool: PgP
     summary.terminal_execution_count = 1;
     let summaries = vec![summary];
 
-    let finalized = finalize_claimed_run_from_summaries(&pool, run_id, coordinator_id, &summaries)
-        .await
-        .unwrap();
+    let finalized = finalize_claimed_run_from_summaries(
+        &pool,
+        run_id,
+        coordinator_id,
+        "aggregation-hash",
+        &summaries,
+    )
+    .await
+    .unwrap();
 
     assert!(finalized.is_none());
 
@@ -160,17 +184,27 @@ async fn stale_or_expired_finalization_owner_cannot_commit(pool: PgPool) {
     set_finalization_lease(&pool, run_id, current_coordinator_id, "60 seconds").await;
     let summaries = [terminal_summary(run_id, 0, "completed")];
 
-    let finalized =
-        finalize_claimed_run_from_summaries(&pool, run_id, stale_coordinator_id, &summaries)
-            .await
-            .unwrap();
+    let finalized = finalize_claimed_run_from_summaries(
+        &pool,
+        run_id,
+        stale_coordinator_id,
+        "aggregation-hash",
+        &summaries,
+    )
+    .await
+    .unwrap();
 
     assert!(finalized.is_none());
     set_finalization_lease(&pool, run_id, stale_coordinator_id, "-1 second").await;
-    let expired =
-        finalize_claimed_run_from_summaries(&pool, run_id, stale_coordinator_id, &summaries)
-            .await
-            .unwrap();
+    let expired = finalize_claimed_run_from_summaries(
+        &pool,
+        run_id,
+        stale_coordinator_id,
+        "aggregation-hash",
+        &summaries,
+    )
+    .await
+    .unwrap();
     assert!(expired.is_none());
 
     let status =

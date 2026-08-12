@@ -31,6 +31,7 @@ How `runs.status` and `runs.gate_status` move through creation, dispatch, finali
 - Coordinator dispatch claims an open `run_id + run_shard` cursor, marks a new `pending` run as `running`, selects a bounded shard-local chunk window, and inserts one `run.chunk.ready` outbox event record per selected chunk.
 - Before dispatch and finalization, the coordinator recovers expired worker chunk leases or marks exhausted chunks failed.
 - Finalization only claims runs whose chunks are all terminal and whose finalization lease is open; `pending` or `leased` chunks keep the run out of finalization, including chunks waiting for execution retry windows.
+- Finalization verifies and merges one bounded scorecard per shard, applies the frozen run gates, and stores the scorecard with the final gate status under the same coordinator lease.
 - Cancellation applies to `pending`, `running`, and `finalizing` runs. A
   `creating` run is owned by the creation recovery workflow until it becomes
   `pending` or `failed`.

@@ -179,6 +179,41 @@ pub(crate) async fn validate_profile_executability(
         expected_evaluator_execution_count += runnable_for_case;
     }
 
+    for gate in &profile.scorecard.gates {
+        let matching_case_count = dataset
+            .cases
+            .iter()
+            .filter(|case| {
+                let groups = matching_groups_for_case(profile, case);
+                let case_group_matches = gate
+                    .case_group
+                    .as_ref()
+                    .is_none_or(|case_group| groups.iter().any(|group| &group.id == case_group));
+                let tags_match = gate
+                    .tags_all
+                    .iter()
+                    .all(|required| case.tags.iter().any(|tag| tag == required));
+                let target_matches = groups.iter().any(|group| {
+                    group.evaluators.iter().any(|binding| {
+                        binding.required
+                            && binding.dimension == gate.dimension
+                            && gate
+                                .binding_id
+                                .as_ref()
+                                .is_none_or(|binding_id| &binding.id == binding_id)
+                    })
+                });
+                case_group_matches && tags_match && target_matches
+            })
+            .count();
+        if matching_case_count == 0 {
+            issues.push(format!(
+                "scorecard gate '{}' does not match any dataset cases",
+                gate.id
+            ));
+        }
+    }
+
     if !issues.is_empty() {
         anyhow::bail!(
             "profile executability validation failed:\n- {}",
@@ -198,6 +233,123 @@ pub(crate) async fn validate_profile_executability(
 
 fn collect_static_profile_config_issues(profile: &RunProfile) -> Vec<String> {
     let mut issues = Vec::new();
+
+    if profile.scorecard.gates.len() > 64 {
+        issues.push("scorecard.gates must contain at most 64 entries".to_string());
+    }
+    let mut gate_ids = HashSet::new();
+    for gate in &profile.scorecard.gates {
+        if gate.id.trim().is_empty()
+            || !gate
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        {
+            issues.push(format!(
+                "scorecard gate id '{}' must contain only ASCII letters, numbers, '.', '_' or '-'",
+                gate.id
+            ));
+        }
+        if !gate_ids.insert(gate.id.clone()) {
+            issues.push(format!(
+                "scorecard contains duplicate gate id '{}'",
+                gate.id
+            ));
+        }
+        if gate.dimension.trim().is_empty() {
+            issues.push(format!(
+                "scorecard gate '{}' dimension must not be empty",
+                gate.id
+            ));
+        }
+        if gate.tags_all.len() > 16
+            || gate
+                .tags_all
+                .iter()
+                .any(|tag| tag.trim().is_empty() || tag.len() > 128)
+        {
+            issues.push(format!(
+                "scorecard gate '{}' tags_all must contain at most 16 non-empty tags of at most 128 bytes",
+                gate.id
+            ));
+        }
+        let rates = [
+            gate.min_mean_score,
+            gate.score_threshold,
+            gate.min_pass_rate,
+            gate.min_coverage,
+            gate.max_error_rate,
+            gate.max_abstention_rate,
+        ];
+        if rates
+            .into_iter()
+            .flatten()
+            .any(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            issues.push(format!(
+                "scorecard gate '{}' thresholds must be finite and between 0.0 and 1.0",
+                gate.id
+            ));
+        }
+        if gate.min_pass_rate.is_some() != gate.score_threshold.is_some() {
+            issues.push(format!(
+                "scorecard gate '{}' score_threshold and min_pass_rate must be configured together",
+                gate.id
+            ));
+        }
+        if rates.into_iter().all(|value| value.is_none()) {
+            issues.push(format!(
+                "scorecard gate '{}' must configure at least one threshold",
+                gate.id
+            ));
+        }
+        if let Some(case_group) = &gate.case_group
+            && !profile
+                .case_groups
+                .iter()
+                .any(|group| &group.id == case_group)
+        {
+            issues.push(format!(
+                "scorecard gate '{}' references unknown case_group '{}'",
+                gate.id, case_group
+            ));
+        }
+        let candidate_groups = profile.case_groups.iter().filter(|group| {
+            gate.case_group
+                .as_ref()
+                .is_none_or(|case_group| &group.id == case_group)
+        });
+        let target_exists = candidate_groups.clone().any(|group| {
+            group.evaluators.iter().any(|binding| {
+                binding.required
+                    && binding.dimension == gate.dimension
+                    && gate
+                        .binding_id
+                        .as_ref()
+                        .is_none_or(|binding_id| &binding.id == binding_id)
+            })
+        });
+        if !target_exists {
+            issues.push(format!(
+                "scorecard gate '{}' does not target a required evaluator binding",
+                gate.id
+            ));
+        }
+        if gate.binding_id.is_none() {
+            let conflicting_methods = candidate_groups
+                .filter_map(|group| group.aggregation.dimensions.get(&gate.dimension))
+                .map(|policy| &policy.method)
+                .collect::<HashSet<_>>()
+                .len()
+                > 1;
+            if conflicting_methods {
+                issues.push(format!(
+                    "scorecard gate '{}' spans conflicting aggregation methods; set case_group or binding_id",
+                    gate.id
+                ));
+            }
+        }
+    }
 
     if profile.agent.provider.trim().is_empty() {
         issues.push("agent.provider must not be empty".to_string());
@@ -397,6 +549,7 @@ mod tests {
             PersistenceSettings,
             RunDefaults,
             RunProfile,
+            ScorecardGate,
         },
         db::workflows::run_profile_validation::matching_groups_for_case,
         models::evaluator::EvaluatorState,
@@ -418,6 +571,7 @@ mod tests {
                 persist_raw_outputs: PersistRawOutputsMode::All,
                 persist_evaluator_evidence: true,
             },
+            scorecard: Default::default(),
             agent: AgentProfile {
                 provider: "example".to_string(),
                 name: "test-agent".to_string(),
@@ -711,6 +865,31 @@ mod tests {
         let issues = super::collect_static_profile_config_issues(&profile);
 
         assert!(issues.is_empty(), "unexpected issues: {issues:?}");
+    }
+
+    #[test]
+    fn profile_validates_scorecard_gate_targets_and_thresholds() {
+        let mut profile = profile();
+        profile.scorecard.gates.push(ScorecardGate {
+            id: "quality_release".to_string(),
+            dimension: "quality".to_string(),
+            binding_id: Some("missing".to_string()),
+            case_group: Some("missing".to_string()),
+            tags_all: vec![],
+            min_mean_score: Some(1.1),
+            score_threshold: Some(0.8),
+            min_pass_rate: None,
+            min_coverage: None,
+            max_error_rate: None,
+            max_abstention_rate: None,
+        });
+
+        let issues = super::collect_static_profile_config_issues(&profile).join("\n");
+
+        assert!(issues.contains("thresholds must be finite"));
+        assert!(issues.contains("must be configured together"));
+        assert!(issues.contains("unknown case_group"));
+        assert!(issues.contains("does not target a required evaluator"));
     }
 
     #[test]

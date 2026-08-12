@@ -15,6 +15,17 @@ persistence:
   persist_raw_outputs: failures_only
   persist_evaluator_evidence: true
 
+# Run-level gates are evaluated after all shard scorecards are merged.
+scorecard:
+  gates:
+    - id: quality_release
+      dimension: quality
+      case_group: sentiment_classification
+      min_mean_score: 0.85
+      min_coverage: 1.0
+      max_error_rate: 0.0
+      max_abstention_rate: 0.0
+
 agent:
   provider: llama.cpp
   name: qwen2.5-0.5b-instruct

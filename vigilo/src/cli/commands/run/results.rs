@@ -6,7 +6,11 @@
 
 use super::*;
 
-pub(super) fn run_results_payload(run: &Run, summary: &RunResultsSummary) -> Value {
+pub(super) fn run_results_payload(
+    run: &Run,
+    summary: &RunResultsSummary,
+    scorecard: Option<&Value>,
+) -> Value {
     json!({
         "data": {
             "run": {
@@ -42,6 +46,7 @@ pub(super) fn run_results_payload(run: &Run, summary: &RunResultsSummary) -> Val
                 },
                 "evaluator_result_count": summary.evaluator_result_count,
                 "blocking_failure_count": summary.blocking_failure_count,
+                "scorecard": scorecard,
             },
         },
         "meta": {
@@ -57,7 +62,8 @@ pub(super) async fn exec(context: Context, run_id: String) -> anyhow::Result<()>
     let out = context.out().await?;
     let run = select_existing_run(db, run_id).await?;
     let summary = run_results_workflow::select_run_results_summary(database_router, run_id).await?;
-    let payload = run_results_payload(&run, &summary);
+    let scorecard = run_results_workflow::select_run_scorecard(db, run_id).await?;
+    let payload = run_results_payload(&run, &summary, scorecard.as_ref());
 
     out.write_value(&payload)?;
     Ok(())

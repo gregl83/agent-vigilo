@@ -16,6 +16,7 @@ CREATE TABLE run_shard_summaries (
     score_sum DOUBLE PRECISION NOT NULL DEFAULT 0.0,
     min_score DOUBLE PRECISION,
     max_score DOUBLE PRECISION,
+    scorecard JSONB NOT NULL DEFAULT '{"version":1,"policy_hash":"","entries":[]}'::jsonb,
     failed_chunk_count INTEGER NOT NULL DEFAULT 0 CHECK (failed_chunk_count >= 0),
     cancelled_chunk_count INTEGER NOT NULL DEFAULT 0 CHECK (cancelled_chunk_count >= 0),
     status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
@@ -61,6 +62,9 @@ COMMENT ON COLUMN run_shard_summaries.blocking_failure_count IS
 
 COMMENT ON COLUMN run_shard_summaries.score_count IS
     'Number of scored execution aggregates included in score_sum/min/max.';
+
+COMMENT ON COLUMN run_shard_summaries.scorecard IS
+    'Versioned bounded run-gate rollup computed from current authoritative attempts on this shard.';
 
 COMMENT ON COLUMN run_shard_summaries.status IS
     'Shard summary status: running while work remains, completed when all expected executions are terminal and passing coverage checks, failed when terminal failures or missing aggregates are present.';

@@ -899,6 +899,7 @@ async fn finalize_ready_runs(
             control_db,
             claimed.id,
             coordinator_id,
+            &claimed.aggregation_policy_hash,
             &summaries,
         )
         .await?

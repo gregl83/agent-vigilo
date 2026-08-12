@@ -9,17 +9,22 @@ use std::collections::BTreeSet;
 
 use super::*;
 
+pub(super) struct RunExportRows<'a> {
+    pub(super) executions: &'a [Execution],
+    pub(super) attempts: &'a [ExecutionAttempt],
+    pub(super) aggregates: &'a [ExecutionAggregate],
+    pub(super) evaluator_results: &'a [EvaluatorResult],
+    pub(super) evaluator_diagnostics: &'a [EvaluatorDiagnostic],
+    pub(super) scorecard: Option<&'a Value>,
+}
+
 pub(super) fn run_export_payload(
     run: &Run,
     summary: &RunResultsSummary,
-    executions: &[Execution],
-    attempts: &[ExecutionAttempt],
-    aggregates: &[ExecutionAggregate],
-    evaluator_results: &[EvaluatorResult],
-    evaluator_diagnostics: &[EvaluatorDiagnostic],
+    rows: &RunExportRows<'_>,
 ) -> Value {
     let mut attempts_by_execution: BTreeMap<(i16, Uuid), Vec<&ExecutionAttempt>> = BTreeMap::new();
-    for attempt in attempts {
+    for attempt in rows.attempts {
         attempts_by_execution
             .entry((attempt.run_shard, attempt.execution_id))
             .or_default()
@@ -27,19 +32,20 @@ pub(super) fn run_export_payload(
     }
 
     let mut aggregates_by_execution: BTreeMap<(i16, Uuid), &ExecutionAggregate> = BTreeMap::new();
-    for aggregate in aggregates {
+    for aggregate in rows.aggregates {
         aggregates_by_execution.insert((aggregate.run_shard, aggregate.execution_id), aggregate);
     }
 
     let mut results_by_attempt: BTreeMap<(i16, Uuid), Vec<&EvaluatorResult>> = BTreeMap::new();
-    for result in evaluator_results {
+    for result in rows.evaluator_results {
         results_by_attempt
             .entry((result.run_shard, result.attempt_id))
             .or_default()
             .push(result);
     }
 
-    let exported_executions = executions
+    let exported_executions = rows
+        .executions
         .iter()
         .map(|execution| {
             let exported_attempts = attempts_by_execution
@@ -56,7 +62,8 @@ pub(super) fn run_export_payload(
                         .iter()
                         .map(|result| result.id)
                         .collect::<BTreeSet<Uuid>>();
-                    let attempt_diagnostics = evaluator_diagnostics
+                    let attempt_diagnostics = rows
+                        .evaluator_diagnostics
                         .iter()
                         .filter(|diagnostic| result_ids.contains(&diagnostic.evaluator_result_id))
                         .collect::<Vec<_>>();
@@ -101,6 +108,7 @@ pub(super) fn run_export_payload(
                 "updated_at": run.updated_at,
             },
             "results": {
+                "scorecard": rows.scorecard,
                 "execution_count": summary.execution_count,
                 "aggregate_count": summary.aggregate_count,
                 "missing_aggregate_count": summary.missing_aggregate_count,
@@ -122,10 +130,10 @@ pub(super) fn run_export_payload(
         },
         "meta": {
             "summary_only": false,
-            "execution_count": executions.len(),
-            "attempt_count": attempts.len(),
-            "aggregate_count": aggregates.len(),
-            "evaluator_result_count": evaluator_results.len(),
+            "execution_count": rows.executions.len(),
+            "attempt_count": rows.attempts.len(),
+            "aggregate_count": rows.aggregates.len(),
+            "evaluator_result_count": rows.evaluator_results.len(),
         }
     })
 }
@@ -149,6 +157,7 @@ pub(super) async fn exec(
 
     let run = select_existing_run(db, run_id).await?;
     let summary = run_results_workflow::select_run_results_summary(database_router, run_id).await?;
+    let scorecard = run_results_workflow::select_run_scorecard(db, run_id).await?;
     let routes = run_export_workflow::select_run_export_routes(database_router, run_id).await?;
 
     match format {
@@ -192,11 +201,14 @@ pub(super) async fn exec(
             let payload = run_export_payload(
                 &run,
                 &summary,
-                &all_executions,
-                &all_attempts,
-                &all_aggregates,
-                &all_evaluator_results,
-                &all_evaluator_diagnostics,
+                &RunExportRows {
+                    executions: &all_executions,
+                    attempts: &all_attempts,
+                    aggregates: &all_aggregates,
+                    evaluator_results: &all_evaluator_results,
+                    evaluator_diagnostics: &all_evaluator_diagnostics,
+                    scorecard: scorecard.as_ref(),
+                },
             );
             out.write_value(&payload)?;
         }
@@ -229,6 +241,14 @@ pub(super) async fn exec(
                 },
             });
             out.write_line(serde_json::to_string(&summary_line)?)?;
+
+            if let Some(scorecard) = &scorecard {
+                out.write_line(serde_json::to_string(&json!({
+                    "type": "run_scorecard",
+                    "run_id": run_id,
+                    "scorecard": scorecard,
+                }))?)?;
+            }
 
             for route in &routes {
                 let route_line = json!({

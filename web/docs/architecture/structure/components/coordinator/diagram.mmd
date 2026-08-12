@@ -25,7 +25,7 @@ flowchart TD
     DispatchWorkflow["fa:fa-share-nodes <br/> <b>Run Dispatch Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Claims a control cursor, prepares an execution snapshot, and inserts one run.chunk.ready outbox record per selected chunk.</small>"]:::component
 
     FinalizationPass["fa:fa-flag-checkered <br/> <b>Finalization Pass</b> <br/> <small>[Component: Rust]</small> <br/> <small>Bounds finalizable-run work and logs candidate backlog per coordinator cycle.</small>"]:::component
-    FinalizeWorkflow["fa:fa-calculator <br/> <b>Run Finalization Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Reads routed shard summaries, sets global gate status, and inserts a run.completed outbox record.</small>"]:::component
+    FinalizeWorkflow["fa:fa-calculator <br/> <b>Run Finalization Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Merges bounded shard scorecards, applies run gates, and commits the scorecard, gate status, and completion event.</small>"]:::component
 
     OutboxPublisher["fa:fa-paper-plane <br/> <b>Outbox Publisher</b> <br/> <small>[Component: Rust / Tokio]</small> <br/> <small>Claims delivery batches, logs per-placement backlog, publishes with bounded concurrency, and deletes completed rows.</small>"]:::component
     EventPublisher["fa:fa-plug <br/> <b>Event Publisher Boundary</b> <br/> <small>[Component: Rust Trait]</small> <br/> <small>Separates durable outbox handling from the broker transport.</small>"]:::component
@@ -77,7 +77,7 @@ flowchart TD
 
     CycleOrchestrator -->|"Then finalizes"| FinalizationPass
     FinalizationPass -->|"Claims and finalizes one terminal run at a time with"| FinalizeWorkflow
-    FinalizeWorkflow -->|"Reads routed shard summaries and updates the control run summary in <br> <small>[SQL/TCP]</small>"| Database
+    FinalizeWorkflow -->|"Reads one scorecard summary per shard and atomically stores the final scorecard and run outcome in <br> <small>[SQL/TCP]</small>"| Database
 
     CycleOrchestrator -->|"Finally publishes with"| OutboxPublisher
     OutboxPublisher -->|"Claims delivery rows, marks ledgers, deletes completed rows, and reschedules retries in <br> <small>[SQL/TCP]</small>"| Database

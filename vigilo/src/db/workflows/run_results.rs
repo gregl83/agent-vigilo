@@ -11,6 +11,18 @@ use super::run_shard_summary::{
 };
 use crate::context::database;
 
+pub(crate) async fn select_run_scorecard(
+    db: &sqlx::PgPool,
+    run_id: Uuid,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    Ok(
+        sqlx::query_scalar("SELECT scorecard FROM run_scorecards WHERE run_id = $1::uuid")
+            .bind(run_id)
+            .fetch_optional(db)
+            .await?,
+    )
+}
+
 #[derive(Debug, Clone, Default, sqlx::FromRow)]
 pub(crate) struct RunResultsSummary {
     pub(crate) execution_count: i64,
@@ -168,6 +180,12 @@ mod tests {
             score_sum: 0.0,
             min_score: None,
             max_score: None,
+            scorecard: serde_json::json!({
+                "version": 1,
+                "run_shard": run_shard,
+                "policy_hash": "hash",
+                "entries": [],
+            }),
             failed_chunk_count: 0,
             cancelled_chunk_count: 0,
             status: "completed".to_owned(),

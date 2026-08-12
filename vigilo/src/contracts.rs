@@ -17,3 +17,4 @@ pub(crate) mod evaluator;
 pub(crate) mod evaluator_ref;
 pub(crate) mod normalization;
 pub(crate) mod run;
+pub(crate) mod scorecard;

@@ -16,7 +16,7 @@ pub(crate) async fn select_next_finalization_candidate(
 ) -> anyhow::Result<Option<ClaimedRunForFinalization>> {
     let candidate = sqlx::query_as::<_, ClaimedRunForFinalization>(
         r#"
-        SELECT r.id, r.run_key
+        SELECT r.id, r.run_key, r.aggregation_policy_hash
         FROM runs r
         WHERE r.status IN ('running'::run_status, 'finalizing'::run_status)
           AND (
@@ -149,7 +149,7 @@ pub(crate) async fn claim_finalization_candidate(
             updated_at = now()
         FROM candidate
         WHERE r.id = candidate.id
-        RETURNING r.id, r.run_key
+        RETURNING r.id, r.run_key, r.aggregation_policy_hash
         "#,
     )
     .bind(run_id)
@@ -167,19 +167,42 @@ pub(super) async fn finalize_claimed_run(
     coordinator_id: Uuid,
     summary: &FinalizationSummary,
 ) -> anyhow::Result<Option<FinalizedRun>> {
+    let scorecard = serde_json::to_value(&summary.scorecard)?;
     let finalized = sqlx::query_as::<_, FinalizedRun>(
         r#"
         WITH run_row AS (
             SELECT
                 id,
                 run_key,
-                expected_execution_count
+                expected_execution_count,
+                aggregation_policy_hash
             FROM runs
             WHERE id = $1::uuid
               AND status = 'finalizing'::run_status
               AND coordinator_id = $14::uuid
               AND coordinator_leased_until >= now()
+              AND aggregation_policy_hash = $16::text
             FOR UPDATE
+        ),
+        inserted_scorecard AS (
+            INSERT INTO run_scorecards (
+                run_id,
+                schema_version,
+                aggregation_policy_hash,
+                shard_count,
+                passed,
+                scorecard
+            )
+            SELECT
+                rr.id,
+                $15::smallint,
+                $16::text,
+                $17::int,
+                $18::bool,
+                $19::jsonb
+            FROM run_row rr
+            ON CONFLICT (run_id) DO NOTHING
+            RETURNING run_id
         ),
         finalized AS (
             UPDATE runs r
@@ -208,6 +231,7 @@ pub(super) async fn finalize_claimed_run(
                 coordinator_heartbeat_at = now(),
                 updated_at = now()
             FROM run_row rr
+            JOIN inserted_scorecard scorecard ON scorecard.run_id = rr.id
             WHERE r.id = rr.id
             RETURNING
                 r.id,
@@ -271,6 +295,11 @@ pub(super) async fn finalize_claimed_run(
     .bind(summary.has_terminal_chunk_failure)
     .bind(summary.shard_summary_count)
     .bind(coordinator_id)
+    .bind(i16::try_from(summary.scorecard.version)?)
+    .bind(&summary.scorecard.policy_hash)
+    .bind(i32::try_from(summary.scorecard.shard_count)?)
+    .bind(summary.scorecard.passed)
+    .bind(scorecard)
     .fetch_optional(db)
     .await?;
 

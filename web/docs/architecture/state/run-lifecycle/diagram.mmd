@@ -21,6 +21,7 @@ flowchart TD
 
     FinalizeGuard{Running or finalizing with no open chunks?}
     Finalizing[Run finalizing]
+    Scorecard[Merge shard scorecards and apply run gates]
     FinalizeCheck{Still finalizing and no open chunks?}
     Gate{Gate outcome}
     CompletedPass[Run completed + gate pass]
@@ -51,7 +52,7 @@ flowchart TD
     FinalizeGuard -- No --> Noop
 
     Finalizing --> FinalizeCheck
-    FinalizeCheck -- Yes --> Gate
+    FinalizeCheck -- Yes --> Scorecard --> Gate
     FinalizeCheck -- No --> Noop
 
     Gate -- Criteria met --> CompletedPass --> CompletedEvent
@@ -67,7 +68,7 @@ flowchart TD
     Running -. Unrecoverable system error .-> Failed
 
     class Create command
-    class Creating,Seed,SeedGuard,Activate,Pending,Running,Finalizing,DispatchGuard,DispatchLock,DispatchEvents,DispatchCursor,FinalizeGuard,FinalizeCheck,Gate,CompletedEvent,CancelGuard,CancelCascade,CancelEvent system
+    class Creating,Seed,SeedGuard,Activate,Pending,Running,Finalizing,DispatchGuard,DispatchLock,DispatchEvents,DispatchCursor,FinalizeGuard,FinalizeCheck,Scorecard,Gate,CompletedEvent,CancelGuard,CancelCascade,CancelEvent system
     class CompletedPass success
     class CompletedFail,Cancelled,Failed,Reject error
     class Noop component

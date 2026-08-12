@@ -98,6 +98,7 @@ case_groups: []
 - `description` (string): human-readable profile summary.
 - `defaults` (object): run-level behavior defaults.
 - `persistence` (object): persistence policy controls.
+- `scorecard` (object): run-level dimension and evaluator gates.
 - `agent` (object): required worker-side target invocation configuration.
 - `case_groups` (array): per-task evaluator and aggregation definitions.
 
@@ -125,7 +126,7 @@ persistence:
   persist_evaluator_evidence: true
 ```
 
-- `mode` (enum): `full` | `summary`. `full` stores execution-level case snapshots and evaluator binding config on each execution. `summary` stores only summary-safe execution identity/routing fields and redacts execution `input_payload`, `expected_output`, `case_metadata`, tags, and evaluator binding `config` in the execution snapshot.
+- `mode` (enum): `full` | `summary`. `full` stores execution-level case snapshots and evaluator binding config on each execution. `summary` redacts payloads, metadata, and evaluator config but retains tags referenced by scorecard gates.
 - `persist_raw_outputs` (enum): `all` | `failures_only` | `none`. Controls `evaluator_results.raw_evaluator_output`; `failures_only` retains host-failed and errored invocation output.
 - `persist_evaluator_evidence` (bool): controls `evaluator_diagnostics.evidence`. When `false`, diagnostic evidence and raw evaluator output are redacted.
 
@@ -293,6 +294,36 @@ Aggregation behavior:
 - Optional bindings are diagnostic only. Their results and diagnostics remain available for reporting but never affect scores or gates.
 - If an execution has no complete required score set, its aggregate status is `error`.
 - If multiple case groups match the same case, their dimension policies and duplicate evaluator bindings must be identical or non-overlapping; conflicting policies are rejected.
+
+## `scorecard.gates`
+
+Scorecard gates apply after all executions finish. They enforce run-wide rules without loading every execution into the control database.
+
+```yaml
+scorecard:
+  gates:
+    - id: safety_release
+      dimension: safety
+      tags_all: [jailbreak]
+      min_mean_score: 0.99
+      score_threshold: 1.0
+      min_pass_rate: 1.0
+      min_coverage: 1.0
+      max_error_rate: 0.0
+      max_abstention_rate: 0.0
+```
+
+- `id`: unique stable gate id. A profile supports at most 64 gates.
+- `dimension`: required dimension to score.
+- `binding_id`: optional required evaluator binding target. Without it, the gate uses the execution's dimension score.
+- `case_group`: optional exact case-group filter.
+- `tags_all`: optional list of tags every matching case must have.
+- `min_mean_score`: minimum mean score across scored matching executions.
+- `score_threshold` and `min_pass_rate`: configured together; require a fraction of scored executions to meet the threshold.
+- `min_coverage`: minimum fraction of matching executions with a score.
+- `max_error_rate` and `max_abstention_rate`: maximum fractions over matching executions.
+
+A gate with no matching executions fails. Any failed scorecard gate fails the run even when every execution passed its overall score gate. `vigilo run results` and run exports include the final scorecard and failed rules.
 
 ## Evaluation Plan Resolution
 

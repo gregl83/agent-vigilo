@@ -47,6 +47,10 @@ pub(crate) struct RunProfile {
     /// Persistence behavior controls for run/evaluation artifacts.
     pub(crate) persistence: PersistenceSettings,
 
+    /// Run-level scorecard and gate policy applied after every shard completes.
+    #[serde(default)]
+    pub(crate) scorecard: ScorecardSettings,
+
     /// Agent target invoked by workers before evaluator execution.
     pub(crate) agent: AgentProfile,
 
@@ -55,6 +59,52 @@ pub(crate) struct RunProfile {
     /// Empty by default to allow incremental authoring/validation.
     #[serde(default)]
     pub(crate) case_groups: Vec<CaseGroupProfile>,
+}
+
+/// Run-level rules evaluated from bounded shard-local rollups.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ScorecardSettings {
+    /// Gates evaluated after shard scorecards are merged.
+    #[serde(default)]
+    pub(crate) gates: Vec<ScorecardGate>,
+}
+
+/// One run-level gate over a dimension across all matching executions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ScorecardGate {
+    /// Stable gate identifier within the profile.
+    pub(crate) id: String,
+    /// Dimension to evaluate.
+    pub(crate) dimension: String,
+    /// Optional evaluator binding target within the dimension.
+    #[serde(default)]
+    pub(crate) binding_id: Option<String>,
+    /// Optional exact case-group selector.
+    #[serde(default)]
+    pub(crate) case_group: Option<String>,
+    /// Optional tag selector; a case matches when it has every configured tag.
+    #[serde(default)]
+    pub(crate) tags_all: Vec<String>,
+    /// Minimum mean normalized score across scored matching executions.
+    #[serde(default)]
+    pub(crate) min_mean_score: Option<f64>,
+    /// Score at or above which a matching execution counts as passing.
+    #[serde(default)]
+    pub(crate) score_threshold: Option<f64>,
+    /// Minimum fraction of scored matching executions meeting `score_threshold`.
+    #[serde(default)]
+    pub(crate) min_pass_rate: Option<f64>,
+    /// Minimum scored-execution coverage over expected matching executions.
+    #[serde(default)]
+    pub(crate) min_coverage: Option<f64>,
+    /// Maximum execution error rate over expected matching executions.
+    #[serde(default)]
+    pub(crate) max_error_rate: Option<f64>,
+    /// Maximum execution abstention rate over expected matching executions.
+    #[serde(default)]
+    pub(crate) max_abstention_rate: Option<f64>,
 }
 
 /// Agent target configuration attached to this run profile.
@@ -310,7 +360,7 @@ pub(crate) struct DimensionAggregation {
 }
 
 /// Supported dimension aggregation methods.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AggregationMethod {
     /// Use the minimum score among contributors.

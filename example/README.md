@@ -9,7 +9,7 @@ This example demonstrates a file-based run profile and dataset that target a loc
 
 The profile points at `http://agent_vigilo_agent:8080/v1/chat/completions`, the llama.cpp-backed agent service in `infra/dev/docker-compose.yml`. Workers send an OpenAI-compatible chat completions request and map the agent response into the evaluator `actual` envelope.
 
-The example uses one score-gated `quality` dimension. The stable profile binding owns normalization, threshold, dimension, weight, and blocking policy; the evaluator supplies only its measurement and diagnostics. The run passes only when the weighted aggregate score is at least `defaults.min_execution_score`.
+The example uses one `quality` dimension. Each execution must meet `defaults.min_execution_score`, then the run-level `quality_release` scorecard gate requires complete coverage, no errors or abstentions, and a mean quality score of at least `0.85`.
 
 The evaluator returns an ordinal sentiment label. `profile.yaml` explicitly maps `positive`, `neutral`, and `negative` to scores; see the [normalization reference](../web/docs/configuration/measurement-normalization.mdx) for every measurement type.
 

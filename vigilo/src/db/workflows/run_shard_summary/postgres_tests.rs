@@ -1,5 +1,6 @@
 // PostgreSQL-backed workflow scenarios and fixtures.
 
+use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -78,6 +79,96 @@ async fn refresh_run_shard_summary_counts_terminal_outcomes(pool: PgPool) {
     assert_eq!(summary.score_count, 0);
     assert_eq!(summary.score_sum, 0.0);
     assert_eq!(summary.status, "failed");
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires a PostgreSQL DATABASE_URL for sqlx summary tests"]
+async fn refresh_run_shard_summary_builds_bounded_scorecard_gate(pool: PgPool) {
+    let run_id = Uuid::now_v7();
+    let run_shard = 4i16;
+    let dataset_id = Uuid::now_v7();
+    let dataset_version_id = Uuid::now_v7();
+    let execution_id = Uuid::now_v7();
+    let attempt_id = Uuid::now_v7();
+
+    seed_control_run(&pool, run_id, dataset_id, dataset_version_id).await;
+    seed_run_snapshot(&pool, run_id, run_shard, dataset_id, dataset_version_id, 1).await;
+    sqlx::query(
+        r#"
+        UPDATE run_snapshots
+        SET config_snapshot = jsonb_build_object(
+            'profile', jsonb_build_object(
+                'scorecard', jsonb_build_object(
+                    'gates', jsonb_build_array(jsonb_build_object(
+                        'id', 'quality_release',
+                        'dimension', 'quality',
+                        'case_group', 'sentiment',
+                        'tags_all', jsonb_build_array('release'),
+                        'min_mean_score', 0.9,
+                        'min_coverage', 1.0
+                    ))
+                )
+            )
+        )
+        WHERE run_id = $1::uuid AND run_shard = $2
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let chunk_id = seed_chunk(&pool, run_id, run_shard, dataset_version_id, "completed").await;
+    seed_execution(
+        &pool,
+        run_id,
+        run_shard,
+        chunk_id,
+        execution_id,
+        attempt_id,
+        "completed",
+    )
+    .await;
+    sqlx::query(
+        r#"
+        UPDATE executions
+        SET profile_group_id = 'sentiment',
+            tags = '["release"]'::jsonb,
+            evaluator_manifest = '[{"id":"quality_eval","required":true,"dimension":"quality"}]'::jsonb
+        WHERE run_id = $1::uuid AND run_shard = $2 AND id = $3::uuid
+        "#,
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(execution_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    seed_aggregate(&pool, run_id, run_shard, execution_id, attempt_id, "passed").await;
+    sqlx::query(
+        "UPDATE execution_aggregates SET dimension_scores = '{\"quality\":0.8}'::jsonb WHERE run_id = $1::uuid AND run_shard = $2 AND execution_id = $3::uuid",
+    )
+    .bind(run_id)
+    .bind(run_shard)
+    .bind(execution_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let summary = refresh_run_shard_summary(&pool, run_id, run_shard)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(summary.scorecard["version"], json!(1));
+    assert_eq!(summary.scorecard["run_shard"], json!(run_shard));
+    assert_eq!(
+        summary.scorecard["entries"][0]["id"],
+        json!("quality_release")
+    );
+    assert_eq!(summary.scorecard["entries"][0]["expected_count"], json!(1));
+    assert_eq!(summary.scorecard["entries"][0]["scored_count"], json!(1));
+    assert_eq!(summary.scorecard["entries"][0]["score_sum"], json!(0.8));
 }
 
 async fn seed_control_run(pool: &PgPool, run_id: Uuid, dataset_id: Uuid, dataset_version_id: Uuid) {

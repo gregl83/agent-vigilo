@@ -9,6 +9,11 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::run_shard_summary::RunShardSummary;
+use crate::contracts::scorecard::{
+    RunScorecard,
+    ShardScorecard,
+    merge_shard_scorecards,
+};
 
 mod queries;
 
@@ -24,6 +29,7 @@ pub(crate) use queries::{
 pub(crate) struct ClaimedRunForFinalization {
     pub(crate) id: Uuid,
     pub(crate) run_key: String,
+    pub(crate) aggregation_policy_hash: String,
 }
 
 /// Run projection returned after final gate status is persisted.
@@ -45,7 +51,7 @@ pub(crate) struct FinalizationCandidateBacklog {
     pub(crate) oldest_candidate_lag_seconds: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct FinalizationSummary {
     expected_execution_count: i32,
     terminal_execution_count: i32,
@@ -58,11 +64,13 @@ struct FinalizationSummary {
     shard_summary_count: i32,
     coverage_complete: bool,
     has_terminal_chunk_failure: bool,
+    scorecard: RunScorecard,
     gate_status: &'static str,
 }
 
 fn summarize_for_finalization(
     summaries: &[RunShardSummary],
+    aggregation_policy_hash: &str,
 ) -> anyhow::Result<Option<FinalizationSummary>> {
     if summaries.is_empty() || summaries.iter().any(|summary| !summary.is_terminal()) {
         return Ok(None);
@@ -101,11 +109,18 @@ fn summarize_for_finalization(
         })?;
     let coverage_complete = terminal_execution_count >= expected_execution_count;
     let has_terminal_chunk_failure = failed_chunk_count > 0 || cancelled_chunk_count > 0;
+    let shard_scorecards = summaries
+        .iter()
+        .map(|summary| serde_json::from_value::<ShardScorecard>(summary.scorecard.clone()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let scorecard = merge_shard_scorecards(aggregation_policy_hash, &shard_scorecards)
+        .map_err(anyhow::Error::msg)?;
     let gate_status = if has_terminal_chunk_failure
         || failed_execution_count > 0
         || errored_execution_count > 0
         || missing_aggregate_count > 0
         || !coverage_complete
+        || !scorecard.passed
     {
         "fail"
     } else {
@@ -124,6 +139,7 @@ fn summarize_for_finalization(
         shard_summary_count: i32::try_from(summaries.len())?,
         coverage_complete,
         has_terminal_chunk_failure,
+        scorecard,
         gate_status,
     }))
 }
@@ -170,9 +186,10 @@ pub(crate) async fn finalize_claimed_run_from_summaries(
     db: &PgPool,
     run_id: Uuid,
     coordinator_id: Uuid,
+    aggregation_policy_hash: &str,
     summaries: &[RunShardSummary],
 ) -> anyhow::Result<Option<FinalizedRun>> {
-    let Some(summary) = summarize_for_finalization(summaries)? else {
+    let Some(summary) = summarize_for_finalization(summaries, aggregation_policy_hash)? else {
         return Ok(None);
     };
 
@@ -192,11 +209,18 @@ mod tests {
     fn finalization_waits_for_a_complete_terminal_summary_set() {
         let run_id = Uuid::nil();
 
-        assert!(summarize_for_finalization(&[]).unwrap().is_none());
         assert!(
-            summarize_for_finalization(&[terminal_summary(run_id, 0, "running")])
+            summarize_for_finalization(&[], "aggregation-hash")
                 .unwrap()
                 .is_none()
+        );
+        assert!(
+            summarize_for_finalization(
+                &[terminal_summary(run_id, 0, "running")],
+                "aggregation-hash",
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -210,7 +234,7 @@ mod tests {
         let mut second = terminal_summary(run_id, 2, "completed");
         second.failed_execution_count = 1;
 
-        let summary = summarize_for_finalization(&[first, second])
+        let summary = summarize_for_finalization(&[first, second], "aggregation-hash")
             .unwrap()
             .unwrap();
 
@@ -235,7 +259,9 @@ mod tests {
         ];
 
         for summary in cases {
-            let decision = summarize_for_finalization(&[summary]).unwrap().unwrap();
+            let decision = summarize_for_finalization(&[summary], "aggregation-hash")
+                .unwrap()
+                .unwrap();
             assert_eq!(decision.gate_status, "fail");
         }
     }
@@ -244,11 +270,48 @@ mod tests {
     fn finalization_passes_with_complete_successful_coverage() {
         let summary = terminal_summary(Uuid::nil(), 0, "completed");
 
-        let decision = summarize_for_finalization(&[summary]).unwrap().unwrap();
+        let decision = summarize_for_finalization(&[summary], "aggregation-hash")
+            .unwrap()
+            .unwrap();
 
         assert!(decision.coverage_complete);
         assert!(!decision.has_terminal_chunk_failure);
         assert_eq!(decision.gate_status, "pass");
+    }
+
+    #[test]
+    fn finalization_fails_when_run_scorecard_gate_fails() {
+        let mut summary = terminal_summary(Uuid::nil(), 0, "completed");
+        summary.passed_execution_count = 1;
+        summary.scorecard["entries"] = serde_json::json!([{
+            "id": "safety",
+            "dimension": "safety",
+            "binding_id": null,
+            "case_group": null,
+            "tags_all": ["jailbreak"],
+            "min_mean_score": 1.0,
+            "score_threshold": null,
+            "min_pass_rate": null,
+            "min_coverage": 1.0,
+            "max_error_rate": 0.0,
+            "max_abstention_rate": 0.0,
+            "expected_count": 1,
+            "scored_count": 1,
+            "passed_count": 0,
+            "error_count": 0,
+            "abstained_count": 0,
+            "score_sum": 0.9,
+            "min_score": 0.9,
+            "max_score": 0.9
+        }]);
+
+        let decision = summarize_for_finalization(&[summary], "aggregation-hash")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(decision.passed_execution_count, 1);
+        assert!(!decision.scorecard.passed);
+        assert_eq!(decision.gate_status, "fail");
     }
 
     #[test]
@@ -259,7 +322,7 @@ mod tests {
         first.terminal_execution_count = i32::MAX;
         let second = terminal_summary(run_id, 1, "completed");
 
-        let error = summarize_for_finalization(&[first, second]).unwrap_err();
+        let error = summarize_for_finalization(&[first, second], "aggregation-hash").unwrap_err();
 
         assert!(error.to_string().contains("expected_execution_count total"));
     }
@@ -283,6 +346,12 @@ mod tests {
             score_sum: 0.0,
             min_score: None,
             max_score: None,
+            scorecard: serde_json::json!({
+                "version": 1,
+                "run_shard": run_shard,
+                "policy_hash": "aggregation-hash",
+                "entries": [],
+            }),
             failed_chunk_count: 0,
             cancelled_chunk_count: 0,
             status: status.to_owned(),

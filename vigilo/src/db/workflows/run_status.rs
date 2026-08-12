@@ -216,6 +216,12 @@ mod tests {
             score_sum: 0.0,
             min_score: None,
             max_score: None,
+            scorecard: serde_json::json!({
+                "version": 1,
+                "run_shard": run_shard,
+                "policy_hash": "hash",
+                "entries": [],
+            }),
             failed_chunk_count: 0,
             cancelled_chunk_count: 1,
             status: "running".to_string(),

@@ -218,6 +218,7 @@ Workers stay chunk-local:
 Finalization fans in:
 
 - Each execution placement maintains `run_shard_summaries`.
+- On the terminal shard transition, each summary adds one bounded, mergeable entry per configured scorecard gate. Entries contain counts, score sums, and extrema; nonterminal refreshes do not scan scorecard inputs and summaries never contain execution rows.
 - The coordinator inspects a bounded number of candidates per cycle and reads
   routed summaries for each run. A blocked candidate is moved behind unchecked
   candidates, allowing a later ready run to finalize in the same cycle.
@@ -227,6 +228,7 @@ Finalization fans in:
 - The control database claims the run without waiting behind active dispatch
   lifecycle locks. The global outcome and `run.completed` event are written
   only while that coordinator still owns an unexpired finalization lease.
+- The coordinator verifies every shard scorecard has the same policy hash and gate set, merges exact counters, evaluates run gates, and atomically stores `run_scorecards`, `runs.gate_status`, and the completion event.
 - A failed placement read defers that run without discarding summaries already
   read from healthy placements. The run cannot finalize until every routed
   summary is available and terminal.

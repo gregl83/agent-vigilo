@@ -281,6 +281,7 @@ fn compute_aggregation_policy_hash(profile: &RunProfile) -> anyhow::Result<Strin
             "min_execution_score": profile.defaults.min_execution_score,
         },
         "case_groups": groups,
+        "scorecard": profile.scorecard,
     }))
 }
 
@@ -872,9 +873,12 @@ mod tests {
         let optional_hash = compute_aggregation_policy_hash(&profile).unwrap();
         profile.case_groups[0].evaluators[0].pass_threshold = 0.9;
         let threshold_hash = compute_aggregation_policy_hash(&profile).unwrap();
+        profile.scorecard.gates[0].min_mean_score = Some(0.9);
+        let scorecard_hash = compute_aggregation_policy_hash(&profile).unwrap();
 
         assert_ne!(required_hash, optional_hash);
         assert_ne!(optional_hash, threshold_hash);
+        assert_ne!(threshold_hash, scorecard_hash);
     }
 
     #[test]
@@ -1033,7 +1037,7 @@ mod tests {
             min_score: Some(0.2),
             max_score: Some(1.0),
         };
-        let payload = results::run_results_payload(&run, &summary);
+        let payload = results::run_results_payload(&run, &summary, None);
 
         assert_eq!(payload["meta"]["summary_only"], json!(true));
         assert!(payload["data"]["executions"].is_null());
@@ -1292,11 +1296,14 @@ mod tests {
         let payload = export::run_export_payload(
             &run,
             &summary,
-            &executions,
-            &attempts,
-            &aggregates,
-            &evaluator_results,
-            &[],
+            &export::RunExportRows {
+                executions: &executions,
+                attempts: &attempts,
+                aggregates: &aggregates,
+                evaluator_results: &evaluator_results,
+                evaluator_diagnostics: &[],
+                scorecard: None,
+            },
         );
 
         assert_eq!(payload["meta"]["summary_only"], json!(false));

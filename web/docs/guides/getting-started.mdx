@@ -53,7 +53,7 @@ that can be watched, queried, exported, and used as a deployment gate.
 Vigilo calculates results in this order:
 
 ```text
-evaluator measurement -> host binding policy -> evaluator completeness -> dimension_scores -> aggregate_score -> execution status -> run gate_status
+evaluator measurement -> host binding policy -> dimension_scores -> execution status -> shard scorecards -> run scorecard -> gate_status
 ```
 
 - Evaluators return one <GlossaryTerm term="measurement">measurement</GlossaryTerm>
@@ -67,7 +67,7 @@ evaluator measurement -> host binding policy -> evaluator completeness -> dimens
 - An <GlossaryTerm term="execution">execution</GlossaryTerm> passes when
   evaluator completeness is satisfied, `aggregate_score >= defaults.min_execution_score`, and no hard blocking
   host-derived blocking result fails.
-- A run passes when every expected execution has an aggregate, no chunk failed or was cancelled, and no execution failed or errored.
+- A run passes when execution coverage is complete, no chunk or execution failed, and every configured run scorecard gate passes.
 
 A result is blocking only when its evaluator binding or dimension policy says
 `blocking: true`. Evaluator diagnostics cannot block. Missing, errored, abstained,
