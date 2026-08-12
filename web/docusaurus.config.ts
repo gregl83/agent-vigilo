@@ -51,6 +51,11 @@ const config: Config = {
             'https://github.com/gregl83/agent-vigilo/tree/main/docs/',
         },
         blog: false,
+        sitemap: {
+          changefreq: null,
+          ignorePatterns: ['/search', '/docs/category/guides'],
+          priority: null,
+        },
         theme: {
           customCss: './src/css/custom.css',
         },
