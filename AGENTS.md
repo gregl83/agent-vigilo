@@ -19,6 +19,8 @@ This repository supports AI-assisted development, but generated changes must fol
 - A new ABI requires a frozen versioned WIT file, adapter module, real Wasm
   fixture marked with `package.metadata.vigilo.abi-fixture`, registry entry,
   compatibility-matrix coverage, and documentation.
+- Run fixture-backed ABI tests with `--features evaluator-abi-fixtures`; do not
+  mark them ignored because `--ignored` is reserved for the PostgreSQL tier.
 - Retain old adapters while published artifacts or reproducible runs depend on
   them. Unknown identities and altered contract hashes must fail closed.
 - Keep evaluator execution contracts in `vigilo/src/contracts/`, not persistence models.

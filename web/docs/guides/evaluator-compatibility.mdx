@@ -90,6 +90,10 @@ To add a breaking ABI while retaining existing versions:
 5. Point new evaluator templates and documentation at the new current version.
 6. Build every fixture and run the registry-driven compatibility matrix.
 
+Fixture-backed compatibility tests use the `evaluator-abi-fixtures` Cargo
+feature. They are normal tests rather than ignored tests, keeping them isolated
+from the PostgreSQL tier that selects `--ignored` tests.
+
 The registry is static and auditable. CI invariants reject duplicate
 declarations, adapter ids, and fixture artifacts; runtime resolution rejects
 unknown identities and changed contract hashes. Workers cache a compiled

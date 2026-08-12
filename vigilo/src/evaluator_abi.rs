@@ -148,18 +148,19 @@ pub(crate) fn resolve_identity(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    #[cfg(feature = "evaluator-abi-fixtures")]
     use std::{
-        collections::{
-            BTreeMap,
-            HashSet,
-        },
+        collections::BTreeMap,
         fs,
         path::Path,
     };
 
+    #[cfg(feature = "evaluator-abi-fixtures")]
     use serde_json::json;
 
     use super::*;
+    #[cfg(feature = "evaluator-abi-fixtures")]
     use crate::{
         context::wasm::Config,
         contracts::evaluator::{
@@ -170,6 +171,7 @@ mod tests {
         },
     };
 
+    #[cfg(feature = "evaluator-abi-fixtures")]
     fn evaluator_input() -> EvaluatorInput {
         EvaluatorInput {
             run_id: "run-1".to_string(),
@@ -244,8 +246,8 @@ mod tests {
         assert!(resolve_identity(&identity).is_err());
     }
 
+    #[cfg(feature = "evaluator-abi-fixtures")]
     #[test]
-    #[ignore = "requires prebuilt Wasm fixtures for every registered evaluator ABI"]
     fn all_registered_evaluator_abis_execute_in_one_host() {
         let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/wasm32-wasip2/release");
         let runtime = Wasm::new(Config {
