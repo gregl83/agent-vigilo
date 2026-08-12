@@ -52,11 +52,11 @@ use crate::{
             EvaluatorOutcome,
             EvaluatorReportedError,
             Measurement,
-            PreferenceOutcome,
             Severity,
             TestCase,
         },
         evaluator_ref::parse_fully_qualified_evaluator,
+        normalization,
         run::{
             AggregationSettings,
             CaseGroupProfile,
@@ -780,52 +780,35 @@ fn normalize_measurement(
     policy: &NormalizationPolicy,
     measurement: &Measurement,
 ) -> anyhow::Result<f64> {
-    let score = match (policy, measurement) {
-        (NormalizationPolicy::Binary, Measurement::Binary { value }) => {
-            if *value {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        (NormalizationPolicy::Range { direction }, Measurement::Range { value, min, max }) => {
-            if !value.is_finite() || !min.is_finite() || !max.is_finite() || max <= min {
-                anyhow::bail!("range measurement must have finite values and max greater than min");
-            }
-            if value < min || value > max {
-                anyhow::bail!("range measurement value must be within its declared bounds");
-            }
-            let normalized = (value - min) / (max - min);
-            match direction {
-                crate::contracts::run::ScoreDirection::HigherIsBetter => normalized,
-                crate::contracts::run::ScoreDirection::LowerIsBetter => 1.0 - normalized,
-            }
-        }
-        (NormalizationPolicy::Normalized, Measurement::Normalized { value }) => {
-            if !value.is_finite() || !(0.0..=1.0).contains(value) {
-                anyhow::bail!("normalized measurement must be finite and between 0.0 and 1.0");
-            }
-            *value
-        }
-        (
-            NormalizationPolicy::Preference {
-                preferred,
-                tie,
-                not_preferred,
-            },
-            Measurement::Preference { outcome },
-        ) => match outcome {
-            PreferenceOutcome::Preferred => *preferred,
-            PreferenceOutcome::Tie => *tie,
-            PreferenceOutcome::NotPreferred => *not_preferred,
-        },
-        _ => anyhow::bail!(
-            "measurement kind '{}' is incompatible with normalization policy",
-            measurement.kind()
-        ),
-    };
+    normalization::normalize_measurement(policy, measurement).map_err(anyhow::Error::msg)
+}
 
-    Ok(score)
+fn normalization_policy_hash(policy: &NormalizationPolicy) -> anyhow::Result<String> {
+    Ok(blake3::hash(&serde_json::to_vec(policy)?)
+        .to_hex()
+        .to_string())
+}
+
+fn set_raw_measurement(
+    row: &mut evaluator_results::EvaluatorResultInsertRow,
+    measurement: &Measurement,
+) {
+    match measurement {
+        Measurement::Binary { value } => {
+            row.measurement_kind = Some(measurement.kind().to_string());
+            row.raw_boolean = Some(*value);
+        }
+        Measurement::Numeric { value, unit } if value.is_finite() => {
+            row.measurement_kind = Some(measurement.kind().to_string());
+            row.raw_numeric = Some(*value);
+            row.raw_unit.clone_from(unit);
+        }
+        Measurement::Ordinal { value } if !value.trim().is_empty() => {
+            row.measurement_kind = Some(measurement.kind().to_string());
+            row.raw_ordinal = Some(value.clone());
+        }
+        Measurement::Numeric { .. } | Measurement::Ordinal { .. } => {}
+    }
 }
 
 fn interpret_measurement(
@@ -948,6 +931,7 @@ async fn evaluate_case_execution(
                 let profile_version = profile_version.clone();
                 let persistence = run_profile.persistence.clone();
                 tasks.spawn(async move {
+                    let policy_hash = normalization_policy_hash(&binding.normalization)?;
                     let wasm = context.wasm().await?.clone();
                     let component = get_or_load_component(&context, &binding.evaluator_ref).await?;
                     let wasm_permit = wasm.acquire_evaluation_permit().await?;
@@ -992,10 +976,12 @@ async fn evaluate_case_execution(
                             judgment: None,
                             blocking,
                             measurement_kind: None,
-                            raw_score: None,
-                            raw_score_min: None,
-                            raw_score_max: None,
+                            raw_boolean: None,
+                            raw_numeric: None,
+                            raw_ordinal: None,
+                            raw_unit: None,
                             normalized_score: None,
+                            normalization_policy_hash: policy_hash.clone(),
                             pass_threshold: binding.pass_threshold,
                             weight: binding.weight,
                             error_code: None,
@@ -1071,18 +1057,12 @@ async fn evaluate_case_execution(
                                             measurement,
                                         ) {
                                             Ok((score, status)) => {
-                                                let (raw_score, raw_score_min, raw_score_max) =
-                                                    measurement.raw_parts();
                                                 let mut row = base_row(&status);
                                                 row.outcome = "completed".to_string();
                                                 row.judgment = Some(
                                                     map_evaluation_status(&status).to_string(),
                                                 );
-                                                row.measurement_kind =
-                                                    Some(measurement.kind().to_string());
-                                                row.raw_score = raw_score;
-                                                row.raw_score_min = raw_score_min;
-                                                row.raw_score_max = raw_score_max;
+                                                set_raw_measurement(&mut row, measurement);
                                                 row.normalized_score = Some(score);
                                                 row.raw_evaluator_output =
                                                     persisted_raw_evaluator_output(
@@ -1112,6 +1092,7 @@ async fn evaluate_case_execution(
                                                 let status = EvaluationStatus::Error;
                                                 let reason = err.to_string();
                                                 let mut row = base_row(&status);
+                                                set_raw_measurement(&mut row, measurement);
                                                 row.error_code =
                                                     Some("invalid_measurement".to_string());
                                                 row.error_message = Some(reason.clone());
@@ -1533,6 +1514,7 @@ mod tests {
         map_severity,
         matching_groups_for_case,
         metadata_from_case_row,
+        normalization_policy_hash,
         normalize_measurement,
         persisted_case_expected_output,
         persisted_case_input_payload,
@@ -1560,6 +1542,7 @@ mod tests {
                 DimensionAggregation,
                 EvaluatorBinding,
                 NormalizationPolicy,
+                NumericMapping,
                 PersistRawOutputsMode,
                 PersistenceMode,
                 PersistenceSettings,
@@ -1598,7 +1581,14 @@ mod tests {
             dimension: dimension.to_string(),
             blocking: false,
             weight: 1.0,
-            normalization: NormalizationPolicy::Normalized,
+            normalization: NormalizationPolicy::Numeric {
+                unit: None,
+                mapping: NumericMapping::Linear {
+                    min: 0.0,
+                    max: 1.0,
+                    direction: crate::contracts::run::ScoreDirection::HigherIsBetter,
+                },
+            },
             pass_threshold: 0.8,
             config: json!({"threshold": 0.8}),
         }
@@ -1884,7 +1874,11 @@ mod tests {
         assert_eq!(manifest[0]["id"], json!("vigilo_sentiment-basic-en_0.1.0"));
         assert_eq!(manifest[0]["required"], json!(true));
         assert_eq!(manifest[0]["pass_threshold"], json!(0.8));
-        assert_eq!(manifest[0]["normalization"]["method"], json!("normalized"));
+        assert_eq!(manifest[0]["normalization"]["method"], json!("numeric"));
+        assert_eq!(
+            manifest[0]["normalization"]["mapping"]["type"],
+            json!("linear")
+        );
         assert_eq!(manifest[0]["config"]["redacted"], json!(true));
     }
 
@@ -1999,8 +1993,14 @@ mod tests {
     #[test]
     fn normalization_rejects_measurements_that_do_not_match_host_policy() {
         let error = normalize_measurement(
-            &NormalizationPolicy::Binary,
-            &Measurement::Normalized { value: 1.0 },
+            &NormalizationPolicy::Binary {
+                false_score: 0.0,
+                true_score: 1.0,
+            },
+            &Measurement::Numeric {
+                value: 1.0,
+                unit: None,
+            },
         )
         .unwrap_err();
 
@@ -2008,33 +2008,64 @@ mod tests {
     }
 
     #[test]
-    fn normalization_rejects_invalid_ranges_instead_of_clamping() {
+    fn normalization_rejects_out_of_domain_values_instead_of_clamping() {
         let error = normalize_measurement(
-            &NormalizationPolicy::Range {
-                direction: crate::contracts::run::ScoreDirection::HigherIsBetter,
+            &NormalizationPolicy::Numeric {
+                unit: None,
+                mapping: NumericMapping::Linear {
+                    min: 0.0,
+                    max: 1.0,
+                    direction: crate::contracts::run::ScoreDirection::HigherIsBetter,
+                },
             },
-            &Measurement::Range {
+            &Measurement::Numeric {
                 value: 2.0,
-                min: 0.0,
-                max: 1.0,
+                unit: None,
             },
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("within its declared bounds"));
+        assert!(error.to_string().contains("outside the configured domain"));
     }
 
     #[test]
     fn host_threshold_derives_judgment_from_measurement() {
-        let measurement = Measurement::Normalized { value: 0.8 };
+        let measurement = Measurement::Numeric {
+            value: 0.8,
+            unit: None,
+        };
+        let policy = NormalizationPolicy::Numeric {
+            unit: None,
+            mapping: NumericMapping::Linear {
+                min: 0.0,
+                max: 1.0,
+                direction: crate::contracts::run::ScoreDirection::HigherIsBetter,
+            },
+        };
 
         assert_eq!(
-            interpret_measurement(&NormalizationPolicy::Normalized, 0.8, &measurement).unwrap(),
+            interpret_measurement(&policy, 0.8, &measurement).unwrap(),
             (0.8, EvaluationStatus::Passed)
         );
         assert_eq!(
-            interpret_measurement(&NormalizationPolicy::Normalized, 0.81, &measurement).unwrap(),
+            interpret_measurement(&policy, 0.81, &measurement).unwrap(),
             (0.8, EvaluationStatus::Failed)
         );
+    }
+
+    #[test]
+    fn normalization_policy_hash_is_stable_and_policy_specific() {
+        let mut policy = NormalizationPolicy::Binary {
+            false_score: 0.0,
+            true_score: 1.0,
+        };
+        let original = normalization_policy_hash(&policy).unwrap();
+
+        assert_eq!(normalization_policy_hash(&policy).unwrap(), original);
+        policy = NormalizationPolicy::Binary {
+            false_score: 0.2,
+            true_score: 1.0,
+        };
+        assert_ne!(normalization_policy_hash(&policy).unwrap(), original);
     }
 }

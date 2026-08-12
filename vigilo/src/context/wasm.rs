@@ -75,7 +75,6 @@ use crate::contracts::evaluator::{
     EvaluatorOutput,
     EvaluatorReportedError,
     Measurement,
-    PreferenceOutcome,
     Severity,
 };
 
@@ -263,19 +262,6 @@ fn map_severity(severity: evaluator_test_bindings::vigilo::evaluator::types::Sev
     }
 }
 
-/// Map bound evaluator preference outcome to evaluation preference outcome type.
-fn map_preference_outcome(
-    outcome: evaluator_test_bindings::vigilo::evaluator::types::PreferenceOutcome,
-) -> PreferenceOutcome {
-    use evaluator_test_bindings::vigilo::evaluator::types::PreferenceOutcome as BindingPreferenceOutcome;
-
-    match outcome {
-        BindingPreferenceOutcome::Preferred => PreferenceOutcome::Preferred,
-        BindingPreferenceOutcome::Tie => PreferenceOutcome::Tie,
-        BindingPreferenceOutcome::NotPreferred => PreferenceOutcome::NotPreferred,
-    }
-}
-
 /// Map a bound evaluator measurement without assigning policy semantics.
 fn map_measurement(
     measurement: evaluator_test_bindings::vigilo::evaluator::types::Measurement,
@@ -284,15 +270,11 @@ fn map_measurement(
 
     match measurement {
         BindingMeasurement::Binary(value) => Measurement::Binary { value },
-        BindingMeasurement::Range(range) => Measurement::Range {
-            value: range.value,
-            min: range.min,
-            max: range.max,
+        BindingMeasurement::Numeric(numeric) => Measurement::Numeric {
+            value: numeric.value,
+            unit: numeric.unit,
         },
-        BindingMeasurement::Normalized(value) => Measurement::Normalized { value },
-        BindingMeasurement::Preference(outcome) => Measurement::Preference {
-            outcome: map_preference_outcome(outcome),
-        },
+        BindingMeasurement::Ordinal(value) => Measurement::Ordinal { value },
     }
 }
 
@@ -1241,11 +1223,10 @@ mod tests {
                 content_hash: Some("hash".to_string()),
                 interface_version: Some("1.0.0".to_string()),
             },
-            outcome: wit_types::EvaluatorOutcome::Completed(wit_types::Measurement::Range(
-                wit_types::RangeMeasurement {
+            outcome: wit_types::EvaluatorOutcome::Completed(wit_types::Measurement::Numeric(
+                wit_types::NumericMeasurement {
                     value: 0.4,
-                    min: 0.0,
-                    max: 1.0,
+                    unit: Some("ratio".to_string()),
                 },
             )),
             diagnostics: vec![wit_types::DiagnosticFinding {
@@ -1379,11 +1360,8 @@ mod tests {
     }
 
     #[test]
-    fn wit_enum_mappings_cover_diagnostic_and_preference_variants() {
-        use wit_types::{
-            PreferenceOutcome as WitPreference,
-            Severity as WitSeverity,
-        };
+    fn wit_enum_mappings_cover_diagnostic_variants() {
+        use wit_types::Severity as WitSeverity;
 
         let severities = [
             (WitSeverity::None, Severity::None),
@@ -1395,15 +1373,6 @@ mod tests {
         for (input, expected) in severities {
             assert_eq!(map_severity(input), expected);
         }
-
-        let preferences = [
-            (WitPreference::Preferred, PreferenceOutcome::Preferred),
-            (WitPreference::Tie, PreferenceOutcome::Tie),
-            (WitPreference::NotPreferred, PreferenceOutcome::NotPreferred),
-        ];
-        for (input, expected) in preferences {
-            assert_eq!(map_preference_outcome(input), expected);
-        }
     }
 
     #[test]
@@ -1414,25 +1383,19 @@ mod tests {
                 Measurement::Binary { value: true },
             ),
             (
-                wit_types::Measurement::Range(wit_types::RangeMeasurement {
+                wit_types::Measurement::Numeric(wit_types::NumericMeasurement {
                     value: 0.5,
-                    min: 0.0,
-                    max: 1.0,
+                    unit: Some("ratio".to_string()),
                 }),
-                Measurement::Range {
+                Measurement::Numeric {
                     value: 0.5,
-                    min: 0.0,
-                    max: 1.0,
+                    unit: Some("ratio".to_string()),
                 },
             ),
             (
-                wit_types::Measurement::Normalized(0.75),
-                Measurement::Normalized { value: 0.75 },
-            ),
-            (
-                wit_types::Measurement::Preference(wit_types::PreferenceOutcome::Tie),
-                Measurement::Preference {
-                    outcome: PreferenceOutcome::Tie,
+                wit_types::Measurement::Ordinal("tie".to_string()),
+                Measurement::Ordinal {
+                    value: "tie".to_string(),
                 },
             ),
         ];
@@ -1453,7 +1416,10 @@ mod tests {
         assert_eq!(output.metadata, json!({"duration_ms": 4}));
         assert!(matches!(
             output.outcome,
-            EvaluatorOutcome::Completed(Measurement::Range { value: 0.4, .. })
+            EvaluatorOutcome::Completed(Measurement::Numeric {
+                value: 0.4,
+                unit: Some(ref unit),
+            }) if unit == "ratio"
         ));
         assert_eq!(output.diagnostics.len(), 1);
         let finding = &output.diagnostics[0];

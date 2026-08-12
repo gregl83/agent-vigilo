@@ -118,8 +118,8 @@ pub(super) async fn select_evaluator_results(
             er.evaluator_interface_version, er.evaluator_runtime_version,
             er.dimension, er.outcome::text as outcome,
             er.judgment::text as judgment, er.blocking,
-            er.measurement_kind, er.raw_score, er.raw_score_min, er.raw_score_max,
-            er.normalized_score, er.pass_threshold, er.weight,
+            er.measurement_kind, er.raw_boolean, er.raw_numeric, er.raw_ordinal, er.raw_unit,
+            er.normalized_score, er.normalization_policy_hash, er.pass_threshold, er.weight,
             er.error_code, er.error_message, er.abstention_category, er.abstention_reason,
             er.raw_evaluator_output, er.created_at
         FROM evaluator_results er

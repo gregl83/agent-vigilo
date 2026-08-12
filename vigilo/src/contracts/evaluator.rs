@@ -231,34 +231,20 @@ pub(crate) enum Severity {
     Medium,
     /// Major impact.
     High,
-    /// Critical impact, often policy-blocking.
+    /// Critical diagnostic impact; release consequences remain host-owned.
     Critical,
 }
 
-/// Outcome for pairwise/preference style evaluators.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum PreferenceOutcome {
-    /// Candidate is preferred over baseline/comparator.
-    Preferred,
-    /// No preference difference detected.
-    Tie,
-    /// Candidate is not preferred over baseline/comparator.
-    NotPreferred,
-}
-
 /// Evaluator-native primary measurement. Interpretation belongs to the host profile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum Measurement {
     /// Boolean measurement.
     Binary { value: bool },
-    /// Numeric measurement with evaluator-declared bounds.
-    Range { value: f64, min: f64, max: f64 },
-    /// Measurement already expressed on the canonical zero-to-one scale.
-    Normalized { value: f64 },
-    /// Pairwise comparison measurement.
-    Preference { outcome: PreferenceOutcome },
+    /// Raw numeric observation with an optional unit identifier.
+    Numeric { value: f64, unit: Option<String> },
+    /// Raw categorical or ordered label interpreted by host policy.
+    Ordinal { value: String },
 }
 
 impl Measurement {
@@ -266,29 +252,8 @@ impl Measurement {
     pub(crate) fn kind(&self) -> &'static str {
         match self {
             Measurement::Binary { .. } => "binary",
-            Measurement::Range { .. } => "range",
-            Measurement::Normalized { .. } => "normalized",
-            Measurement::Preference { .. } => "preference",
-        }
-    }
-
-    /// Extracts numeric components without assigning normalization semantics.
-    pub(crate) fn raw_parts(&self) -> (Option<f64>, Option<f64>, Option<f64>) {
-        match self {
-            Measurement::Binary { value } => {
-                let raw = if *value { 1.0 } else { 0.0 };
-                (Some(raw), Some(0.0), Some(1.0))
-            }
-            Measurement::Range { value, min, max } => (Some(*value), Some(*min), Some(*max)),
-            Measurement::Normalized { value } => (Some(*value), Some(0.0), Some(1.0)),
-            Measurement::Preference { outcome } => {
-                let raw = match outcome {
-                    PreferenceOutcome::Preferred => 1.0,
-                    PreferenceOutcome::Tie => 0.5,
-                    PreferenceOutcome::NotPreferred => 0.0,
-                };
-                (Some(raw), Some(0.0), Some(1.0))
-            }
+            Measurement::Numeric { .. } => "numeric",
+            Measurement::Ordinal { .. } => "ordinal",
         }
     }
 }
@@ -308,14 +273,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn range_measurement_exposes_raw_parts_without_normalizing() {
-        let measurement = Measurement::Range {
-            value: 1.0,
-            min: 10.0,
-            max: 5.0,
+    fn measurement_preserves_raw_numeric_units() {
+        let measurement = Measurement::Numeric {
+            value: 42.0,
+            unit: Some("milliseconds".to_string()),
         };
 
-        assert_eq!(measurement.raw_parts(), (Some(1.0), Some(10.0), Some(5.0)));
+        assert_eq!(measurement.kind(), "numeric");
     }
 
     #[test]
@@ -328,7 +292,10 @@ mod tests {
                 content_hash: None,
                 interface_version: None,
             },
-            outcome: EvaluatorOutcome::Completed(Measurement::Normalized { value: 0.8 }),
+            outcome: EvaluatorOutcome::Completed(Measurement::Numeric {
+                value: 0.8,
+                unit: None,
+            }),
             diagnostics: vec![],
             metadata: Value::Null,
         };

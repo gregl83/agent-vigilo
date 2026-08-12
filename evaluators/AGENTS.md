@@ -20,6 +20,8 @@ This file applies to evaluator crates under `evaluators/`.
 - Read canonical evaluator `input` fields and return canonical `output`.
 - Return one primary measurement or abstention and zero or more diagnostics;
   evaluators must not implement dimension, threshold, weight, or blocking policy.
+- Measurements are raw `binary`, `numeric`, or `ordinal` observations. Do not
+  normalize values or assign ordinal utilities inside evaluator code.
 - Do not introduce alternate envelope names for evaluator entrypoints.
 
 ## Build and Test Expectations
@@ -40,4 +42,5 @@ This file applies to evaluator crates under `evaluators/`.
 
 - Example crate: `evaluators/sentiment-basic-en`
 - Guide: `web/docs/guides/creating-evaluators.mdx`
+- Normalization examples: `web/docs/configuration/measurement-normalization.mdx`
 - Template details: `evaluators/sentiment-basic-en/README.md`

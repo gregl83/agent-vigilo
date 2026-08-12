@@ -38,10 +38,12 @@ pub(crate) struct EvaluatorResultInsertRow {
     pub(crate) judgment: Option<String>,
     pub(crate) blocking: bool,
     pub(crate) measurement_kind: Option<String>,
-    pub(crate) raw_score: Option<f64>,
-    pub(crate) raw_score_min: Option<f64>,
-    pub(crate) raw_score_max: Option<f64>,
+    pub(crate) raw_boolean: Option<bool>,
+    pub(crate) raw_numeric: Option<f64>,
+    pub(crate) raw_ordinal: Option<String>,
+    pub(crate) raw_unit: Option<String>,
     pub(crate) normalized_score: Option<f64>,
+    pub(crate) normalization_policy_hash: String,
     pub(crate) pass_threshold: f64,
     pub(crate) weight: f64,
     pub(crate) error_code: Option<String>,
@@ -61,7 +63,7 @@ pub(crate) async fn insert_evaluator_results_batch(
     let mut inserted = 0;
     for chunk in rows.chunks(BATCH_CHUNK_SIZE) {
         let mut query = QueryBuilder::<Postgres>::new(
-            "INSERT INTO evaluator_results (run_id, run_shard, execution_id, attempt_id, binding_id, evaluator_id, evaluator_version, evaluator_profile_id, evaluator_profile_version, evaluator_interface_version, evaluator_runtime_version, dimension, outcome, judgment, blocking, measurement_kind, raw_score, raw_score_min, raw_score_max, normalized_score, pass_threshold, weight, error_code, error_message, abstention_category, abstention_reason, raw_evaluator_output) ",
+            "INSERT INTO evaluator_results (run_id, run_shard, execution_id, attempt_id, binding_id, evaluator_id, evaluator_version, evaluator_profile_id, evaluator_profile_version, evaluator_interface_version, evaluator_runtime_version, dimension, outcome, judgment, blocking, measurement_kind, raw_boolean, raw_numeric, raw_ordinal, raw_unit, normalized_score, normalization_policy_hash, pass_threshold, weight, error_code, error_message, abstention_category, abstention_reason, raw_evaluator_output) ",
         );
         query.push_values(chunk, |mut b, row| {
             b.push_bind(row.run_id)
@@ -82,10 +84,12 @@ pub(crate) async fn insert_evaluator_results_batch(
                 .push_unseparated("::evaluation_status")
                 .push_bind(row.blocking)
                 .push_bind(&row.measurement_kind)
-                .push_bind(row.raw_score)
-                .push_bind(row.raw_score_min)
-                .push_bind(row.raw_score_max)
+                .push_bind(row.raw_boolean)
+                .push_bind(row.raw_numeric)
+                .push_bind(&row.raw_ordinal)
+                .push_bind(&row.raw_unit)
                 .push_bind(row.normalized_score)
+                .push_bind(&row.normalization_policy_hash)
                 .push_bind(row.pass_threshold)
                 .push_bind(row.weight)
                 .push_bind(&row.error_code)

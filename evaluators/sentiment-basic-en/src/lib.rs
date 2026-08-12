@@ -151,12 +151,6 @@ impl Guest for Evaluator {
         })
         .to_string();
 
-        let normalized = match label {
-            "positive" => 1.0,
-            "neutral" => 0.5,
-            _ => 0.0,
-        };
-
         let severity = if label == "negative" {
             Severity::Medium
         } else {
@@ -171,7 +165,7 @@ impl Guest for Evaluator {
                 content_hash: None,
                 interface_version: Some("1.0.0".to_string()),
             },
-            outcome: EvaluatorOutcome::Completed(Measurement::Normalized(normalized)),
+            outcome: EvaluatorOutcome::Completed(Measurement::Ordinal(label.to_string())),
             diagnostics: vec![DiagnosticFinding {
                 severity,
                 category: "sentiment_classification".to_string(),

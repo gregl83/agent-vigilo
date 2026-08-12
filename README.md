@@ -28,6 +28,8 @@ It focuses on the parts of AI evaluation that become hard as systems grow: idemp
 
 Each evaluator invocation returns one measurement or abstention plus optional diagnostics. The profile binding owns normalization, threshold, dimension, weight, requiredness, and blocking policy. Missing, errored, abstained, duplicated, or invalid required output produces an errored execution aggregate with no score. An execution passes when completeness is satisfied, `aggregate_score >= min_execution_score`, and no host-derived blocking result fails.
 
+See [Measurement Normalization](web/docs/configuration/measurement-normalization.mdx) for copyable binary, numeric, curve, threshold, and ordinal policy examples.
+
 A run can fail operationally because work did not complete, or complete with a failed gate because evaluation policy failed.
 
 ## Start Here

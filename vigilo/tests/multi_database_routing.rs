@@ -764,6 +764,8 @@ case_groups:
         weight: 1.0
         normalization:
           method: binary
+          false_score: 0.0
+          true_score: 1.0
         pass_threshold: 1.0
     aggregation:
       dimensions:

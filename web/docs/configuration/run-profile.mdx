@@ -225,6 +225,8 @@ evaluators:
     weight: 1.0
     normalization:
       method: binary
+      false_score: 0.0
+      true_score: 1.0
     pass_threshold: 1.0
     config:
       schema:
@@ -237,7 +239,7 @@ evaluators:
 - `dimension` (string): profile-owned aggregation bucket.
 - `blocking` (bool): makes a host-derived failed judgment a hard blocking result.
 - `weight` (f64): finite value greater than or equal to `0.0`; the binding's contribution inside its dimension.
-- `normalization` (object): required host interpretation. Methods are `binary`, `normalized`, `range` with `direction: higher_is_better | lower_is_better`, or `preference` with explicit `preferred`, `tie`, and `not_preferred` values in `0.0..=1.0`. A mismatched or invalid measurement becomes an evaluator error.
+- `normalization` (object): required host interpretation for a raw `binary`, `numeric`, or `ordinal` measurement. Numeric policies support linear, piecewise-linear, and threshold mappings. See [Measurement Normalization](./measurement-normalization) for every supported shape and copyable examples.
 - `pass_threshold` (f64): required finite value in `0.0..=1.0`. The host derives `passed` when `normalized_score >= pass_threshold`; otherwise it derives `failed`.
 - `config` (object, optional)
 

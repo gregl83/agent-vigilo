@@ -1161,7 +1161,7 @@ mod tests {
             error_execution_count: 0,
             skipped_execution_count: 0,
             missing_aggregate_count: 0,
-            evaluator_result_count: 1,
+            evaluator_result_count: 3,
             blocking_failure_count: 0,
             average_score: Some(1.0),
             min_score: Some(1.0),
@@ -1238,7 +1238,7 @@ mod tests {
             updated_at: now,
         }];
 
-        let evaluator_results = vec![EvaluatorResult {
+        let mut evaluator_results = vec![EvaluatorResult {
             id: evaluator_result_id,
             run_id: run.id,
             run_shard,
@@ -1255,11 +1255,13 @@ mod tests {
             outcome: "completed".to_string(),
             judgment: Some("passed".to_string()),
             blocking: true,
-            measurement_kind: Some("normalized".to_string()),
-            raw_score: Some(1.0),
-            raw_score_min: Some(0.0),
-            raw_score_max: Some(1.0),
+            measurement_kind: Some("numeric".to_string()),
+            raw_boolean: None,
+            raw_numeric: Some(1.0),
+            raw_ordinal: None,
+            raw_unit: Some("ratio".to_string()),
             normalized_score: Some(1.0),
+            normalization_policy_hash: "policy-hash".to_string(),
             pass_threshold: 0.8,
             weight: 1.0,
             error_code: None,
@@ -1269,6 +1271,23 @@ mod tests {
             raw_evaluator_output: json!({"result": "pass"}),
             created_at: now,
         }];
+        let mut binary_result = evaluator_results[0].clone();
+        binary_result.id = Uuid::now_v7();
+        binary_result.binding_id = "schema_valid".to_string();
+        binary_result.measurement_kind = Some("binary".to_string());
+        binary_result.raw_boolean = Some(true);
+        binary_result.raw_numeric = None;
+        binary_result.raw_unit = None;
+        binary_result.normalization_policy_hash = "binary-policy-hash".to_string();
+        let mut ordinal_result = evaluator_results[0].clone();
+        ordinal_result.id = Uuid::now_v7();
+        ordinal_result.binding_id = "preference".to_string();
+        ordinal_result.measurement_kind = Some("ordinal".to_string());
+        ordinal_result.raw_numeric = None;
+        ordinal_result.raw_ordinal = Some("tie".to_string());
+        ordinal_result.raw_unit = None;
+        ordinal_result.normalization_policy_hash = "ordinal-policy-hash".to_string();
+        evaluator_results.extend([binary_result, ordinal_result]);
 
         let payload = export::run_export_payload(
             &run,
@@ -1283,7 +1302,7 @@ mod tests {
         assert_eq!(payload["meta"]["summary_only"], json!(false));
         assert_eq!(payload["meta"]["execution_count"], json!(1));
         assert_eq!(payload["meta"]["attempt_count"], json!(1));
-        assert_eq!(payload["meta"]["evaluator_result_count"], json!(1));
+        assert_eq!(payload["meta"]["evaluator_result_count"], json!(3));
         assert_eq!(
             payload["data"]["executions"][0]["execution"]["id"],
             json!(execution_id)
@@ -1295,6 +1314,14 @@ mod tests {
         assert_eq!(
             payload["data"]["executions"][0]["attempts"][0]["evaluator_results"][0]["id"],
             json!(evaluator_result_id)
+        );
+        assert_eq!(
+            payload["data"]["executions"][0]["attempts"][0]["evaluator_results"][1]["raw_boolean"],
+            json!(true)
+        );
+        assert_eq!(
+            payload["data"]["executions"][0]["attempts"][0]["evaluator_results"][2]["raw_ordinal"],
+            json!("tie")
         );
         assert_eq!(
             payload["data"]["executions"][0]["aggregate"]["execution_id"],

@@ -11,6 +11,8 @@ The profile points at `http://agent_vigilo_agent:8080/v1/chat/completions`, the 
 
 The example uses one score-gated `quality` dimension. The stable profile binding owns normalization, threshold, dimension, weight, and blocking policy; the evaluator supplies only its measurement and diagnostics. The run passes only when the weighted aggregate score is at least `defaults.min_execution_score`.
 
+The evaluator returns an ordinal sentiment label. `profile.yaml` explicitly maps `positive`, `neutral`, and `negative` to scores; see the [normalization reference](../web/docs/configuration/measurement-normalization.mdx) for every measurement type.
+
 Each example dataset case sets `case_group: sentiment_classification`, which explicitly routes the case to the matching profile case group. If `case_group` is omitted, Vigilo falls back to `task_type` and tag matching.
 
 ## Model

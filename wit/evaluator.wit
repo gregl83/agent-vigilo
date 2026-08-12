@@ -59,23 +59,15 @@ interface types {
         critical,
     }
 
-    enum preference-outcome {
-        preferred,
-        tie,
-        not-preferred,
-    }
-
-    record range-measurement {
+    record numeric-measurement {
         value: f64,
-        min: f64,
-        max: f64,
+        unit: option<string>,
     }
 
     variant measurement {
         binary(bool),
-        range(range-measurement),
-        normalized(f64),
-        preference(preference-outcome),
+        numeric(numeric-measurement),
+        ordinal(string),
     }
 
     record abstention {

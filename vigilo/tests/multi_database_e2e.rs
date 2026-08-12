@@ -1435,7 +1435,11 @@ case_groups:
         blocking: true
         weight: 1.0
         normalization:
-          method: normalized
+          method: ordinal
+          values:
+            positive: 1.0
+            neutral: 0.5
+            negative: 0.0
         pass_threshold: 0.5
     aggregation:
       dimensions:

@@ -131,7 +131,8 @@ Each evaluator invocation result records:
 - execution outcome (completed / error / abstained)
 - host-derived judgment (passed / failed) for completed measurements
 - profile aggregation dimension
-- raw and normalized measurement, host threshold, weight, and blocking policy
+- typed raw measurement (`binary`, `numeric`, or `ordinal`), normalized score,
+  normalization policy hash, host threshold, weight, and blocking policy
 - raw evaluator output according to `persistence.persist_raw_outputs`
 
 Each diagnostic records severity, category, reason, tags, and evidence. It has

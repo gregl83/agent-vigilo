@@ -50,11 +50,19 @@ struct SeededAttempt {
     worker_id: Uuid,
 }
 
+#[derive(Debug, PartialEq, sqlx::FromRow)]
+struct PersistedRawMeasurement {
+    binding_id: String,
+    raw_boolean: Option<bool>,
+    raw_numeric: Option<f64>,
+    raw_ordinal: Option<String>,
+}
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx migration tests"]
 async fn evaluator_invocation_and_diagnostics_persist_as_separate_rows(pool: PgPool) {
     let seed = seed_running_attempt(&pool, 60, 120).await;
-    let row = evaluator_results::EvaluatorResultInsertRow {
+    let numeric_row = evaluator_results::EvaluatorResultInsertRow {
         run_id: seed.run_id,
         run_shard: seed.run_shard,
         execution_id: seed.execution_id,
@@ -70,11 +78,13 @@ async fn evaluator_invocation_and_diagnostics_persist_as_separate_rows(pool: PgP
         outcome: "completed".to_string(),
         judgment: Some("failed".to_string()),
         blocking: true,
-        measurement_kind: Some("normalized".to_string()),
-        raw_score: Some(0.2),
-        raw_score_min: Some(0.0),
-        raw_score_max: Some(1.0),
+        measurement_kind: Some("numeric".to_string()),
+        raw_boolean: None,
+        raw_numeric: Some(0.2),
+        raw_ordinal: None,
+        raw_unit: Some("ratio".to_string()),
         normalized_score: Some(0.2),
+        normalization_policy_hash: "policy-hash".to_string(),
         pass_threshold: 0.8,
         weight: 1.0,
         error_code: None,
@@ -91,32 +101,60 @@ async fn evaluator_invocation_and_diagnostics_persist_as_separate_rows(pool: PgP
             tags: vec!["quality".to_string()],
         }],
     };
+    let mut binary_row = numeric_row.clone();
+    binary_row.binding_id = "schema_valid".to_string();
+    binary_row.judgment = Some("passed".to_string());
+    binary_row.measurement_kind = Some("binary".to_string());
+    binary_row.raw_boolean = Some(true);
+    binary_row.raw_numeric = None;
+    binary_row.raw_unit = None;
+    binary_row.normalized_score = Some(1.0);
+    binary_row.normalization_policy_hash = "binary-policy-hash".to_string();
+    binary_row.diagnostics.clear();
+    let mut ordinal_row = numeric_row.clone();
+    ordinal_row.binding_id = "preference".to_string();
+    ordinal_row.measurement_kind = Some("ordinal".to_string());
+    ordinal_row.raw_numeric = None;
+    ordinal_row.raw_ordinal = Some("tie".to_string());
+    ordinal_row.raw_unit = None;
+    ordinal_row.normalized_score = Some(0.3);
+    ordinal_row.normalization_policy_hash = "ordinal-policy-hash".to_string();
+    ordinal_row.diagnostics.clear();
+    let rows = [numeric_row, binary_row, ordinal_row];
 
     let mut tx = pool.begin().await.unwrap();
     assert_eq!(
-        evaluator_results::insert_evaluator_results_batch(&mut tx, std::slice::from_ref(&row))
+        evaluator_results::insert_evaluator_results_batch(&mut tx, &rows)
             .await
             .unwrap(),
-        1
+        3
     );
     assert_eq!(
-        evaluator_results::insert_evaluator_results_batch(&mut tx, &[row])
+        evaluator_results::insert_evaluator_results_batch(&mut tx, &rows)
             .await
             .unwrap(),
         0
     );
     tx.commit().await.unwrap();
 
-    let persisted: (String, Option<String>, Option<f64>, i64) = sqlx::query_as(
+    let persisted: (
+        String,
+        Option<String>,
+        Option<f64>,
+        Option<f64>,
+        Option<String>,
+        i64,
+    ) = sqlx::query_as(
         r#"
-        SELECT er.outcome::text, er.judgment::text, er.normalized_score,
+        SELECT er.outcome::text, er.judgment::text, er.raw_numeric, er.normalized_score,
+               er.raw_unit,
                COUNT(ed.id)::bigint
         FROM evaluator_results er
         LEFT JOIN evaluator_diagnostics ed
           ON ed.run_id = er.run_id AND ed.run_shard = er.run_shard
          AND ed.evaluator_result_id = er.id
         WHERE er.run_id = $1::uuid AND er.run_shard = $2 AND er.binding_id = $3
-        GROUP BY er.outcome, er.judgment, er.normalized_score
+        GROUP BY er.outcome, er.judgment, er.raw_numeric, er.normalized_score, er.raw_unit
         "#,
     )
     .bind(seed.run_id)
@@ -132,8 +170,47 @@ async fn evaluator_invocation_and_diagnostics_persist_as_separate_rows(pool: PgP
             "completed".to_string(),
             Some("failed".to_string()),
             Some(0.2),
+            Some(0.2),
+            Some("ratio".to_string()),
             1
         )
+    );
+
+    let typed_raw = sqlx::query_as::<_, PersistedRawMeasurement>(
+        r#"
+        SELECT binding_id, raw_boolean, raw_numeric, raw_ordinal
+        FROM evaluator_results
+        WHERE run_id = $1::uuid AND run_shard = $2
+        ORDER BY binding_id
+        "#,
+    )
+    .bind(seed.run_id)
+    .bind(seed.run_shard)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        typed_raw,
+        vec![
+            PersistedRawMeasurement {
+                binding_id: "preference".to_string(),
+                raw_boolean: None,
+                raw_numeric: None,
+                raw_ordinal: Some("tie".to_string()),
+            },
+            PersistedRawMeasurement {
+                binding_id: "quality_score".to_string(),
+                raw_boolean: None,
+                raw_numeric: Some(0.2),
+                raw_ordinal: None,
+            },
+            PersistedRawMeasurement {
+                binding_id: "schema_valid".to_string(),
+                raw_boolean: Some(true),
+                raw_numeric: None,
+                raw_ordinal: None,
+            },
+        ]
     );
 }
 

@@ -55,7 +55,11 @@ case_groups:
         # Total contribution of this evaluator inside the quality dimension.
         weight: 1.0
         normalization:
-          method: normalized
+          method: ordinal
+          values:
+            positive: 1.0
+            neutral: 0.5
+            negative: 0.0
         # Host-owned judgment threshold; evaluators do not pass or fail releases.
         pass_threshold: 0.5
         config:

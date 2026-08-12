@@ -19,10 +19,12 @@ CREATE TABLE evaluator_results (
     blocking BOOLEAN NOT NULL DEFAULT false,
 
     measurement_kind TEXT,
-    raw_score DOUBLE PRECISION,
-    raw_score_min DOUBLE PRECISION,
-    raw_score_max DOUBLE PRECISION,
+    raw_boolean BOOLEAN,
+    raw_numeric DOUBLE PRECISION,
+    raw_ordinal TEXT,
+    raw_unit TEXT,
     normalized_score DOUBLE PRECISION,
+    normalization_policy_hash TEXT NOT NULL CHECK (btrim(normalization_policy_hash) <> ''),
     pass_threshold DOUBLE PRECISION NOT NULL CHECK (pass_threshold >= 0.0 AND pass_threshold <= 1.0),
     weight DOUBLE PRECISION NOT NULL DEFAULT 1.0 CHECK (weight >= 0),
 
@@ -42,20 +44,33 @@ CREATE TABLE evaluator_results (
         REFERENCES execution_attempts(run_id, run_shard, id) ON DELETE CASCADE,
     CONSTRAINT chk_evaluator_result_normalized_score
         CHECK (normalized_score IS NULL OR (normalized_score >= 0.0 AND normalized_score <= 1.0)),
+    CONSTRAINT chk_evaluator_result_raw_numeric
+        CHECK (raw_numeric IS NULL OR raw_numeric NOT IN ('NaN'::float8, 'Infinity'::float8, '-Infinity'::float8)),
+    CONSTRAINT chk_evaluator_result_measurement_shape CHECK (
+        (measurement_kind IS NULL AND raw_boolean IS NULL AND raw_numeric IS NULL
+            AND raw_ordinal IS NULL AND raw_unit IS NULL)
+        OR
+        (measurement_kind = 'binary' AND raw_boolean IS NOT NULL AND raw_numeric IS NULL
+            AND raw_ordinal IS NULL AND raw_unit IS NULL)
+        OR
+        (measurement_kind = 'numeric' AND raw_boolean IS NULL AND raw_numeric IS NOT NULL
+            AND raw_ordinal IS NULL)
+        OR
+        (measurement_kind = 'ordinal' AND raw_boolean IS NULL AND raw_numeric IS NULL
+            AND raw_ordinal IS NOT NULL AND btrim(raw_ordinal) <> '' AND raw_unit IS NULL)
+    ),
     CONSTRAINT chk_evaluator_result_outcome_shape CHECK (
         (outcome = 'completed' AND judgment IN ('passed', 'failed')
             AND measurement_kind IS NOT NULL AND normalized_score IS NOT NULL
             AND error_code IS NULL AND error_message IS NULL
             AND abstention_category IS NULL AND abstention_reason IS NULL)
         OR
-        (outcome = 'error' AND judgment IS NULL AND measurement_kind IS NULL
+        (outcome = 'error' AND judgment IS NULL
             AND normalized_score IS NULL AND error_code IS NOT NULL AND error_message IS NOT NULL
-            AND raw_score IS NULL AND raw_score_min IS NULL AND raw_score_max IS NULL
             AND abstention_category IS NULL AND abstention_reason IS NULL)
         OR
         (outcome = 'abstained' AND judgment IS NULL AND measurement_kind IS NULL
-            AND normalized_score IS NULL AND raw_score IS NULL
-            AND raw_score_min IS NULL AND raw_score_max IS NULL
+            AND normalized_score IS NULL
             AND error_code IS NULL AND error_message IS NULL
             AND abstention_category IS NOT NULL)
     ),
@@ -94,3 +109,7 @@ COMMENT ON COLUMN evaluator_results.outcome IS
     'Evaluator execution outcome. This is separate from the host-derived judgment.';
 COMMENT ON COLUMN evaluator_results.judgment IS
     'Host-derived passed or failed judgment after normalization and pass_threshold.';
+COMMENT ON COLUMN evaluator_results.measurement_kind IS
+    'Raw evaluator measurement type: binary, numeric, or ordinal.';
+COMMENT ON COLUMN evaluator_results.normalization_policy_hash IS
+    'BLAKE3 hash of the binding normalization policy used to derive normalized_score.';

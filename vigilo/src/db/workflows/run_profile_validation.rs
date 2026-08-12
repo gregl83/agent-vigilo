@@ -19,9 +19,9 @@ use crate::{
             EvaluatorIdentity,
             parse_fully_qualified_evaluator,
         },
+        normalization,
         run::{
             DatasetCase,
-            NormalizationPolicy,
             RunDataset,
             RunProfile,
         },
@@ -280,18 +280,10 @@ fn collect_static_profile_config_issues(profile: &RunProfile) -> Vec<String> {
                 ));
             }
 
-            if let NormalizationPolicy::Preference {
-                preferred,
-                tie,
-                not_preferred,
-            } = &binding.normalization
-                && [preferred, tie, not_preferred]
-                    .iter()
-                    .any(|value| !value.is_finite() || !(0.0..=1.0).contains(*value))
-            {
+            if let Err(err) = normalization::validate_policy(&binding.normalization) {
                 issues.push(format!(
-                    "case_group '{}' evaluator binding '{}' preference normalization values must be finite and between 0.0 and 1.0",
-                    group.id, binding.id
+                    "case_group '{}' evaluator binding '{}' has invalid normalization policy: {}",
+                    group.id, binding.id, err
                 ));
             }
 
@@ -399,6 +391,7 @@ mod tests {
             DimensionAggregation,
             EvaluatorBinding,
             NormalizationPolicy,
+            NumericMapping,
             PersistRawOutputsMode,
             PersistenceMode,
             PersistenceSettings,
@@ -477,7 +470,14 @@ mod tests {
             dimension: "quality".to_string(),
             blocking: false,
             weight: 1.0,
-            normalization: NormalizationPolicy::Normalized,
+            normalization: NormalizationPolicy::Numeric {
+                unit: None,
+                mapping: NumericMapping::Linear {
+                    min: 0.0,
+                    max: 1.0,
+                    direction: crate::contracts::run::ScoreDirection::HigherIsBetter,
+                },
+            },
             pass_threshold: 0.5,
             config: serde_json::json!({}),
         }
@@ -589,10 +589,8 @@ mod tests {
             .push(evaluator_binding("quality", "core/quality:1.0.0"));
         let binding = &mut profile.case_groups[0].evaluators[0];
         binding.pass_threshold = 1.1;
-        binding.normalization = NormalizationPolicy::Preference {
-            preferred: 1.0,
-            tie: f64::NAN,
-            not_preferred: 0.0,
+        binding.normalization = NormalizationPolicy::Ordinal {
+            values: [("tie".to_string(), f64::NAN)].into_iter().collect(),
         };
 
         let issues = super::collect_static_profile_config_issues(&profile);
@@ -601,7 +599,7 @@ mod tests {
         assert!(
             issues
                 .iter()
-                .any(|issue| issue.contains("preference normalization"))
+                .any(|issue| issue.contains("invalid normalization policy"))
         );
     }
 

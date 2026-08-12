@@ -1,0 +1,181 @@
+---
+sidebar_label: Measurement Normalization
+sidebar_position: 2
+title: Measurement Normalization
+description: Map raw evaluator measurements to host-owned scores with binary, numeric, and ordinal policies.
+keywords:
+  - evaluator measurement
+  - normalization policy
+  - piecewise linear scoring
+  - threshold scoring
+  - ordinal scoring
+---
+
+# Measurement Normalization
+
+Evaluators report what they observed. The run profile decides what that
+observation means for scoring.
+
+```text
+raw measurement -> profile normalization -> normalized score -> pass threshold -> judgment
+```
+
+This separation keeps evaluator code reusable while dimensions, scoring, and
+release policy remain under the run owner's control.
+
+## Choose a Measurement Type
+
+| Evaluator observation | Measurement | Profile policy |
+| --- | --- | --- |
+| Yes or no | `binary` | Explicit scores for `false` and `true` |
+| Number, optionally with a unit | `numeric` | Linear, piecewise-linear, or threshold mapping |
+| Label such as `preferred` or `tie` | `ordinal` | Explicit score for every accepted label |
+
+An evaluator must return exactly one of these types when it completes.
+
+## Binary
+
+Use binary measurements for checks with two possible observations, such as
+schema validity.
+
+Evaluator return:
+
+```rust
+Measurement::Binary(true)
+```
+
+Profile policy:
+
+```yaml
+normalization:
+  method: binary
+  false_score: 0.0
+  true_score: 1.0
+pass_threshold: 1.0
+```
+
+Both scores are explicit. Reversing them is valid when `false` is the desirable
+observation.
+
+## Numeric: Linear
+
+Use a linear mapping when utility changes evenly across a fixed domain.
+
+Evaluator return:
+
+```rust
+Measurement::Numeric(NumericMeasurement {
+    value: 240.0,
+    unit: Some("milliseconds".to_string()),
+})
+```
+
+Profile policy:
+
+```yaml
+normalization:
+  method: numeric
+  unit: milliseconds
+  mapping:
+    type: linear
+    min: 0.0
+    max: 1000.0
+    direction: lower_is_better
+pass_threshold: 0.75
+```
+
+`higher_is_better` maps `min` to `0.0` and `max` to `1.0`.
+`lower_is_better` reverses that mapping. The reported unit must exactly match
+the configured unit.
+
+## Numeric: Piecewise Linear
+
+Use a curve when equal raw changes should not have equal scoring impact.
+
+```yaml
+normalization:
+  method: numeric
+  mapping:
+    type: piecewise_linear
+    points:
+      - { value: 0.0, score: 0.0 }
+      - { value: 70.0, score: 0.3 }
+      - { value: 90.0, score: 1.0 }
+      - { value: 100.0, score: 1.0 }
+pass_threshold: 0.8
+```
+
+Vigilo interpolates between adjacent points. The first and last point define
+the accepted domain; values outside it are rejected rather than clamped.
+
+## Numeric: Thresholds
+
+Use thresholds when raw values belong in discrete scoring bands.
+
+```yaml
+normalization:
+  method: numeric
+  unit: milliseconds
+  mapping:
+    type: thresholds
+    min: 0.0
+    max: 2000.0
+    cutpoints: [200.0, 500.0]
+    scores: [1.0, 0.6, 0.0]
+pass_threshold: 0.6
+```
+
+The example defines these intervals:
+
+| Raw value | Score |
+| --- | --- |
+| `0 <= value < 200` | `1.0` |
+| `200 <= value < 500` | `0.6` |
+| `500 <= value <= 2000` | `0.0` |
+
+There must be exactly one more score than cut points.
+
+## Ordinal
+
+Use ordinal measurements for named outcomes. The evaluator reports the label;
+the profile supplies its utility.
+
+Evaluator return:
+
+```rust
+Measurement::Ordinal("tie".to_string())
+```
+
+Profile policy:
+
+```yaml
+normalization:
+  method: ordinal
+  values:
+    preferred: 1.0
+    tie: 0.4
+    not_preferred: 0.0
+pass_threshold: 0.8
+```
+
+There is no universal value for `tie`. An evaluator label that is absent from
+`values` is rejected.
+
+## Validation and Failures
+
+Vigilo rejects:
+
+- non-finite measurements or policy values
+- scores outside `0.0..=1.0`
+- numeric values outside the configured domain
+- mismatched measurement types or units
+- unordered, duplicated, or malformed curve and threshold definitions
+- ordinal labels not declared by the profile
+
+Invalid measurements are recorded as evaluator errors and receive no score.
+When the binding is required, evaluator completeness fails and aggregate scores
+are withheld. Vigilo never clamps, extrapolates, or silently substitutes a
+default utility.
+
+See [Run Profile Configuration](./run-profile) for dimensions, weights,
+requiredness, blocking, and aggregation.

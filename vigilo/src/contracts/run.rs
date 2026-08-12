@@ -237,23 +237,50 @@ pub(crate) struct EvaluatorBinding {
 
 /// Host-owned conversion from an evaluator measurement to a normalized score.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "method", rename_all = "snake_case")]
+#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum NormalizationPolicy {
-    /// Converts `false` to zero and `true` to one.
-    Binary,
-    /// Linearly maps the evaluator-declared range to zero through one.
-    Range { direction: ScoreDirection },
-    /// Requires an already normalized zero-through-one value.
-    Normalized,
-    /// Maps preference outcomes using profile-owned values.
-    Preference {
-        preferred: f64,
-        tie: f64,
-        not_preferred: f64,
+    /// Maps both possible binary observations explicitly.
+    Binary { false_score: f64, true_score: f64 },
+    /// Maps a raw numeric observation through a declarative utility function.
+    Numeric {
+        #[serde(default)]
+        unit: Option<String>,
+        mapping: NumericMapping,
+    },
+    /// Maps evaluator-provided labels to explicit utility values.
+    Ordinal { values: BTreeMap<String, f64> },
+}
+
+/// Host-owned mapping from a numeric measurement to zero-through-one utility.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum NumericMapping {
+    /// Linearly maps a fixed raw domain in the configured direction.
+    Linear {
+        min: f64,
+        max: f64,
+        direction: ScoreDirection,
+    },
+    /// Linearly interpolates between ordered raw-value utility points.
+    PiecewiseLinear { points: Vec<UtilityPoint> },
+    /// Assigns one score to each interval formed by ordered cut points.
+    Thresholds {
+        min: f64,
+        max: f64,
+        cutpoints: Vec<f64>,
+        scores: Vec<f64>,
     },
 }
 
-/// Direction used when normalizing range measurements.
+/// One raw-value to normalized-score point in a piecewise-linear mapping.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UtilityPoint {
+    pub(crate) value: f64,
+    pub(crate) score: f64,
+}
+
+/// Direction used by linear numeric normalization.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ScoreDirection {
@@ -384,6 +411,8 @@ case_groups:
         weight: 1.0
         normalization:
           method: binary
+          false_score: 0.0
+          true_score: 1.0
         pass_threshold: 1.0
         config:
           schema:
@@ -408,6 +437,47 @@ case_groups:
             "core/json-schema:1.0.0"
         );
         assert!(profile.case_groups[0].evaluators[0].required);
+    }
+
+    #[test]
+    fn parse_every_normalization_policy_shape() {
+        let raw = r#"
+- method: binary
+  false_score: 0.0
+  true_score: 1.0
+- method: numeric
+  unit: milliseconds
+  mapping:
+    type: linear
+    min: 0.0
+    max: 1000.0
+    direction: lower_is_better
+- method: numeric
+  mapping:
+    type: piecewise_linear
+    points:
+      - { value: 0.0, score: 0.0 }
+      - { value: 10.0, score: 1.0 }
+- method: numeric
+  mapping:
+    type: thresholds
+    min: 0.0
+    max: 100.0
+    cutpoints: [50.0, 80.0]
+    scores: [0.0, 0.5, 1.0]
+- method: ordinal
+  values:
+    preferred: 1.0
+    tie: 0.4
+    not_preferred: 0.0
+"#;
+
+        let policies: Vec<NormalizationPolicy> = serde_yaml::from_str(raw).unwrap();
+
+        assert_eq!(policies.len(), 5);
+        for policy in policies {
+            crate::contracts::normalization::validate_policy(&policy).unwrap();
+        }
     }
 
     #[test]

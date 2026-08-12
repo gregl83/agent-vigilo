@@ -72,6 +72,10 @@ Keep the evaluator contract in sync with `wit/evaluator.wit`.
 The release contract is `vigilo:evaluator@1.0.0`. Rebuild and republish evaluators
 when their implementation or declared interface version changes.
 
+Evaluators can return raw `binary`, `numeric`, or `ordinal` measurements. See
+[Measurement Normalization](/docs/configuration/measurement-normalization) for
+copyable evaluator returns and the matching profile policy for every type.
+
 ## Build and Test Loop
 
 Build your evaluator for WASI Preview 2:
