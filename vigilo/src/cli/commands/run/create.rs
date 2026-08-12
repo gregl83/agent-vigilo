@@ -57,6 +57,11 @@ pub(super) async fn exec(
     let profile_hash = hash_json(&profile_payload)?;
     let dataset_hash = hash_json(&dataset_payload)?;
     let aggregation_policy_hash = compute_aggregation_policy_hash(&parsed.profile)?;
+    let execution_plan = EvaluatorExecutionPlan::new(
+        aggregation_policy_hash.clone(),
+        executability.resolved_evaluators.clone(),
+    );
+    let execution_plan_hash = execution_plan.hash()?;
     let profile_version_id = format!(
         "{}/{}",
         parsed.profile.profile_id, parsed.profile.profile_version
@@ -85,6 +90,8 @@ pub(super) async fn exec(
         "profile_hash": profile_hash,
         "dataset_hash": dataset_hash,
         "aggregation_policy_hash": aggregation_policy_hash,
+        "execution_plan_hash": execution_plan_hash,
+        "execution_plan": execution_plan,
         "chunk_size": chunk_size,
         "executability": executability,
     });
@@ -156,6 +163,7 @@ pub(super) async fn exec(
             "profile_hash": profile_hash,
             "dataset_hash": dataset_hash,
             "aggregation_policy_hash": aggregation_policy_hash,
+            "execution_plan_hash": execution_plan_hash,
             "status": creation.status,
             "error_message": creation.error_message,
         },

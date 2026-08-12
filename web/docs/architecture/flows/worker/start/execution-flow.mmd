@@ -44,10 +44,10 @@ sequenceDiagram
             end
 
             alt Chunk claimed
-                Vigilo->>ExecutionDB: Load run snapshot and case batch
-                ExecutionDB-->>Vigilo: Profile snapshot and cases
-                Vigilo->>ControlDB: Load evaluator catalog metadata
-                ControlDB-->>Vigilo: Runnable evaluator records
+                Vigilo->>ExecutionDB: Load and verify run snapshot and case batch
+                ExecutionDB-->>Vigilo: Profile, pinned execution plan, and cases
+                Vigilo->>ControlDB: Fetch pinned evaluator artifacts by database id
+                ControlDB-->>Vigilo: Exact artifact and ABI records
                 Vigilo->>ExecutionDB: Start chunk and attempt lease heartbeat
                 Vigilo->>WASM: Warm evaluator components
                 WASM-->>Vigilo: Warmup result
@@ -56,7 +56,7 @@ sequenceDiagram
                     Vigilo->>Agent: Invoke multiple cases with shared HTTP client
                 and Evaluator calls
                     Vigilo->>Vigilo: Acquire Wasm evaluation semaphore permits
-                    Vigilo->>WASM: Execute evaluators in sandboxed stores
+                    Vigilo->>WASM: Dispatch pinned ABI adapters in sandboxed stores
                 end
                 WASM-->>Vigilo: Evaluation outputs
                 Vigilo->>ExecutionDB: Persist batched results and lease-guarded terminal transitions

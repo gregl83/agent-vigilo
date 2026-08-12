@@ -79,7 +79,7 @@ impl Context {
 
     pub async fn reg(
         &self,
-    ) -> anyhow::Result<&moka::future::Cache<String, wasmtime::component::Component>> {
+    ) -> anyhow::Result<&moka::future::Cache<String, crate::evaluator_abi::PreparedEvaluator>> {
         self.0.reg.get().await
     }
 

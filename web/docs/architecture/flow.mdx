@@ -45,6 +45,12 @@ A run is created with:
 - aggregation policy
 - agent configuration (versioned target)
 
+At creation, every evaluator reference is resolved to an immutable
+<GlossaryTerm term="evaluator-execution-plan">evaluator execution plan</GlossaryTerm>.
+The plan pins registry id, artifact hash, evaluator ABI, host adapter, runtime
+version, and the complete scoring-policy hash. Each execution placement receives
+the same plan and workers verify its hash before use.
+
 Reference formats:
 
 - [Run Profile Configuration](../configuration/run-profile.mdx)
@@ -115,6 +121,8 @@ execution.status = retry_scheduled (if retryable)
 After a successful agent response:
 
 - evaluators are executed
+- each pinned evaluator artifact and ABI identity is verified before its
+  version-specific host adapter is selected
 - Wasm evaluator invocations acquire a worker-local semaphore permit
 - each evaluator runs in a fresh Wasmtime store with memory, table, instance, fuel, timeout, and log-message limits
 - the profile binding normalizes a completed measurement and derives its judgment

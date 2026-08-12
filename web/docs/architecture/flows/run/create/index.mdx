@@ -27,6 +27,11 @@ idempotent. If immediate creation cannot finish, the command returns that same
 creation lease and resumes the remaining placements. Dispatch cursors appear
 only in the transaction that changes a fully seeded run to `pending`.
 
+Creation also resolves every evaluator reference to an exact registry id,
+artifact hash, supported ABI, host adapter, and runtime version. This evaluator
+execution plan and the complete scoring-policy hash are copied into each run
+snapshot. Workers verify both hashes before executing any case.
+
 ## Execution Flow
 
 <Mermaid value={executionFlowDiagram} />

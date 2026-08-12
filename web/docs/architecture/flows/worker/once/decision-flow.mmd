@@ -14,11 +14,11 @@ flowchart TD
     Consume{Worker message available?}
     Payload{Chunk-ready payload valid?}
     Claim{Chunk claimable?}
-    Context[Load run context]
+    Context[Load and verify pinned run context]
     Warm[Warm evaluator components]
     Cases[Load chunk case batch]
     Permit[Acquire Wasm evaluation permits]
-    Execute[Execute case evaluations in sandboxed stores]
+    Execute[Dispatch pinned ABI adapters in sandboxed stores]
     Persist[Persist terminal transitions]
     CheckRetry{Open retry work?}
     Delay[Release chunk and delay message until retry window]

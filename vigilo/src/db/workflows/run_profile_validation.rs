@@ -15,6 +15,7 @@ use sqlx::PgPool;
 use crate::{
     agent_client,
     contracts::{
+        evaluator_abi::ResolvedEvaluator,
         evaluator_ref::{
             EvaluatorIdentity,
             parse_fully_qualified_evaluator,
@@ -37,6 +38,8 @@ pub(crate) struct ProfileExecutabilitySummary {
     pub(crate) expected_evaluator_execution_count: usize,
     pub(crate) unique_evaluator_ref_count: usize,
     pub(crate) runnable_evaluator_ref_count: usize,
+    #[serde(skip_serializing)]
+    pub(crate) resolved_evaluators: Vec<ResolvedEvaluator>,
 }
 
 /// Validates that a profile can execute every dataset case with runnable evaluators.
@@ -59,6 +62,7 @@ pub(crate) async fn validate_profile_executability(
     dataset: &RunDataset,
 ) -> anyhow::Result<ProfileExecutabilitySummary> {
     let mut runnable_by_ref: HashMap<String, bool> = HashMap::new();
+    let mut resolved_evaluators = Vec::new();
     let mut parsed_refs: Vec<(String, String, EvaluatorIdentity)> = Vec::new();
     let mut issues = collect_static_profile_config_issues(profile);
 
@@ -128,15 +132,48 @@ pub(crate) async fn validate_profile_executability(
             continue;
         }
 
-        if evaluator_record.interface_version.as_deref() != Some("1.0.0") {
+        let Some((package, interface)) = evaluator_record.interface_name.rsplit_once('/') else {
             issues.push(format!(
-                "case_group '{}' references evaluator '{}' with interface version {:?}; expected 1.0.0",
-                group_id, evaluator_ref, evaluator_record.interface_version
+                "case_group '{}' references evaluator '{}' without a valid interface name",
+                group_id, evaluator_ref,
+            ));
+            continue;
+        };
+        let abi = match crate::evaluator_abi::resolve_declaration(
+            package,
+            &evaluator_record.wit_world,
+            interface,
+            &evaluator_record.interface_version,
+        ) {
+            Ok(adapter) => adapter.identity().clone(),
+            Err(err) => {
+                issues.push(format!(
+                    "case_group '{}' references evaluator '{}' with unsupported ABI: {}",
+                    group_id, evaluator_ref, err,
+                ));
+                continue;
+            }
+        };
+        if abi.contract_hash != evaluator_record.abi_contract_hash
+            || abi.adapter != evaluator_record.abi_adapter
+        {
+            issues.push(format!(
+                "case_group '{}' references evaluator '{}' with an unverified ABI identity",
+                group_id, evaluator_ref,
             ));
             continue;
         }
 
-        runnable_by_ref.insert(evaluator_ref, true);
+        runnable_by_ref.insert(evaluator_ref.clone(), true);
+        resolved_evaluators.push(ResolvedEvaluator {
+            evaluator_ref,
+            evaluator_id: evaluator_record.id,
+            content_hash: evaluator_record.content_hash.clone(),
+            abi,
+            runtime: evaluator_record.runtime.clone(),
+            runtime_version: evaluator_record.runtime_version.clone(),
+            runtime_fingerprint: evaluator_record.runtime_fingerprint.clone(),
+        });
     }
 
     let mut expected_evaluator_execution_count = 0usize;
@@ -228,6 +265,7 @@ pub(crate) async fn validate_profile_executability(
         expected_evaluator_execution_count,
         unique_evaluator_ref_count: runnable_by_ref.len(),
         runnable_evaluator_ref_count,
+        resolved_evaluators,
     })
 }
 

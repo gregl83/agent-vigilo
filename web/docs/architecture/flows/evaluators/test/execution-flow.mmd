@@ -21,9 +21,9 @@ sequenceDiagram
     alt Evaluator found and testable
         DB-->>Vigilo: Evaluator record
         Vigilo->>Vigilo: Read and parse test input
-        Vigilo->>WASM: Execute evaluator with input
+        Vigilo->>WASM: Verify stored ABI and dispatch its adapter with input
         WASM-->>Vigilo: Evaluation output
-        Vigilo->>Vigilo: Normalize results and build payload
+        Vigilo->>Vigilo: Build native measurement and diagnostics payload
         Vigilo-->>User: Success response
     else Evaluator missing
         DB-->>Vigilo: No evaluator record

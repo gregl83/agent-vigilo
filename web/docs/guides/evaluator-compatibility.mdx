@@ -1,0 +1,106 @@
+---
+sidebar_label: Evaluator Compatibility
+title: Evaluator ABI Compatibility
+description: Agent Vigilo's evaluator WIT contract, host adapter, release compatibility rules, and reproducible run execution.
+sidebar_position: 4
+keywords:
+  - evaluator ABI compatibility
+  - versioned WIT contracts
+  - WASM evaluator adapter
+  - reproducible evaluation runs
+---
+
+# Evaluator ABI Compatibility
+
+An evaluator's <GlossaryTerm term="evaluator-abi">ABI</GlossaryTerm> is the
+binary WIT boundary between its WebAssembly component and the Vigilo host.
+Evaluator package versions describe evaluator behavior; ABI versions describe
+the wire contract. They are separate.
+
+## Current ABI
+
+| ABI | WIT source | Host adapter | Use |
+| --- | --- | --- | --- |
+| `1.0.0` | `wit/evaluator/v1.0.0/evaluator.wit` | `vigilo-evaluator-v1@1` | Current pre-release contract |
+
+There is no older released ABI. Before the first Vigilo release, `1.0.0` is the
+only contract and host adapter. Use its versioned path in `Vigilo.toml` and
+generated bindings so builds stay explicit and cannot silently change contract.
+
+## Publication
+
+Publishing verifies all of the following before inserting an artifact:
+
+1. `[wit]` names a supported package, world, interface, and ABI version.
+2. The referenced WIT file declares those same values.
+3. The compiled component links against the exact host adapter.
+4. The registry records the artifact content hash, WIT contract hash, and adapter id.
+
+A version string alone is not proof of compatibility. Unknown contracts,
+changed frozen contracts, and components compiled for a different interface are
+rejected.
+
+## Run Pinning
+
+Run creation resolves each profile evaluator to one immutable tuple:
+
+```text
+evaluator id + artifact content hash + ABI identity + host adapter + runtime version
+```
+
+That tuple is stored in the run's hashed execution plan. Workers load the plan
+from the execution database, verify its hash, fetch the evaluator by database
+id, and compare the stored artifact and ABI fields before compiling it. The
+prepared-evaluator cache is keyed by artifact hash, contract hash, and adapter.
+
+Registry lifecycle changes affect new runs. An already-created run continues
+with its pinned artifact, including after that evaluator is deprecated or
+yanked. Deleting or mutating a pinned registry row causes execution to fail
+closed instead of silently selecting replacement code.
+
+## Release Rules
+
+- Keep only `wit/evaluator/v1.0.0/evaluator.wit` before the first release.
+- Freeze a versioned WIT file when a release supports it.
+- After release, add a new WIT directory and host adapter for a breaking ABI change.
+- Retain released adapters while evaluator artifacts or reproducible runs depend on them.
+- When a second ABI exists, test real components for both versions through one host build.
+- Bump the evaluator package version whenever evaluator code or behavior changes.
+
+The host rejects any ABI identity other than the exact supported `1.0.0`
+contract. The adapter registry remains the extension point for compatibility
+after a future breaking contract is actually released.
+
+## Adding A New ABI
+
+Each supported version has one self-contained module under
+`vigilo/src/evaluator_abi/`. That module owns its generated WIT bindings,
+identity and contract hash, typed linking, input/output conversion, execution,
+and real compatibility fixture. Shared workers and scoring code only use the
+canonical host contracts.
+
+To add a breaking ABI while retaining existing versions:
+
+1. Add `wit/evaluator/<version>/evaluator.wit`; do not edit released WIT files.
+2. Add `vigilo/src/evaluator_abi/<version>.rs` implementing the adapter contract.
+3. Add a real Wasm fixture, mark its crate with
+   `package.metadata.vigilo.abi-fixture = true`, and declare its artifact in the
+   adapter under tests.
+4. Add the adapter to the static registry in `vigilo/src/evaluator_abi.rs`.
+5. Point new evaluator templates and documentation at the new current version.
+6. Build every fixture and run the registry-driven compatibility matrix.
+
+The registry is static and auditable. CI invariants reject duplicate
+declarations, adapter ids, and fixture artifacts; runtime resolution rejects
+unknown identities and changed contract hashes. Workers cache a compiled
+component and pre-instantiated linker plan with its resolved adapter, so version
+selection and typed linking happen once per artifact load rather than once per
+evaluation. A new ABI must not require changes to workers, aggregation,
+database workflows, or profile policy.
+
+## Related
+
+- [Creating Evaluators](./creating-evaluators.mdx)
+- [Publishing Evaluators](./publishing.mdx)
+- [`Vigilo.toml` Reference](../configuration/vigilo-toml.mdx)
+- [Worker Components](../architecture/structure/components/worker/index.mdx)

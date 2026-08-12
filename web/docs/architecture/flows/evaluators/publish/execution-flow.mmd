@@ -14,14 +14,15 @@ sequenceDiagram
     User->>Vigilo: vigilo evaluator publish
     activate Vigilo
 
-    Vigilo->>Vigilo: Compile and validate WASM
+    Vigilo->>Vigilo: Resolve exact supported WIT ABI
+    Vigilo->>Vigilo: Compile WASM and typed-link selected adapter
     Vigilo->>DB: Check evaluator version uniqueness
     DB-->>Vigilo: Version available
 
     Vigilo->>DB: Check evaluator hash uniqueness
     DB-->>Vigilo: Hash available
 
-    Vigilo->>DB: Insert evaluator WASM and metadata
+    Vigilo->>DB: Insert WASM, artifact hash, contract hash, and adapter id
     DB-->>Vigilo: Saved
 
     Vigilo-->>User: Success response

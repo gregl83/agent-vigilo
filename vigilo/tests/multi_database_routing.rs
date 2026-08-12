@@ -525,6 +525,10 @@ async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
 }
 
 async fn seed_evaluator(primary: &PgPool) -> anyhow::Result<()> {
+    let abi_contract_hash =
+        blake3::hash(include_bytes!("../../wit/evaluator/v1.0.0/evaluator.wit"))
+            .to_hex()
+            .to_string();
     sqlx::query(
         r#"
         INSERT INTO evaluators (
@@ -537,6 +541,8 @@ async fn seed_evaluator(primary: &PgPool) -> anyhow::Result<()> {
             interface_name,
             interface_version,
             wit_world,
+            abi_contract_hash,
+            abi_adapter,
             runtime,
             runtime_version,
             runtime_fingerprint,
@@ -549,9 +555,11 @@ async fn seed_evaluator(primary: &PgPool) -> anyhow::Result<()> {
             'multi-database-routing-json-schema',
             decode('', 'hex'),
             0,
-            'evaluator',
+            'vigilo:evaluator/evaluator',
             '1.0.0',
             'evaluator-world',
+            $1,
+            'vigilo-evaluator-v1@1',
             'wasmtime',
             'integration',
             'integration',
@@ -564,6 +572,8 @@ async fn seed_evaluator(primary: &PgPool) -> anyhow::Result<()> {
             interface_name = EXCLUDED.interface_name,
             interface_version = EXCLUDED.interface_version,
             wit_world = EXCLUDED.wit_world,
+            abi_contract_hash = EXCLUDED.abi_contract_hash,
+            abi_adapter = EXCLUDED.abi_adapter,
             runtime = EXCLUDED.runtime,
             runtime_version = EXCLUDED.runtime_version,
             runtime_fingerprint = EXCLUDED.runtime_fingerprint,
@@ -571,6 +581,7 @@ async fn seed_evaluator(primary: &PgPool) -> anyhow::Result<()> {
             updated_at = now()
         "#,
     )
+    .bind(abi_contract_hash)
     .execute(primary)
     .await?;
 

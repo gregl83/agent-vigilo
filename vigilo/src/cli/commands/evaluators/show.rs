@@ -33,6 +33,8 @@ pub(super) async fn exec(context: Context, evaluator: String) -> anyhow::Result<
                 "interface_name": e.interface_name,
                 "interface_version": e.interface_version,
                 "wit_world": e.wit_world,
+                "abi_contract_hash": e.abi_contract_hash,
+                "abi_adapter": e.abi_adapter,
                 "runtime": e.runtime,
                 "runtime_version": e.runtime_version,
                 "runtime_fingerprint": e.runtime_fingerprint,

@@ -99,7 +99,6 @@ enum RetrySettlement {
 #[derive(Debug)]
 struct WorkerRunContext {
     profile: RunProfile,
-    evaluator_refs: Vec<String>,
     evaluator_catalog: execution_processing::RunEvaluatorCatalog,
 }
 
@@ -355,7 +354,7 @@ impl EvaluatorLoaderService {
         }
     }
 
-    /// Returns a compiled component from cache or loads it from registry.
+    /// Returns a prepared evaluator from cache or loads it from the registry.
     ///
     /// Errors if:
     /// - evaluator ref format is invalid
@@ -365,37 +364,46 @@ impl EvaluatorLoaderService {
     async fn get_or_load(
         &self,
         evaluator_ref: &str,
-    ) -> anyhow::Result<wasmtime::component::Component> {
-        execution_processing::get_or_load_component(&self.context, evaluator_ref).await
+        evaluator: &execution_processing::RunEvaluatorCatalogEntry,
+    ) -> anyhow::Result<crate::evaluator_abi::PreparedEvaluator> {
+        execution_processing::get_or_load_component(&self.context, evaluator_ref, evaluator).await
     }
 
-    /// Preloads a set of evaluator refs into the registry cache.
-    async fn warm_refs(&self, evaluator_refs: &[String]) -> anyhow::Result<WarmupStats> {
+    /// Preloads a pinned evaluator catalog into the registry cache.
+    async fn warm_catalog(
+        &self,
+        evaluator_catalog: &execution_processing::RunEvaluatorCatalog,
+    ) -> anyhow::Result<WarmupStats> {
         let started = Instant::now();
         let mut stats = WarmupStats {
-            requested: evaluator_refs.len(),
+            requested: evaluator_catalog.len(),
             ..WarmupStats::default()
         };
 
         let cache = self.context.reg().await?;
         let mut misses = Vec::new();
-        for evaluator_ref in evaluator_refs {
-            if cache.get(evaluator_ref).await.is_some() {
+        for (evaluator_ref, evaluator) in evaluator_catalog {
+            if cache
+                .get(&evaluator.abi.cache_key(&evaluator.content_hash))
+                .await
+                .is_some()
+            {
                 stats.cache_hits += 1;
                 continue;
             }
 
-            misses.push(evaluator_ref.clone());
+            misses.push((evaluator_ref.clone(), evaluator.clone()));
         }
 
         for batch in misses.chunks(WARMUP_PARALLELISM) {
             let mut tasks = JoinSet::new();
-            for evaluator_ref in batch {
+            for (evaluator_ref, evaluator) in batch {
                 let evaluator_ref = evaluator_ref.clone();
+                let evaluator = evaluator.clone();
                 let loader = self.clone();
                 tasks.spawn(async move {
                     loader
-                        .get_or_load(&evaluator_ref)
+                        .get_or_load(&evaluator_ref, &evaluator)
                         .await
                         .map(|_| evaluator_ref)
                 });
@@ -437,8 +445,8 @@ impl EvaluatorLoaderService {
             .await;
         let context = cell
             .get_or_try_init(|| async {
-                let Some(profile_snapshot) =
-                    run_snapshots::select_run_profile_snapshot(execution_db, run_id, run_shard)
+                let Some(snapshot) =
+                    run_snapshots::select_worker_run_snapshot(execution_db, run_id, run_shard)
                         .await?
                 else {
                     anyhow::bail!(
@@ -447,17 +455,23 @@ impl EvaluatorLoaderService {
                         run_shard
                     );
                 };
-                let profile: RunProfile =
-                    serde_json::from_value(profile_snapshot).map_err(|err| {
-                        anyhow::anyhow!("run '{}' profile is invalid: {}", run_id, err)
-                    })?;
-                let evaluator_refs = execution_processing::evaluator_refs_from_profile(&profile)?;
-                let db = self.context.dbr().await?.control().await?;
-                let evaluator_catalog =
-                    execution_processing::build_run_evaluator_catalog(db, &profile).await?;
+                let evaluator_catalog = execution_processing::build_pinned_evaluator_catalog(
+                    snapshot.execution_plan.evaluators.clone(),
+                )?;
+                let expected_refs =
+                    execution_processing::evaluator_refs_from_profile(&snapshot.profile)?;
+                if expected_refs.len() != evaluator_catalog.len()
+                    || expected_refs
+                        .iter()
+                        .any(|evaluator_ref| !evaluator_catalog.contains_key(evaluator_ref))
+                {
+                    anyhow::bail!(
+                        "run '{}' execution plan does not cover its profile evaluators",
+                        run_id
+                    );
+                }
                 Ok::<_, anyhow::Error>(Arc::new(WorkerRunContext {
-                    profile,
-                    evaluator_refs,
+                    profile: snapshot.profile,
                     evaluator_catalog,
                 }))
             })
@@ -1057,7 +1071,7 @@ async fn run_worker_message_admitted(
     // Warmup failures are treated as recoverable worker failures because no
     // case state has been advanced yet.
     match evaluator_loader
-        .warm_refs(&run_context.evaluator_refs)
+        .warm_catalog(&run_context.evaluator_catalog)
         .await
     {
         Ok(stats) => {

@@ -16,7 +16,12 @@ This file applies to evaluator crates under `evaluators/`.
 
 ## Contract Alignment
 
-- Implement the current contract from `wit/evaluator.wit`.
+- Implement the current contract from `wit/evaluator/v1.0.0/evaluator.wit`.
+- Before the first release, `v1.0.0` is the only supported ABI. Once an ABI is
+  released, freeze its WIT file; later breaking changes require a new versioned
+  contract and host adapter.
+- Evaluator crates select an ABI but never contain host adapters or compatibility
+  dispatch; those remain isolated under `vigilo/src/evaluator_abi/`.
 - Read canonical evaluator `input` fields and return canonical `output`.
 - Return one primary measurement or abstention and zero or more diagnostics;
   evaluators must not implement dimension, threshold, weight, or blocking policy.

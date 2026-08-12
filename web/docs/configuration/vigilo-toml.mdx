@@ -46,7 +46,7 @@ owner = "evaluators-team"
 tier = "example"
 
 [wit]
-path = "../../wit/evaluator.wit"
+path = "../../wit/evaluator/v1.0.0/evaluator.wit"
 world = "evaluator-world"
 package = "vigilo:evaluator"
 version = "1.0.0"
@@ -107,13 +107,13 @@ tier = "example"
 
 ## `[wit]`
 
-Optional but recommended. Declares the
+Required for publication. Declares the immutable
 <GlossaryTerm term="wit-contract">WIT contract</GlossaryTerm> implemented by the
 evaluator.
 
 ```toml
 [wit]
-path = "../../wit/evaluator.wit"
+path = "../../wit/evaluator/v1.0.0/evaluator.wit"
 world = "evaluator-world"
 package = "vigilo:evaluator"
 version = "1.0.0"
@@ -128,9 +128,17 @@ Fields:
 - `package`: expected WIT package name
 - `version`: expected WIT package version
 - `interface`: expected exported evaluator interface
-- `strict`: when `true`, publish fails if the WIT file does not match these values
+- `strict`: retained for manifest compatibility; supported ABI declarations are
+  always verified, even when this is `false`
 
-If `[wit]` is omitted, the evaluator can still be prepared, but registry interface metadata is not populated from the manifest.
+Publication fails when `[wit]` is omitted, the declared ABI is unsupported, the
+referenced WIT does not match the declaration, or the compiled component does
+not link against the selected host adapter. Use `strict = true` for clarity.
+
+Before the first release, `v1.0.0` is the only supported contract. Released WIT
+files are immutable; see
+[Evaluator Compatibility](../guides/evaluator-compatibility.mdx) for the ABI
+release and upgrade rules.
 
 ---
 

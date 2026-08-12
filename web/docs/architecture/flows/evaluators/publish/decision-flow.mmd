@@ -9,7 +9,8 @@ config:
 flowchart TD
     Start([vigilo evaluator publish])
 
-    Compile{WASM compiles and validates?}
+    Contract{Declared WIT is the exact supported ABI?}
+    Compile{WASM compiles and links to its adapter?}
     Version{Evaluator version exists?}
     Hash{Evaluator hash exists?}
 
@@ -17,12 +18,15 @@ flowchart TD
 
     Success([Success response])
 
-    CompileFail([Compilation or validation error])
+    ContractFail([Unsupported or mismatched WIT error])
+    CompileFail([Compilation or typed-link error])
     VersionFail([Evaluator version conflict])
     HashFail([Duplicate evaluator code conflict])
 
-    Start --> Compile
+    Start --> Contract
 
+    Contract -- No --> ContractFail
+    Contract -- Yes --> Compile
     Compile -- No --> CompileFail
     Compile -- Yes --> Version
 

@@ -306,7 +306,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-wasip2
-      - run: cargo build -p sentiment-basic-en --target wasm32-wasip2 --release --locked
+      - name: Build evaluator ABI fixtures
+        run: |
+          mapfile -t packages < <(
+            cargo metadata --no-deps --format-version 1 |
+              jq -r '.packages[] | select(.metadata.vigilo["abi-fixture"] == true) | .name'
+          )
+          test "${#packages[@]}" -gt 0
+          package_args=()
+          for package in "${packages[@]}"; do
+            package_args+=(--package "$package")
+          done
+          cargo build --target wasm32-wasip2 --release --locked "${package_args[@]}"
+      - name: Verify evaluator ABI compatibility
+        run: >-
+          cargo test -p vigilo --locked --bin vigilo
+          evaluator_abi::tests::all_registered_evaluator_abis_execute_in_one_host
+          -- --ignored --exact
 
   web:
     name: Web

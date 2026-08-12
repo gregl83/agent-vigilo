@@ -44,6 +44,7 @@ A run can fail operationally because work did not complete, or complete with a f
 - [Runtime limits](https://agentvigilo.com/docs/configuration/runtime-limits): Wasm evaluator sandbox and worker concurrency controls.
 - [Outbox lifecycle](https://agentvigilo.com/docs/architecture/state/outbox-lifecycle/): durable event publication and retry behavior.
 - [Publishing evaluators](https://agentvigilo.com/docs/guides/publishing): build and publish versioned WASM evaluators.
+- [Evaluator compatibility](https://agentvigilo.com/docs/guides/evaluator-compatibility): versioned WIT ABIs, host adapters, and immutable run pinning.
 
 ## Core Stack
 

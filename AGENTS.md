@@ -10,7 +10,17 @@ This repository supports AI-assisted development, but generated changes must fol
 ## Repository Rules
 
 - Keep evaluator interface vocabulary as `input` and `output`.
-- Treat `wit/evaluator.wit` as the source of truth for evaluator ABI.
+- Treat `wit/evaluator/v1.0.0/evaluator.wit` as the sole pre-release source of
+  truth for the evaluator ABI. Freeze versioned contracts when they are released.
+- Keep each supported ABI self-contained under `vigilo/src/evaluator_abi/`: WIT
+  bindings, identity, validation, input/output mapping, execution, and fixture.
+- Register adapters explicitly in `vigilo/src/evaluator_abi.rs`. Adding an
+  ABI must not require worker, aggregation, database, or profile-policy changes.
+- A new ABI requires a frozen versioned WIT file, adapter module, real Wasm
+  fixture marked with `package.metadata.vigilo.abi-fixture`, registry entry,
+  compatibility-matrix coverage, and documentation.
+- Retain old adapters while published artifacts or reproducible runs depend on
+  them. Unknown identities and altered contract hashes must fail closed.
 - Keep evaluator execution contracts in `vigilo/src/contracts/`, not persistence models.
 - Preserve strict evaluator identifier format: `<namespace>/<name>:<version>`.
 - Avoid broad refactors outside the requested scope.

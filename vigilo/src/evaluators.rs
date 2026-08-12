@@ -148,6 +148,8 @@ pub(crate) async fn publish_vigilo_evaluator(
         interface_name: component.interface_name,
         interface_version: component.interface_version,
         wit_world: component.wit_world,
+        abi_contract_hash: component.abi.contract_hash,
+        abi_adapter: component.abi.adapter,
         runtime: component.runtime,
         runtime_version: component.runtime_version,
         runtime_fingerprint: component.runtime_fingerprint,

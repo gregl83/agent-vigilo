@@ -21,10 +21,10 @@ flowchart TD
 
     SetupManager["fa:fa-screwdriver-wrench <br/> <b>Setup Manager</b> <br/> <small>[Component: Rust]</small> <br/> <small>Applies schema migrations and bootstraps built-in evaluator packages.</small>"]:::component
     EvaluatorRegistry["fa:fa-box-archive <br/> <b>Evaluator Registry Manager</b> <br/> <small>[Component: Rust]</small> <br/> <small>Publishes, searches, inspects, tests, and changes evaluator registry state.</small>"]:::component
-    EvaluatorPreparer["fa:fa-cubes <br/> <b>Evaluator Package Preparer</b> <br/> <small>[Component: Rust / Wasmtime]</small> <br/> <small>Reads Vigilo.toml, validates WIT metadata, loads WASM bytes, and computes artifact metadata.</small>"]:::component
+    EvaluatorPreparer["fa:fa-cubes <br/> <b>Evaluator Package Preparer</b> <br/> <small>[Component: Rust / Wasmtime]</small> <br/> <small>Resolves the static ABI adapter registry, typed-links versioned components, and computes artifact metadata.</small>"]:::component
 
     RunPlanner["fa:fa-list-check <br/> <b>Run Input Planner</b> <br/> <small>[Component: Rust]</small> <br/> <small>Reads profile and dataset payloads, canonicalizes case data, and plans run chunks.</small>"]:::component
-    RunValidator["fa:fa-shield-halved <br/> <b>Run Validation Service</b> <br/> <small>[Component: Rust]</small> <br/> <small>Checks agent settings, evaluator references, runnable evaluator state, and case group coverage.</small>"]:::component
+    RunValidator["fa:fa-shield-halved <br/> <b>Run Validation Service</b> <br/> <small>[Component: Rust]</small> <br/> <small>Checks policy, resolves exact evaluator artifacts and ABIs, and builds the immutable execution plan.</small>"]:::component
     RunPersistence["fa:fa-database <br/> <b>Run Persistence Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Persists recoverable control plans, shard assignments, and idempotent execution seed data.</small>"]:::component
     RunQueries["fa:fa-magnifying-glass <br/> <b>Run Query, Export, and Shard Admin Component</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Serves routed run reads and manages shard route inspection, move, and rebalance operations.</small>"]:::component
 

@@ -42,9 +42,12 @@ use super::{
 };
 use crate::{
     context::Context,
-    contracts::run::{
-        RunDataset,
-        RunProfile,
+    contracts::{
+        evaluator_abi::EvaluatorExecutionPlan,
+        run::{
+            RunDataset,
+            RunProfile,
+        },
     },
     db::{
         tables::runs,
@@ -261,7 +264,7 @@ fn compute_dataset_version_id(
     }))
 }
 
-/// Computes the hash used to version aggregation behavior from profile groups.
+/// Computes the hash of all profile policy that can change scoring or gating.
 fn compute_aggregation_policy_hash(profile: &RunProfile) -> anyhow::Result<String> {
     let groups = profile
         .case_groups
@@ -269,6 +272,7 @@ fn compute_aggregation_policy_hash(profile: &RunProfile) -> anyhow::Result<Strin
         .map(|group| {
             json!({
                 "id": group.id,
+                "applies_to": group.applies_to,
                 "evaluators": group.evaluators,
                 "aggregation": group.aggregation,
             })
@@ -873,12 +877,18 @@ mod tests {
         let optional_hash = compute_aggregation_policy_hash(&profile).unwrap();
         profile.case_groups[0].evaluators[0].pass_threshold = 0.9;
         let threshold_hash = compute_aggregation_policy_hash(&profile).unwrap();
+        profile.case_groups[0]
+            .applies_to
+            .tags_all
+            .push("release".to_string());
+        let selector_hash = compute_aggregation_policy_hash(&profile).unwrap();
         profile.scorecard.gates[0].min_mean_score = Some(0.9);
         let scorecard_hash = compute_aggregation_policy_hash(&profile).unwrap();
 
         assert_ne!(required_hash, optional_hash);
         assert_ne!(optional_hash, threshold_hash);
-        assert_ne!(threshold_hash, scorecard_hash);
+        assert_ne!(threshold_hash, selector_hash);
+        assert_ne!(selector_hash, scorecard_hash);
     }
 
     #[test]

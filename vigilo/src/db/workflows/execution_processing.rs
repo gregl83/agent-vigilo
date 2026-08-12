@@ -50,10 +50,15 @@ use crate::{
             EvaluationStatus,
             EvaluatorInput,
             EvaluatorOutcome,
+            EvaluatorOutput,
             EvaluatorReportedError,
             Measurement,
             Severity,
             TestCase,
+        },
+        evaluator_abi::{
+            EvaluatorAbiIdentity,
+            ResolvedEvaluator,
         },
         evaluator_ref::parse_fully_qualified_evaluator,
         normalization,
@@ -72,10 +77,7 @@ use crate::{
         evaluator_results,
         evaluators,
     },
-    models::{
-        evaluator::EvaluatorState,
-        run_chunk::RunChunk,
-    },
+    models::run_chunk::RunChunk,
 };
 
 mod queries;
@@ -264,12 +266,90 @@ fn persisted_evaluator_manifest(
 pub(crate) struct RunEvaluatorCatalogEntry {
     pub(crate) evaluator_id: Uuid,
     pub(crate) evaluator_version: String,
-    pub(crate) evaluator_interface_version: Option<String>,
-    pub(crate) evaluator_runtime_version: Option<String>,
+    pub(crate) content_hash: String,
+    pub(crate) abi: EvaluatorAbiIdentity,
+    pub(crate) evaluator_runtime: String,
+    pub(crate) evaluator_runtime_version: String,
+    pub(crate) evaluator_runtime_fingerprint: String,
 }
 
 /// Lookup table keyed by fully qualified evaluator ref.
 pub(crate) type RunEvaluatorCatalog = BTreeMap<String, RunEvaluatorCatalogEntry>;
+
+fn evaluator_output_identity_error(
+    output: &EvaluatorOutput,
+    evaluator_ref: &str,
+    evaluator: &RunEvaluatorCatalogEntry,
+) -> Option<String> {
+    if output.evaluator_identifier() != evaluator_ref {
+        return Some(format!(
+            "evaluator reported identity '{}' but binding expected '{}'",
+            output.evaluator_identifier(),
+            evaluator_ref,
+        ));
+    }
+    if output
+        .evaluator
+        .interface_version
+        .as_deref()
+        .is_some_and(|version| version != evaluator.abi.version)
+    {
+        return Some(format!(
+            "evaluator '{}' reported interface version '{}' but run pinned '{}'",
+            evaluator_ref,
+            output
+                .evaluator
+                .interface_version
+                .as_deref()
+                .unwrap_or_default(),
+            evaluator.abi.version,
+        ));
+    }
+    if output
+        .evaluator
+        .content_hash
+        .as_deref()
+        .is_some_and(|hash| hash != evaluator.content_hash)
+    {
+        return Some(format!(
+            "evaluator '{}' reported content hash '{}' but run pinned '{}'",
+            evaluator_ref,
+            output.evaluator.content_hash.as_deref().unwrap_or_default(),
+            evaluator.content_hash,
+        ));
+    }
+    None
+}
+
+/// Builds a worker catalog only from the immutable run execution plan.
+pub(crate) fn build_pinned_evaluator_catalog(
+    resolved: Vec<ResolvedEvaluator>,
+) -> anyhow::Result<RunEvaluatorCatalog> {
+    let mut catalog = BTreeMap::new();
+    for evaluator in resolved {
+        crate::evaluator_abi::resolve_identity(&evaluator.abi)?;
+        let identity = parse_fully_qualified_evaluator(&evaluator.evaluator_ref)?;
+        let entry = RunEvaluatorCatalogEntry {
+            evaluator_id: evaluator.evaluator_id,
+            evaluator_version: identity.version,
+            content_hash: evaluator.content_hash,
+            abi: evaluator.abi,
+            evaluator_runtime: evaluator.runtime,
+            evaluator_runtime_version: evaluator.runtime_version,
+            evaluator_runtime_fingerprint: evaluator.runtime_fingerprint,
+        };
+        if catalog
+            .insert(evaluator.evaluator_ref.clone(), entry)
+            .is_some()
+        {
+            anyhow::bail!(
+                "run execution plan repeats evaluator '{}'",
+                evaluator.evaluator_ref
+            );
+        }
+    }
+    Ok(catalog)
+}
 
 const CASE_EXECUTION_PARALLELISM: usize = 8;
 const EVALUATOR_EXECUTION_PARALLELISM: usize = 8;
@@ -463,128 +543,58 @@ pub(crate) fn evaluator_refs_from_profile(profile: &RunProfile) -> anyhow::Resul
     Ok(unique_refs.into_iter().collect())
 }
 
-/// Builds the evaluator runtime catalog for a run profile in one database round trip.
-///
-/// The catalog validates that every referenced evaluator exists and is in a
-/// runnable state before workers begin processing cases.
-///
-/// Query behavior:
-/// - Parse each fully qualified evaluator ref from the profile.
-/// - Fetch runtime metadata for the unique identities in one table query.
-/// - Return a map keyed by the original ref string so execution can resolve
-///   bindings without repeatedly querying evaluator rows.
-pub(crate) async fn build_run_evaluator_catalog(
-    db: &PgPool,
-    profile: &RunProfile,
-) -> anyhow::Result<RunEvaluatorCatalog> {
-    let evaluator_refs = evaluator_refs_from_profile(profile)?;
-    let parsed = evaluator_refs
-        .iter()
-        .map(|evaluator_ref| {
-            parse_fully_qualified_evaluator(evaluator_ref)
-                .map(|identity| (evaluator_ref.clone(), identity))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    let identities = parsed
-        .iter()
-        .map(|(_, identity)| {
-            (
-                identity.namespace.clone(),
-                identity.name.clone(),
-                identity.version.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    let fetched =
-        evaluators::select_evaluator_runtime_metadata_by_identities(db, &identities).await?;
-    let fetched_by_identity = fetched
-        .into_iter()
-        .map(|row| {
-            let key = (row.namespace.clone(), row.name.clone(), row.version.clone());
-            (key, row)
-        })
-        .collect::<BTreeMap<_, _>>();
-
-    let mut catalog = BTreeMap::new();
-    for (evaluator_ref, identity) in parsed {
-        let key = (
-            identity.namespace.clone(),
-            identity.name.clone(),
-            identity.version.clone(),
-        );
-
-        let Some(evaluator) = fetched_by_identity.get(&key) else {
-            anyhow::bail!("evaluator '{}' no longer exists", evaluator_ref);
-        };
-
-        if !is_runnable_evaluator_state(&evaluator.state) {
-            anyhow::bail!(
-                "evaluator '{}' is not runnable in state '{:?}'",
-                evaluator_ref,
-                evaluator.state
-            );
-        }
-
-        catalog.insert(
-            evaluator_ref,
-            RunEvaluatorCatalogEntry {
-                evaluator_id: evaluator.id,
-                evaluator_version: evaluator.version.clone(),
-                evaluator_interface_version: evaluator.interface_version.clone(),
-                evaluator_runtime_version: Some(evaluator.runtime_version.clone()),
-            },
-        );
-    }
-
-    Ok(catalog)
-}
-
-/// Loads or returns a cached Wasmtime component for a fully qualified evaluator ref.
+/// Loads or returns the exact component pinned by a run execution plan.
 ///
 /// Component compilation is single-flight through the registry cache, so
-/// concurrent requests for the same evaluator share one load/compile operation.
+/// concurrent requests for the same artifact and ABI share one load operation.
 ///
-/// Query behavior: on a cache miss, fetch the evaluator registry row, validate
-/// that it is still runnable, compile the stored WASM bytes, and cache the
-/// compiled component for the process.
+/// On a cache miss, this fetches the evaluator by immutable database id,
+/// verifies every pinned artifact, ABI, and runtime field, typed-links the
+/// selected adapter, and caches the compiled component for the process.
 pub(crate) async fn get_or_load_component(
     context: &Context,
     evaluator_ref: &str,
-) -> anyhow::Result<wasmtime::component::Component> {
+    evaluator: &RunEvaluatorCatalogEntry,
+) -> anyhow::Result<crate::evaluator_abi::PreparedEvaluator> {
     let context = context.clone();
     let evaluator_ref_owned = evaluator_ref.to_string();
     let evaluator_ref_for_closure = evaluator_ref_owned.clone();
+    let evaluator = evaluator.clone();
+    let cache_key = evaluator.abi.cache_key(&evaluator.content_hash);
     let cache = context.reg().await?.clone();
     let component = cache
-        .try_get_with(evaluator_ref_owned.clone(), async move {
-            let identity = parse_fully_qualified_evaluator(&evaluator_ref_for_closure)?;
+        .try_get_with(cache_key, async move {
             let db = context.dbr().await?.control().await?;
-            let evaluator_record = evaluators::select_evaluator(
-                db,
-                &identity.namespace,
-                &identity.name,
-                &identity.version,
-            )
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "evaluator '{}' was not found in registry during worker execution",
-                    evaluator_ref_for_closure
-                )
-            })?;
-
-            if !is_runnable_evaluator_state(&evaluator_record.state) {
+            let evaluator_record = evaluators::select_evaluator_by_id(db, evaluator.evaluator_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "pinned evaluator '{}' ({}) was not found during worker execution",
+                        evaluator_ref_for_closure,
+                        evaluator.evaluator_id,
+                    )
+                })?;
+            let actual_interface = evaluator_record.interface_name.rsplit_once('/');
+            let matches_plan = evaluator_record.content_hash == evaluator.content_hash
+                && actual_interface.is_some_and(|(package, interface)| {
+                    package == evaluator.abi.package && interface == evaluator.abi.interface
+                })
+                && evaluator_record.wit_world == evaluator.abi.world
+                && evaluator_record.interface_version == evaluator.abi.version
+                && evaluator_record.abi_contract_hash == evaluator.abi.contract_hash
+                && evaluator_record.abi_adapter == evaluator.abi.adapter
+                && evaluator_record.runtime == evaluator.evaluator_runtime
+                && evaluator_record.runtime_version == evaluator.evaluator_runtime_version
+                && evaluator_record.runtime_fingerprint == evaluator.evaluator_runtime_fingerprint;
+            if !matches_plan {
                 anyhow::bail!(
-                    "evaluator '{}' is not runnable in state '{:?}'",
-                    evaluator_ref_for_closure,
-                    evaluator_record.state
+                    "pinned evaluator '{}' no longer matches the run execution plan",
+                    evaluator_ref_for_closure
                 );
             }
 
             let wasm = context.wasm().await?;
-            wasm.compile_component(&evaluator_record.wasm_bytes)
+            wasm.compile_evaluator(&evaluator_record.wasm_bytes, &evaluator.abi)
         })
         .await
         .map_err(|err| {
@@ -948,7 +958,9 @@ async fn evaluate_case_execution(
                 tasks.spawn(async move {
                     let policy_hash = normalization_policy_hash(&binding.normalization)?;
                     let wasm = context.wasm().await?.clone();
-                    let component = get_or_load_component(&context, &binding.evaluator_ref).await?;
+                    let component =
+                        get_or_load_component(&context, &binding.evaluator_ref, &evaluator_entry)
+                            .await?;
                     let wasm_permit = wasm.acquire_evaluation_permit().await?;
 
                     let evaluator_input = EvaluatorInput {
@@ -980,12 +992,10 @@ async fn evaluate_case_execution(
                             evaluator_version: evaluator_entry.evaluator_version.clone(),
                             evaluator_profile_id: profile_id.clone(),
                             evaluator_profile_version: profile_version.clone(),
-                            evaluator_interface_version: evaluator_entry
-                                .evaluator_interface_version
-                                .clone(),
-                            evaluator_runtime_version: evaluator_entry
-                                .evaluator_runtime_version
-                                .clone(),
+                            evaluator_interface_version: Some(evaluator_entry.abi.version.clone()),
+                            evaluator_runtime_version: Some(
+                                evaluator_entry.evaluator_runtime_version.clone(),
+                            ),
                             dimension: binding.dimension.clone(),
                             outcome: "error".to_string(),
                             judgment: None,
@@ -1014,13 +1024,12 @@ async fn evaluate_case_execution(
                     let (record, row) = match output {
                         Ok(evaluator_output) => {
                             let serialized_output = serde_json::to_value(&evaluator_output)?;
-                            if evaluator_output.evaluator_identifier() != binding.evaluator_ref {
+                            if let Some(reason) = evaluator_output_identity_error(
+                                &evaluator_output,
+                                &binding.evaluator_ref,
+                                &evaluator_entry,
+                            ) {
                                 let status = EvaluationStatus::Error;
-                                let reason = format!(
-                                    "evaluator reported identity '{}' but binding expected '{}'",
-                                    evaluator_output.evaluator_identifier(),
-                                    binding.evaluator_ref
-                                );
                                 let mut row = base_row(&status);
                                 row.error_code = Some("identity_mismatch".to_string());
                                 row.error_message = Some(reason.clone());
@@ -1505,14 +1514,6 @@ pub(crate) async fn process_case_batch_execution(
     Ok(processed)
 }
 
-/// Returns whether an evaluator lifecycle state is executable by workers.
-pub(crate) fn is_runnable_evaluator_state(state: &EvaluatorState) -> bool {
-    matches!(
-        state,
-        EvaluatorState::Active | EvaluatorState::Deprecated | EvaluatorState::Yanked
-    )
-}
-
 #[cfg(test)]
 #[path = "execution_processing/postgres_tests.rs"]
 mod postgres_tests;
@@ -1522,7 +1523,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
+        RunEvaluatorCatalogEntry,
         evaluation_plan_for_case,
+        evaluator_output_identity_error,
         interpret_measurement,
         make_test_case,
         map_evaluation_status,
@@ -1544,6 +1547,9 @@ mod tests {
         contracts::{
             evaluator::{
                 EvaluationStatus,
+                EvaluatorIdentity,
+                EvaluatorOutcome,
+                EvaluatorOutput,
                 Measurement,
                 Severity,
             },
@@ -1569,6 +1575,36 @@ mod tests {
         db::workflows::chunk_processing::WorkerCaseBatchItem,
     };
 
+    fn evaluator_output(
+        interface_version: Option<&str>,
+        content_hash: Option<&str>,
+    ) -> EvaluatorOutput {
+        EvaluatorOutput {
+            evaluator: EvaluatorIdentity {
+                namespace: "vigilo".to_string(),
+                name: "quality".to_string(),
+                version: "1.0.0".to_string(),
+                content_hash: content_hash.map(ToOwned::to_owned),
+                interface_version: interface_version.map(ToOwned::to_owned),
+            },
+            outcome: EvaluatorOutcome::Completed(Measurement::Binary { value: true }),
+            diagnostics: Vec::new(),
+            metadata: json!({}),
+        }
+    }
+
+    fn evaluator_catalog_entry() -> RunEvaluatorCatalogEntry {
+        RunEvaluatorCatalogEntry {
+            evaluator_id: Uuid::nil(),
+            evaluator_version: "1.0.0".to_string(),
+            content_hash: "artifact-hash".to_string(),
+            abi: crate::evaluator_abi::current_identity(),
+            evaluator_runtime: "wasmtime".to_string(),
+            evaluator_runtime_version: "44.0.0".to_string(),
+            evaluator_runtime_fingerprint: "runtime-fingerprint".to_string(),
+        }
+    }
+
     #[test]
     fn attempt_allocation_batch_accepts_valid_and_empty_inputs() {
         assert_eq!(
@@ -1587,6 +1623,39 @@ mod tests {
         ] {
             assert!(!error.to_string().is_empty());
         }
+    }
+
+    #[test]
+    fn evaluator_output_identity_must_match_the_pinned_artifact_and_abi() {
+        let entry = evaluator_catalog_entry();
+        let evaluator_ref = "vigilo/quality:1.0.0";
+
+        assert!(
+            evaluator_output_identity_error(
+                &evaluator_output(Some("1.0.0"), Some("artifact-hash")),
+                evaluator_ref,
+                &entry,
+            )
+            .is_none()
+        );
+        assert!(
+            evaluator_output_identity_error(
+                &evaluator_output(Some("0.1.0"), Some("artifact-hash")),
+                evaluator_ref,
+                &entry,
+            )
+            .unwrap()
+            .contains("interface version")
+        );
+        assert!(
+            evaluator_output_identity_error(
+                &evaluator_output(Some("1.0.0"), Some("different")),
+                evaluator_ref,
+                &entry,
+            )
+            .unwrap()
+            .contains("content hash")
+        );
     }
 
     fn evaluator_binding(evaluator_ref: &str, dimension: &str) -> EvaluatorBinding {

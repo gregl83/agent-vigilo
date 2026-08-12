@@ -637,6 +637,10 @@ async fn seed_sentiment_evaluator(primary: &PgPool) -> anyhow::Result<()> {
     })?;
     let wasm_size_bytes = wasm_bytes.len() as i64;
     let content_hash = blake3::hash(&wasm_bytes).to_hex().to_string();
+    let abi_contract_hash =
+        blake3::hash(include_bytes!("../../wit/evaluator/v1.0.0/evaluator.wit"))
+            .to_hex()
+            .to_string();
 
     sqlx::query(
         r#"
@@ -650,6 +654,8 @@ async fn seed_sentiment_evaluator(primary: &PgPool) -> anyhow::Result<()> {
             interface_name,
             interface_version,
             wit_world,
+            abi_contract_hash,
+            abi_adapter,
             runtime,
             runtime_version,
             runtime_fingerprint,
@@ -665,9 +671,11 @@ async fn seed_sentiment_evaluator(primary: &PgPool) -> anyhow::Result<()> {
             $1,
             $2,
             $3,
-            'evaluator',
+            'vigilo:evaluator/evaluator',
             '1.0.0',
             'evaluator-world',
+            $4,
+            'vigilo-evaluator-v1@1',
             'wasmtime',
             'integration',
             'integration',
@@ -683,6 +691,8 @@ async fn seed_sentiment_evaluator(primary: &PgPool) -> anyhow::Result<()> {
             interface_name = EXCLUDED.interface_name,
             interface_version = EXCLUDED.interface_version,
             wit_world = EXCLUDED.wit_world,
+            abi_contract_hash = EXCLUDED.abi_contract_hash,
+            abi_adapter = EXCLUDED.abi_adapter,
             runtime = EXCLUDED.runtime,
             runtime_version = EXCLUDED.runtime_version,
             runtime_fingerprint = EXCLUDED.runtime_fingerprint,
@@ -696,6 +706,7 @@ async fn seed_sentiment_evaluator(primary: &PgPool) -> anyhow::Result<()> {
     .bind(content_hash)
     .bind(wasm_bytes)
     .bind(wasm_size_bytes)
+    .bind(abi_contract_hash)
     .execute(primary)
     .await?;
 

@@ -62,12 +62,16 @@ pub(crate) struct EvaluatorDraft {
     pub(crate) content_hash: String,
     /// Serialized WebAssembly component bytes.
     pub(crate) wasm_bytes: Vec<u8>,
-    /// Optional WIT interface name implemented by the component.
-    pub(crate) interface_name: Option<String>,
-    /// Optional WIT interface version implemented by the component.
-    pub(crate) interface_version: Option<String>,
-    /// Optional WIT world used to instantiate the component.
-    pub(crate) wit_world: Option<String>,
+    /// Verified WIT interface name implemented by the component.
+    pub(crate) interface_name: String,
+    /// Verified WIT interface version implemented by the component.
+    pub(crate) interface_version: String,
+    /// Verified WIT world used to instantiate the component.
+    pub(crate) wit_world: String,
+    /// Hash of the immutable WIT contract verified by the host.
+    pub(crate) abi_contract_hash: String,
+    /// Versioned host adapter selected for this contract.
+    pub(crate) abi_adapter: String,
     /// Runtime family used to execute the component.
     pub(crate) runtime: String,
     /// Runtime version used when preparing the component.
@@ -108,12 +112,16 @@ pub(crate) struct Evaluator {
     pub(crate) wasm_bytes: Vec<u8>,
     /// Size of `wasm_bytes` recorded for listing and audit queries.
     pub(crate) wasm_size_bytes: i64,
-    /// Optional WIT interface name implemented by the component.
-    pub(crate) interface_name: Option<String>,
-    /// Optional WIT interface version implemented by the component.
-    pub(crate) interface_version: Option<String>,
-    /// Optional WIT world used to instantiate the component.
-    pub(crate) wit_world: Option<String>,
+    /// Verified WIT interface name implemented by the component.
+    pub(crate) interface_name: String,
+    /// Verified WIT interface version implemented by the component.
+    pub(crate) interface_version: String,
+    /// Verified WIT world used to instantiate the component.
+    pub(crate) wit_world: String,
+    /// Hash of the immutable WIT contract verified by the host.
+    pub(crate) abi_contract_hash: String,
+    /// Versioned host adapter selected for this contract.
+    pub(crate) abi_adapter: String,
     /// Runtime family used to execute the component.
     pub(crate) runtime: String,
     /// Runtime version used when preparing the component.

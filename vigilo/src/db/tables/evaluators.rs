@@ -24,8 +24,15 @@ pub(crate) struct EvaluatorRuntimeMetadata {
     pub(crate) version: String,
     pub(crate) id: Uuid,
     pub(crate) state: EvaluatorState,
-    pub(crate) interface_version: Option<String>,
+    pub(crate) interface_version: String,
+    pub(crate) interface_name: String,
+    pub(crate) wit_world: String,
+    pub(crate) content_hash: String,
+    pub(crate) abi_contract_hash: String,
+    pub(crate) abi_adapter: String,
+    pub(crate) runtime: String,
     pub(crate) runtime_version: String,
+    pub(crate) runtime_fingerprint: String,
 }
 
 /// Loads runtime metadata for a batch of fully qualified evaluator identities.
@@ -56,8 +63,15 @@ pub(crate) async fn select_evaluator_runtime_metadata_by_identities(
             e.version,
             e.id,
             e.state,
+            e.interface_name,
             e.interface_version,
-            e.runtime_version
+            e.wit_world,
+            e.content_hash,
+            e.abi_contract_hash,
+            e.abi_adapter,
+            e.runtime,
+            e.runtime_version,
+            e.runtime_fingerprint
         FROM requested r
         JOIN evaluators e
           ON e.namespace = r.namespace
@@ -86,14 +100,16 @@ pub(crate) async fn insert_evaluator(
         INSERT INTO evaluators (
             namespace, name, version, content_hash, wasm_bytes,
             wasm_size_bytes, interface_name, interface_version,
-            wit_world, runtime, runtime_version, runtime_fingerprint,
+            wit_world, abi_contract_hash, abi_adapter,
+            runtime, runtime_version, runtime_fingerprint,
             description, tags, metadata
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
         RETURNING
             id, namespace, name, version, content_hash, wasm_bytes,
             wasm_size_bytes, interface_name, interface_version,
-            wit_world, runtime, runtime_version, runtime_fingerprint,
+            wit_world, abi_contract_hash, abi_adapter,
+            runtime, runtime_version, runtime_fingerprint,
             description, tags, metadata, state, state_reason, created_at, updated_at
         "#,
     )
@@ -106,6 +122,8 @@ pub(crate) async fn insert_evaluator(
     .bind(&draft.interface_name)
     .bind(&draft.interface_version)
     .bind(&draft.wit_world)
+    .bind(&draft.abi_contract_hash)
+    .bind(&draft.abi_adapter)
     .bind(&draft.runtime)
     .bind(&draft.runtime_version)
     .bind(&draft.runtime_fingerprint)
@@ -128,7 +146,8 @@ pub(crate) async fn select_evaluator_by_id(
         SELECT
             id, namespace, name, version, content_hash, wasm_bytes,
             wasm_size_bytes, interface_name, interface_version,
-            wit_world, runtime, runtime_version, runtime_fingerprint,
+            wit_world, abi_contract_hash, abi_adapter,
+            runtime, runtime_version, runtime_fingerprint,
             description, tags, metadata, state, state_reason, created_at, updated_at
         FROM evaluators
         WHERE id = $1
@@ -152,7 +171,8 @@ pub(crate) async fn select_latest_evaluator_by_name(
         SELECT
             id, namespace, name, version, content_hash, wasm_bytes,
             wasm_size_bytes, interface_name, interface_version,
-            wit_world, runtime, runtime_version, runtime_fingerprint,
+            wit_world, abi_contract_hash, abi_adapter,
+            runtime, runtime_version, runtime_fingerprint,
             description, tags, metadata, state, state_reason, created_at, updated_at
         FROM evaluators
         WHERE namespace = $1 AND name = $2
@@ -180,7 +200,8 @@ pub(crate) async fn select_evaluator(
         SELECT
             id, namespace, name, version, content_hash, wasm_bytes,
             wasm_size_bytes, interface_name, interface_version,
-            wit_world, runtime, runtime_version, runtime_fingerprint,
+            wit_world, abi_contract_hash, abi_adapter,
+            runtime, runtime_version, runtime_fingerprint,
             description, tags, metadata, state, state_reason, created_at, updated_at
         FROM evaluators
         WHERE namespace = $1 AND name = $2 AND version = $3
@@ -207,7 +228,8 @@ pub(crate) async fn select_evaluator_by_content_hash(
         SELECT
             id, namespace, name, version, content_hash, wasm_bytes,
             wasm_size_bytes, interface_name, interface_version,
-            wit_world, runtime, runtime_version, runtime_fingerprint,
+            wit_world, abi_contract_hash, abi_adapter,
+            runtime, runtime_version, runtime_fingerprint,
             description, tags, metadata, state, state_reason, created_at, updated_at
         FROM evaluators
         WHERE namespace = $1 AND content_hash = $2
@@ -232,7 +254,8 @@ pub(crate) async fn list_evaluators(
         SELECT
             id, namespace, name, version, content_hash, wasm_bytes,
             wasm_size_bytes, interface_name, interface_version,
-            wit_world, runtime, runtime_version, runtime_fingerprint,
+            wit_world, abi_contract_hash, abi_adapter,
+            runtime, runtime_version, runtime_fingerprint,
             description, tags, metadata, state, state_reason, created_at, updated_at
         FROM evaluators
         WHERE namespace = $1

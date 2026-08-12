@@ -2,7 +2,7 @@
 //!
 //! This module prepares evaluator artifacts for publishing, compiles registry
 //! components, and executes evaluator tests inside a Wasmtime component-model
-//! sandbox. Keep WIT mapping here aligned with `wit/evaluator.wit`; resource
+//! sandbox. Keep each adapter aligned with its versioned WIT contract; resource
 //! limits, fuel, timeout, and log caps must be enforced for every invocation.
 
 use std::{
@@ -52,7 +52,6 @@ use wasmtime::{
     Store,
     StoreLimits,
     StoreLimitsBuilder,
-    component,
     component::ResourceTable,
 };
 use wasmtime_wasi::{
@@ -66,26 +65,21 @@ use super::super::manifest::{
     Wit,
     read_manifest,
 };
-use crate::contracts::evaluator::{
-    Abstention,
-    DiagnosticFinding,
-    EvaluatorIdentity,
-    EvaluatorInput,
-    EvaluatorOutcome,
-    EvaluatorOutput,
-    EvaluatorReportedError,
-    Measurement,
-    Severity,
+use crate::{
+    contracts::{
+        evaluator::{
+            EvaluatorInput,
+            EvaluatorOutput,
+        },
+        evaluator_abi::EvaluatorAbiIdentity,
+    },
+    evaluator_abi::{
+        PreparedEvaluator,
+        resolve_declaration,
+    },
 };
 
-mod evaluator_test_bindings {
-    wasmtime::component::bindgen!({
-        path: "../wit/evaluator.wit",
-        world: "evaluator-world",
-    });
-}
-
-struct EvaluatorTestHost {
+pub(crate) struct EvaluatorHost {
     table: ResourceTable,
     ctx: WasiCtx,
     limits: StoreLimits,
@@ -94,7 +88,7 @@ struct EvaluatorTestHost {
     log_messages: u32,
 }
 
-impl WasiView for EvaluatorTestHost {
+impl WasiView for EvaluatorHost {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
             ctx: &mut self.ctx,
@@ -103,41 +97,8 @@ impl WasiView for EvaluatorTestHost {
     }
 }
 
-impl evaluator_test_bindings::vigilo::evaluator::executor::Host for EvaluatorTestHost {
-    fn trace(&mut self, msg: String) {
-        if let Some(msg) = self.capped_log_message(msg) {
-            debug!("evaluator.trace: {}", msg);
-        }
-    }
-
-    fn debug(&mut self, msg: String) {
-        if let Some(msg) = self.capped_log_message(msg) {
-            debug!("evaluator.debug: {}", msg);
-        }
-    }
-
-    fn warn(&mut self, msg: String) {
-        if let Some(msg) = self.capped_log_message(msg) {
-            warn!("evaluator.warn: {}", msg);
-        }
-    }
-
-    fn error(&mut self, msg: String) {
-        if let Some(msg) = self.capped_log_message(msg) {
-            warn!("evaluator.error: {}", msg);
-        }
-    }
-
-    fn send_http_request(
-        &mut self,
-        _req: evaluator_test_bindings::vigilo::evaluator::executor::HttpRequest,
-    ) -> Result<evaluator_test_bindings::vigilo::evaluator::executor::HttpResponse, String> {
-        Err("send_http_request is not enabled yet; outbound HTTP policy enforcement is not configured".to_string())
-    }
-}
-
-impl EvaluatorTestHost {
-    fn capped_log_message(&mut self, msg: String) -> Option<String> {
+impl EvaluatorHost {
+    pub(crate) fn capped_log_message(&mut self, msg: String) -> Option<String> {
         if self.max_log_messages == 0 || self.log_messages >= self.max_log_messages {
             return None;
         }
@@ -158,177 +119,6 @@ fn truncate_utf8_bytes(mut value: String, max_bytes: usize) -> String {
     }
     value.truncate(end);
     value
-}
-
-/// Parse JSON payload from raw str.
-fn parse_json_payload(field_name: &str, raw: &str) -> anyhow::Result<Value> {
-    if raw.trim().is_empty() {
-        return Ok(Value::Object(Default::default()));
-    }
-
-    serde_json::from_str(raw).map_err(|err| anyhow::anyhow!("invalid {} JSON: {}", field_name, err))
-}
-
-fn serialize_json_payload(field_name: &str, value: &Value) -> anyhow::Result<String> {
-    serde_json::to_string(value)
-        .map_err(|err| anyhow::anyhow!("invalid {} JSON value: {}", field_name, err))
-}
-
-fn serialize_optional_json_payload(
-    field_name: &str,
-    value: &Option<Value>,
-) -> anyhow::Result<Option<String>> {
-    value
-        .as_ref()
-        .map(|v| serialize_json_payload(field_name, v))
-        .transpose()
-}
-
-fn map_input_to_wit_input(
-    input: EvaluatorInput,
-) -> anyhow::Result<evaluator_test_bindings::vigilo::evaluator::types::Input> {
-    let tool_calls = input
-        .actual
-        .tool_calls
-        .into_iter()
-        .map(|call| {
-            Ok(
-                evaluator_test_bindings::vigilo::evaluator::types::ToolCall {
-                    name: call.name,
-                    arguments_json: serialize_json_payload("tool-call.arguments", &call.arguments)?,
-                    result_json: serialize_optional_json_payload("tool-call.result", &call.result)?,
-                },
-            )
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    let trace = input
-        .actual
-        .trace
-        .into_iter()
-        .map(|event| {
-            Ok(
-                evaluator_test_bindings::vigilo::evaluator::types::AgentTraceEvent {
-                    kind: event.kind,
-                    name: event.name,
-                    payload_json: serialize_json_payload("trace.payload", &event.payload)?,
-                },
-            )
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    Ok(evaluator_test_bindings::vigilo::evaluator::types::Input {
-        run_id: input.run_id,
-        execution_id: input.execution_id,
-        attempt_id: input.attempt_id,
-        test_case: evaluator_test_bindings::vigilo::evaluator::types::TestCase {
-            id: input.case.id,
-            task_type: input.case.task_type,
-            case_group: input.case.case_group,
-            input_json: serialize_json_payload("case.input", &input.case.input)?,
-            expected_json: serialize_optional_json_payload("case.expected", &input.case.expected)?,
-            context_json: serialize_optional_json_payload("case.context", &input.case.context)?,
-            tags: input.case.tags,
-            metadata_json: serialize_json_payload(
-                "case.metadata",
-                &serde_json::to_value(input.case.metadata)?,
-            )?,
-        },
-        actual: evaluator_test_bindings::vigilo::evaluator::types::AgentOutput {
-            text: input.actual.text,
-            structured_json: serialize_optional_json_payload(
-                "actual.structured",
-                &input.actual.structured,
-            )?,
-            tool_calls,
-            trace,
-            raw_json: serialize_json_payload("actual.raw", &input.actual.raw)?,
-            metadata_json: serialize_json_payload("actual.metadata", &input.actual.metadata)?,
-        },
-        evaluator_config_json: serialize_json_payload("evaluator_config", &input.evaluator_config)?,
-    })
-}
-
-/// Map bound evaluator severity to evaluation severity type.
-fn map_severity(severity: evaluator_test_bindings::vigilo::evaluator::types::Severity) -> Severity {
-    use evaluator_test_bindings::vigilo::evaluator::types::Severity as BindingSeverity;
-
-    match severity {
-        BindingSeverity::None => Severity::None,
-        BindingSeverity::Low => Severity::Low,
-        BindingSeverity::Medium => Severity::Medium,
-        BindingSeverity::High => Severity::High,
-        BindingSeverity::Critical => Severity::Critical,
-    }
-}
-
-/// Map a bound evaluator measurement without assigning policy semantics.
-fn map_measurement(
-    measurement: evaluator_test_bindings::vigilo::evaluator::types::Measurement,
-) -> Measurement {
-    use evaluator_test_bindings::vigilo::evaluator::types::Measurement as BindingMeasurement;
-
-    match measurement {
-        BindingMeasurement::Binary(value) => Measurement::Binary { value },
-        BindingMeasurement::Numeric(numeric) => Measurement::Numeric {
-            value: numeric.value,
-            unit: numeric.unit,
-        },
-        BindingMeasurement::Ordinal(value) => Measurement::Ordinal { value },
-    }
-}
-
-/// Map WIT evaluator output to host output struct.
-fn map_wit_output_to_output(
-    output: evaluator_test_bindings::vigilo::evaluator::types::Output,
-) -> anyhow::Result<EvaluatorOutput> {
-    let metadata = parse_json_payload("metadata-json", &output.metadata_json)?;
-
-    use evaluator_test_bindings::vigilo::evaluator::types::EvaluatorOutcome as BindingOutcome;
-
-    let outcome = match output.outcome {
-        BindingOutcome::Completed(measurement) => {
-            EvaluatorOutcome::Completed(map_measurement(measurement))
-        }
-        BindingOutcome::Abstained(abstention) => {
-            if abstention.category.trim().is_empty() {
-                anyhow::bail!("abstention category must not be empty");
-            }
-            EvaluatorOutcome::Abstained(Abstention {
-                category: abstention.category,
-                reason: abstention.reason,
-            })
-        }
-    };
-    let diagnostics = output
-        .diagnostics
-        .into_iter()
-        .map(|finding| {
-            if finding.category.trim().is_empty() {
-                anyhow::bail!("diagnostic category must not be empty");
-            }
-            Ok(DiagnosticFinding {
-                severity: map_severity(finding.severity),
-                category: finding.category,
-                reason: finding.reason,
-                evidence: parse_json_payload("evidence-json", &finding.evidence_json)?,
-                tags: finding.tags,
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-
-    Ok(EvaluatorOutput {
-        evaluator: EvaluatorIdentity {
-            namespace: output.evaluator.namespace,
-            name: output.evaluator.name,
-            version: output.evaluator.version,
-            content_hash: output.evaluator.content_hash,
-            interface_version: output.evaluator.interface_version,
-        },
-        outcome,
-        diagnostics,
-        metadata,
-    })
 }
 
 struct PackageMetadata {
@@ -358,10 +148,9 @@ struct WitDocument {
     worlds: Vec<WitWorld>,
 }
 
+#[derive(Debug)]
 struct WitMetadata {
-    interface_name: Option<String>,
-    interface_version: Option<String>,
-    wit_world: Option<String>,
+    abi: Option<EvaluatorAbiIdentity>,
 }
 
 const PACKAGE_METADATA_SECTION: &str = "vigilo.package";
@@ -597,11 +386,7 @@ fn resolve_wit_metadata(
     manifest_wit: Option<&Wit>,
 ) -> anyhow::Result<WitMetadata> {
     let Some(wit) = manifest_wit else {
-        return Ok(WitMetadata {
-            interface_name: None,
-            interface_version: None,
-            wit_world: None,
-        });
+        return Ok(WitMetadata { abi: None });
     };
 
     let wit_path = package_path.join(&wit.path);
@@ -613,51 +398,48 @@ fn resolve_wit_metadata(
         .map(|w| w.exports.iter().any(|e| e == &wit.interface))
         .unwrap_or(false);
 
+    let abi_identity = resolve_declaration(&wit.package, &wit.world, &wit.interface, &wit.version)?
+        .identity()
+        .clone();
     let package_matches = parsed.package == wit.package;
     let version_matches = parsed.version.as_deref() == Some(wit.version.as_str());
     let world_matches = world.is_some();
     let interface_matches = has_interface_export;
 
-    if wit.strict {
-        if !package_matches {
-            return Err(anyhow::anyhow!(
-                "WIT package mismatch (config={}, file={})",
-                wit.package,
-                parsed.package,
-            ));
-        }
-        if !version_matches {
-            return Err(anyhow::anyhow!(
-                "WIT version mismatch (config={}, file={})",
-                wit.version,
-                parsed.version.unwrap_or_else(|| "<missing>".to_string()),
-            ));
-        }
-        if !world_matches {
-            return Err(anyhow::anyhow!(
-                "WIT world '{}' not found in {}",
-                wit.world,
-                wit_path.display(),
-            ));
-        }
-        if !interface_matches {
-            return Err(anyhow::anyhow!(
-                "WIT interface '{}' is not exported by world '{}'",
-                wit.interface,
-                wit.world,
-            ));
-        }
-    } else if !package_matches || !version_matches || !world_matches || !interface_matches {
-        warn!(
-            "WIT config does not fully match {} (strict=false), continuing with configured values",
-            wit_path.display()
+    if !wit.strict {
+        warn!("[wit].strict=false is deprecated; supported evaluator ABIs are always verified");
+    }
+    if !package_matches {
+        anyhow::bail!(
+            "WIT package mismatch (config={}, file={})",
+            wit.package,
+            parsed.package,
+        );
+    }
+    if !version_matches {
+        anyhow::bail!(
+            "WIT version mismatch (config={}, file={})",
+            wit.version,
+            parsed.version.unwrap_or_else(|| "<missing>".to_string()),
+        );
+    }
+    if !world_matches {
+        anyhow::bail!(
+            "WIT world '{}' not found in {}",
+            wit.world,
+            wit_path.display(),
+        );
+    }
+    if !interface_matches {
+        anyhow::bail!(
+            "WIT interface '{}' is not exported by world '{}'",
+            wit.interface,
+            wit.world,
         );
     }
 
     Ok(WitMetadata {
-        interface_name: Some(format!("{}/{}", wit.package, wit.interface)),
-        interface_version: Some(wit.version.clone()),
-        wit_world: Some(wit.world.clone()),
+        abi: Some(abi_identity),
     })
 }
 
@@ -799,14 +581,15 @@ pub struct Component {
     pub description: Option<String>,
     pub tags: Value,
     pub metadata: Value,
-    pub interface_name: Option<String>,
-    pub interface_version: Option<String>,
-    pub wit_world: Option<String>,
+    pub interface_name: String,
+    pub interface_version: String,
+    pub wit_world: String,
+    pub abi: EvaluatorAbiIdentity,
     pub runtime: String,
     pub runtime_version: String,
     pub runtime_fingerprint: String,
     #[allow(dead_code)]
-    pub component: component::Component,
+    pub component: PreparedEvaluator,
     pub wasm_hash: String,
     pub wasm_bytes: Vec<u8>,
     #[allow(dead_code)]
@@ -958,6 +741,9 @@ impl Wasm {
         let manifest = read_manifest(&package_path)?;
         let manifest_profile = manifest.get_profile(&profile)?;
         let wit_metadata = resolve_wit_metadata(&package_path, manifest.wit.as_ref())?;
+        let abi = wit_metadata.abi.clone().ok_or_else(|| {
+            anyhow::anyhow!("Vigilo.toml must declare a supported [wit] evaluator contract")
+        })?;
 
         let package_metadata = get_package_metadata(&package_path, &manifest.package.manifest)?;
         let evaluator_metadata = resolve_evaluator_metadata(&manifest.package, &package_metadata)?;
@@ -1009,8 +795,8 @@ impl Wasm {
         )?;
         let wasm_hash = blake3::hash(&wasm_bytes).to_hex().to_string();
 
-        let component = component::Component::new(&self.engine, &wasm_bytes)?;
-        let serialized = component.serialize()?;
+        let prepared = self.compile_evaluator(&wasm_bytes, &abi)?;
+        let serialized = prepared.serialize()?;
 
         let runtime_version = resolve_runtime_version()?;
 
@@ -1020,13 +806,14 @@ impl Wasm {
             description: evaluator_metadata.description,
             tags: evaluator_metadata.tags,
             metadata: evaluator_metadata.metadata,
-            interface_name: wit_metadata.interface_name,
-            interface_version: wit_metadata.interface_version,
-            wit_world: wit_metadata.wit_world,
+            interface_name: format!("{}/{}", abi.package, abi.interface),
+            interface_version: abi.version.clone(),
+            wit_world: abi.world.clone(),
+            abi,
             runtime: WASM_RUNTIME_NAME.to_string(),
             runtime_version,
             runtime_fingerprint: self.fingerprint.clone(),
-            component,
+            component: prepared,
             wasm_hash,
             wasm_bytes,
             serialized,
@@ -1034,38 +821,42 @@ impl Wasm {
     }
 
     /// Compile evaluator wasm bytes into a component for registry caching.
-    pub fn compile_component(&self, wasm_bytes: &[u8]) -> anyhow::Result<component::Component> {
-        Ok(component::Component::new(&self.engine, wasm_bytes)?)
+    pub fn compile_evaluator(
+        &self,
+        wasm_bytes: &[u8],
+        identity: &EvaluatorAbiIdentity,
+    ) -> anyhow::Result<PreparedEvaluator> {
+        PreparedEvaluator::compile(self, wasm_bytes, identity)
     }
 
     /// Run evaluator in test mode.
     pub fn test_evaluator(
         &self,
         wasm_bytes: &[u8],
+        abi: &EvaluatorAbiIdentity,
         input: EvaluatorInput,
     ) -> anyhow::Result<EvaluatorOutput> {
-        let component = component::Component::new(&self.engine, wasm_bytes)?;
-        self.test_evaluator_component(&component, input)
+        let evaluator = self.compile_evaluator(wasm_bytes, abi)?;
+        self.test_evaluator_component(&evaluator, input)
     }
 
-    /// Run evaluator in test mode using a precompiled component.
+    /// Run evaluator in test mode using a prepared component and adapter.
     pub fn test_evaluator_component(
         &self,
-        component: &component::Component,
+        evaluator: &PreparedEvaluator,
         input: EvaluatorInput,
     ) -> anyhow::Result<EvaluatorOutput> {
-        let mut linker = component::Linker::new(&self.engine);
+        evaluator.execute(self, input)
+    }
 
-        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
+    pub(crate) fn engine(&self) -> &Engine {
+        &self.engine
+    }
 
-        evaluator_test_bindings::vigilo::evaluator::executor::add_to_linker::<
-            _,
-            wasmtime::component::HasSelf<EvaluatorTestHost>,
-        >(&mut linker, |host: &mut EvaluatorTestHost| host)?;
-
+    pub(crate) fn evaluator_store(&self) -> anyhow::Result<Store<EvaluatorHost>> {
         let mut store = Store::new(
             &self.engine,
-            EvaluatorTestHost {
+            EvaluatorHost {
                 table: ResourceTable::new(),
                 ctx: WasiCtxBuilder::new().build(),
                 limits: self.config.store_limits()?,
@@ -1086,27 +877,7 @@ impl Wasm {
                 store.epoch_deadline_trap();
             }
         }
-        let bindings =
-            evaluator_test_bindings::EvaluatorWorld::instantiate(&mut store, component, &linker)?;
-
-        let input = map_input_to_wit_input(input)?;
-
-        let output = bindings
-            .vigilo_evaluator_evaluator()
-            .call_evaluate(&mut store, &input)
-            .map_err(|err| anyhow::anyhow!("evaluator trapped in wasm sandbox: {}", err))?
-            .map_err(|err| {
-                anyhow::Error::new(EvaluatorReportedError {
-                    code: if err.code.trim().is_empty() {
-                        "invalid_evaluator_error".to_string()
-                    } else {
-                        err.code
-                    },
-                    message: err.message,
-                })
-            })?;
-
-        map_wit_output_to_output(output)
+        Ok(store)
     }
 }
 
@@ -1129,7 +900,6 @@ impl Context {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
         fs,
         time::SystemTime,
     };
@@ -1137,22 +907,8 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{
-        evaluator_test_bindings::vigilo::evaluator::{
-            executor,
-            types as wit_types,
-        },
-        *,
-    };
-    use crate::{
-        contracts::evaluator::{
-            AgentOutput,
-            AgentTraceEvent,
-            TestCase,
-            ToolCall,
-        },
-        manifest::Package,
-    };
+    use super::*;
+    use crate::manifest::Package;
 
     const TEST_WIT: &str = r#"
         package vigilo:evaluator@1.0.0;
@@ -1168,75 +924,14 @@ mod tests {
         b"\0asm\x01\0\0\0".to_vec()
     }
 
-    fn test_host(max_log_message_bytes: usize, max_log_messages: u32) -> EvaluatorTestHost {
-        EvaluatorTestHost {
+    fn test_host(max_log_message_bytes: usize, max_log_messages: u32) -> EvaluatorHost {
+        EvaluatorHost {
             table: ResourceTable::new(),
             ctx: WasiCtxBuilder::new().build(),
             limits: Config::default().store_limits().unwrap(),
             max_log_message_bytes,
             max_log_messages,
             log_messages: 0,
-        }
-    }
-
-    fn evaluator_input() -> EvaluatorInput {
-        EvaluatorInput {
-            run_id: "run-1".to_string(),
-            execution_id: "execution-1".to_string(),
-            attempt_id: "attempt-1".to_string(),
-            case: TestCase {
-                id: "case-1".to_string(),
-                task_type: "classification".to_string(),
-                case_group: Some("sentiment".to_string()),
-                input: json!({"text": "hello"}),
-                expected: Some(json!({"label": "positive"})),
-                context: None,
-                tags: vec!["example".to_string()],
-                metadata: BTreeMap::from([("source".to_string(), json!("test"))]),
-            },
-            actual: AgentOutput {
-                text: Some("positive".to_string()),
-                structured: Some(json!({"label": "positive"})),
-                tool_calls: vec![ToolCall {
-                    name: "lookup".to_string(),
-                    arguments: json!({"id": 1}),
-                    result: Some(json!({"found": true})),
-                }],
-                trace: vec![AgentTraceEvent {
-                    kind: "tool_call".to_string(),
-                    name: Some("lookup".to_string()),
-                    payload: json!({"step": 1}),
-                }],
-                raw: json!({"provider": "test"}),
-                metadata: json!({"latency_ms": 12}),
-            },
-            evaluator_config: json!({"threshold": 0.8}),
-        }
-    }
-
-    fn wit_output() -> wit_types::Output {
-        wit_types::Output {
-            evaluator: wit_types::EvaluatorIdentity {
-                namespace: "vigilo".to_string(),
-                name: "example".to_string(),
-                version: "1.0.0".to_string(),
-                content_hash: Some("hash".to_string()),
-                interface_version: Some("1.0.0".to_string()),
-            },
-            outcome: wit_types::EvaluatorOutcome::Completed(wit_types::Measurement::Numeric(
-                wit_types::NumericMeasurement {
-                    value: 0.4,
-                    unit: Some("ratio".to_string()),
-                },
-            )),
-            diagnostics: vec![wit_types::DiagnosticFinding {
-                severity: wit_types::Severity::High,
-                category: "tone".to_string(),
-                reason: Some("too terse".to_string()),
-                evidence_json: r#"{"span":"answer"}"#.to_string(),
-                tags: vec!["style".to_string()],
-            }],
-            metadata_json: r#"{"duration_ms":4}"#.to_string(),
         }
     }
 
@@ -1310,146 +1005,6 @@ mod tests {
     }
 
     #[test]
-    fn evaluator_http_requests_are_rejected_until_policy_is_configured() {
-        let mut host = test_host(10, 1);
-        let request = executor::HttpRequest {
-            method: "GET".to_string(),
-            uri: "https://example.test".to_string(),
-            headers: Vec::new(),
-            body: None,
-            timeout_ms: None,
-        };
-
-        let err = executor::Host::send_http_request(&mut host, request).unwrap_err();
-
-        assert!(err.contains("outbound HTTP policy enforcement is not configured"));
-    }
-
-    #[test]
-    fn json_payload_parsing_accepts_blank_objects_and_labels_errors() {
-        assert_eq!(parse_json_payload("metadata", "  ").unwrap(), json!({}));
-        assert_eq!(
-            parse_json_payload("metadata", r#"{"ok":true}"#).unwrap(),
-            json!({"ok": true})
-        );
-
-        let err = parse_json_payload("evidence", "{").unwrap_err();
-        assert!(err.to_string().contains("invalid evidence JSON"));
-    }
-
-    #[test]
-    fn evaluator_input_mapping_preserves_structured_fields() {
-        let mapped = map_input_to_wit_input(evaluator_input()).unwrap();
-
-        assert_eq!(mapped.run_id, "run-1");
-        assert_eq!(mapped.test_case.case_group.as_deref(), Some("sentiment"));
-        assert_eq!(
-            parse_json_payload("input", &mapped.test_case.input_json).unwrap(),
-            json!({"text": "hello"})
-        );
-        assert_eq!(mapped.actual.tool_calls[0].name, "lookup");
-        assert_eq!(
-            parse_json_payload("arguments", &mapped.actual.tool_calls[0].arguments_json).unwrap(),
-            json!({"id": 1})
-        );
-        assert_eq!(mapped.actual.trace[0].kind, "tool_call");
-        assert_eq!(
-            parse_json_payload("config", &mapped.evaluator_config_json).unwrap(),
-            json!({"threshold": 0.8})
-        );
-    }
-
-    #[test]
-    fn wit_enum_mappings_cover_diagnostic_variants() {
-        use wit_types::Severity as WitSeverity;
-
-        let severities = [
-            (WitSeverity::None, Severity::None),
-            (WitSeverity::Low, Severity::Low),
-            (WitSeverity::Medium, Severity::Medium),
-            (WitSeverity::High, Severity::High),
-            (WitSeverity::Critical, Severity::Critical),
-        ];
-        for (input, expected) in severities {
-            assert_eq!(map_severity(input), expected);
-        }
-    }
-
-    #[test]
-    fn wit_measurement_mapping_covers_every_contract_variant() {
-        let cases = [
-            (
-                wit_types::Measurement::Binary(true),
-                Measurement::Binary { value: true },
-            ),
-            (
-                wit_types::Measurement::Numeric(wit_types::NumericMeasurement {
-                    value: 0.5,
-                    unit: Some("ratio".to_string()),
-                }),
-                Measurement::Numeric {
-                    value: 0.5,
-                    unit: Some("ratio".to_string()),
-                },
-            ),
-            (
-                wit_types::Measurement::Ordinal("tie".to_string()),
-                Measurement::Ordinal {
-                    value: "tie".to_string(),
-                },
-            ),
-        ];
-
-        for (input, expected) in cases {
-            assert_eq!(
-                serde_json::to_value(map_measurement(input)).unwrap(),
-                serde_json::to_value(expected).unwrap()
-            );
-        }
-    }
-
-    #[test]
-    fn wit_output_mapping_preserves_measurement_diagnostics_and_json_payloads() {
-        let output = map_wit_output_to_output(wit_output()).unwrap();
-
-        assert_eq!(output.evaluator.namespace, "vigilo");
-        assert_eq!(output.metadata, json!({"duration_ms": 4}));
-        assert!(matches!(
-            output.outcome,
-            EvaluatorOutcome::Completed(Measurement::Numeric {
-                value: 0.4,
-                unit: Some(ref unit),
-            }) if unit == "ratio"
-        ));
-        assert_eq!(output.diagnostics.len(), 1);
-        let finding = &output.diagnostics[0];
-        assert_eq!(finding.severity, Severity::High);
-        assert_eq!(finding.evidence, json!({"span": "answer"}));
-        assert_eq!(finding.category, "tone");
-    }
-
-    #[test]
-    fn wit_output_mapping_labels_invalid_json_fields() {
-        let mut output = wit_output();
-        output.metadata_json = "{".to_string();
-        let err = map_wit_output_to_output(output).unwrap_err();
-        assert!(err.to_string().contains("invalid metadata-json JSON"));
-
-        let mut output = wit_output();
-        output.diagnostics[0].evidence_json = "{".to_string();
-        let err = map_wit_output_to_output(output).unwrap_err();
-        assert!(err.to_string().contains("invalid evidence-json JSON"));
-
-        let mut output = wit_output();
-        output.diagnostics[0].category = " ".to_string();
-        let err = map_wit_output_to_output(output).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("diagnostic category must not be empty")
-        );
-    }
-
-    #[test]
     fn package_metadata_embedding_is_idempotent_and_rejects_conflicts() {
         let original = minimal_wasm_module();
         let embedded =
@@ -1499,11 +1054,9 @@ mod tests {
 
         let metadata = resolve_wit_metadata(dir.path(), Some(&valid)).unwrap();
         assert_eq!(
-            metadata.interface_name.as_deref(),
-            Some("vigilo:evaluator/evaluator")
+            metadata.abi.unwrap(),
+            crate::evaluator_abi::current_identity()
         );
-        assert_eq!(metadata.interface_version.as_deref(), Some("1.0.0"));
-        assert_eq!(metadata.wit_world.as_deref(), Some("evaluator-world"));
 
         let mismatches = [
             (
@@ -1511,28 +1064,28 @@ mod tests {
                 "1.0.0",
                 "evaluator-world",
                 "evaluator",
-                "package mismatch",
+                "unsupported evaluator ABI",
             ),
             (
                 "vigilo:evaluator",
                 "9.0.0",
                 "evaluator-world",
                 "evaluator",
-                "version mismatch",
+                "unsupported evaluator ABI",
             ),
             (
                 "vigilo:evaluator",
                 "1.0.0",
                 "missing-world",
                 "evaluator",
-                "not found",
+                "unsupported evaluator ABI",
             ),
             (
                 "vigilo:evaluator",
                 "1.0.0",
                 "evaluator-world",
                 "missing-interface",
-                "is not exported",
+                "unsupported evaluator ABI",
             ),
         ];
         for (package, version, world, interface, expected) in mismatches {
@@ -1543,23 +1096,31 @@ mod tests {
     }
 
     #[test]
-    fn optional_wit_metadata_accepts_missing_or_non_strict_contracts() {
+    fn evaluator_abi_metadata_requires_a_supported_declaration() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("evaluator.wit"), TEST_WIT).unwrap();
 
         let absent = resolve_wit_metadata(dir.path(), None).unwrap();
-        assert!(absent.interface_name.is_none());
-        assert!(absent.interface_version.is_none());
-        assert!(absent.wit_world.is_none());
+        assert!(absent.abi.is_none());
 
         let configured = manifest_wit("other:package", "9.0.0", "missing", "missing", false);
-        let metadata = resolve_wit_metadata(dir.path(), Some(&configured)).unwrap();
-        assert_eq!(
-            metadata.interface_name.as_deref(),
-            Some("other:package/missing")
+        let error = resolve_wit_metadata(dir.path(), Some(&configured)).unwrap_err();
+        assert!(error.to_string().contains("unsupported evaluator ABI"));
+
+        fs::write(
+            dir.path().join("evaluator.wit"),
+            TEST_WIT.replace("@1.0.0", "@0.1.0"),
+        )
+        .unwrap();
+        let configured = manifest_wit(
+            "vigilo:evaluator",
+            "1.0.0",
+            "evaluator-world",
+            "evaluator",
+            false,
         );
-        assert_eq!(metadata.interface_version.as_deref(), Some("9.0.0"));
-        assert_eq!(metadata.wit_world.as_deref(), Some("missing"));
+        let error = resolve_wit_metadata(dir.path(), Some(&configured)).unwrap_err();
+        assert!(error.to_string().contains("WIT version mismatch"));
     }
 
     #[test]

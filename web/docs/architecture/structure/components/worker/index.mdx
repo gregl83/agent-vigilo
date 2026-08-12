@@ -26,7 +26,13 @@ Describes the major internal responsibilities of the worker runtime.
 - `vigilo worker start` defaults to one in-flight chunk per worker process. `--max-inflight-chunks` / `VIGILO_WORKER_MAX_INFLIGHT_CHUNKS` can raise that limit, and RabbitMQ prefetch is set to the same value.
 - Workers attach a process `worker_id`, host label, internal queue message UUID, broker message id, attempt lease, and heartbeat timestamp to newly allocated attempts.
 - While a chunk is processing, the worker renews the chunk lease and current running attempt leases. Terminal execution transitions require current-attempt authority and a live attempt lease for that worker.
-- Run context and evaluator components are cached inside the worker process to avoid repeated profile parsing and WASM compilation.
+- Run context caches verify the execution plan and scoring-policy hashes from the
+  immutable run snapshot. Evaluator component caches use the artifact hash, WIT
+  contract hash, and adapter id, preventing collisions across ABI versions.
+- Workers fetch each evaluator by its pinned registry id and reject artifact or
+  ABI drift before dispatching its prepared version-specific host adapter. The
+  adapter is resolved once per cached artifact, not per case. Lifecycle changes
+  affect new runs without changing an already-created run.
 - Workers use a shared HTTP client and run chunk cases with bounded chunk-local parallelism before persisting results in batch.
 - Evaluator execution is admitted through a process-wide Wasm semaphore and each invocation runs in a fresh Wasmtime store with memory, table, instance, fuel, timeout, and log-message limits.
 - The completeness and aggregation component verifies every required evaluator binding before publishing scores. Missing, errored, skipped, or unscored required output produces an errored aggregate with no score; optional diagnostic output cannot affect policy.

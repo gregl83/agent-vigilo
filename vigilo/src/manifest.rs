@@ -40,9 +40,10 @@ fn default_false() -> bool {
 
 /// WIT contract reference declared by an evaluator crate.
 ///
-/// These fields identify which interface/world the evaluator implements.
-/// `strict` defaults to false so older manifests remain loadable while newer
-/// manifests can opt into stricter contract checks.
+/// These fields identify which immutable interface/world the evaluator
+/// implements. Supported contracts are always verified during publication.
+/// `strict` remains accepted for manifest compatibility but cannot weaken ABI
+/// validation.
 #[derive(Deserialize)]
 pub(crate) struct Wit {
     pub path: String,

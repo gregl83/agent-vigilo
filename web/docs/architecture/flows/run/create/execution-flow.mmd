@@ -18,14 +18,15 @@ sequenceDiagram
     Vigilo->>Vigilo: Load and parse profile and dataset inputs
     Vigilo->>Vigilo: Canonicalize payloads and validate dataset
     Vigilo->>ControlDB: Validate profile executability
-    ControlDB-->>Vigilo: Runnable evaluator summary
+    ControlDB-->>Vigilo: Verified evaluator artifacts and ABI identities
+    Vigilo->>Vigilo: Hash scoring policy and immutable evaluator execution plan
 
     Vigilo->>Vigilo: Plan case blobs, dataset version, run, chunks, and shard assignments
     Vigilo->>ControlDB: Commit creating run, routes, placement ledger, and exact chunk plan
     ControlDB-->>Vigilo: Durable run id and creation lease
 
     loop Each pending execution placement
-        Vigilo->>ExecutionDB: Idempotently store prerequisites, run snapshot, and owned chunks
+        Vigilo->>ExecutionDB: Idempotently store prerequisites, hashed run snapshot, and owned chunks
         alt Seed transaction committed
             ExecutionDB-->>Vigilo: Placement seeded
             Vigilo->>ControlDB: Mark placement seeded

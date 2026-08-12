@@ -1,31 +1,29 @@
-//! Compiled evaluator registry cache context.
+//! Prepared evaluator registry cache context.
 //!
-//! Workers use this cache to reuse Wasmtime components keyed by fully qualified
-//! evaluator references. Values are weighted by approximate compiled image size
-//! so the cache stays within the configured memory budget.
+//! Workers reuse Wasmtime components by artifact hash, immutable WIT contract
+//! hash, and host adapter id. Values are weighted by approximate compiled image
+//! size so the cache stays within the configured memory budget.
 
 use moka::future::Cache;
 use tokio::sync::OnceCell;
 use tracing::debug;
-use wasmtime::component::Component;
+
+use crate::evaluator_abi::PreparedEvaluator;
 
 pub struct Context {
-    pub(crate) cell: OnceCell<Cache<String, Component>>,
+    pub(crate) cell: OnceCell<Cache<String, PreparedEvaluator>>,
 }
 
 impl Context {
-    pub async fn get(&self) -> anyhow::Result<&Cache<String, Component>> {
+    pub async fn get(&self) -> anyhow::Result<&Cache<String, PreparedEvaluator>> {
         self.cell
             .get_or_try_init(|| async {
                 debug!("initializing evaluators registry");
 
                 let cache = Cache::builder()
-                    .weigher(|_key: &String, module: &Component| {
-                        // approximate compiled module size in bytes
-                        // module::image_range gives the mapped memory region size
-                        let range = module.image_range();
-                        let size = range.end as usize - range.start as usize;
-                        // weigher must return u32 — cap at u32::MAX for enormous modules
+                    .weigher(|_key: &String, evaluator: &PreparedEvaluator| {
+                        let size = evaluator.approximate_size();
+                        // The weigher returns u32; cap enormous modules at u32::MAX.
                         size.try_into().unwrap_or(u32::MAX)
                     })
                     .max_capacity(512 * 1024 * 1024)

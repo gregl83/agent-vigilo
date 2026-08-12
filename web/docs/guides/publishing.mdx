@@ -52,7 +52,7 @@ At minimum:
 manifest = "Cargo.toml"
 
 [wit]
-path = "../../wit/evaluator.wit"
+path = "../../wit/evaluator/v1.0.0/evaluator.wit"
 world = "evaluator-world"
 package = "vigilo:evaluator"
 version = "1.0.0"
@@ -119,9 +119,15 @@ When you run `vigilo evaluator publish`, the following steps occur:
 2. The selected `[profile.<name>]` resolves the compiled wasm artifact path.
 3. `name`, `version`, description, keywords, and optional `package.metadata.vigilo` are read from `Cargo.toml`.
 4. Optional `[package]` fields in `Vigilo.toml` override description, tags, and registry metadata.
-5. Optional `[wit]` settings validate the evaluator WIT package, version, world, and exported interface.
+5. Required `[wit]` settings select a supported versioned ABI; the referenced
+   WIT declaration and compiled component are both verified against its host adapter.
 6. The wasm artifact timestamp is compared with the Cargo manifest timestamp to catch stale builds.
-7. The wasm component is tagged with embedded package metadata, compiled with Wasmtime, hashed, and inserted into the registry.
+7. The wasm component is tagged with embedded package metadata, compiled with
+   Wasmtime, hashed, and stored with its WIT contract hash and adapter identity.
+
+Publication never guesses compatibility from a version string. Typed component
+linking must succeed for the declared adapter. See
+[Evaluator Compatibility](./evaluator-compatibility.mdx).
 
 The published registry identity uses the strict
 <GlossaryTerm term="evaluator-identifier">evaluator identifier</GlossaryTerm>

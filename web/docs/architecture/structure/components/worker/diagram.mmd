@@ -24,14 +24,14 @@ flowchart TD
     MessageSettlement["fa:fa-check-double <br/> <b>Message Settlement</b> <br/> <small>[Component: Rust / AMQP]</small> <br/> <small>Acknowledges handled messages, delays planned execution retries, or requeues bounded recoverable failures.</small>"]:::component
 
     ChunkWorkflow["fa:fa-handshake <br/> <b>Chunk Lease Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Uses message route hints, validates local write epochs, and claims or settles owned leases.</small>"]:::component
-    RunContextCache["fa:fa-boxes-stacked <br/> <b>Run Context Cache</b> <br/> <small>[Component: Rust / Moka]</small> <br/> <small>Caches execution-local run snapshots, evaluator refs, and evaluator runtime catalog entries.</small>"]:::component
-    EvaluatorLoader["fa:fa-cubes <br/> <b>Evaluator Loader Service</b> <br/> <small>[Component: Rust / Wasmtime]</small> <br/> <small>Validates evaluator refs, loads runnable registry records, and warms compiled components.</small>"]:::component
+    RunContextCache["fa:fa-boxes-stacked <br/> <b>Run Context Cache</b> <br/> <small>[Component: Rust / Moka]</small> <br/> <small>Caches verified run snapshots and pinned evaluator execution plans.</small>"]:::component
+    EvaluatorLoader["fa:fa-cubes <br/> <b>Evaluator Loader Service</b> <br/> <small>[Component: Rust / Wasmtime]</small> <br/> <small>Loads exact pinned artifacts, resolves ABI adapters, and warms prepared evaluators.</small>"]:::component
     CaseBatchLoader["fa:fa-table-list <br/> <b>Case Batch Loader</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Loads dataset cases covered by the claimed chunk ordinal range.</small>"]:::component
 
     ExecutionProcessor["fa:fa-list-check <br/> <b>Execution Processing Workflow</b> <br/> <small>[Component: Rust / Tokio]</small> <br/> <small>Allocates due attempts under a shared run-state guard, skips retry waits, and runs chunk cases with bounded parallelism.</small>"]:::component
     AgentClient["fa:fa-brain <br/> <b>Agent Invocation Client</b> <br/> <small>[Component: Rust / HTTP]</small> <br/> <small>Sends evaluator-safe case input to the configured target and normalizes agent output.</small>"]:::component
     WasmSemaphore["fa:fa-gauge-high <br/> <b>Wasm Evaluation Semaphore</b> <br/> <small>[Component: Rust / Tokio]</small> <br/> <small>Caps active evaluator invocations across the worker process.</small>"]:::component
-    EvaluatorExecutor["fa:fa-microchip <br/> <b>Evaluator Runtime Executor</b> <br/> <small>[Component: Rust / Wasmtime]</small> <br/> <small>Runs WIT-backed evaluator components in fresh stores with memory, fuel, timeout, and log limits.</small>"]:::component
+    EvaluatorExecutor["fa:fa-microchip <br/> <b>Evaluator Runtime Executor</b> <br/> <small>[Component: Rust / Wasmtime]</small> <br/> <small>Dispatches versioned ABI adapters in fresh stores with memory, fuel, timeout, and log limits.</small>"]:::component
     CompletenessAggregator["fa:fa-list-check <br/> <b>Completeness & Aggregation</b> <br/> <small>[Component: Rust]</small> <br/> <small>Verifies required evaluator scores before calculating authoritative dimension and aggregate scores.</small>"]:::component
     ResultPersistence["fa:fa-database <br/> <b>Result Persistence Workflow</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Appends evaluator results and upserts aggregates with child-row authority checks.</small>"]:::component
     TerminalTransitions["fa:fa-shield-halved <br/> <b>Terminal Transition Guard</b> <br/> <small>[Component: Rust / SQLx]</small> <br/> <small>Marks attempts completed, retry-scheduled, or terminal only when current-attempt and live-lease authority still match.</small>"]:::component
@@ -85,10 +85,10 @@ flowchart TD
     MessageHandler -->|"Claims chunk ownership with"| ChunkWorkflow
     ChunkWorkflow -->|"Reads and updates chunk leases in <br> <small>[SQL/TCP]</small>"| Database
 
-    MessageHandler -->|"Loads profile and evaluator metadata through"| RunContextCache
-    RunContextCache -->|"Reads run profile and evaluator catalog from <br> <small>[SQL/TCP]</small>"| Database
-    RunContextCache -->|"Warms evaluator refs with"| EvaluatorLoader
-    EvaluatorLoader -->|"Reads runnable evaluator WASM from <br> <small>[SQL/TCP]</small>"| Database
+    MessageHandler -->|"Loads verified profile and execution plan through"| RunContextCache
+    RunContextCache -->|"Reads the immutable run snapshot from <br> <small>[SQL/TCP]</small>"| Database
+    RunContextCache -->|"Warms pinned evaluator artifacts with"| EvaluatorLoader
+    EvaluatorLoader -->|"Reads exact evaluator WASM by pinned id and hash from <br> <small>[SQL/TCP]</small>"| Database
 
     MessageHandler -->|"Loads cases with"| CaseBatchLoader
     CaseBatchLoader -->|"Reads dataset case rows from <br> <small>[SQL/TCP]</small>"| Database
@@ -98,7 +98,7 @@ flowchart TD
     AgentClient -->|"Sends case input and receives output from <br> <small>[TEXT/HTTP]</small>"| TargetAgent
     ExecutionProcessor -->|"Acquires active-evaluation permits from"| WasmSemaphore
     WasmSemaphore -->|"Admits bounded evaluator calls into"| EvaluatorExecutor
-    EvaluatorExecutor -->|"Gets compiled components from"| EvaluatorLoader
+    EvaluatorExecutor -->|"Gets prepared evaluators from"| EvaluatorLoader
     EvaluatorExecutor -->|"Returns one measurement or abstention plus diagnostics to"| CompletenessAggregator
     ExecutionProcessor -->|"Provides the resolved binding plan to"| CompletenessAggregator
     CompletenessAggregator -->|"Applies binding policy and supplies authoritative results to"| ResultPersistence

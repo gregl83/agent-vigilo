@@ -14,9 +14,11 @@ CREATE TABLE evaluators (
     wasm_size_bytes BIGINT NOT NULL CHECK (wasm_size_bytes >= 0),
 
     -- interface/runtime compatibility metadata
-    interface_name TEXT,
-    interface_version TEXT,
-    wit_world TEXT,
+    interface_name TEXT NOT NULL CHECK (btrim(interface_name) <> ''),
+    interface_version TEXT NOT NULL CHECK (btrim(interface_version) <> ''),
+    wit_world TEXT NOT NULL CHECK (btrim(wit_world) <> ''),
+    abi_contract_hash TEXT NOT NULL CHECK (btrim(abi_contract_hash) <> ''),
+    abi_adapter TEXT NOT NULL CHECK (btrim(abi_adapter) <> ''),
     runtime TEXT NOT NULL,
     runtime_version TEXT NOT NULL,
     runtime_fingerprint TEXT NOT NULL,
@@ -76,13 +78,19 @@ COMMENT ON COLUMN evaluators.wasm_size_bytes IS
     'Size of the stored WASM artifact in bytes.';
 
 COMMENT ON COLUMN evaluators.interface_name IS
-    'Logical evaluator interface implemented by the artifact, used for compatibility checks in the host runtime.';
+    'Verified evaluator package and interface implemented by the artifact.';
 
 COMMENT ON COLUMN evaluators.interface_version IS
-    'Version of the evaluator interface contract expected by the host.';
+    'Verified immutable evaluator ABI version implemented by the artifact.';
 
 COMMENT ON COLUMN evaluators.wit_world IS
-    'WIT world or component contract used to build the evaluator artifact, when applicable.';
+    'Verified WIT world used to instantiate the evaluator artifact.';
+
+COMMENT ON COLUMN evaluators.abi_contract_hash IS
+    'BLAKE3 hash of the immutable host-supported WIT contract verified during publication.';
+
+COMMENT ON COLUMN evaluators.abi_adapter IS
+    'Versioned host adapter used to instantiate and translate this evaluator ABI.';
 
 COMMENT ON COLUMN evaluators.runtime IS
     'Expected runtime family used to execute the evaluator artifact, such as wasmtime.';

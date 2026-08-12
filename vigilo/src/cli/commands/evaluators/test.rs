@@ -58,7 +58,24 @@ pub(super) async fn exec(
     let parsed_input: EvaluatorInput = serde_json::from_str(&input_raw)
         .map_err(|err| anyhow::anyhow!("invalid evaluator test input json: {}", err))?;
 
-    let evaluation_output = wasm.test_evaluator(&evaluator_record.wasm_bytes, parsed_input)?;
+    let abi = crate::contracts::evaluator_abi::EvaluatorAbiIdentity {
+        package: evaluator_record
+            .interface_name
+            .rsplit_once('/')
+            .map(|(package, _)| package.to_string())
+            .ok_or_else(|| anyhow::anyhow!("evaluator has no verified ABI package"))?,
+        world: evaluator_record.wit_world.clone(),
+        interface: evaluator_record
+            .interface_name
+            .rsplit_once('/')
+            .map(|(_, interface)| interface.to_string())
+            .ok_or_else(|| anyhow::anyhow!("evaluator has no verified ABI interface"))?,
+        version: evaluator_record.interface_version.clone(),
+        contract_hash: evaluator_record.abi_contract_hash.clone(),
+        adapter: evaluator_record.abi_adapter.clone(),
+    };
+    let evaluation_output =
+        wasm.test_evaluator(&evaluator_record.wasm_bytes, &abi, parsed_input)?;
 
     let payload = json!({
         "data": {

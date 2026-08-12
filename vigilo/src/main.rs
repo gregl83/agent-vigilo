@@ -34,6 +34,7 @@ mod context;
 use context::Context;
 mod contracts;
 mod db;
+mod evaluator_abi;
 mod evaluators;
 mod manifest;
 mod models;
