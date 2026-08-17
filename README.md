@@ -74,6 +74,19 @@ Run the service-free tier with:
 cargo test --workspace --locked --lib --bins
 ```
 
+The repository-local performance harness is a separate opt-in workflow. Phase
+1 provides a service-free startup measurement and validates that performance
+tooling stays out of the shipped dependency graph:
+
+```bash
+cargo perf check
+```
+
+Build, run, comparison, artifact, and isolation details are in
+[`performance/README.md`](performance/README.md). Database, coordinator,
+worker/Wasm, and lifecycle performance workloads remain registered but are not
+executable until their isolated Phase 2 fixtures land.
+
 After setting `DATABASE_URL`, run every PostgreSQL-backed SQLx test with:
 
 ```bash

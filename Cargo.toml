@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "evaluators/sentiment-basic-en",
+    "xtask",
     "vigilo",
 ]
 resolver = "2"

@@ -1,0 +1,153 @@
+# Performance Configuration And Artifact Schemas
+
+This directory documents the contracts consumed and produced by `cargo perf`.
+The Rust models in `xtask/src/perf/model.rs` are authoritative; this document is
+the maintainer-facing field reference.
+
+## Execution Flow
+
+1. The workload registry defines which measurements exist and what makes each
+   execution valid.
+2. A profile selects exact workload tuples and sets campaign sampling limits.
+3. The runner verifies that the selected binary manifests advertise every
+   required workload capability.
+4. The runner executes the resolved profile and writes raw samples, block
+   records, comparisons, and a report under `target/perf/runs`.
+
+An unknown workload, tuple, schema, or capability is an unsupported result. The
+runner never skips required work and reports success for the remainder.
+
+## Versioning
+
+The version identifiers describe different contracts:
+
+| Identifier | Meaning |
+| --- | --- |
+| `workload-registry/v1` | Shape of the registry document. |
+| Registry `revision` | Content revision of the catalog using that shape. |
+| `startup.cli-help.v1` | Semantic version of one workload definition. |
+| `reference-v1` | Semantic version of one campaign composition. |
+| Git commit and digests | Exact runner, source, binary, and setup inputs. |
+
+A runner refactor that preserves measurement semantics does not require a new
+workload version. A fixture, oracle, measured region, or workload meaning change
+does. Retain the old ID and add `.v2`; do not silently redefine `.v1`.
+
+## Workload Registry
+
+`performance/registry/workloads-v1.toml` is the typed catalog referenced by all
+profiles.
+
+### Registry Fields
+
+| Field | Meaning |
+| --- | --- |
+| `schema_id` | Registry document shape. The current runner accepts only `workload-registry/v1`. |
+| `revision` | Positive catalog content revision. It does not identify a Vigilo release. |
+| `[constants]` | Audited Vigilo limits used to shape fixtures and projections. |
+| `[[workloads]]` | Stable workload contracts available for profile selection. |
+
+### Workload Fields
+
+| Field | Meaning |
+| --- | --- |
+| `id` | Stable semantic workload ID recorded in profiles and result artifacts. |
+| `owner` | Repository component responsible for the protected production boundary. |
+| `status` | `implemented` when the runner can execute the workload; `planned` reserves the contract but fails if selected. |
+| `capability` | Exact capability required in every selected build manifest. This is separate from `id` so future adapters can map one workload to version-specific binary capabilities. |
+| `tuples` | Allowed fixture shapes. Profiles must select one exact value from this list. |
+| `unit` | Denominator used to interpret the result, such as one process start, case, evaluation, chunk, or run. |
+| `oracle` | Stable name of the exact correctness validation required after execution. Timing is invalid if the oracle fails. |
+| `required_metrics` | External observations required for a valid result. Missing required measurements cannot be treated as a pass. |
+| `watchdog_ms` | Hard outer deadline for one execution. Exceeding it terminates the process tree. |
+| `planning_duration_ms` | Conservative duration estimate used to prove the campaign fits its profile cap. It is not an execution timeout. |
+| `preconditioning` | `none`, or `one-per-binary` for one unmeasured execution of each binary before sampling. |
+| `command` | Arguments passed directly to the measured Vigilo executable without shell interpretation. Currently used by the startup workload. |
+| `help_signatures` | Required substrings in startup stdout. A missing signature is a fixture/capability mismatch. |
+
+For `startup.cli-help.v1`, the runner launches the release executable with
+`--help`, requires exit `0` and the configured help signatures, and records wall
+time, child CPU, peak RSS, and executable size. One execution per binary is
+discarded before measurement to equalize host executable-loading effects.
+
+### Audited Constants
+
+Registry constants mirror production limits that affect fixture boundaries or
+capacity calculations. `cargo perf check` detects drift for the constants it
+audits; the runner does not scrape Rust source during a campaign.
+
+| Fields | Purpose |
+| --- | --- |
+| `database_connections_per_target`, `database_acquire_timeout_ms`, `database_operation_deadline_ms` | Database pool and operation bounds. |
+| `run_chunk_size`, `creation_case_page_size`, `creation_page_budget` | Run-creation chunking, paging, and per-pass work. |
+| `case_blob_group_size`, `membership_group_size`, `chunk_insert_group_size` | Database insert grouping boundaries. |
+| `coordinator_tick_ms`, `coordinator_create_recovery_budget`, `coordinator_dispatch_budget`, `coordinator_finalization_budget` | Coordinator cadence and bounded work per pass. |
+| `dispatch_window_size`, `lease_recovery_batch_size` | Dispatch and expired-lease recovery boundaries. |
+| `outbox_batch_size`, `outbox_publish_parallelism` | Durable outbox claim and publication limits. |
+| `worker_default_inflight_chunks`, `worker_heartbeat_ms` | Worker claim capacity and lease heartbeat. |
+| `case_concurrency`, `evaluator_concurrency`, `wasm_concurrency`, `wasm_max_memory_mib` | Worker and Wasm concurrency/resource bounds. |
+| `result_insert_group_size` | Evaluator-result database insert grouping. |
+
+## Profiles
+
+Files under `performance/profiles` configure campaigns. They select registry
+entries but do not implement workloads.
+
+### Profile Fields
+
+| Field | Meaning |
+| --- | --- |
+| `schema_id` | Profile document shape. The current runner accepts only `profile/v1`. |
+| `id` | Stable profile identity recorded in every campaign artifact. |
+| `description` | Human-readable campaign purpose. |
+| `requires_workload_selection` | Requires at least one explicit `--workload` instead of running the entire profile. |
+| `campaign_cap_secs` | Hard wall-clock limit for the complete campaign. |
+| `schedule_seed` | Stable input to deterministic `ABBA`/`BAAB` block ordering. |
+| `max_artifact_bytes` | Maximum total size of the generated run directory. |
+| `max_stdout_bytes`, `max_stderr_bytes` | Maximum output retained from each process; total observed bytes are still recorded. |
+| `max_residual_orientation_effect` | Optional limit for unexplained ordering bias after counterbalancing. |
+| `[[workloads]]` | Ordered workload tuple selections executed by the profile. |
+
+### Profile Workload Fields
+
+| Field | Meaning |
+| --- | --- |
+| `id` | Workload ID that must exist in the registry and profile. |
+| `tuple` | One exact fixture shape declared by that registry entry. |
+| `blocks` | Positive even number of blocks. A comparison block contains four executions. |
+| `timing` | `informative` for ordinary measurements or `calibration` for no-change noise data. Calibration interpretation is currently manual. |
+
+`developer-v1` requires explicit workload selection. Other profiles run their
+complete declared list unless repeated `--workload` options filter it. An
+unknown or out-of-profile selection fails before provisioning.
+
+## Environment Configuration
+
+Files under `performance/environments` describe a host contract. They are not
+service credentials or provisioning scripts.
+
+| Field | Meaning |
+| --- | --- |
+| `schema_id` | Environment document shape, currently `environment/v1`. |
+| `id` | Stable host contract identity. Results from different IDs are not canonical blocking comparisons. |
+| `canonical` | Whether results may support calibrated blocking verdicts. |
+| `provider`, `instance_type` | Infrastructure provider and host shape. |
+| `os`, `architecture`, `vcpus`, `memory_mib`, `storage` | Required operating system, hardware, and storage characteristics. |
+| `validity` | Readiness observations required before accepting a canonical campaign. |
+
+## Generated Artifact Schemas
+
+Phase 1 owns these additive machine-readable contracts:
+
+| Schema | Responsibility |
+| --- | --- |
+| `environment/v1` | Observed host and collector identity plus validity limitations. |
+| `build-manifest/v1` | Immutable executable, source, toolchain, dependency, setup-asset, and capability provenance. |
+| `sample/v1` | Raw execution position, process measurements, and validation state. |
+| `comparison/v1` | Balanced estimator inputs, effects, confidence intervals, diagnostics, and verdict. |
+| `report/v1` | Campaign status, failures, comparison summaries, and artifact links. |
+
+Every persisted document carries its schema ID. Readers reject an unknown
+schema ID and preserve unknown additive fields. Retained version fixtures are
+required before a schema is revised; format migrations are deferred until a
+second version exists.

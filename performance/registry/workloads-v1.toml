@@ -1,0 +1,99 @@
+# `v1` identifies the registry document shape, not a moving "latest" workload.
+# Increment `revision` when this catalog changes without changing that shape.
+# Published workload IDs are immutable semantic contracts: retain an existing
+# `.v1` entry and add `.v2` when its fixture, oracle, or measured meaning changes.
+schema_id = "workload-registry/v1"
+revision = 1
+
+[constants]
+database_connections_per_target = 5
+database_acquire_timeout_ms = 10000
+database_operation_deadline_ms = 30000
+run_chunk_size = 100
+creation_case_page_size = 1000
+creation_page_budget = 64
+case_blob_group_size = 500
+membership_group_size = 2000
+chunk_insert_group_size = 2000
+coordinator_tick_ms = 5000
+coordinator_create_recovery_budget = 16
+coordinator_dispatch_budget = 64
+coordinator_finalization_budget = 64
+dispatch_window_size = 512
+lease_recovery_batch_size = 1000
+outbox_batch_size = 1000
+outbox_publish_parallelism = 64
+worker_default_inflight_chunks = 1
+worker_heartbeat_ms = 15000
+case_concurrency = 8
+evaluator_concurrency = 8
+wasm_concurrency = 8
+wasm_max_memory_mib = 64
+result_insert_group_size = 500
+
+[[workloads]]
+id = "startup.cli-help.v1"
+owner = "runtime-cli"
+status = "implemented"
+capability = "startup.cli-help.v1"
+tuples = ["cold-help"]
+unit = "process_start"
+oracle = "exit_0_and_help_signature"
+required_metrics = ["wall_time", "child_cpu", "peak_rss", "executable_bytes"]
+watchdog_ms = 10000
+planning_duration_ms = 1000
+preconditioning = "one-per-binary"
+command = ["--help"]
+help_signatures = ["Usage:", "Commands:"]
+
+[[workloads]]
+id = "run.create.v1"
+owner = "run-creation"
+status = "planned"
+capability = "run.create.v1"
+tuples = ["cases-1001"]
+unit = "case_and_run"
+oracle = "exact_control_and_execution_rows"
+required_metrics = ["wall_time", "child_cpu", "peak_rss", "sql", "wal"]
+watchdog_ms = 120000
+planning_duration_ms = 5000
+preconditioning = "none"
+
+[[workloads]]
+id = "coordinator.dispatch.v1"
+owner = "coordinator"
+status = "planned"
+capability = "coordinator.dispatch.v1"
+tuples = ["chunks-512"]
+unit = "cycle_and_chunk"
+oracle = "exact_dispatch_and_queue_state"
+required_metrics = ["wall_time", "process_cpu", "service_cpu", "sql", "wal", "queue"]
+watchdog_ms = 180000
+planning_duration_ms = 5000
+preconditioning = "none"
+
+[[workloads]]
+id = "worker.execute-wasm.v1"
+owner = "worker-evaluator"
+status = "planned"
+capability = "worker.execute-wasm.v1"
+tuples = ["cases-8-evaluators-1", "cases-1-evaluators-8"]
+unit = "useful_case_and_evaluation"
+oracle = "exact_attempt_result_and_chunk_state"
+required_metrics = ["wall_time", "process_cpu", "service_cpu", "sql", "wal", "http", "queue"]
+watchdog_ms = 180000
+planning_duration_ms = 5000
+preconditioning = "none"
+
+[[workloads]]
+id = "system.lifecycle.v1"
+owner = "distributed-runtime"
+status = "planned"
+capability = "system.lifecycle.v1"
+tuples = ["workers-1", "workers-2"]
+unit = "useful_case_chunk_and_run"
+oracle = "exact_completed_run_and_drained_work"
+required_metrics = ["wall_time", "throughput", "process_cpu", "service_cpu", "sql", "wal", "http", "queue"]
+watchdog_ms = 600000
+planning_duration_ms = 30000
+preconditioning = "none"

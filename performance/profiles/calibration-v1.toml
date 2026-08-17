@@ -1,0 +1,39 @@
+schema_id = "profile/v1"
+id = "calibration-v1"
+description = "No-change environment and noise calibration."
+requires_workload_selection = false
+campaign_cap_secs = 21600
+schedule_seed = 3742228074
+max_artifact_bytes = 1073741824
+max_stdout_bytes = 262144
+max_stderr_bytes = 262144
+
+[[workloads]]
+id = "startup.cli-help.v1"
+tuple = "cold-help"
+blocks = 30
+timing = "calibration"
+
+[[workloads]]
+id = "run.create.v1"
+tuple = "cases-1001"
+blocks = 30
+timing = "calibration"
+
+[[workloads]]
+id = "coordinator.dispatch.v1"
+tuple = "chunks-512"
+blocks = 30
+timing = "calibration"
+
+[[workloads]]
+id = "worker.execute-wasm.v1"
+tuple = "cases-8-evaluators-1"
+blocks = 30
+timing = "calibration"
+
+[[workloads]]
+id = "system.lifecycle.v1"
+tuple = "workers-1"
+blocks = 30
+timing = "calibration"

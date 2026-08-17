@@ -1,0 +1,51 @@
+schema_id = "profile/v1"
+id = "reference-v1"
+description = "Complete provisional MVP reference matrix with informative timing."
+requires_workload_selection = false
+campaign_cap_secs = 7200
+schedule_seed = 2895838983
+max_artifact_bytes = 536870912
+max_stdout_bytes = 262144
+max_stderr_bytes = 262144
+
+[[workloads]]
+id = "startup.cli-help.v1"
+tuple = "cold-help"
+blocks = 20
+timing = "informative"
+
+[[workloads]]
+id = "run.create.v1"
+tuple = "cases-1001"
+blocks = 20
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.dispatch.v1"
+tuple = "chunks-512"
+blocks = 20
+timing = "informative"
+
+[[workloads]]
+id = "worker.execute-wasm.v1"
+tuple = "cases-8-evaluators-1"
+blocks = 20
+timing = "informative"
+
+[[workloads]]
+id = "worker.execute-wasm.v1"
+tuple = "cases-1-evaluators-8"
+blocks = 20
+timing = "informative"
+
+[[workloads]]
+id = "system.lifecycle.v1"
+tuple = "workers-1"
+blocks = 6
+timing = "informative"
+
+[[workloads]]
+id = "system.lifecycle.v1"
+tuple = "workers-2"
+blocks = 6
+timing = "informative"

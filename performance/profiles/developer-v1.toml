@@ -1,0 +1,15 @@
+schema_id = "profile/v1"
+id = "developer-v1"
+description = "Fast local correctness and informative timing checks."
+requires_workload_selection = true
+campaign_cap_secs = 900
+schedule_seed = 1279471102
+max_artifact_bytes = 16777216
+max_stdout_bytes = 262144
+max_stderr_bytes = 262144
+
+[[workloads]]
+id = "startup.cli-help.v1"
+tuple = "cold-help"
+blocks = 2
+timing = "informative"

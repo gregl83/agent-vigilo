@@ -1,0 +1,2 @@
+[alias]
+perf = "run --locked -p xtask -- perf"

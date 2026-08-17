@@ -1,0 +1,571 @@
+//! Versioned configuration, provenance, sample, comparison, and report models.
+//!
+//! These types are the performance harness's machine contracts. Schema IDs
+//! version document shapes, while stable workload/profile IDs version benchmark
+//! meaning. Flattened extension maps preserve unknown additive fields when a
+//! document is read and written by the current schema reader.
+
+use std::collections::BTreeMap;
+
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use serde_json::Value;
+
+/// Supported environment-manifest schema identifier.
+pub const ENVIRONMENT_SCHEMA: &str = "environment/v1";
+/// Supported immutable build-manifest schema identifier.
+pub const BUILD_SCHEMA: &str = "build-manifest/v1";
+/// Supported workload-registry schema identifier.
+pub const REGISTRY_SCHEMA: &str = "workload-registry/v1";
+/// Supported execution-profile schema identifier.
+pub const PROFILE_SCHEMA: &str = "profile/v1";
+/// Supported raw-sample and block-record schema identifier.
+pub const SAMPLE_SCHEMA: &str = "sample/v1";
+/// Supported statistical-comparison schema identifier.
+pub const COMPARISON_SCHEMA: &str = "comparison/v1";
+/// Supported campaign-manifest and report schema identifier.
+pub const REPORT_SCHEMA: &str = "report/v1";
+
+/// Typed catalog of workload contracts and audited production constants.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkloadRegistry {
+    /// Document shape identifier, currently [`REGISTRY_SCHEMA`].
+    pub schema_id: String,
+    /// Positive content revision within the schema generation.
+    pub revision: u32,
+    /// Production limits and batch sizes consumed by fixtures and projections.
+    pub constants: RegistryConstants,
+    /// Stable semantic workload contracts available to profiles.
+    pub workloads: Vec<Workload>,
+    /// Unknown additive fields retained for forward compatibility.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Audited production constants that affect fixture shape or capacity models.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegistryConstants {
+    /// Maximum pooled connections allocated per database target.
+    pub database_connections_per_target: u32,
+    /// Maximum time to acquire a pooled database connection.
+    pub database_acquire_timeout_ms: u64,
+    /// Outer deadline for one database operation.
+    pub database_operation_deadline_ms: u64,
+    /// Cases assigned to one run chunk.
+    pub run_chunk_size: u32,
+    /// Cases read in one run-creation page.
+    pub creation_case_page_size: u32,
+    /// Maximum creation pages processed per pass.
+    pub creation_page_budget: u32,
+    /// Case blobs inserted per statement group.
+    pub case_blob_group_size: u32,
+    /// Dataset memberships inserted per statement group.
+    pub membership_group_size: u32,
+    /// Run chunks inserted per statement group.
+    pub chunk_insert_group_size: u32,
+    /// Coordinator service interval in milliseconds.
+    pub coordinator_tick_ms: u64,
+    /// Creation-recovery work budget per coordinator pass.
+    pub coordinator_create_recovery_budget: u32,
+    /// Dispatch work budget per coordinator pass.
+    pub coordinator_dispatch_budget: u32,
+    /// Finalization work budget per coordinator pass.
+    pub coordinator_finalization_budget: u32,
+    /// Chunks considered in one dispatch window.
+    pub dispatch_window_size: u32,
+    /// Expired leases reclaimed per recovery batch.
+    pub lease_recovery_batch_size: u32,
+    /// Outbox deliveries claimed per publication batch.
+    pub outbox_batch_size: u32,
+    /// Maximum concurrent outbox publications.
+    pub outbox_publish_parallelism: u32,
+    /// Default in-flight chunk limit for one worker.
+    pub worker_default_inflight_chunks: u32,
+    /// Worker lease-heartbeat interval in milliseconds.
+    pub worker_heartbeat_ms: u64,
+    /// Maximum concurrent case executions.
+    pub case_concurrency: u32,
+    /// Maximum concurrent evaluator executions.
+    pub evaluator_concurrency: u32,
+    /// Maximum concurrent Wasm component executions.
+    pub wasm_concurrency: u32,
+    /// Maximum linear memory available to one Wasm evaluation.
+    pub wasm_max_memory_mib: u32,
+    /// Evaluator results inserted per statement group.
+    pub result_insert_group_size: u32,
+}
+
+/// Whether the harness has an executable driver for a workload contract.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImplementationStatus {
+    /// The runner can provision, execute, and validate the workload.
+    Implemented,
+    /// The contract is reserved but its driver or fixtures are not available.
+    Planned,
+}
+
+/// Unmeasured warmup policy applied before a workload campaign.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Preconditioning {
+    /// Start measurement without an additional harness warmup execution.
+    None,
+    /// Discard one execution for each measured binary before sampling.
+    OnePerBinary,
+}
+
+/// One stable semantic workload and its execution requirements.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Workload {
+    /// Versioned workload identity recorded in every dependent artifact.
+    pub id: String,
+    /// Repository component responsible for the protected boundary.
+    pub owner: String,
+    /// Availability of the workload's executable driver.
+    pub status: ImplementationStatus,
+    /// Capability required from every compared build manifest.
+    pub capability: String,
+    /// Explicit fixture shapes that profiles may select.
+    pub tuples: Vec<String>,
+    /// Denominator used to interpret throughput and resource measurements.
+    pub unit: String,
+    /// Exact correctness contract applied to an execution.
+    pub oracle: String,
+    /// External measurements required for a valid workload result.
+    pub required_metrics: Vec<String>,
+    /// Outer deadline for one workload execution.
+    pub watchdog_ms: u64,
+    /// Conservative per-execution duration used for campaign planning.
+    pub planning_duration_ms: u64,
+    /// Unmeasured warmup policy for this workload.
+    pub preconditioning: Preconditioning,
+    /// Arguments passed directly to the measured Vigilo binary.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Required substrings in the startup workload's help output.
+    #[serde(default)]
+    pub help_signatures: Vec<String>,
+    /// Unknown additive fields retained for forward compatibility.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Frozen campaign composition and resource limits.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Profile {
+    /// Document shape identifier, currently [`PROFILE_SCHEMA`].
+    pub schema_id: String,
+    /// Versioned profile identity recorded in campaign artifacts.
+    pub id: String,
+    /// Human-readable purpose of the profile.
+    pub description: String,
+    /// Whether callers must explicitly select at least one workload.
+    pub requires_workload_selection: bool,
+    /// Hard wall-clock limit for the complete campaign.
+    pub campaign_cap_secs: u64,
+    /// Stable seed controlling counterbalanced schedule orientation.
+    pub schedule_seed: u64,
+    /// Maximum total bytes retained in the run directory.
+    pub max_artifact_bytes: u64,
+    /// Maximum stdout bytes retained from each process.
+    pub max_stdout_bytes: usize,
+    /// Maximum stderr bytes retained from each process.
+    pub max_stderr_bytes: usize,
+    /// Optional invalidation threshold for unexplained orientation bias.
+    #[serde(default)]
+    pub max_residual_orientation_effect: Option<f64>,
+    /// Ordered workload tuples and sampling policies in the campaign.
+    pub workloads: Vec<ProfileWorkload>,
+    /// Unknown additive fields retained for forward compatibility.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// One exact workload tuple selected by a profile.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProfileWorkload {
+    /// Stable workload ID resolved through the registry.
+    pub id: String,
+    /// Registered fixture shape selected for the workload.
+    pub tuple: String,
+    /// Positive even count of four-execution measurement blocks.
+    pub blocks: u32,
+    /// Whether results are informative or environment calibration data.
+    pub timing: String,
+}
+
+/// Immutable identity and compatibility manifest for a release snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildManifest {
+    /// Document shape identifier, currently [`BUILD_SCHEMA`].
+    pub schema_id: String,
+    /// RFC 3339 timestamp at which the snapshot was created.
+    pub created_at: String,
+    /// Platform-specific executable file name.
+    pub executable_name: String,
+    /// BLAKE3 digest of the measured executable.
+    pub executable_digest: String,
+    /// Executable size in bytes.
+    pub executable_bytes: u64,
+    /// Source Git commit when the worktree has a resolvable `HEAD`.
+    pub source_commit: Option<String>,
+    /// Whether tracked source differed from the recorded commit.
+    pub source_dirty: bool,
+    /// Human-readable identity of the source worktree.
+    pub source_label: String,
+    /// BLAKE3 digest of the source `Cargo.lock`.
+    pub cargo_lock_digest: String,
+    /// Digest of the resolved Cargo dependency tree.
+    pub dependency_tree_digest: String,
+    /// Digest of the migration tree copied into setup assets.
+    pub migrations_digest: String,
+    /// Digest of the supported evaluator WIT contract tree.
+    pub evaluator_abi_digest: String,
+    /// Full `rustc --version --verbose` provenance.
+    pub rustc: String,
+    /// Cargo version used to build the snapshot.
+    pub cargo: String,
+    /// Compilation target triple.
+    pub target: String,
+    /// Cargo profile used for the measured executable.
+    pub profile: String,
+    /// Semantic workload contracts this build can execute.
+    pub capabilities: Vec<String>,
+    /// Immutable setup inputs copied beside the build manifest.
+    pub setup_assets: Vec<SetupAsset>,
+    /// Unknown additive fields retained for forward compatibility.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// One content-addressed setup input retained with a build snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetupAsset {
+    /// Logical asset name used during compatibility negotiation.
+    pub name: String,
+    /// Path relative to the snapshot directory.
+    pub relative_path: String,
+    /// Deterministic BLAKE3 digest of the file or tree.
+    pub digest: String,
+}
+
+/// Host and collector identity recorded for a campaign.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvironmentManifest {
+    /// Document shape identifier, currently [`ENVIRONMENT_SCHEMA`].
+    pub schema_id: String,
+    /// RFC 3339 time at which the environment was observed.
+    pub created_at: String,
+    /// Stable environment contract ID or local-development identity.
+    pub environment_id: String,
+    /// Whether the host satisfies the canonical comparison contract.
+    pub canonical: bool,
+    /// Operating-system identity.
+    pub os: String,
+    /// Host CPU architecture.
+    pub architecture: String,
+    /// Logical processors visible to the harness.
+    pub logical_cpus: usize,
+    /// Host name when it can be observed safely.
+    pub hostname: Option<String>,
+    /// Resource-collection backend used by the process runner.
+    pub collector: String,
+    /// Comparability limitations or successful validity observations.
+    pub validity: Vec<String>,
+    /// Unknown additive fields retained for forward compatibility.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Role assigned to a binary within a measurement schedule.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum BinaryRole {
+    /// Before-change executable in a comparison campaign.
+    Baseline,
+    /// After-change executable in a comparison campaign.
+    Candidate,
+    /// Sole executable in an informative run campaign.
+    Single,
+}
+
+/// Ordered binary assignment for one four-execution block.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Orientation {
+    /// Baseline, candidate, candidate, baseline order.
+    #[serde(rename = "ABBA")]
+    Abba,
+    /// Candidate, baseline, baseline, candidate order.
+    #[serde(rename = "BAAB")]
+    Baab,
+    /// Four repetitions of a sole binary.
+    #[serde(rename = "single")]
+    Single,
+}
+
+/// Correctness and external-validity classification for one sample.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SampleState {
+    /// Execution and required observations satisfied the workload contract.
+    Valid,
+    /// The measured product violated correctness, liveness, or resource limits.
+    ProductFailure,
+    /// The harness or environment could not produce a comparable observation.
+    Invalid,
+}
+
+/// Machine-readable sample classification with diagnostic context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Validation {
+    /// High-level validity classification.
+    pub state: SampleState,
+    /// Stable reason code for automation and aggregation.
+    pub code: String,
+    /// Human-readable diagnostic message.
+    pub message: String,
+}
+
+/// Process-level measurements captured for one execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessMeasurement {
+    /// Elapsed wall-clock time in nanoseconds.
+    pub wall_time_ns: u64,
+    /// Process-tree CPU time in nanoseconds when supported.
+    pub cpu_time_ns: Option<u64>,
+    /// Peak process-tree resident memory in bytes when supported.
+    pub peak_rss_bytes: Option<u64>,
+    /// Stable resource-collector identity.
+    pub resource_source: String,
+    /// Process exit code when observable.
+    pub exit_code: Option<i32>,
+    /// Whether the harness watchdog terminated the process tree.
+    pub timed_out: bool,
+    /// Total stdout bytes observed before any retention truncation.
+    pub stdout_bytes: u64,
+    /// Total stderr bytes observed before any retention truncation.
+    pub stderr_bytes: u64,
+    /// Whether retained stdout omitted overflow bytes.
+    pub stdout_truncated: bool,
+    /// Whether retained stderr omitted overflow bytes.
+    pub stderr_truncated: bool,
+}
+
+/// Raw observation for one scheduled workload execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Sample {
+    /// Document shape identifier, currently [`SAMPLE_SCHEMA`].
+    pub schema_id: String,
+    /// Campaign identity shared by all related artifacts.
+    pub run_id: String,
+    /// Frozen profile that selected the workload.
+    pub profile_id: String,
+    /// Stable workload contract ID.
+    pub workload_id: String,
+    /// Exact registered fixture shape.
+    pub tuple_id: String,
+    /// Zero-based measurement block index.
+    pub block_id: u32,
+    /// Pair of opposite-orientation blocks used for balance checks.
+    pub orientation_set_id: u32,
+    /// Binary ordering assigned to the block.
+    pub orientation: Orientation,
+    /// Adjacent-pair index within the block.
+    pub pair_id: u8,
+    /// One-based execution position within the block.
+    pub position: u8,
+    /// Binary role executed for this sample.
+    pub role: BinaryRole,
+    /// Whether statistics may consume this sample.
+    pub measured: bool,
+    /// RFC 3339 timestamp immediately before process execution.
+    pub started_at: String,
+    /// Externally observed process measurements.
+    pub process: ProcessMeasurement,
+    /// Correctness and validity result.
+    pub validation: Validation,
+    /// Unknown additive fields retained for forward compatibility.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Completeness and validity summary for one measurement block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockRecord {
+    /// Document shape identifier, currently [`SAMPLE_SCHEMA`].
+    pub schema_id: String,
+    /// Campaign identity shared by all related artifacts.
+    pub run_id: String,
+    /// Stable workload contract ID.
+    pub workload_id: String,
+    /// Exact registered fixture shape.
+    pub tuple_id: String,
+    /// Zero-based block index.
+    pub block_id: u32,
+    /// Pair of opposite-orientation blocks used for balance checks.
+    pub orientation_set_id: u32,
+    /// Binary ordering assigned to the block.
+    pub orientation: Orientation,
+    /// Whether all four scheduled executions were recorded.
+    pub complete: bool,
+    /// Whether all samples satisfied correctness and validity contracts.
+    pub valid: bool,
+    /// Number of sample records attached to the block.
+    pub sample_count: usize,
+}
+
+/// Gating or diagnostic disposition of a comparison.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// Candidate remained within the calibrated harmful-effect budget.
+    Pass,
+    /// Candidate exceeded the budget with required confirmation.
+    Regression,
+    /// Candidate produced a statistically supported beneficial effect.
+    Improvement,
+    /// Estimate is reportable but no numerical gate applies.
+    Informative,
+    /// Available complete blocks cannot support a required conclusion.
+    Inconclusive,
+    /// External validity or schedule-balance requirements were violated.
+    Invalid,
+}
+
+/// Statistical comparison and diagnostics for one measured metric.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricComparison {
+    /// Stable metric name.
+    pub name: String,
+    /// Unit shared by baseline, candidate, and interval values.
+    pub unit: String,
+    /// Direction interpreted as harmful by the gating policy.
+    pub direction: String,
+    /// Median baseline observation in the declared unit.
+    pub baseline_median: f64,
+    /// Median candidate observation in the declared unit.
+    pub candidate_median: f64,
+    /// Unadjusted relative candidate-minus-baseline change.
+    pub raw_candidate_delta: f64,
+    /// Counterbalanced relative effect expressed in the harmful direction.
+    pub harmful_effect: f64,
+    /// Lower bound of the bootstrap confidence interval.
+    pub confidence_lower: f64,
+    /// Upper bound of the bootstrap confidence interval.
+    pub confidence_upper: f64,
+    /// Calibrated positive-harm threshold, if the profile has one.
+    pub practical_budget: Option<f64>,
+    /// Disposition derived from the estimate, interval, and budget.
+    pub verdict: Verdict,
+    /// Complete valid `ABBA` blocks included in the estimate.
+    pub valid_abba_blocks: usize,
+    /// Complete valid `BAAB` blocks included in the estimate.
+    pub valid_baab_blocks: usize,
+    /// Valid blocks excluded because no opposite orientation was available.
+    pub unmatched_blocks: usize,
+    /// Remaining effect associated with block orientation.
+    pub residual_orientation_effect: f64,
+    /// Median effect grouped by `ABBA` and `BAAB` orientation.
+    pub orientation_medians: BTreeMap<String, f64>,
+    /// Median observation grouped by binary role and execution position.
+    pub position_medians: BTreeMap<String, f64>,
+    /// Stable estimator identity needed to interpret the result.
+    pub estimator: String,
+    /// Seed used for deterministic bootstrap resampling.
+    pub bootstrap_seed: u64,
+}
+
+/// Versioned comparison artifact for one workload tuple.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComparisonDocument {
+    /// Document shape identifier, currently [`COMPARISON_SCHEMA`].
+    pub schema_id: String,
+    /// Campaign identity shared by all related artifacts.
+    pub run_id: String,
+    /// Frozen profile that selected the workload.
+    pub profile_id: String,
+    /// Stable workload contract ID.
+    pub workload_id: String,
+    /// Exact registered fixture shape.
+    pub tuple_id: String,
+    /// Digest of the immutable baseline executable.
+    pub baseline_digest: String,
+    /// Digest of the immutable candidate executable.
+    pub candidate_digest: String,
+    /// Metric-level estimates and diagnostics.
+    pub metrics: Vec<MetricComparison>,
+    /// Aggregate disposition for the workload tuple.
+    pub verdict: Verdict,
+    /// Unknown additive fields retained for forward compatibility.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Checkpointed plan, provenance links, and completion state for a campaign.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CampaignManifest {
+    /// Document shape identifier, currently [`REPORT_SCHEMA`].
+    pub schema_id: String,
+    /// Unique campaign identity.
+    pub run_id: String,
+    /// Campaign kind, such as single-binary run or comparison.
+    pub kind: String,
+    /// Current lifecycle or terminal status.
+    pub status: String,
+    /// RFC 3339 campaign creation timestamp.
+    pub created_at: String,
+    /// RFC 3339 completion timestamp once terminal.
+    pub completed_at: Option<String>,
+    /// Frozen profile used to resolve the campaign.
+    pub profile_id: String,
+    /// Effective deterministic scheduling seed.
+    pub schedule_seed: u64,
+    /// Ordered workload and tuple identities in the resolved campaign.
+    pub selected_workloads: Vec<String>,
+    /// Number of scheduled executions eligible for measurement.
+    pub planned_measured_executions: u64,
+    /// Number of scheduled but discarded preconditioning executions.
+    pub planned_preconditioning_executions: u64,
+    /// Maximum bytes allowed beneath the campaign directory.
+    pub artifact_limit_bytes: u64,
+    /// Relative path to the captured environment manifest.
+    pub environment_file: String,
+    /// Relative baseline manifest path for comparison campaigns.
+    pub baseline_manifest: Option<String>,
+    /// Relative candidate or single-binary manifest path.
+    pub candidate_manifest: String,
+    /// Terminal failure explanation when the campaign did not pass.
+    pub failure: Option<String>,
+    /// Unknown additive fields retained for forward compatibility.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Machine source for terminal and Markdown campaign summaries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportDocument {
+    /// Document shape identifier, currently [`REPORT_SCHEMA`].
+    pub schema_id: String,
+    /// Campaign identity shared by all related artifacts.
+    pub run_id: String,
+    /// Campaign kind, such as single-binary run or comparison.
+    pub kind: String,
+    /// Terminal campaign status.
+    pub status: String,
+    /// Frozen profile used to resolve the campaign.
+    pub profile_id: String,
+    /// RFC 3339 time at which the report view was generated.
+    pub generated_at: String,
+    /// Per-workload statistical comparison documents.
+    pub comparisons: Vec<ComparisonDocument>,
+    /// Correctness, validity, or regression explanations.
+    pub failures: Vec<String>,
+    /// Relative paths to retained campaign artifacts.
+    pub artifact_files: Vec<String>,
+    /// Unknown additive fields retained for forward compatibility.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}

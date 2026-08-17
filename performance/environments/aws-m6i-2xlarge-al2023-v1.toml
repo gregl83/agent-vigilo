@@ -1,0 +1,11 @@
+schema_id = "environment/v1"
+id = "aws-m6i-2xlarge-al2023-v1"
+canonical = true
+provider = "aws"
+instance_type = "m6i.2xlarge"
+os = "Amazon Linux 2023"
+architecture = "x86_64"
+vcpus = 8
+memory_mib = 32768
+storage = "dedicated provisioned EBS; exact volume contract is frozen with provisioning"
+validity = ["exclusive_host", "fixed_cpu_policy", "no_swap", "thermal_and_load_check"]
