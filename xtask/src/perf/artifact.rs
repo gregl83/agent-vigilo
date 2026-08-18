@@ -398,4 +398,62 @@ mod tests {
         atomic_text(&path, "second\n").unwrap();
         assert_eq!(fs::read_to_string(path).unwrap(), "second\n");
     }
+
+    #[test]
+    fn tree_copy_digests_and_sizes_are_deterministic() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let target = directory.path().join("target");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("a.txt"), b"alpha").unwrap();
+        fs::write(source.join("nested/b.txt"), b"beta").unwrap();
+
+        let digest = digest_tree(&source).unwrap();
+        copy_tree(&source, &target).unwrap();
+        assert_eq!(digest_tree(&target).unwrap(), digest);
+        assert_eq!(directory_bytes(&target).unwrap(), 9);
+        assert_eq!(
+            digest_file(&target.join("a.txt")).unwrap(),
+            blake3::hash(b"alpha").to_hex().to_string()
+        );
+        assert_eq!(
+            directory_bytes(&directory.path().join("missing")).unwrap(),
+            0
+        );
+        assert_eq!(
+            digest_tree(&directory.path().join("missing")).unwrap(),
+            blake3::hash(b"").to_hex().to_string()
+        );
+    }
+
+    #[test]
+    fn json_jsonl_and_run_directories_use_owned_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let run = create_run_dir(root.path(), None, "unit").unwrap();
+        assert!(run.starts_with(root.path().join("target/perf/runs")));
+        fs::write(run.join("occupied"), "data").unwrap();
+        assert!(create_run_dir(root.path(), Some(&run), "unit").is_err());
+
+        let json = run.join("value.json");
+        let jsonl = run.join("values.jsonl");
+        atomic_json(&json, &serde_json::json!({"value": 1})).unwrap();
+        atomic_jsonl(
+            &jsonl,
+            &[
+                serde_json::json!({"value": 1}),
+                serde_json::json!({"value": 2}),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(json).unwrap()).unwrap()["value"],
+            1
+        );
+        assert_eq!(fs::read_to_string(jsonl).unwrap().lines().count(), 2);
+        let id = run_id();
+        let (timestamp, process) = id.split_once('-').unwrap();
+        assert!(timestamp.parse::<u128>().is_ok());
+        assert_eq!(process, std::process::id().to_string());
+        assert!(no_extra().is_empty());
+    }
 }

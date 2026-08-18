@@ -1,0 +1,1317 @@
+//! Run-scoped PostgreSQL, RabbitMQ, and deterministic HTTP-agent services.
+//!
+//! Docker Compose resources are created under a unique project and carry the
+//! campaign marker as a live label. Destructive database, vhost, and topology
+//! operations require names derived from that marker. Teardown verifies the
+//! exact recorded container and volume inventory before invoking Compose.
+
+use std::{
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
+    fs,
+    io::{
+        Read,
+        Write,
+    },
+    net::{
+        TcpListener,
+        TcpStream,
+    },
+    path::{
+        Path,
+        PathBuf,
+    },
+    process::Command,
+    sync::{
+        Arc,
+        Mutex,
+        atomic::{
+            AtomicBool,
+            AtomicU64,
+            Ordering,
+        },
+    },
+    thread::{
+        self,
+        JoinHandle,
+    },
+    time::Duration,
+};
+
+use anyhow::{
+    Context,
+    Result,
+    bail,
+};
+use postgres::{
+    Client as PgClient,
+    NoTls,
+};
+use reqwest::blocking::Client as HttpClient;
+use serde::{
+    Deserialize,
+    Serialize,
+};
+use serde_json::{
+    Value,
+    json,
+};
+use url::Url;
+
+use super::{
+    artifact::{
+        atomic_json,
+        atomic_text,
+    },
+    model::ExternalMeasurements,
+};
+
+const OWNERSHIP_LABEL: &str = "io.vigilo.run-id";
+const PERFORMANCE_LABEL: &str = "io.vigilo.performance";
+const POSTGRES_PASSWORD: &str = "vigilo_perf";
+const POSTGRES_USER: &str = "vigilo_perf";
+const RABBIT_PASSWORD: &str = "vigilo_perf";
+const RABBIT_USER: &str = "vigilo_perf";
+
+/// Exercises live service ownership, collector reset, and exact cleanup.
+pub fn integration_self_test(root: &Path) -> Result<()> {
+    let run_id = format!("service-test-{}", uuid::Uuid::now_v7());
+    let run_dir = root.join("target/perf/service-tests").join(&run_id);
+    fs::create_dir_all(&run_dir)?;
+    let mut harness = ServiceHarness::start(root, &run_dir, &run_id, "good", 256)?;
+    let database_url = harness.create_database("sentinel")?;
+    let scope = harness.create_sample_scope(database_url, "sentinel")?;
+
+    let first = harness.begin_measurement(&scope)?;
+    let response = HttpClient::new()
+        .post(harness.agent_url())
+        .json(&json!({"sentinel": true}))
+        .send()?;
+    if !response.status().is_success() {
+        bail!(
+            "deterministic agent sentinel returned {}",
+            response.status()
+        );
+    }
+    let first_measurement =
+        harness.finish_measurement(&scope, first, BTreeMap::from([("sentinel".into(), 1)]))?;
+    if first_measurement.http_requests != Some(1)
+        || first_measurement.durable_counts.get("sentinel") != Some(&1)
+    {
+        bail!("first collector sentinel was not observed exactly once");
+    }
+
+    let second = harness.begin_measurement(&scope)?;
+    let second_measurement = harness.finish_measurement(&scope, second, BTreeMap::new())?;
+    if second_measurement.http_requests != Some(0)
+        || second_measurement.durable_counts.contains_key("sentinel")
+    {
+        bail!("sample collector reset retained the prior sentinel");
+    }
+    harness.release_scope(scope)?;
+    harness.stop()?;
+    if !labelled_volumes(root, &run_id)?.is_empty() {
+        bail!("service self-test cleanup left run-owned volumes");
+    }
+    if !labelled_resources(root, "network", &run_id)?.is_empty() {
+        bail!("service self-test cleanup left a run-owned network");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct OwnedResource {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ServiceManifest {
+    schema_id: String,
+    run_id: String,
+    project: String,
+    compose_file: String,
+    environment_file: String,
+    postgres_admin_url: String,
+    rabbit_management_url: String,
+    agent_url: String,
+    containers: Vec<OwnedResource>,
+    networks: Vec<OwnedResource>,
+    volumes: Vec<OwnedResource>,
+}
+
+/// Immutable observations taken immediately before a measured command.
+pub struct MeasurementBaseline {
+    wal_lsn: String,
+    database_bytes: i64,
+    service_sampler: ServiceSampler,
+}
+
+#[derive(Default)]
+struct ServiceStats {
+    memory_bytes: Option<u64>,
+    cpu_percent: Option<f64>,
+}
+
+struct ServiceSampler {
+    stop: Arc<AtomicBool>,
+    stats: Arc<Mutex<ServiceStats>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// Exact durable counts returned by a workload-specific oracle.
+pub type DurableCounts = BTreeMap<String, i64>;
+
+/// One fresh database and RabbitMQ vhost used by a sample.
+pub struct SampleScope {
+    /// PostgreSQL URL containing the run ownership marker.
+    pub database_url: String,
+    /// RabbitMQ URL containing the run-owned vhost.
+    pub messaging_url: String,
+    /// Namespace applied to all Vigilo RabbitMQ topology names.
+    pub mq_namespace: String,
+    database_name: String,
+    vhost: String,
+}
+
+/// Run-scoped service topology and collectors.
+pub struct ServiceHarness {
+    root: PathBuf,
+    run_dir: PathBuf,
+    run_id: String,
+    marker: String,
+    project: String,
+    compose_file: PathBuf,
+    environment_file: PathBuf,
+    postgres_admin_url: String,
+    rabbit_management_url: String,
+    rabbit_amqp_port: u16,
+    http: HttpClient,
+    manifest: ServiceManifest,
+    databases: BTreeSet<String>,
+    vhosts: BTreeSet<String>,
+    sequence: u64,
+    agent: DeterministicAgent,
+    stopped: bool,
+}
+
+impl ServiceHarness {
+    /// Starts an isolated Compose project and verifies its ownership inventory.
+    pub fn start(
+        root: &Path,
+        run_dir: &Path,
+        run_id: &str,
+        agent_response: &str,
+        agent_payload_bytes: usize,
+    ) -> Result<Self> {
+        let marker = safe_name(run_id);
+        if marker.is_empty() {
+            bail!("performance run ID produced an empty ownership marker");
+        }
+        let project = truncate_name(&format!("vigilo-perf-{marker}"), 56);
+        let compose_file = root.join("performance/compose.yml");
+        if !compose_file.is_file() {
+            bail!(
+                "performance Compose file is missing: {}",
+                compose_file.display()
+            );
+        }
+        command_output(
+            root,
+            "docker",
+            &["version", "--format", "{{.Server.Version}}"],
+        )
+        .context("Docker engine is required for service-backed performance workloads")?;
+        command_output(root, "docker", &["compose", "version"])?;
+
+        let environment_file = run_dir.join("service-compose.env");
+        atomic_text(
+            &environment_file,
+            &format!("VIGILO_PERF_PROJECT={project}\nVIGILO_PERF_RUN_ID={run_id}\n"),
+        )?;
+        let compose_args = compose_args(&compose_file, &environment_file, &project);
+        let mut up_args = compose_args.clone();
+        up_args.extend(["up".into(), "--detach".into(), "--wait".into()]);
+        if let Err(error) = command_output_owned(root, "docker", &up_args) {
+            return match cleanup_started_topology(root, run_id, &compose_args) {
+                Ok(()) => Err(error.context("start performance topology")),
+                Err(cleanup) => Err(error.context(format!(
+                    "topology start failed and rollback refused or failed: {cleanup:#}"
+                ))),
+            };
+        }
+        let initialized = (|| {
+            let agent = DeterministicAgent::start(run_id, agent_response, agent_payload_bytes)?;
+            let postgres_port = compose_port(root, &compose_args, "postgres", 5432)?;
+            let rabbit_amqp_port = compose_port(root, &compose_args, "rabbitmq", 5672)?;
+            let rabbit_management_port = compose_port(root, &compose_args, "rabbitmq", 15672)?;
+            let postgres_admin_url = format!(
+                "postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@127.0.0.1:{postgres_port}/postgres"
+            );
+            let rabbit_management_url = format!("http://127.0.0.1:{rabbit_management_port}");
+            let containers = compose_resources(root, &compose_args, "container")?;
+            let networks = labelled_resources(root, "network", run_id)?;
+            let volumes = labelled_volumes(root, run_id)?;
+            verify_container_labels(root, run_id, &containers)?;
+            validate_inventory(run_id, &containers, &networks, &volumes)?;
+            let manifest = ServiceManifest {
+                schema_id: "service-topology/v1".into(),
+                run_id: run_id.into(),
+                project: project.clone(),
+                compose_file: compose_file.display().to_string(),
+                environment_file: environment_file.display().to_string(),
+                postgres_admin_url: redact_url(&postgres_admin_url),
+                rabbit_management_url: rabbit_management_url.clone(),
+                agent_url: agent.url().to_owned(),
+                containers,
+                networks,
+                volumes,
+            };
+            atomic_json(&run_dir.join("services.json"), &manifest)?;
+            Ok::<_, anyhow::Error>((
+                agent,
+                rabbit_amqp_port,
+                postgres_admin_url,
+                rabbit_management_url,
+                manifest,
+            ))
+        })();
+        let (agent, rabbit_amqp_port, postgres_admin_url, rabbit_management_url, manifest) =
+            match initialized {
+                Ok(initialized) => initialized,
+                Err(error) => {
+                    return match cleanup_started_topology(root, run_id, &compose_args) {
+                        Ok(()) => Err(error.context("initialize performance topology")),
+                        Err(cleanup) => Err(error
+                            .context(format!("topology rollback refused or failed: {cleanup:#}"))),
+                    };
+                }
+            };
+
+        Ok(Self {
+            root: root.to_path_buf(),
+            run_dir: run_dir.to_path_buf(),
+            run_id: run_id.into(),
+            marker,
+            project,
+            compose_file,
+            environment_file,
+            postgres_admin_url,
+            rabbit_management_url,
+            rabbit_amqp_port,
+            http: HttpClient::builder()
+                .timeout(Duration::from_secs(10))
+                .build()?,
+            manifest,
+            databases: BTreeSet::new(),
+            vhosts: BTreeSet::new(),
+            sequence: 0,
+            agent,
+            stopped: false,
+        })
+    }
+
+    /// Returns the deterministic run-scoped agent endpoint.
+    pub fn agent_url(&self) -> &str {
+        self.agent.url()
+    }
+
+    /// Creates an empty database owned by this campaign.
+    pub fn create_database(&mut self, purpose: &str) -> Result<String> {
+        self.sequence += 1;
+        let name = database_name(&self.marker, purpose, self.sequence);
+        self.require_owned_database(&name)?;
+        let mut admin = PgClient::connect(&self.postgres_admin_url, NoTls)?;
+        admin.batch_execute(&format!("CREATE DATABASE {}", quoted_identifier(&name)))?;
+        self.databases.insert(name.clone());
+        database_url(&self.postgres_admin_url, &name)
+    }
+
+    /// Clones a prepared template database into a fresh sample database.
+    pub fn clone_database(&mut self, template: &str, purpose: &str) -> Result<String> {
+        self.require_owned_database(template)?;
+        self.sequence += 1;
+        let name = database_name(&self.marker, purpose, self.sequence);
+        self.require_owned_database(&name)?;
+        let mut admin = PgClient::connect(&self.postgres_admin_url, NoTls)?;
+        admin.batch_execute(&format!(
+            "CREATE DATABASE {} TEMPLATE {}",
+            quoted_identifier(&name),
+            quoted_identifier(template)
+        ))?;
+        self.databases.insert(name.clone());
+        database_url(&self.postgres_admin_url, &name)
+    }
+
+    /// Returns the database name from a validated run-owned URL.
+    pub fn owned_database_name(&self, database_url: &str) -> Result<String> {
+        let parsed = Url::parse(database_url)?;
+        require_loopback_url(&parsed)?;
+        let name = parsed.path().trim_start_matches('/').to_owned();
+        self.require_owned_database(&name)?;
+        Ok(name)
+    }
+
+    /// Creates a fresh RabbitMQ vhost and namespace for one sample.
+    pub fn create_sample_scope(
+        &mut self,
+        database_url: String,
+        purpose: &str,
+    ) -> Result<SampleScope> {
+        self.sequence += 1;
+        let suffix = truncate_name(&safe_name(purpose), 20);
+        let vhost = truncate_name(
+            &format!("perf-{}-{suffix}-{}", self.marker, self.sequence),
+            63,
+        );
+        self.require_owned_vhost(&vhost)?;
+        let vhost_url = format!("{}/api/vhosts/{vhost}", self.rabbit_management_url);
+        self.rabbit(self.http.put(&vhost_url))?;
+        let permission_url = format!(
+            "{}/api/permissions/{vhost}/{RABBIT_USER}",
+            self.rabbit_management_url
+        );
+        self.rabbit(self.http.put(&permission_url).json(&json!({
+            "configure": ".*",
+            "write": ".*",
+            "read": ".*"
+        })))?;
+        self.vhosts.insert(vhost.clone());
+        let messaging_url = format!(
+            "amqp://{RABBIT_USER}:{RABBIT_PASSWORD}@127.0.0.1:{}/{vhost}",
+            self.rabbit_amqp_port
+        );
+        let database_name = self.owned_database_name(&database_url)?;
+        Ok(SampleScope {
+            database_url,
+            messaging_url,
+            mq_namespace: truncate_name(&format!("perf-{}-{}", self.marker, self.sequence), 63),
+            database_name,
+            vhost,
+        })
+    }
+
+    /// Resets all scoped collectors immediately before the measured command.
+    pub fn begin_measurement(&self, scope: &SampleScope) -> Result<MeasurementBaseline> {
+        self.require_scope(scope)?;
+        self.agent.reset()?;
+        let mut client = PgClient::connect(&scope.database_url, NoTls)?;
+        client.batch_execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")?;
+        let _ = client.simple_query("SELECT pg_stat_statements_reset()")?;
+        let wal_lsn: String = client
+            .query_one("SELECT pg_current_wal_lsn()::text", &[])?
+            .get(0);
+        let database_bytes: i64 = client
+            .query_one("SELECT pg_database_size(current_database())", &[])?
+            .get(0);
+        let service_sampler = ServiceSampler::start(&self.root, self.container_ids())?;
+        Ok(MeasurementBaseline {
+            wal_lsn,
+            database_bytes,
+            service_sampler,
+        })
+    }
+
+    /// Collects scoped database, RabbitMQ, HTTP, and container measurements.
+    pub fn finish_measurement(
+        &self,
+        scope: &SampleScope,
+        mut baseline: MeasurementBaseline,
+        durable_counts: DurableCounts,
+    ) -> Result<ExternalMeasurements> {
+        self.require_scope(scope)?;
+        let services = baseline.service_sampler.finish()?;
+        let mut client = PgClient::connect(&scope.database_url, NoTls)?;
+        let stats = client.query_one(
+            r#"
+            SELECT
+                COALESCE(SUM(calls), 0)::bigint,
+                COALESCE(SUM(total_exec_time), 0)::double precision,
+                COALESCE(SUM(rows), 0)::bigint
+            FROM pg_stat_statements
+            WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+              AND query NOT LIKE '%pg_stat_statements%'
+            "#,
+            &[],
+        )?;
+        let wal_bytes: i64 = client
+            .query_one(
+                "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), $1::pg_lsn)::bigint",
+                &[&baseline.wal_lsn],
+            )?
+            .get(0);
+        let database_bytes: i64 = client
+            .query_one("SELECT pg_database_size(current_database())", &[])?
+            .get(0);
+        let queue = self.queue_counts(&scope.vhost)?;
+        let http = self.agent.snapshot();
+        Ok(ExternalMeasurements {
+            sql_calls: Some(nonnegative_u64(stats.get::<_, i64>(0))?),
+            sql_time_ms: Some(stats.get(1)),
+            sql_rows: Some(nonnegative_u64(stats.get::<_, i64>(2))?),
+            wal_bytes: Some(nonnegative_u64(wal_bytes)?),
+            database_bytes_delta: Some(database_bytes - baseline.database_bytes),
+            http_requests: Some(http.requests),
+            http_bytes: Some(http.bytes),
+            http_peak_concurrency: Some(http.peak_concurrency),
+            queue_ready: Some(queue.0),
+            queue_unacked: Some(queue.1),
+            service_memory_bytes: services.memory_bytes,
+            service_cpu_percent: services.cpu_percent,
+            durable_counts,
+        })
+    }
+
+    /// Removes one sample's database and RabbitMQ vhost after artifacts are captured.
+    pub fn release_scope(&mut self, scope: SampleScope) -> Result<()> {
+        self.require_scope(&scope)?;
+        self.delete_vhost(&scope.vhost)?;
+        self.drop_database(&scope.database_name)?;
+        Ok(())
+    }
+
+    /// Drops a prepared template database after all dependent samples finish.
+    pub fn release_database(&mut self, database_url: &str) -> Result<()> {
+        let name = self.owned_database_name(database_url)?;
+        self.drop_database(&name)
+    }
+
+    /// Stops the topology after verifying the recorded live ownership inventory.
+    pub fn stop(&mut self) -> Result<()> {
+        if self.stopped {
+            return Ok(());
+        }
+        for vhost in self.vhosts.clone() {
+            self.delete_vhost(&vhost)?;
+        }
+        for database in self.databases.clone() {
+            self.drop_database(&database)?;
+        }
+        let compose_args = compose_args(&self.compose_file, &self.environment_file, &self.project);
+        let live_containers = compose_resources(&self.root, &compose_args, "container")?;
+        let live_networks = labelled_resources(&self.root, "network", &self.run_id)?;
+        let live_volumes = labelled_volumes(&self.root, &self.run_id)?;
+        verify_container_labels(&self.root, &self.run_id, &live_containers)?;
+        validate_cleanup_inventory(
+            &self.run_id,
+            &self.manifest,
+            &live_containers,
+            &live_networks,
+            &live_volumes,
+        )?;
+        let mut down_args = compose_args;
+        down_args.extend(["down".into(), "--volumes".into(), "--remove-orphans".into()]);
+        command_output_owned(&self.root, "docker", &down_args)?;
+        atomic_text(&self.run_dir.join("services.stopped"), &self.run_id)?;
+        self.stopped = true;
+        Ok(())
+    }
+
+    fn require_owned_database(&self, name: &str) -> Result<()> {
+        let prefix = database_prefix(&self.marker);
+        if !name.starts_with(&prefix)
+            || !name.chars().all(|character| {
+                character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+            })
+        {
+            bail!("refusing database operation without matching ownership marker: {name}");
+        }
+        Ok(())
+    }
+
+    fn require_owned_vhost(&self, vhost: &str) -> Result<()> {
+        if !vhost.starts_with(&format!("perf-{}-", self.marker)) {
+            bail!("refusing RabbitMQ operation without matching ownership marker: {vhost}");
+        }
+        Ok(())
+    }
+
+    fn require_scope(&self, scope: &SampleScope) -> Result<()> {
+        self.require_owned_database(&scope.database_name)?;
+        self.require_owned_vhost(&scope.vhost)?;
+        let database = Url::parse(&scope.database_url)?;
+        let messaging = Url::parse(&scope.messaging_url)?;
+        require_loopback_url(&database)?;
+        require_loopback_url(&messaging)
+    }
+
+    fn rabbit(&self, request: reqwest::blocking::RequestBuilder) -> Result<()> {
+        let response = request
+            .basic_auth(RABBIT_USER, Some(RABBIT_PASSWORD))
+            .send()?;
+        if !response.status().is_success() {
+            bail!(
+                "RabbitMQ management request failed with {}",
+                response.status()
+            );
+        }
+        Ok(())
+    }
+
+    fn queue_counts(&self, vhost: &str) -> Result<(u64, u64)> {
+        self.require_owned_vhost(vhost)?;
+        let response = self
+            .http
+            .get(format!("{}/api/queues/{vhost}", self.rabbit_management_url))
+            .basic_auth(RABBIT_USER, Some(RABBIT_PASSWORD))
+            .send()?;
+        if !response.status().is_success() {
+            bail!("RabbitMQ queue collector failed with {}", response.status());
+        }
+        let queues: Vec<Value> = response.json()?;
+        let ready = queues
+            .iter()
+            .filter_map(|queue| queue["messages_ready"].as_u64())
+            .sum();
+        let unacked = queues
+            .iter()
+            .filter_map(|queue| queue["messages_unacknowledged"].as_u64())
+            .sum();
+        Ok((ready, unacked))
+    }
+
+    fn container_ids(&self) -> Vec<String> {
+        self.manifest
+            .containers
+            .iter()
+            .map(|resource| resource.id.clone())
+            .collect()
+    }
+
+    fn delete_vhost(&mut self, vhost: &str) -> Result<()> {
+        self.require_owned_vhost(vhost)?;
+        if !self.vhosts.contains(vhost) {
+            return Ok(());
+        }
+        let response = self
+            .http
+            .delete(format!("{}/api/vhosts/{vhost}", self.rabbit_management_url))
+            .basic_auth(RABBIT_USER, Some(RABBIT_PASSWORD))
+            .send()?;
+        if !response.status().is_success() && response.status().as_u16() != 404 {
+            bail!("RabbitMQ vhost cleanup failed with {}", response.status());
+        }
+        self.vhosts.remove(vhost);
+        Ok(())
+    }
+
+    fn drop_database(&mut self, name: &str) -> Result<()> {
+        self.require_owned_database(name)?;
+        if !self.databases.contains(name) {
+            return Ok(());
+        }
+        let mut admin = PgClient::connect(&self.postgres_admin_url, NoTls)?;
+        admin.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
+            &[&name],
+        )?;
+        admin.batch_execute(&format!(
+            "DROP DATABASE IF EXISTS {}",
+            quoted_identifier(name)
+        ))?;
+        self.databases.remove(name);
+        Ok(())
+    }
+}
+
+impl Drop for ServiceHarness {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop() {
+            eprintln!(
+                "performance topology cleanup refused or failed; inspect {}: {error:#}",
+                self.run_dir.join("services.json").display()
+            );
+        }
+    }
+}
+
+impl ServiceSampler {
+    fn start(root: &Path, container_ids: Vec<String>) -> Result<Self> {
+        let initial = collect_container_stats(root, &container_ids)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Mutex::new(initial));
+        let thread_root = root.to_path_buf();
+        let thread_stop = stop.clone();
+        let thread_stats = stats.clone();
+        let thread = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                if let Ok(observation) = collect_container_stats(&thread_root, &container_ids)
+                    && let Ok(mut aggregate) = thread_stats.lock()
+                {
+                    aggregate.memory_bytes =
+                        maximum(aggregate.memory_bytes, observation.memory_bytes);
+                    aggregate.cpu_percent =
+                        maximum_f64(aggregate.cpu_percent, observation.cpu_percent);
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        Ok(Self {
+            stop,
+            stats,
+            thread: Some(thread),
+        })
+    }
+
+    fn finish(&mut self) -> Result<ServiceStats> {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("service collector thread panicked"))?;
+        }
+        let stats = self
+            .stats
+            .lock()
+            .map_err(|_| anyhow::anyhow!("service collector state was poisoned"))?;
+        Ok(ServiceStats {
+            memory_bytes: stats.memory_bytes,
+            cpu_percent: stats.cpu_percent,
+        })
+    }
+}
+
+impl Drop for ServiceSampler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn collect_container_stats(root: &Path, ids: &[String]) -> Result<ServiceStats> {
+    if ids.is_empty() {
+        return Ok(ServiceStats::default());
+    }
+    let mut args = vec![
+        "stats".into(),
+        "--no-stream".into(),
+        "--format".into(),
+        "{{json .}}".into(),
+    ];
+    args.extend(ids.iter().cloned());
+    let output = command_output_owned(root, "docker", &args)?;
+    let mut memory = 0u64;
+    let mut cpu = 0.0;
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let value: Value = serde_json::from_str(line)?;
+        if let Some(usage) = value["MemUsage"].as_str().and_then(parse_memory_usage) {
+            memory = memory.saturating_add(usage);
+        }
+        if let Some(percent) = value["CPUPerc"].as_str().and_then(parse_percent) {
+            cpu += percent;
+        }
+    }
+    Ok(ServiceStats {
+        memory_bytes: Some(memory),
+        cpu_percent: Some(cpu),
+    })
+}
+
+fn maximum(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    left.into_iter().chain(right).max()
+}
+
+fn maximum_f64(left: Option<f64>, right: Option<f64>) -> Option<f64> {
+    left.into_iter().chain(right).reduce(f64::max)
+}
+
+#[derive(Default)]
+struct AgentCounters {
+    requests: AtomicU64,
+    bytes: AtomicU64,
+    active: AtomicU64,
+    peak: AtomicU64,
+}
+
+#[derive(Debug)]
+struct AgentSnapshot {
+    requests: u64,
+    bytes: u64,
+    peak_concurrency: u64,
+}
+
+struct DeterministicAgent {
+    url: String,
+    counters: Arc<AgentCounters>,
+    shutdown: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl DeterministicAgent {
+    fn start(run_id: &str, response_text: &str, payload_bytes: usize) -> Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?;
+        let path = format!("/perf/{}/invoke", safe_name(run_id));
+        let url = format!("http://{address}{path}");
+        let counters = Arc::new(AgentCounters::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_counters = counters.clone();
+        let thread_shutdown = shutdown.clone();
+        let body = agent_body(response_text, payload_bytes);
+        let thread = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let counters = thread_counters.clone();
+                        let body = body.clone();
+                        thread::spawn(move || {
+                            let _ = handle_agent(stream, &body, &counters);
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self {
+            url,
+            counters,
+            shutdown,
+            thread: Some(thread),
+        })
+    }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    fn reset(&self) -> Result<()> {
+        if self.counters.active.load(Ordering::Acquire) != 0 {
+            bail!("cannot reset HTTP collector while a request is active");
+        }
+        self.counters.requests.store(0, Ordering::Release);
+        self.counters.bytes.store(0, Ordering::Release);
+        self.counters.peak.store(0, Ordering::Release);
+        Ok(())
+    }
+
+    fn snapshot(&self) -> AgentSnapshot {
+        AgentSnapshot {
+            requests: self.counters.requests.load(Ordering::Acquire),
+            bytes: self.counters.bytes.load(Ordering::Acquire),
+            peak_concurrency: self.counters.peak.load(Ordering::Acquire),
+        }
+    }
+}
+
+impl Drop for DeterministicAgent {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn handle_agent(
+    mut stream: TcpStream,
+    response_body: &[u8],
+    counters: &AgentCounters,
+) -> Result<()> {
+    let active = counters.active.fetch_add(1, Ordering::AcqRel) + 1;
+    counters.peak.fetch_max(active, Ordering::AcqRel);
+    let result = (|| {
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 8192];
+        loop {
+            let read = stream.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(header_end) = find_bytes(&request, b"\r\n\r\n") {
+                let content_length = parse_content_length(&request[..header_end]).unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            if request.len() > 2 * 1024 * 1024 {
+                bail!("agent request exceeded 2 MiB");
+            }
+        }
+        counters.requests.fetch_add(1, Ordering::AcqRel);
+        counters.bytes.fetch_add(
+            (request.len() + response_body.len()) as u64,
+            Ordering::AcqRel,
+        );
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            response_body.len()
+        )?;
+        stream.write_all(response_body)?;
+        Ok(())
+    })();
+    counters.active.fetch_sub(1, Ordering::AcqRel);
+    result
+}
+
+fn agent_body(response_text: &str, payload_bytes: usize) -> Vec<u8> {
+    let minimum = json!({"text": response_text}).to_string();
+    if minimum.len() >= payload_bytes {
+        return minimum.into_bytes();
+    }
+    let empty_padded = json!({"text": response_text, "padding": ""}).to_string();
+    if empty_padded.len() > payload_bytes {
+        return minimum.into_bytes();
+    }
+    let padding = "x".repeat(payload_bytes - empty_padded.len());
+    json!({"text": response_text, "padding": padding})
+        .to_string()
+        .into_bytes()
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn parse_content_length(headers: &[u8]) -> Option<usize> {
+    for line in String::from_utf8_lossy(headers).lines() {
+        let lowercase = line.to_ascii_lowercase();
+        if let Some(value) = lowercase.strip_prefix("content-length:") {
+            return value.trim().parse().ok();
+        }
+    }
+    None
+}
+
+fn compose_args(compose: &Path, environment: &Path, project: &str) -> Vec<String> {
+    vec![
+        "compose".into(),
+        "--file".into(),
+        compose.display().to_string(),
+        "--env-file".into(),
+        environment.display().to_string(),
+        "--project-name".into(),
+        project.into(),
+    ]
+}
+
+fn compose_port(root: &Path, compose_args: &[String], service: &str, port: u16) -> Result<u16> {
+    let mut args = compose_args.to_vec();
+    args.extend(["port".into(), service.into(), port.to_string()]);
+    let output = command_output_owned(root, "docker", &args)?;
+    let address = output
+        .lines()
+        .next()
+        .context("Docker Compose returned no port")?
+        .trim();
+    let (host, port) = address
+        .rsplit_once(':')
+        .context("invalid Docker Compose port output")?;
+    if host.trim_matches(['[', ']']) != "127.0.0.1" {
+        bail!("performance service was not bound to loopback: {address}");
+    }
+    Ok(port.parse()?)
+}
+
+fn compose_resources(
+    root: &Path,
+    compose_args: &[String],
+    kind: &str,
+) -> Result<Vec<OwnedResource>> {
+    if kind != "container" {
+        bail!("unsupported Compose resource kind: {kind}");
+    }
+    let mut args = compose_args.to_vec();
+    args.extend(["ps".into(), "--quiet".into()]);
+    let ids = command_output_owned(root, "docker", &args)?;
+    let mut resources = Vec::new();
+    for id in ids.lines().map(str::trim).filter(|id| !id.is_empty()) {
+        let inspected = command_output(root, "docker", &["inspect", "--format", "{{.Name}}", id])?;
+        resources.push(OwnedResource {
+            id: id.into(),
+            name: inspected.trim_start_matches('/').into(),
+        });
+    }
+    resources.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(resources)
+}
+
+fn labelled_volumes(root: &Path, run_id: &str) -> Result<Vec<OwnedResource>> {
+    labelled_resources(root, "volume", run_id)
+}
+
+fn labelled_resources(root: &Path, kind: &str, run_id: &str) -> Result<Vec<OwnedResource>> {
+    let output = command_output(
+        root,
+        "docker",
+        &[
+            kind,
+            "ls",
+            "--quiet",
+            "--filter",
+            &format!("label={OWNERSHIP_LABEL}={run_id}"),
+            "--filter",
+            &format!("label={PERFORMANCE_LABEL}=true"),
+        ],
+    )?;
+    let mut resources = output
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| OwnedResource {
+            id: name.into(),
+            name: name.into(),
+        })
+        .collect::<Vec<_>>();
+    resources.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(resources)
+}
+
+fn verify_container_labels(root: &Path, run_id: &str, containers: &[OwnedResource]) -> Result<()> {
+    for container in containers {
+        let labels = command_output(
+            root,
+            "docker",
+            &[
+                "inspect",
+                "--format",
+                "{{index .Config.Labels \"io.vigilo.run-id\"}}|{{index .Config.Labels \"io.vigilo.performance\"}}",
+                &container.id,
+            ],
+        )?;
+        if labels != format!("{run_id}|true") {
+            bail!(
+                "performance container {} has unexpected ownership labels: {labels}",
+                container.name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_inventory(
+    run_id: &str,
+    containers: &[OwnedResource],
+    networks: &[OwnedResource],
+    volumes: &[OwnedResource],
+) -> Result<()> {
+    if containers.len() != 2 || networks.len() != 1 || volumes.len() != 2 {
+        bail!(
+            "performance topology inventory mismatch for {run_id}: expected 2 containers, 1 network, and 2 volumes; found {}, {}, and {}",
+            containers.len(),
+            networks.len(),
+            volumes.len()
+        );
+    }
+    Ok(())
+}
+
+fn validate_cleanup_inventory(
+    run_id: &str,
+    manifest: &ServiceManifest,
+    live_containers: &[OwnedResource],
+    live_networks: &[OwnedResource],
+    live_volumes: &[OwnedResource],
+) -> Result<()> {
+    if manifest.run_id != run_id
+        || manifest.containers != live_containers
+        || manifest.networks != live_networks
+        || manifest.volumes != live_volumes
+    {
+        bail!("refusing topology cleanup because the live ownership inventory changed");
+    }
+    Ok(())
+}
+
+fn cleanup_started_topology(root: &Path, run_id: &str, compose_args: &[String]) -> Result<()> {
+    let containers = compose_resources(root, compose_args, "container")?;
+    let networks = labelled_resources(root, "network", run_id)?;
+    let volumes = labelled_volumes(root, run_id)?;
+    verify_container_labels(root, run_id, &containers)?;
+    validate_inventory(run_id, &containers, &networks, &volumes)?;
+    let mut down_args = compose_args.to_vec();
+    down_args.extend(["down".into(), "--volumes".into(), "--remove-orphans".into()]);
+    command_output_owned(root, "docker", &down_args)?;
+    Ok(())
+}
+
+fn database_name(marker: &str, purpose: &str, sequence: u64) -> String {
+    let prefix = database_prefix(marker);
+    let purpose = safe_name(purpose).replace('-', "_");
+    truncate_name(&format!("{prefix}_{purpose}_{sequence}"), 63)
+}
+
+fn database_prefix(marker: &str) -> String {
+    truncate_name(
+        &format!("vigilo_perf_{}", safe_name(marker).replace('-', "_")),
+        42,
+    )
+}
+
+fn database_url(admin_url: &str, name: &str) -> Result<String> {
+    let mut url = Url::parse(admin_url)?;
+    require_loopback_url(&url)?;
+    url.set_path(&format!("/{name}"));
+    Ok(url.to_string())
+}
+
+fn require_loopback_url(url: &Url) -> Result<()> {
+    if !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1")) {
+        bail!("performance endpoint must use a loopback host: {url}");
+    }
+    Ok(())
+}
+
+fn quoted_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn safe_name(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|character| {
+            if character.is_ascii_alphanumeric() {
+                Some(character.to_ascii_lowercase())
+            } else if matches!(character, '-' | '_' | '.') {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_owned()
+}
+
+fn truncate_name(value: &str, maximum: usize) -> String {
+    value.chars().take(maximum).collect()
+}
+
+fn redact_url(value: &str) -> String {
+    Url::parse(value)
+        .map(|mut url| {
+            let _ = url.set_password(Some("<redacted>"));
+            url.to_string()
+        })
+        .unwrap_or_else(|_| "<invalid-url>".into())
+}
+
+fn nonnegative_u64(value: i64) -> Result<u64> {
+    value
+        .try_into()
+        .context("collector returned a negative count")
+}
+
+fn parse_percent(value: &str) -> Option<f64> {
+    value.trim().trim_end_matches('%').parse().ok()
+}
+
+fn parse_memory_usage(value: &str) -> Option<u64> {
+    parse_size(value.split('/').next()?.trim())
+}
+
+fn parse_size(value: &str) -> Option<u64> {
+    let split = value.find(|character: char| !character.is_ascii_digit() && character != '.')?;
+    let number: f64 = value[..split].parse().ok()?;
+    let multiplier = match value[split..].trim() {
+        "B" => 1.0,
+        "kB" | "KB" => 1_000.0,
+        "KiB" => 1_024.0,
+        "MB" => 1_000_000.0,
+        "MiB" => 1_048_576.0,
+        "GB" => 1_000_000_000.0,
+        "GiB" => 1_073_741_824.0,
+        _ => return None,
+    };
+    Some((number * multiplier) as u64)
+}
+
+fn command_output(root: &Path, program: &str, args: &[&str]) -> Result<String> {
+    let args = args
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    command_output_owned(root, program, &args)
+}
+
+fn command_output_owned(root: &Path, program: &str, args: &[String]) -> Result<String> {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("run {program} {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "{program} {} failed with {}: {}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn database_and_vhost_names_embed_the_ownership_marker() {
+        assert!(database_name("run-123", "worker", 1).starts_with("vigilo_perf_run_123"));
+        assert!(format!("perf-{}-sample", safe_name("run-123")).starts_with("perf-run-123-"));
+    }
+
+    #[test]
+    fn non_loopback_endpoints_are_refused() {
+        assert!(require_loopback_url(&Url::parse("postgres://localhost/db").unwrap()).is_ok());
+        assert!(
+            require_loopback_url(&Url::parse("postgres://db.example.com/prod").unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn cleanup_requires_the_exact_recorded_inventory() {
+        let resources = vec![OwnedResource {
+            id: "one".into(),
+            name: "one".into(),
+        }];
+        let manifest = ServiceManifest {
+            schema_id: "service-topology/v1".into(),
+            run_id: "run".into(),
+            project: "project".into(),
+            compose_file: "compose".into(),
+            environment_file: "env".into(),
+            postgres_admin_url: "postgres".into(),
+            rabbit_management_url: "rabbit".into(),
+            agent_url: "agent".into(),
+            containers: resources.clone(),
+            networks: resources.clone(),
+            volumes: resources.clone(),
+        };
+        assert!(
+            validate_cleanup_inventory("run", &manifest, &resources, &resources, &resources)
+                .is_ok()
+        );
+        assert!(
+            validate_cleanup_inventory("other", &manifest, &resources, &resources, &resources)
+                .is_err()
+        );
+        assert!(validate_cleanup_inventory("run", &manifest, &[], &resources, &resources).is_err());
+    }
+
+    #[test]
+    fn byte_and_percent_collectors_parse_docker_output() {
+        assert_eq!(parse_memory_usage("12.5MiB / 1GiB"), Some(13_107_200));
+        assert_eq!(parse_percent("3.25%"), Some(3.25));
+    }
+
+    #[test]
+    fn deterministic_agent_body_has_the_requested_size() {
+        assert_eq!(agent_body("good reliable response", 1024).len(), 1024);
+        assert!(agent_body("long response", 1).len() > 1);
+    }
+
+    #[test]
+    fn deterministic_agent_serves_requests_and_resets_counters() {
+        let agent = DeterministicAgent::start("run-1", "good", 256).unwrap();
+        let url = Url::parse(agent.url()).unwrap();
+        let mut stream =
+            TcpStream::connect((url.host_str().unwrap(), url.port().unwrap())).unwrap();
+        write!(
+            stream,
+            "POST {} HTTP/1.1\r\nhost: localhost\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}",
+            url.path()
+        )
+        .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        assert!(find_bytes(&response, b"HTTP/1.1 200 OK").is_some());
+        assert!(find_bytes(&response, b"\"text\":\"good\"").is_some());
+
+        let snapshot = agent.snapshot();
+        assert_eq!(snapshot.requests, 1);
+        assert!(snapshot.bytes >= 258);
+        assert_eq!(snapshot.peak_concurrency, 1);
+        agent.reset().unwrap();
+        assert_eq!(agent.snapshot().requests, 0);
+    }
+
+    #[test]
+    fn collectors_and_name_helpers_cover_boundary_values() {
+        assert_eq!(
+            collect_container_stats(Path::new("."), &[])
+                .unwrap()
+                .memory_bytes,
+            None
+        );
+        let mut sampler = ServiceSampler::start(Path::new("."), Vec::new()).unwrap();
+        assert_eq!(sampler.finish().unwrap().cpu_percent, None);
+        assert_eq!(maximum(Some(2), Some(3)), Some(3));
+        assert_eq!(maximum(None, None), None);
+        assert_eq!(maximum_f64(Some(2.0), Some(1.0)), Some(2.0));
+        assert_eq!(
+            parse_content_length(b"Host: local\r\nCONTENT-LENGTH: 12"),
+            Some(12)
+        );
+        assert_eq!(parse_content_length(b"content-length: nope"), None);
+        assert_eq!(find_bytes(b"abcabc", b"bca"), Some(1));
+        assert_eq!(parse_size("1KB"), Some(1_000));
+        assert_eq!(parse_size("1KiB"), Some(1_024));
+        assert_eq!(parse_size("2MB"), Some(2_000_000));
+        assert_eq!(parse_size("1GiB"), Some(1_073_741_824));
+        assert_eq!(parse_size("12"), None);
+        assert_eq!(parse_size("1XB"), None);
+        assert_eq!(nonnegative_u64(7).unwrap(), 7);
+        assert!(nonnegative_u64(-1).is_err());
+        assert_eq!(quoted_identifier("a\"b"), "\"a\"\"b\"");
+        assert_eq!(safe_name(" A/b_c.d "), "ab-c-d");
+        assert_eq!(truncate_name("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn endpoint_and_compose_helpers_preserve_owned_configuration() {
+        assert_eq!(
+            database_url("postgres://user:secret@localhost:5432/admin", "owned")
+                .unwrap()
+                .as_str(),
+            "postgres://user:secret@localhost:5432/owned"
+        );
+        assert_eq!(
+            redact_url("postgres://user:secret@localhost/db"),
+            "postgres://user:%3Credacted%3E@localhost/db"
+        );
+        assert_eq!(redact_url("not a url"), "<invalid-url>");
+        let args = compose_args(Path::new("compose.yml"), Path::new("run.env"), "project");
+        assert_eq!(args[0], "compose");
+        assert_eq!(args.last().unwrap(), "project");
+
+        let containers = vec![
+            OwnedResource {
+                id: "1".into(),
+                name: "one".into(),
+            },
+            OwnedResource {
+                id: "2".into(),
+                name: "two".into(),
+            },
+        ];
+        let network = vec![OwnedResource {
+            id: "3".into(),
+            name: "net".into(),
+        }];
+        let volumes = vec![
+            OwnedResource {
+                id: "4".into(),
+                name: "a".into(),
+            },
+            OwnedResource {
+                id: "5".into(),
+                name: "b".into(),
+            },
+        ];
+        assert!(validate_inventory("run", &containers, &network, &volumes).is_ok());
+        assert!(validate_inventory("run", &[], &network, &volumes).is_err());
+    }
+}

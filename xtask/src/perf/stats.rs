@@ -297,6 +297,7 @@ mod tests {
                         stdout_truncated: false,
                         stderr_truncated: false,
                     },
+                    external: Default::default(),
                     validation: Validation {
                         state: SampleState::Valid,
                         code: "ok".into(),

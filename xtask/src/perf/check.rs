@@ -30,6 +30,7 @@ use super::{
         load_registry,
         validate_profile_registry,
     },
+    fixture,
     model::ImplementationStatus,
     process::{
         ProcessSpec,
@@ -82,6 +83,7 @@ pub fn execute(args: CheckArgs) -> Result<u8> {
     validate_dependency_boundaries(&root)?;
     validate_package_contents(&root)?;
     validate_fixture_tree(&root)?;
+    validate_service_configuration(&root)?;
     if let Some(base) = args.bootstrap_base.as_deref() {
         validate_bootstrap_delta(&root, base)?;
     }
@@ -98,7 +100,7 @@ pub fn execute(args: CheckArgs) -> Result<u8> {
     println!("  tools:       cargo, rustc, and git available");
     println!("  production:  no reverse dependency or package leakage");
     println!("  process:     timeout, truncation, exit, and cleanup self-test passed");
-    println!("  services:    no Phase 1 service endpoint is opened or mutated");
+    println!("  services:    Compose and fixture contracts valid; no services provisioned");
     Ok(EXIT_PASS)
 }
 
@@ -169,13 +171,52 @@ fn validate_profile_implementation_contract(
         .iter()
         .filter(|workload| workload.status == ImplementationStatus::Implemented)
         .collect();
-    if implemented.len() != 1 || implemented[0].id != "startup.cli-help.v1" {
-        bail!("Phase 1 must implement only startup.cli-help.v1");
+    let ids = implemented
+        .iter()
+        .map(|workload| workload.id.as_str())
+        .collect::<Vec<_>>();
+    let expected = [
+        "startup.cli-help.v1",
+        "run.create.v1",
+        "coordinator.dispatch.v1",
+        "worker.execute-wasm.v1",
+        "system.lifecycle.v1",
+    ];
+    if ids != expected {
+        bail!("Phase 2 must implement the complete ordered MVP workload set");
     }
-    let startup = implemented[0];
+    let startup = implemented
+        .first()
+        .context("implemented workload set is empty")?;
     if startup.command != ["--help"] || startup.help_signatures.is_empty() {
         bail!("startup workload must use the supported --help boundary");
     }
+    Ok(())
+}
+
+fn validate_service_configuration(root: &Path) -> Result<()> {
+    let fixture = fixture::load(root, "mvp-v1")?;
+    if fixture.coordinator.chunks != 512
+        || fixture.run_create.cases != 1001
+        || fixture.lifecycle.cases == 0
+    {
+        bail!("MVP fixture cardinalities do not match the frozen workload contract");
+    }
+    let compose = root.join("performance/compose.yml");
+    let content = fs::read_to_string(&compose)?;
+    for required in [
+        "127.0.0.1::5432",
+        "127.0.0.1::5672",
+        "io.vigilo.performance",
+        "io.vigilo.run-id",
+        "VIGILO_PERF_PROJECT",
+    ] {
+        if !content.contains(required) {
+            bail!("performance Compose contract is missing {required:?}");
+        }
+    }
+    command_output(root, "docker", &["compose", "version"])
+        .context("Docker Compose CLI is required for Phase 2 workloads")?;
     Ok(())
 }
 
@@ -386,6 +427,7 @@ fn process_self_test() -> Result<()> {
         program: &executable,
         args: &valid,
         current_dir: None,
+        env: &[],
         timeout: Duration::from_secs(2),
         stdout_limit: 1024,
         stderr_limit: 1024,
@@ -399,6 +441,7 @@ fn process_self_test() -> Result<()> {
         program: &executable,
         args: &crash,
         current_dir: None,
+        env: &[],
         timeout: Duration::from_secs(2),
         stdout_limit: 1024,
         stderr_limit: 1024,
@@ -412,6 +455,7 @@ fn process_self_test() -> Result<()> {
         program: &executable,
         args: &timeout,
         current_dir: None,
+        env: &[],
         timeout: Duration::from_millis(20),
         stdout_limit: 1024,
         stderr_limit: 1024,
@@ -429,6 +473,7 @@ fn process_self_test() -> Result<()> {
         program: &executable,
         args: &truncation,
         current_dir: None,
+        env: &[],
         timeout: Duration::from_secs(2),
         stdout_limit: 64,
         stderr_limit: 64,
@@ -470,5 +515,41 @@ mod tests {
         assert!(validate_endpoint("amqp://127.0.0.1/vigilo_perf_123", marker).is_ok());
         assert!(validate_endpoint("postgres://db.example.com/vigilo_perf_123", marker).is_err());
         assert!(validate_endpoint("postgres://localhost/development", marker).is_err());
+    }
+
+    #[test]
+    fn repository_static_contracts_pass_without_starting_services() {
+        let root = workspace_root().unwrap();
+        let registry = load_registry(&root).unwrap();
+        validate_constants(&registry.constants).unwrap();
+        validate_environment_contract(&root).unwrap();
+        validate_external_tools(&root).unwrap();
+        validate_profile_implementation_contract(&registry).unwrap();
+        validate_dependency_boundaries(&root).unwrap();
+        validate_package_contents(&root).unwrap();
+        validate_fixture_tree(&root).unwrap();
+        validate_service_configuration(&root).unwrap();
+    }
+
+    #[test]
+    fn static_validators_reject_zero_constants_and_unsafe_fixture_files() {
+        let root = workspace_root().unwrap();
+        let registry = load_registry(&root).unwrap();
+        let mut constants = registry.constants;
+        constants.dispatch_window_size = 0;
+        assert!(validate_constants(&constants).is_err());
+
+        let directory = tempfile::tempdir().unwrap();
+        let performance = directory.path().join("performance");
+        fs::create_dir_all(&performance).unwrap();
+        fs::write(performance.join("generated.jsonl"), "{}\n").unwrap();
+        assert!(validate_fixture_tree(directory.path()).is_err());
+        fs::remove_file(performance.join("generated.jsonl")).unwrap();
+        fs::write(
+            performance.join("private.rs"),
+            "#[path = \"../../vigilo/src/private.rs\"] mod private;",
+        )
+        .unwrap();
+        assert!(validate_fixture_tree(directory.path()).is_err());
     }
 }

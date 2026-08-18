@@ -1,0 +1,22 @@
+schema_id = "performance-fixtures/v1"
+id = "mvp-v1"
+evaluator_ref = "vigilo/sentiment-basic-en:0.1.0"
+agent_response_text = "good reliable response"
+agent_payload_bytes = 1024
+
+[run_create]
+cases = 1001
+expected_chunks = 11
+
+[coordinator]
+chunks = 512
+cases_per_chunk = 100
+
+[worker]
+cases_many = 8
+evaluators_many = 8
+
+[lifecycle]
+cases = 100
+worker_pass_limit = 8
+coordinator_cycle_limit = 8

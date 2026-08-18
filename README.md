@@ -67,6 +67,7 @@ git config core.hooksPath scripts/hooks
 | Database integration | SQL, migrations, transactions, advisory locks, leases, and concurrency | One PostgreSQL server; `DATABASE_URL` must use a role that can create test databases | `Database Integration Tests` |
 | Migration | Greenfield schema application through the CLI setup path | One fresh PostgreSQL database | `Migration Tests` |
 | End-to-end | Routing and the real distributed runtime across process and protocol boundaries | Two PostgreSQL servers, RabbitMQ, evaluator Wasm, and the test HTTP agent | `End-to-End Tests` |
+| Performance services | Perf topology ownership, collector reset, and cleanup integration | Docker Engine with Compose; images are declared in `performance/compose.yml` | Opt-in local tier |
 
 Run the service-free tier with:
 
@@ -74,18 +75,23 @@ Run the service-free tier with:
 cargo test --workspace --locked --lib --bins
 ```
 
-The repository-local performance harness is a separate opt-in workflow. Phase
-1 provides a service-free startup measurement and validates that performance
-tooling stays out of the shipped dependency graph:
+The repository-local performance harness is a separate opt-in workflow. Its
+static check remains service-free and validates that performance tooling stays
+out of the shipped dependency graph:
 
 ```bash
 cargo perf check
 ```
 
-Build, run, comparison, artifact, and isolation details are in
-[`performance/README.md`](performance/README.md). Database, coordinator,
-worker/Wasm, and lifecycle performance workloads remain registered but are not
-executable until their isolated Phase 2 fixtures land.
+The explicit live-service integration tier is:
+
+```bash
+cargo test -p xtask --locked --features performance-services --test performance_services -- --nocapture
+```
+
+It is feature-gated and therefore does not expand normal workspace, database,
+migration, or end-to-end test commands. Build, workload, artifact, and
+isolation details are in [`performance/README.md`](performance/README.md).
 
 After setting `DATABASE_URL`, run every PostgreSQL-backed SQLx test with:
 

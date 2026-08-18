@@ -10,11 +10,14 @@ mod build;
 mod check;
 mod command;
 mod config;
+mod fixture;
 mod model;
 mod process;
 mod report;
 mod schedule;
+mod service;
 mod stats;
+mod workload;
 
 use std::{
     path::PathBuf,
@@ -87,6 +90,41 @@ pub fn run_fixture(args: FixtureArgs) -> Result<u8> {
     Ok(args.exit_code.clamp(0, u8::MAX as i32) as u8)
 }
 
+/// Runs the opt-in live service integration fixture.
+pub fn run_service_fixture() -> Result<u8> {
+    let root = artifact::workspace_root()?;
+    service::integration_self_test(&root)?;
+    Ok(EXIT_PASS)
+}
+
 fn default_profile_dir() -> PathBuf {
     PathBuf::from("performance/profiles")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixture_exit_codes_are_clamped_to_process_range() {
+        assert_eq!(
+            run_fixture(FixtureArgs {
+                delay_ms: 0,
+                output_bytes: 0,
+                exit_code: -1,
+            })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            run_fixture(FixtureArgs {
+                delay_ms: 0,
+                output_bytes: 0,
+                exit_code: 300,
+            })
+                .unwrap(),
+            u8::MAX
+        );
+        assert_eq!(default_profile_dir(), PathBuf::from("performance/profiles"));
+    }
 }

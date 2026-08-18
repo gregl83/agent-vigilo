@@ -31,12 +31,15 @@ enum Command {
     Perf(perf::PerfArgs),
     #[command(name = "__perf-fixture", hide = true)]
     PerfFixture(perf::FixtureArgs),
+    #[command(name = "__perf-service-fixture", hide = true)]
+    PerfServiceFixture,
 }
 
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Perf(args) => perf::run(args),
         Command::PerfFixture(args) => perf::run_fixture(args),
+        Command::PerfServiceFixture => perf::run_service_fixture(),
     };
 
     match result {

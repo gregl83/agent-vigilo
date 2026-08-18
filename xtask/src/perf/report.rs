@@ -134,3 +134,107 @@ fn markdown(report: &ReportDocument) -> String {
     }
     output
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::perf::{
+        artifact::no_extra,
+        model::{
+            COMPARISON_SCHEMA,
+            ComparisonDocument,
+            MetricComparison,
+            Verdict,
+        },
+    };
+
+    fn report() -> ReportDocument {
+        ReportDocument {
+            schema_id: REPORT_SCHEMA.into(),
+            run_id: "run-1".into(),
+            kind: "compare".into(),
+            status: "failure".into(),
+            profile_id: "pr-v1".into(),
+            generated_at: "2026-08-17T00:00:00Z".into(),
+            comparisons: vec![ComparisonDocument {
+                schema_id: COMPARISON_SCHEMA.into(),
+                run_id: "run-1".into(),
+                profile_id: "pr-v1".into(),
+                workload_id: "startup.cli-help.v1".into(),
+                tuple_id: "cold-help".into(),
+                baseline_digest: "a".into(),
+                candidate_digest: "b".into(),
+                metrics: vec![MetricComparison {
+                    name: "wall_time".into(),
+                    unit: "ns".into(),
+                    direction: "higher_is_harmful".into(),
+                    baseline_median: 1_000_000.0,
+                    candidate_median: 1_100_000.0,
+                    raw_candidate_delta: 0.1,
+                    harmful_effect: 0.1,
+                    confidence_lower: 0.05,
+                    confidence_upper: 0.15,
+                    practical_budget: Some(0.05),
+                    verdict: Verdict::Regression,
+                    valid_abba_blocks: 1,
+                    valid_baab_blocks: 1,
+                    unmatched_blocks: 0,
+                    residual_orientation_effect: 0.0,
+                    orientation_medians: BTreeMap::new(),
+                    position_medians: BTreeMap::new(),
+                    estimator: "test".into(),
+                    bootstrap_seed: 1,
+                }],
+                verdict: Verdict::Regression,
+                extra: no_extra(),
+            }],
+            failures: vec!["regression confirmed".into()],
+            artifact_files: vec!["samples.jsonl".into()],
+            extra: no_extra(),
+        }
+    }
+
+    #[test]
+    fn report_round_trip_writes_and_rerenders_human_view() {
+        let directory = tempfile::tempdir().unwrap();
+        let report = report();
+        write(directory.path(), &report).unwrap();
+        let first = fs::read_to_string(directory.path().join("summary.md")).unwrap();
+        assert!(first.contains("+10.00%"));
+        assert!(first.contains("regression confirmed"));
+        assert!(first.contains("samples.jsonl"));
+
+        fs::write(directory.path().join("summary.md"), "stale").unwrap();
+        assert_eq!(
+            execute(ReportArgs {
+                run_dir: directory.path().to_path_buf(),
+            })
+            .unwrap(),
+            EXIT_PASS
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("summary.md")).unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn report_rerender_rejects_unknown_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut report = report();
+        report.schema_id = "report/v2".into();
+        fs::write(
+            directory.path().join("report.json"),
+            serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            execute(ReportArgs {
+                run_dir: directory.path().to_path_buf(),
+            })
+            .is_err()
+        );
+    }
+}

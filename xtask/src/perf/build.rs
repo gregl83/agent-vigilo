@@ -108,15 +108,46 @@ pub fn execute(args: BuildArgs) -> Result<u8> {
     if !executable.is_file() {
         bail!("release build did not produce {}", executable.display());
     }
-    verify_startup_capability(&executable)?;
+    let capabilities = verify_capabilities(&executable)?;
 
     let assets = output.join("setup-assets");
     let migrations_source = source.join("migrations");
     let wit_source = source.join("wit");
     copy_tree(&migrations_source, &assets.join("migrations"))?;
     copy_tree(&wit_source, &assets.join("wit"))?;
+    let evaluator_source = source.join("evaluators/sentiment-basic-en");
+    let evaluator_target = output.join("evaluator-target");
+    let evaluator_status = Command::new("cargo")
+        .args(["build", "--locked", "--release", "--manifest-path"])
+        .arg(evaluator_source.join("Cargo.toml"))
+        .args(["--target", "wasm32-wasip2", "--target-dir"])
+        .arg(&evaluator_target)
+        .current_dir(&source)
+        .status()
+        .context("build frozen evaluator fixture")?;
+    if !evaluator_status.success() {
+        bail!("frozen evaluator fixture build failed with {evaluator_status}");
+    }
+    let evaluator_asset = assets.join("evaluators/sentiment-basic-en");
+    copy_tree(&evaluator_source, &evaluator_asset)?;
+    let evaluator_wasm = evaluator_target.join("wasm32-wasip2/release/sentiment_basic_en.wasm");
+    let evaluator_asset_wasm =
+        evaluator_asset.join("target/wasm32-wasip2/release/sentiment_basic_en.wasm");
+    fs::create_dir_all(
+        evaluator_asset_wasm
+            .parent()
+            .context("evaluator asset parent")?,
+    )?;
+    fs::copy(&evaluator_wasm, &evaluator_asset_wasm).with_context(|| {
+        format!(
+            "copy evaluator fixture {} to {}",
+            evaluator_wasm.display(),
+            evaluator_asset_wasm.display()
+        )
+    })?;
     let migrations_digest = digest_tree(&migrations_source)?;
     let evaluator_abi_digest = digest_tree(&wit_source)?;
+    let evaluator_fixture_digest = digest_tree(&evaluator_asset)?;
     if migrations_digest != digest_tree(&assets.join("migrations"))?
         || evaluator_abi_digest != digest_tree(&assets.join("wit"))?
     {
@@ -166,7 +197,7 @@ pub fn execute(args: BuildArgs) -> Result<u8> {
         cargo,
         target,
         profile: "release".into(),
-        capabilities: vec!["startup.cli-help.v1".into()],
+        capabilities,
         setup_assets: vec![
             SetupAsset {
                 name: "migrations".into(),
@@ -177,6 +208,11 @@ pub fn execute(args: BuildArgs) -> Result<u8> {
                 name: "evaluator-wit".into(),
                 relative_path: "setup-assets/wit".into(),
                 digest: evaluator_abi_digest,
+            },
+            SetupAsset {
+                name: "evaluator-fixture".into(),
+                relative_path: "setup-assets/evaluators/sentiment-basic-en".into(),
+                digest: evaluator_fixture_digest,
             },
         ],
         extra: BTreeMap::new(),
@@ -189,12 +225,34 @@ pub fn execute(args: BuildArgs) -> Result<u8> {
     Ok(EXIT_PASS)
 }
 
-fn verify_startup_capability(executable: &Path) -> Result<()> {
-    let args = vec!["--help".into()];
+fn verify_capabilities(executable: &Path) -> Result<Vec<String>> {
+    verify_help(executable, &["--help"], &["Usage:", "Commands:"])?;
+    verify_help(
+        executable,
+        &["run", "create", "--help"],
+        &["profile-file", "dataset-file"],
+    )?;
+    verify_help(executable, &["coordinator", "once", "--help"], &["Usage:"])?;
+    verify_help(executable, &["worker", "once", "--help"], &["Usage:"])?;
+    Ok(vec![
+        "startup.cli-help.v1".into(),
+        "run.create.v1".into(),
+        "coordinator.dispatch.v1".into(),
+        "worker.execute-wasm.v1".into(),
+        "system.lifecycle.v1".into(),
+    ])
+}
+
+fn verify_help(executable: &Path, arguments: &[&str], signatures: &[&str]) -> Result<()> {
+    let args = arguments
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
     let outcome = execute_process(&ProcessSpec {
         program: executable,
         args: &args,
         current_dir: None,
+        env: &[],
         timeout: Duration::from_secs(10),
         stdout_limit: 256 * 1024,
         stderr_limit: 256 * 1024,
@@ -202,10 +260,11 @@ fn verify_startup_capability(executable: &Path) -> Result<()> {
     let stdout = outcome.stdout.text();
     if outcome.timed_out
         || outcome.exit_code != Some(0)
-        || !stdout.contains("Usage:")
-        || !stdout.contains("Commands:")
+        || signatures
+            .iter()
+            .any(|signature| !stdout.contains(signature))
     {
-        bail!("release binary does not satisfy startup.cli-help.v1");
+        bail!("release binary does not satisfy `{}`", arguments.join(" "));
     }
     Ok(())
 }
@@ -224,4 +283,41 @@ fn command_output(source: &Path, program: &str, args: &[&str]) -> Result<String>
 
 fn optional_command_output(source: &Path, program: &str, args: &[&str]) -> Option<String> {
     command_output(source, program, args).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn help_fixture() -> (PathBuf, Vec<&'static str>) {
+        if cfg!(windows) {
+            (
+                PathBuf::from("powershell.exe"),
+                vec!["-NoProfile", "-Command", "Write-Output 'Usage: Commands:'"],
+            )
+        } else {
+            (
+                PathBuf::from("/bin/sh"),
+                vec!["-c", "printf 'Usage: Commands:\\n'"],
+            )
+        }
+    }
+
+    #[test]
+    fn help_probe_requires_success_and_every_signature() {
+        let (program, arguments) = help_fixture();
+        assert!(verify_help(&program, &arguments, &["Usage:", "Commands:"]).is_ok());
+        assert!(verify_help(&program, &arguments, &["missing"]).is_err());
+    }
+
+    #[test]
+    fn command_probes_capture_required_and_optional_tools() {
+        let root = crate::perf::artifact::workspace_root().unwrap();
+        assert!(
+            command_output(&root, "rustc", &["-V"])
+                .unwrap()
+                .starts_with("rustc ")
+        );
+        assert!(optional_command_output(&root, "missing-vigilo-test-tool", &[]).is_none());
+    }
 }

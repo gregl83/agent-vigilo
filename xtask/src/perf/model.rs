@@ -128,6 +128,8 @@ pub struct Workload {
     pub status: ImplementationStatus,
     /// Capability required from every compared build manifest.
     pub capability: String,
+    /// Versioned fixture catalog consumed by the workload driver.
+    pub fixture: String,
     /// Explicit fixture shapes that profiles may select.
     pub tuples: Vec<String>,
     /// Denominator used to interpret throughput and resource measurements.
@@ -354,6 +356,38 @@ pub struct ProcessMeasurement {
     pub stderr_truncated: bool,
 }
 
+/// Scoped service and durable-state measurements for one workload execution.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExternalMeasurements {
+    /// PostgreSQL statements executed in the sample scope.
+    pub sql_calls: Option<u64>,
+    /// PostgreSQL statement execution time in milliseconds.
+    pub sql_time_ms: Option<f64>,
+    /// Rows observed by scoped PostgreSQL statements.
+    pub sql_rows: Option<u64>,
+    /// WAL bytes generated during the sample.
+    pub wal_bytes: Option<u64>,
+    /// Change in durable PostgreSQL database bytes.
+    pub database_bytes_delta: Option<i64>,
+    /// HTTP requests received by the deterministic agent.
+    pub http_requests: Option<u64>,
+    /// HTTP request and response bytes observed by the agent.
+    pub http_bytes: Option<u64>,
+    /// Maximum simultaneous HTTP requests observed by the agent.
+    pub http_peak_concurrency: Option<u64>,
+    /// Ready RabbitMQ deliveries after workload settlement.
+    pub queue_ready: Option<u64>,
+    /// Unacknowledged RabbitMQ deliveries after workload settlement.
+    pub queue_unacked: Option<u64>,
+    /// Peak memory used by the scoped service containers.
+    pub service_memory_bytes: Option<u64>,
+    /// Maximum sampled aggregate container CPU percentage during execution.
+    pub service_cpu_percent: Option<f64>,
+    /// Exact durable business-state counts produced by the workload oracle.
+    #[serde(default)]
+    pub durable_counts: BTreeMap<String, i64>,
+}
+
 /// Raw observation for one scheduled workload execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sample {
@@ -387,6 +421,9 @@ pub struct Sample {
     pub process: ProcessMeasurement,
     /// Correctness and validity result.
     pub validation: Validation,
+    /// Scoped database, broker, HTTP, service, and durable-state measurements.
+    #[serde(default)]
+    pub external: ExternalMeasurements,
     /// Unknown additive fields retained for forward compatibility.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,

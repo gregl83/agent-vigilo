@@ -39,6 +39,8 @@ pub struct ProcessSpec<'a> {
     pub args: &'a [String],
     /// Optional working directory for the child.
     pub current_dir: Option<&'a Path>,
+    /// Environment variables added or overridden for the child.
+    pub env: &'a [(String, String)],
     /// Hard deadline after which the entire child tree is terminated.
     pub timeout: Duration,
     /// Maximum number of stdout bytes retained in memory.
@@ -91,6 +93,7 @@ pub fn execute(spec: &ProcessSpec<'_>) -> Result<ProcessOutcome> {
     let mut command = Command::new(spec.program);
     command
         .args(spec.args)
+        .envs(spec.env.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -466,6 +469,7 @@ mod tests {
             program: &program,
             args: &args,
             current_dir: None,
+            env: &[],
             timeout: Duration::from_secs(5),
             stdout_limit: 64,
             stderr_limit: 64,
@@ -488,6 +492,7 @@ mod tests {
             program: &program,
             args: &args,
             current_dir: None,
+            env: &[],
             timeout: Duration::from_millis(30),
             stdout_limit: 64,
             stderr_limit: 64,

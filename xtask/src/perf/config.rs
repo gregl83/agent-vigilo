@@ -89,6 +89,7 @@ pub fn validate_registry(registry: &WorkloadRegistry) -> Result<()> {
             );
         }
         if workload.owner.is_empty()
+            || workload.fixture.is_empty()
             || workload.unit.is_empty()
             || workload.oracle.is_empty()
             || workload.required_metrics.is_empty()
@@ -268,5 +269,63 @@ timing = "informative"
         )
         .unwrap();
         assert!(validate_profile(&profile).is_err());
+    }
+
+    #[test]
+    fn repository_profiles_resolve_strict_selections_and_estimates() {
+        let root = crate::perf::artifact::workspace_root().unwrap();
+        let registry = load_registry(&root).unwrap();
+        let developer = load_profile(&root, "developer-v1").unwrap();
+        assert!(load_profile(&root, "../escape").is_err());
+        assert!(select_workloads(&developer, &registry, &[]).is_err());
+        assert!(select_workloads(&developer, &registry, &["run.create.v1".into()]).is_err());
+
+        let selected =
+            select_workloads(&developer, &registry, &["startup.cli-help.v1".into()]).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(estimated_single_millis(&selected), 5_000);
+        assert_eq!(estimated_compare_millis(&selected), 10_000);
+
+        let pr = load_profile(&root, "pr-v1").unwrap();
+        assert_eq!(select_workloads(&pr, &registry, &[]).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn registry_and_profile_validation_reject_contract_drift() {
+        let root = crate::perf::artifact::workspace_root().unwrap();
+        let registry = load_registry(&root).unwrap();
+        let profile = load_profile(&root, "pr-v1").unwrap();
+
+        let mut invalid = registry.clone();
+        invalid.schema_id = "workload-registry/v2".into();
+        assert!(validate_registry(&invalid).is_err());
+        let mut invalid = registry.clone();
+        invalid.revision = 0;
+        assert!(validate_registry(&invalid).is_err());
+        let mut invalid = registry.clone();
+        invalid.workloads.push(invalid.workloads[0].clone());
+        assert!(validate_registry(&invalid).is_err());
+        let mut invalid = registry.clone();
+        invalid.workloads[0].tuples.clear();
+        assert!(validate_registry(&invalid).is_err());
+        let mut invalid = registry.clone();
+        invalid.workloads[0].owner.clear();
+        assert!(validate_registry(&invalid).is_err());
+
+        let mut invalid = profile.clone();
+        invalid.schema_id = "profile/v2".into();
+        assert!(validate_profile(&invalid).is_err());
+        let mut invalid = profile.clone();
+        invalid.max_stdout_bytes = 0;
+        assert!(validate_profile(&invalid).is_err());
+        let mut invalid = profile.clone();
+        invalid.workloads[0].timing = "unknown".into();
+        assert!(validate_profile(&invalid).is_err());
+        let mut invalid = profile.clone();
+        invalid.workloads[0].id = "unknown.v1".into();
+        assert!(validate_profile_registry(&invalid, &registry).is_err());
+        let mut invalid = profile;
+        invalid.workloads[0].tuple = "unknown".into();
+        assert!(validate_profile_registry(&invalid, &registry).is_err());
     }
 }

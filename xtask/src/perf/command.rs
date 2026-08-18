@@ -84,6 +84,11 @@ use super::{
     report,
     schedule,
     stats::compare_wall_time,
+    workload::{
+        ExecutionLimits,
+        WorkloadRequest,
+        WorkloadRunner,
+    },
 };
 
 /// CLI arguments for measuring one immutable release binary.
@@ -159,6 +164,7 @@ pub fn run_single(args: RunArgs) -> Result<u8> {
     let _lease = CampaignLease::acquire(&root)?;
     let run_dir = create_run_dir(&root, args.output.as_deref(), "run")?;
     let id = run_id();
+    let mut workload_runner = WorkloadRunner::new(&root, &run_dir, &id);
     let seed = args.schedule_seed.unwrap_or(profile.schedule_seed);
     let environment = environment_manifest();
     atomic_json(&run_dir.join("environment.json"), &environment)?;
@@ -195,20 +201,25 @@ pub fn run_single(args: RunArgs) -> Result<u8> {
 
     for selected_workload in &selected {
         if selected_workload.workload.preconditioning == Preconditioning::OnePerBinary {
-            let precondition = execute_workload(ExecutionRequest {
-                run_id: &id,
-                profile_id: &profile.id,
-                selected: selected_workload,
-                binary: &binary,
-                role: BinaryRole::Single,
-                orientation: Orientation::Single,
-                block_id: 0,
-                pair_id: 0,
-                position: 0,
-                measured: false,
-                stdout_limit: profile.max_stdout_bytes,
-                stderr_limit: profile.max_stderr_bytes,
-            })?;
+            let precondition = execute_workload(
+                &mut workload_runner,
+                ExecutionRequest {
+                    run_id: &id,
+                    profile_id: &profile.id,
+                    selected: selected_workload,
+                    binary: &binary,
+                    build_manifest: &args.build_manifest,
+                    manifest: &manifest,
+                    role: BinaryRole::Single,
+                    orientation: Orientation::Single,
+                    block_id: 0,
+                    pair_id: 0,
+                    position: 0,
+                    measured: false,
+                    stdout_limit: profile.max_stdout_bytes,
+                    stderr_limit: profile.max_stderr_bytes,
+                },
+            )?;
             let valid = precondition.sample.validation.state == SampleState::Valid;
             readiness.push(ReadinessEvent {
                 schema_id: REPORT_SCHEMA.into(),
@@ -247,20 +258,25 @@ pub fn run_single(args: RunArgs) -> Result<u8> {
                 .iter()
                 .filter(|execution| execution.role == BinaryRole::Candidate)
             {
-                let executed = execute_workload(ExecutionRequest {
-                    run_id: &id,
-                    profile_id: &profile.id,
-                    selected: selected_workload,
-                    binary: &binary,
-                    role: BinaryRole::Single,
-                    orientation,
-                    block_id,
-                    pair_id: execution.pair_id,
-                    position: execution.position,
-                    measured: true,
-                    stdout_limit: profile.max_stdout_bytes,
-                    stderr_limit: profile.max_stderr_bytes,
-                })?;
+                let executed = execute_workload(
+                    &mut workload_runner,
+                    ExecutionRequest {
+                        run_id: &id,
+                        profile_id: &profile.id,
+                        selected: selected_workload,
+                        binary: &binary,
+                        build_manifest: &args.build_manifest,
+                        manifest: &manifest,
+                        role: BinaryRole::Single,
+                        orientation,
+                        block_id,
+                        pair_id: execution.pair_id,
+                        position: execution.position,
+                        measured: true,
+                        stdout_limit: profile.max_stdout_bytes,
+                        stderr_limit: profile.max_stderr_bytes,
+                    },
+                )?;
                 if executed.sample.validation.state != SampleState::Valid {
                     exit = classification_exit(&executed.sample);
                     failures.push(format!(
@@ -360,6 +376,7 @@ pub fn compare(args: CompareArgs) -> Result<u8> {
     let _lease = CampaignLease::acquire(&root)?;
     let run_dir = create_run_dir(&root, args.output.as_deref(), "compare")?;
     let id = run_id();
+    let mut workload_runner = WorkloadRunner::new(&root, &run_dir, &id);
     let seed = args.schedule_seed.unwrap_or(profile.schedule_seed);
     atomic_json(&run_dir.join("environment.json"), &environment_manifest())?;
     let mut campaign = campaign_manifest(
@@ -403,20 +420,30 @@ pub fn compare(args: CompareArgs) -> Result<u8> {
             );
             for role in schedule::preconditioning_order(first_orientation) {
                 let binary = binary_for(role, &baseline_binary, &candidate_binary);
-                let precondition = execute_workload(ExecutionRequest {
-                    run_id: &id,
-                    profile_id: &profile.id,
-                    selected: selected_workload,
-                    binary,
-                    role,
-                    orientation: first_orientation,
-                    block_id: 0,
-                    pair_id: 0,
-                    position: 0,
-                    measured: false,
-                    stdout_limit: profile.max_stdout_bytes,
-                    stderr_limit: profile.max_stderr_bytes,
-                })?;
+                let (build_manifest, manifest) = match role {
+                    BinaryRole::Baseline => (&args.baseline_manifest, &baseline_manifest),
+                    BinaryRole::Candidate => (&args.candidate_manifest, &candidate_manifest),
+                    BinaryRole::Single => unreachable!(),
+                };
+                let precondition = execute_workload(
+                    &mut workload_runner,
+                    ExecutionRequest {
+                        run_id: &id,
+                        profile_id: &profile.id,
+                        selected: selected_workload,
+                        binary,
+                        build_manifest,
+                        manifest,
+                        role,
+                        orientation: first_orientation,
+                        block_id: 0,
+                        pair_id: 0,
+                        position: 0,
+                        measured: false,
+                        stdout_limit: profile.max_stdout_bytes,
+                        stderr_limit: profile.max_stderr_bytes,
+                    },
+                )?;
                 let valid = precondition.sample.validation.state == SampleState::Valid;
                 readiness.push(ReadinessEvent {
                     schema_id: REPORT_SCHEMA.into(),
@@ -472,20 +499,30 @@ pub fn compare(args: CompareArgs) -> Result<u8> {
             let mut block_samples = Vec::new();
             for execution in schedule::executions(orientation) {
                 let binary = binary_for(execution.role, &baseline_binary, &candidate_binary);
-                let executed = execute_workload(ExecutionRequest {
-                    run_id: &id,
-                    profile_id: &profile.id,
-                    selected: selected_workload,
-                    binary,
-                    role: execution.role,
-                    orientation,
-                    block_id,
-                    pair_id: execution.pair_id,
-                    position: execution.position,
-                    measured: true,
-                    stdout_limit: profile.max_stdout_bytes,
-                    stderr_limit: profile.max_stderr_bytes,
-                })?;
+                let (build_manifest, manifest) = match execution.role {
+                    BinaryRole::Baseline => (&args.baseline_manifest, &baseline_manifest),
+                    BinaryRole::Candidate => (&args.candidate_manifest, &candidate_manifest),
+                    BinaryRole::Single => unreachable!(),
+                };
+                let executed = execute_workload(
+                    &mut workload_runner,
+                    ExecutionRequest {
+                        run_id: &id,
+                        profile_id: &profile.id,
+                        selected: selected_workload,
+                        binary,
+                        build_manifest,
+                        manifest,
+                        role: execution.role,
+                        orientation,
+                        block_id,
+                        pair_id: execution.pair_id,
+                        position: execution.position,
+                        measured: true,
+                        stdout_limit: profile.max_stdout_bytes,
+                        stderr_limit: profile.max_stderr_bytes,
+                    },
+                )?;
                 if executed.sample.validation.state != SampleState::Valid {
                     exit = classification_exit(&executed.sample);
                     failures.push(format!(
@@ -737,6 +774,8 @@ struct ExecutionRequest<'request, 'config> {
     profile_id: &'request str,
     selected: &'request SelectedWorkload<'config>,
     binary: &'request Path,
+    build_manifest: &'request Path,
+    manifest: &'request BuildManifest,
     role: BinaryRole,
     orientation: Orientation,
     block_id: u32,
@@ -747,16 +786,40 @@ struct ExecutionRequest<'request, 'config> {
     stderr_limit: usize,
 }
 
-fn execute_workload(request: ExecutionRequest<'_, '_>) -> Result<ExecutedSample> {
+fn execute_workload(
+    runner: &mut WorkloadRunner,
+    request: ExecutionRequest<'_, '_>,
+) -> Result<ExecutedSample> {
     let started_at = Utc::now().to_rfc3339();
-    let outcome = execute(&ProcessSpec {
-        program: request.binary,
-        args: &request.selected.workload.command,
-        current_dir: None,
-        timeout: Duration::from_millis(request.selected.workload.watchdog_ms),
-        stdout_limit: request.stdout_limit,
-        stderr_limit: request.stderr_limit,
-    })?;
+    let (outcome, external) = if request.selected.workload.id == "startup.cli-help.v1" {
+        (
+            execute(&ProcessSpec {
+                program: request.binary,
+                args: &request.selected.workload.command,
+                current_dir: None,
+                env: &[],
+                timeout: Duration::from_millis(request.selected.workload.watchdog_ms),
+                stdout_limit: request.stdout_limit,
+                stderr_limit: request.stderr_limit,
+            })?,
+            Default::default(),
+        )
+    } else {
+        let executed = runner.execute(WorkloadRequest {
+            workload_id: &request.selected.workload.id,
+            tuple: &request.selected.profile.tuple,
+            fixture_id: &request.selected.workload.fixture,
+            binary: request.binary,
+            manifest_path: request.build_manifest,
+            manifest: request.manifest,
+            limits: ExecutionLimits {
+                watchdog: Duration::from_millis(request.selected.workload.watchdog_ms),
+                stdout: request.stdout_limit,
+                stderr: request.stderr_limit,
+            },
+        })?;
+        (executed.process, executed.external)
+    };
     let validation = validate_outcome(&outcome, request.selected, request.role);
     let measurement = ProcessMeasurement {
         wall_time_ns: outcome.wall_time.as_nanos().min(u128::from(u64::MAX)) as u64,
@@ -786,6 +849,7 @@ fn execute_workload(request: ExecutionRequest<'_, '_>) -> Result<ExecutedSample>
             measured: request.measured,
             started_at,
             process: measurement,
+            external,
             validation,
             extra: no_extra(),
         },
@@ -1049,6 +1113,63 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::perf::{
+        artifact::{
+            digest_file,
+            digest_tree,
+        },
+        model::SetupAsset,
+        process::CapturedOutput,
+    };
+
+    fn process_outcome(stdout: &str) -> ProcessOutcome {
+        ProcessOutcome {
+            wall_time: Duration::from_millis(1),
+            cpu_time_ns: Some(1),
+            peak_rss_bytes: Some(1),
+            resource_source: "test",
+            exit_code: Some(0),
+            timed_out: false,
+            stdout: CapturedOutput {
+                bytes_seen: stdout.len() as u64,
+                truncated: false,
+                data: stdout.as_bytes().to_vec(),
+            },
+            stderr: CapturedOutput {
+                bytes_seen: 0,
+                truncated: false,
+                data: Vec::new(),
+            },
+        }
+    }
+
+    fn manifest(binary: &Path, asset: &Path) -> BuildManifest {
+        BuildManifest {
+            schema_id: BUILD_SCHEMA.into(),
+            created_at: "2026-08-18T00:00:00Z".into(),
+            executable_name: binary.file_name().unwrap().to_string_lossy().into_owned(),
+            executable_digest: digest_file(binary).unwrap(),
+            executable_bytes: binary.metadata().unwrap().len(),
+            source_commit: None,
+            source_dirty: false,
+            source_label: "test".into(),
+            cargo_lock_digest: "lock".into(),
+            dependency_tree_digest: "tree".into(),
+            migrations_digest: "migrations".into(),
+            evaluator_abi_digest: "abi".into(),
+            rustc: "rustc test".into(),
+            cargo: "cargo test".into(),
+            target: "test".into(),
+            profile: "release".into(),
+            capabilities: vec!["startup.cli-help.v1".into()],
+            setup_assets: vec![SetupAsset {
+                name: "fixture".into(),
+                relative_path: asset.file_name().unwrap().to_string_lossy().into_owned(),
+                digest: digest_tree(asset).unwrap(),
+            }],
+            extra: BTreeMap::new(),
+        }
+    }
 
     #[test]
     fn candidate_failures_are_product_failures_but_baseline_failures_are_invalid() {
@@ -1078,6 +1199,7 @@ mod tests {
                 stdout_truncated: false,
                 stderr_truncated: false,
             },
+            external: Default::default(),
             validation: Validation {
                 state: SampleState::Invalid,
                 code: "process_exit".into(),
@@ -1115,6 +1237,141 @@ mod tests {
         assert_eq!(
             missing_signature("Usage: vigilo\nCommands:", &signatures),
             None
+        );
+    }
+
+    #[test]
+    fn manifest_verification_rejects_changed_or_escaping_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("vigilo-test");
+        let asset = directory.path().join("assets");
+        let manifest_path = directory.path().join("build-manifest.json");
+        fs::write(&binary, "binary").unwrap();
+        fs::create_dir(&asset).unwrap();
+        fs::write(asset.join("fixture"), "data").unwrap();
+        let valid = manifest(&binary, &asset);
+        atomic_json(&manifest_path, &valid).unwrap();
+        assert_eq!(
+            load_and_verify_manifest(&manifest_path, &binary)
+                .unwrap()
+                .executable_digest,
+            valid.executable_digest
+        );
+
+        fs::write(&binary, "changed").unwrap();
+        assert!(verify_executable_unchanged(&binary, &valid).is_err());
+        fs::write(&binary, "binary").unwrap();
+        let mut unsafe_manifest = valid.clone();
+        unsafe_manifest.setup_assets[0].relative_path = "../outside".into();
+        atomic_json(&manifest_path, &unsafe_manifest).unwrap();
+        assert!(load_and_verify_manifest(&manifest_path, &binary).is_err());
+
+        let mut wrong_schema = valid;
+        wrong_schema.schema_id = "build-manifest/v2".into();
+        atomic_json(&manifest_path, &wrong_schema).unwrap();
+        assert!(load_and_verify_manifest(&manifest_path, &binary).is_err());
+    }
+
+    #[test]
+    fn selected_workloads_require_implementation_capability_and_budget() {
+        let root = workspace_root().unwrap();
+        let registry = load_registry(&root).unwrap();
+        let mut profile = load_profile(&root, "developer-v1").unwrap();
+        let requested = vec!["startup.cli-help.v1".into()];
+        let selected = select_workloads(&profile, &registry, &requested).unwrap();
+        assert!(require_implemented(&selected).is_ok());
+        assert!(validate_campaign_budget(&profile, &selected, 1_000, false).is_ok());
+
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("binary");
+        let asset = directory.path().join("assets");
+        fs::write(&binary, "binary").unwrap();
+        fs::create_dir(&asset).unwrap();
+        let manifest = manifest(&binary, &asset);
+        assert!(require_capabilities(&selected, &[&manifest]).is_ok());
+        let mut missing = manifest.clone();
+        missing.capabilities.clear();
+        assert!(require_capabilities(&selected, &[&missing]).is_err());
+
+        profile.campaign_cap_secs = 0;
+        let selected = select_workloads(&profile, &registry, &requested).unwrap();
+        assert!(validate_campaign_budget(&profile, &selected, 1, false).is_err());
+        profile.campaign_cap_secs = 10;
+        profile.max_artifact_bytes = 1;
+        let selected = select_workloads(&profile, &registry, &requested).unwrap();
+        assert!(validate_campaign_budget(&profile, &selected, 1, false).is_err());
+
+        let mut planned_registry = registry.clone();
+        planned_registry.workloads[0].status = ImplementationStatus::Planned;
+        let selected = select_workloads(&profile, &planned_registry, &requested).unwrap();
+        assert!(require_implemented(&selected).is_err());
+    }
+
+    #[test]
+    fn startup_oracle_classifies_every_process_failure_mode() {
+        let root = workspace_root().unwrap();
+        let registry = load_registry(&root).unwrap();
+        let profile = load_profile(&root, "developer-v1").unwrap();
+        let selected =
+            select_workloads(&profile, &registry, &["startup.cli-help.v1".into()]).unwrap();
+        let selected = &selected[0];
+
+        let valid = process_outcome("Usage: vigilo\nCommands:");
+        assert_eq!(
+            validate_outcome(&valid, selected, BinaryRole::Single).state,
+            SampleState::Valid
+        );
+        let mut timeout = process_outcome("");
+        timeout.timed_out = true;
+        assert_eq!(
+            validate_outcome(&timeout, selected, BinaryRole::Baseline).code,
+            "process_timeout"
+        );
+        assert_eq!(
+            validate_outcome(&timeout, selected, BinaryRole::Baseline).state,
+            SampleState::Invalid
+        );
+        let mut exit = process_outcome("");
+        exit.exit_code = Some(2);
+        assert_eq!(
+            validate_outcome(&exit, selected, BinaryRole::Candidate).code,
+            "process_exit"
+        );
+        let mut truncated = process_outcome("");
+        truncated.stdout.truncated = true;
+        assert_eq!(
+            validate_outcome(&truncated, selected, BinaryRole::Single).code,
+            "output_truncated"
+        );
+        assert_eq!(
+            validate_outcome(&process_outcome("Usage:"), selected, BinaryRole::Single).code,
+            "fixture_mismatch"
+        );
+    }
+
+    #[test]
+    fn campaign_helpers_write_bounded_artifacts() {
+        let directory = tempfile::tempdir().unwrap();
+        checkpoint(directory.path(), &[], &[], &[]).unwrap();
+        assert!(directory.path().join("samples.jsonl").is_file());
+        assert_eq!(artifact_files(false).len(), 7);
+        assert_eq!(artifact_files(true).len(), 8);
+        assert!(ensure_before_deadline(Instant::now() + Duration::from_secs(1)).is_ok());
+        assert!(ensure_before_deadline(Instant::now()).is_err());
+        assert!(enforce_artifact_limit(directory.path(), u64::MAX).is_ok());
+        fs::write(directory.path().join("nonempty"), "x").unwrap();
+        assert!(enforce_artifact_limit(directory.path(), 0).is_err());
+        assert_eq!(
+            binary_for(BinaryRole::Baseline, Path::new("a"), Path::new("b")),
+            Path::new("a")
+        );
+        assert_eq!(
+            binary_for(BinaryRole::Single, Path::new("a"), Path::new("b")),
+            Path::new("b")
+        );
+        assert_eq!(
+            environment_manifest().schema_id,
+            super::super::model::ENVIRONMENT_SCHEMA
         );
     }
 }

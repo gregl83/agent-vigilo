@@ -14,6 +14,10 @@ the maintainer-facing field reference.
 4. The runner executes the resolved profile and writes raw samples, block
    records, comparisons, and a report under `target/perf/runs`.
 
+Service-backed samples use a binary-specific prepared database template, then
+clone it into a fresh database and pair it with a fresh broker scope. Template
+structural counts are verified before use.
+
 An unknown workload, tuple, schema, or capability is an unsupported result. The
 runner never skips required work and reports success for the remainder.
 
@@ -55,6 +59,7 @@ profiles.
 | `owner` | Repository component responsible for the protected production boundary. |
 | `status` | `implemented` when the runner can execute the workload; `planned` reserves the contract but fails if selected. |
 | `capability` | Exact capability required in every selected build manifest. This is separate from `id` so future adapters can map one workload to version-specific binary capabilities. |
+| `fixture` | Versioned fixture catalog used to generate deterministic setup and expected counts. |
 | `tuples` | Allowed fixture shapes. Profiles must select one exact value from this list. |
 | `unit` | Denominator used to interpret the result, such as one process start, case, evaluation, chunk, or run. |
 | `oracle` | Stable name of the exact correctness validation required after execution. Timing is invalid if the oracle fails. |
@@ -69,6 +74,11 @@ For `startup.cli-help.v1`, the runner launches the release executable with
 `--help`, requires exit `0` and the configured help signatures, and records wall
 time, child CPU, peak RSS, and executable size. One execution per binary is
 discarded before measurement to equalize host executable-loading effects.
+
+The four service-backed workloads resolve `fixture` through
+`performance/fixtures/<fixture>.toml`. The catalog fixes evaluator identity,
+agent response size, workload cardinalities, and lifecycle limits. Runtime URLs
+and ownership markers are injected while rendering; they are not credentials.
 
 ### Audited Constants
 
@@ -143,7 +153,8 @@ Phase 1 owns these additive machine-readable contracts:
 | --- | --- |
 | `environment/v1` | Observed host and collector identity plus validity limitations. |
 | `build-manifest/v1` | Immutable executable, source, toolchain, dependency, setup-asset, and capability provenance. |
-| `sample/v1` | Raw execution position, process measurements, and validation state. |
+| `service-topology/v1` | Run-owned Compose inventory and redacted service endpoint provenance. |
+| `sample/v1` | Raw execution position, process and scoped external measurements, durable counts, and validation state. |
 | `comparison/v1` | Balanced estimator inputs, effects, confidence intervals, diagnostics, and verdict. |
 | `report/v1` | Campaign status, failures, comparison summaries, and artifact links. |
 
@@ -151,3 +162,16 @@ Every persisted document carries its schema ID. Readers reject an unknown
 schema ID and preserve unknown additive fields. Retained version fixtures are
 required before a schema is revised; format migrations are deferred until a
 second version exists.
+
+### Sample External Measurements
+
+`sample.external` records PostgreSQL calls/time/rows, WAL bytes, database-size
+delta, HTTP request/byte/peak-concurrency counts, RabbitMQ ready/unacknowledged
+counts, peak sampled service memory/CPU observations, and an exact `durable_counts` map from
+the workload oracle. Collectors reset after unmeasured setup and before every
+measured process region.
+
+`services.json` is the teardown authority for one campaign. It records the
+Compose project, redacted endpoints, agent URL, and exact container/network/volume IDs.
+Cleanup also requires matching live `io.vigilo.performance=true` and
+`io.vigilo.run-id` labels.
