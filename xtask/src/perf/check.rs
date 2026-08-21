@@ -226,8 +226,6 @@ fn validate_service_configuration(root: &Path) -> Result<()> {
             bail!("performance Compose contract is missing {required:?}");
         }
     }
-    command_output(root, "docker", &["compose", "version"])
-        .context("Docker Compose CLI is required for Phase 2 workloads")?;
     Ok(())
 }
 
