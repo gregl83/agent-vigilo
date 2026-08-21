@@ -80,6 +80,8 @@ const RABBIT_USER: &str = "vigilo_perf";
 const RABBIT_MANAGEMENT_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const RABBIT_MANAGEMENT_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 const RABBIT_MANAGEMENT_RETRY_DELAY: Duration = Duration::from_millis(250);
+const WAL_BYTES_QUERY: &str =
+    "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), $1::text::pg_lsn)::bigint";
 
 /// Exercises live service ownership, collector reset, and exact cleanup.
 pub fn integration_self_test(root: &Path) -> Result<()> {
@@ -446,10 +448,7 @@ impl ServiceHarness {
             &[],
         )?;
         let wal_bytes: i64 = client
-            .query_one(
-                "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), $1::pg_lsn)::bigint",
-                &[&baseline.wal_lsn],
-            )?
+            .query_one(WAL_BYTES_QUERY, &[&baseline.wal_lsn])?
             .get(0);
         let database_bytes: i64 = client
             .query_one("SELECT pg_database_size(current_database())", &[])?
@@ -1428,5 +1427,17 @@ mod tests {
         assert_eq!(attempts, 1);
         assert!(message.contains("fixture did not succeed within 0 ms"));
         assert!(message.contains("connection reset"));
+    }
+
+    #[test]
+    fn wal_lsn_query_binds_the_rust_string_as_text_before_casting() {
+        use postgres::types::{
+            ToSql,
+            Type,
+        };
+
+        assert!(<String as ToSql>::accepts(&Type::TEXT));
+        assert!(!<String as ToSql>::accepts(&Type::PG_LSN));
+        assert!(WAL_BYTES_QUERY.contains("$1::text::pg_lsn"));
     }
 }
