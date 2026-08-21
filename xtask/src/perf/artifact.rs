@@ -161,12 +161,14 @@ impl Drop for CampaignLease {
 }
 
 #[cfg(unix)]
+/// Conservatively reports whether a Unix process can still own the host lease.
 fn process_is_alive(process_id: u32) -> bool {
     let result = unsafe { libc::kill(process_id as i32, 0) };
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(windows)]
+/// Conservatively reports whether a Windows process can still own the host lease.
 fn process_is_alive(process_id: u32) -> bool {
     use windows_sys::Win32::{
         Foundation::{
@@ -194,6 +196,7 @@ fn process_is_alive(process_id: u32) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
+/// Treats an owner as live when the target platform has no process probe.
 fn process_is_alive(_process_id: u32) -> bool {
     true
 }
@@ -242,6 +245,7 @@ fn atomic_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 #[cfg(unix)]
+/// Atomically publishes a temporary artifact on Unix-like filesystems.
 fn commit_temp(temp: &Path, path: &Path) -> Result<()> {
     fs::rename(temp, path).with_context(|| format!("commit {}", path.display()))?;
     if let Some(parent) = path.parent() {
@@ -251,6 +255,7 @@ fn commit_temp(temp: &Path, path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
+/// Replaces a Windows artifact while retaining a rollback copy until commit.
 fn commit_temp(temp: &Path, path: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
@@ -282,6 +287,7 @@ fn commit_temp(temp: &Path, path: &Path) -> Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
+/// Publishes a temporary artifact on platforms without a specialized strategy.
 fn commit_temp(temp: &Path, path: &Path) -> Result<()> {
     if path.exists() {
         fs::remove_file(path)?;
@@ -313,6 +319,7 @@ pub fn digest_tree(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+/// Collects regular files as sorted root-relative paths for stable tree operations.
 fn collect_files(root: &Path, path: &Path, files: &mut Vec<(PathBuf, PathBuf)>) -> Result<()> {
     for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
         let entry = entry?;

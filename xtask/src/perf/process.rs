@@ -149,6 +149,7 @@ pub fn execute(spec: &ProcessSpec<'_>) -> Result<ProcessOutcome> {
     })
 }
 
+/// Drains one output stream without blocking the child and retains at most `limit` bytes.
 fn drain<R: Read + Send + 'static>(
     mut reader: R,
     limit: usize,
@@ -184,6 +185,7 @@ struct Resources {
 type ResourceBaseline = libc::rusage;
 
 #[cfg(unix)]
+/// Captures cumulative child usage before launch so one execution can be isolated.
 fn capture_resource_baseline() -> Result<ResourceBaseline> {
     let mut usage = std::mem::MaybeUninit::uninit();
     let result = unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, usage.as_mut_ptr()) };
@@ -200,20 +202,24 @@ fn capture_resource_baseline() -> Result<ResourceBaseline> {
 struct ResourceBaseline;
 
 #[cfg(not(unix))]
+/// Uses an empty baseline on platforms where the controller reports direct usage.
 fn capture_resource_baseline() -> Result<ResourceBaseline> {
     Ok(ResourceBaseline)
 }
 
 #[cfg(unix)]
+/// Places the Unix child in a new process group for whole-tree termination.
 fn configure_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     command.process_group(0);
 }
 
 #[cfg(windows)]
+/// Defers process-tree ownership to the Windows Job Object controller.
 fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(not(any(unix, windows)))]
+/// Leaves process grouping unchanged on unsupported platforms.
 fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]

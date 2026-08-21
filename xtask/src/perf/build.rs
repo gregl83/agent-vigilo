@@ -225,6 +225,7 @@ pub fn execute(args: BuildArgs) -> Result<u8> {
     Ok(EXIT_PASS)
 }
 
+/// Probes supported CLI boundaries and returns the capabilities recorded in the snapshot.
 fn verify_capabilities(executable: &Path) -> Result<Vec<String>> {
     verify_help(executable, &["--help"], &["Usage:", "Commands:"])?;
     verify_help(
@@ -243,6 +244,7 @@ fn verify_capabilities(executable: &Path) -> Result<Vec<String>> {
     ])
 }
 
+/// Requires a help command to exit successfully and contain every frozen signature.
 fn verify_help(executable: &Path, arguments: &[&str], signatures: &[&str]) -> Result<()> {
     let args = arguments
         .iter()
@@ -269,6 +271,7 @@ fn verify_help(executable: &Path, arguments: &[&str], signatures: &[&str]) -> Re
     Ok(())
 }
 
+/// Runs a provenance command in the source tree and returns trimmed standard output.
 fn command_output(source: &Path, program: &str, args: &[&str]) -> Result<String> {
     let output = Command::new(program)
         .args(args)
@@ -281,6 +284,7 @@ fn command_output(source: &Path, program: &str, args: &[&str]) -> Result<String>
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// Runs a best-effort provenance command whose absence must not invalidate a build.
 fn optional_command_output(source: &Path, program: &str, args: &[&str]) -> Option<String> {
     command_output(source, program, args).ok()
 }

@@ -4,6 +4,24 @@
 //! profiles, executes single-binary or counterbalanced comparison campaigns,
 //! and writes machine-readable artifacts. It treats unsupported or incomplete
 //! campaigns as invalid results instead of silently reducing their scope.
+//!
+//! # Module overview
+//!
+//! - `config` and `model` define the versioned input and output contracts.
+//! - `build` creates immutable Vigilo snapshots and records their provenance.
+//! - `schedule` and `stats` define sampling order and comparison semantics.
+//! - `process` owns bounded child execution and platform resource collection.
+//! - `service`, `fixture`, and `workload` provision isolated dependencies,
+//!   render deterministic inputs, execute service-backed workloads, and apply
+//!   exact correctness oracles.
+//! - `command` orchestrates run and comparison campaigns; `artifact` persists
+//!   checkpoints, and `report` derives human-readable views from JSON results.
+//! - `check` validates these contracts and isolation boundaries without
+//!   provisioning benchmark services.
+//!
+//! `build` and campaign commands share a workspace lease. A measured sample is
+//! accepted only after its process result and workload oracle are valid; timing
+//! alone never makes a sample successful.
 
 mod artifact;
 mod build;
@@ -97,6 +115,7 @@ pub fn run_service_fixture() -> Result<u8> {
     Ok(EXIT_PASS)
 }
 
+/// Returns the repository-relative directory containing campaign profiles.
 fn default_profile_dir() -> PathBuf {
     PathBuf::from("performance/profiles")
 }

@@ -4,6 +4,13 @@
 //! and receives a fresh RabbitMQ vhost and namespace. Preparation is outside
 //! the measurement region; collectors are reset only after all prerequisite
 //! work has settled.
+//!
+//! A workload oracle is the exact correctness postcondition for a measured
+//! operation: durable row counts, lifecycle state, outbox events, and queue or
+//! HTTP observations. It is not an evaluator from the evaluator ABI and it is
+//! not a timing threshold. A sample is usable for performance analysis only
+//! after its oracle passes. Timing policy belongs to `stats`, while evaluator
+//! input/output behavior remains owned by the versioned evaluator ABI.
 
 use std::{
     collections::BTreeMap,
@@ -173,6 +180,7 @@ impl WorkloadRunner {
         }
     }
 
+    /// Lazily starts one topology and prevents a campaign from mixing fixture catalogs.
     fn ensure_service(&mut self, fixture_id: &str) -> Result<()> {
         if let Some(fixture) = &self.fixture {
             if fixture.id != fixture_id {
@@ -193,6 +201,11 @@ impl WorkloadRunner {
         Ok(())
     }
 
+    /// Builds a reusable, binary-specific database template outside measurement.
+    ///
+    /// Preparation applies migrations, publishes the frozen evaluator fixture,
+    /// creates any prerequisite run, and verifies structural counts before the
+    /// database can be cloned for samples.
     fn prepare(
         &mut self,
         workload_id: &str,
@@ -278,6 +291,11 @@ impl WorkloadRunner {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Executes the measured region and exact oracle for one isolated sample scope.
+    ///
+    /// Setup commands required only to make the sample runnable occur before
+    /// `begin_measurement`; each match arm defines the workload-specific measured
+    /// boundary and postcondition.
     fn execute_scope(
         &mut self,
         workload_id: &str,
@@ -427,6 +445,7 @@ impl WorkloadRunner {
         }
     }
 
+    /// Renders deterministic profile and dataset inputs beneath the campaign directory.
     fn inputs(&self, identity: &str, cases: usize, evaluators: usize) -> Result<RunInputs> {
         let fixture = self.fixture.as_ref().context("fixture was not loaded")?;
         let service = self
@@ -448,6 +467,10 @@ impl WorkloadRunner {
     }
 }
 
+/// Resolves a registered Phase 2 workload tuple into its setup cardinalities.
+///
+/// Unknown workload IDs and tuples fail closed; future workload versions add
+/// new match arms without changing callers or shared service infrastructure.
 fn workload_shape(
     fixture: &FixtureCatalog,
     workload_id: &str,
@@ -487,6 +510,7 @@ fn workload_shape(
     Ok(shape)
 }
 
+/// Resolves the lifecycle tuple into the number of measured worker processes.
 fn lifecycle_workers(tuple: &str) -> Result<usize> {
     match tuple {
         "workers-1" => Ok(1),
@@ -507,6 +531,7 @@ impl Drop for WorkloadRunner {
     }
 }
 
+/// Resolves a required setup asset relative to its immutable build manifest.
 fn setup_asset(manifest_path: &Path, relative: &str) -> Result<PathBuf> {
     let path = manifest_path
         .parent()
@@ -518,6 +543,7 @@ fn setup_asset(manifest_path: &Path, relative: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Prefixes a Vigilo command with explicit database and machine-output settings.
 fn base_args<const N: usize>(database_url: &str, command: [String; N]) -> Vec<String> {
     let mut args = vec![
         "--database-url".into(),
@@ -572,6 +598,7 @@ fn worker_args(database_url: &str, messaging_url: &str) -> Vec<String> {
     )
 }
 
+/// Runs one bounded Vigilo process without a shell.
 fn invoke(
     binary: &Path,
     args: Vec<String>,
@@ -592,6 +619,7 @@ fn invoke(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Runs the requested worker count concurrently and returns every process outcome.
 fn invoke_workers(
     count: usize,
     binary: &Path,
@@ -620,6 +648,7 @@ fn invoke_workers(
     })
 }
 
+/// Creates a prerequisite run and extracts its stable machine-readable ID.
 fn create_run(
     binary: &Path,
     database_url: &str,
@@ -671,6 +700,10 @@ fn path_arg(path: &Path) -> Result<String> {
         .with_context(|| format!("path is not valid UTF-8: {}", path.display()))
 }
 
+/// Finalizes a measured region and enforces scoped external postconditions.
+///
+/// Process success, queue drain state, and deterministic-agent request counts
+/// must all match before the observations become a workload outcome.
 fn finish(
     service: &ServiceHarness,
     scope: &SampleScope,
@@ -700,6 +733,7 @@ fn scalar(client: &mut Client, query: &str, run_id: &str) -> Result<i64> {
     Ok(client.query_one(query, &[&run_id])?.get(0))
 }
 
+/// Reads the common durable row counts used by preparation and workload oracles.
 fn structural_counts(database_url: &str, run_id: Option<&str>) -> Result<DurableCounts> {
     let mut counts = DurableCounts::new();
     let Some(run_id) = run_id else {
@@ -725,6 +759,7 @@ fn structural_counts(database_url: &str, run_id: Option<&str>) -> Result<Durable
     Ok(counts)
 }
 
+/// Verifies reusable coordinator and worker templates contain no measured results.
 fn verify_prepared(workload_id: &str, cases: usize, counts: &DurableCounts) -> Result<()> {
     if matches!(
         workload_id,
@@ -739,6 +774,7 @@ fn verify_prepared(workload_id: &str, cases: usize, counts: &DurableCounts) -> R
     Ok(())
 }
 
+/// Collects and validates the run-creation durable-state oracle.
 fn oracle_create(
     database_url: &str,
     run_id: &str,
@@ -753,6 +789,7 @@ fn oracle_create(
     Ok(counts)
 }
 
+/// Collects and validates dispatch state plus exact start and chunk-ready events.
 fn oracle_coordinator(database_url: &str, run_id: &str, chunks: usize) -> Result<DurableCounts> {
     let mut counts = structural_counts(database_url, Some(run_id))?;
     let mut client = Client::connect(database_url, NoTls)?;
@@ -779,6 +816,7 @@ fn oracle_coordinator(database_url: &str, run_id: &str, chunks: usize) -> Result
     Ok(counts)
 }
 
+/// Collects and validates worker execution, attempt, result, and chunk counts.
 fn oracle_worker(
     database_url: &str,
     run_id: &str,
@@ -796,6 +834,7 @@ fn oracle_worker(
     Ok(counts)
 }
 
+/// Extends the worker oracle with terminal passing-run invariants.
 fn oracle_lifecycle(
     database_url: &str,
     run_id: &str,
@@ -816,6 +855,7 @@ fn oracle_lifecycle(
     Ok(counts)
 }
 
+/// Applies the pure run-creation postcondition to collected observations.
 fn validate_create_oracle(
     counts: &DurableCounts,
     status: &str,
@@ -828,6 +868,7 @@ fn validate_create_oracle(
     require_status_value(status, "pending")
 }
 
+/// Applies the pure coordinator postcondition to collected observations.
 fn validate_coordinator_oracle(
     status: &str,
     dispatched: i64,
@@ -845,6 +886,7 @@ fn validate_coordinator_oracle(
     Ok(())
 }
 
+/// Applies the pure worker/Wasm postcondition to collected observations.
 fn validate_worker_oracle(
     counts: &DurableCounts,
     completed: i64,
@@ -864,6 +906,7 @@ fn validate_worker_oracle(
     Ok(())
 }
 
+/// Applies the pure end-to-end lifecycle postcondition to collected observations.
 fn validate_lifecycle_oracle(status: &str, totals: [i32; 3], cases: usize) -> Result<()> {
     require_status_value(status, "completed")?;
     if totals != [cases as i32; 3] {
@@ -906,6 +949,10 @@ fn require_count(counts: &DurableCounts, name: &str, expected: i64) -> Result<()
     Ok(())
 }
 
+/// Combines a multi-process lifecycle region into one conservative observation.
+///
+/// CPU is summed, peak memory is maximized, output is concatenated, and any
+/// timeout or nonzero exit is retained.
 fn aggregate(outcomes: Vec<ProcessOutcome>, wall_time: Duration) -> ProcessOutcome {
     let mut cpu = Some(0u64);
     let mut rss = Some(0u64);

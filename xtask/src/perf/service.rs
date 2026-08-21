@@ -509,6 +509,7 @@ impl ServiceHarness {
         Ok(())
     }
 
+    /// Fences database operations to names derived from this campaign marker.
     fn require_owned_database(&self, name: &str) -> Result<()> {
         let prefix = database_prefix(&self.marker);
         if !name.starts_with(&prefix)
@@ -521,6 +522,7 @@ impl ServiceHarness {
         Ok(())
     }
 
+    /// Fences RabbitMQ operations to vhosts derived from this campaign marker.
     fn require_owned_vhost(&self, vhost: &str) -> Result<()> {
         if !vhost.starts_with(&format!("perf-{}-", self.marker)) {
             bail!("refusing RabbitMQ operation without matching ownership marker: {vhost}");
@@ -528,6 +530,7 @@ impl ServiceHarness {
         Ok(())
     }
 
+    /// Revalidates ownership and loopback isolation before using a sample scope.
     fn require_scope(&self, scope: &SampleScope) -> Result<()> {
         self.require_owned_database(&scope.database_name)?;
         self.require_owned_vhost(&scope.vhost)?;
@@ -537,6 +540,7 @@ impl ServiceHarness {
         require_loopback_url(&messaging)
     }
 
+    /// Executes an authenticated RabbitMQ management mutation and requires success.
     fn rabbit(&self, request: reqwest::blocking::RequestBuilder) -> Result<()> {
         let response = request
             .basic_auth(RABBIT_USER, Some(RABBIT_PASSWORD))
@@ -550,6 +554,7 @@ impl ServiceHarness {
         Ok(())
     }
 
+    /// Sums ready and unacknowledged messages across queues in one owned vhost.
     fn queue_counts(&self, vhost: &str) -> Result<(u64, u64)> {
         self.require_owned_vhost(vhost)?;
         let response = self
@@ -580,6 +585,7 @@ impl ServiceHarness {
             .collect()
     }
 
+    /// Idempotently deletes a vhost tracked as owned by this harness instance.
     fn delete_vhost(&mut self, vhost: &str) -> Result<()> {
         self.require_owned_vhost(vhost)?;
         if !self.vhosts.contains(vhost) {
@@ -597,6 +603,7 @@ impl ServiceHarness {
         Ok(())
     }
 
+    /// Idempotently drops a tracked database after terminating its connections.
     fn drop_database(&mut self, name: &str) -> Result<()> {
         self.require_owned_database(name)?;
         if !self.databases.contains(name) {
@@ -628,6 +635,7 @@ impl Drop for ServiceHarness {
 }
 
 impl ServiceSampler {
+    /// Starts peak CPU and memory sampling for the exact recorded containers.
     fn start(root: &Path, container_ids: Vec<String>) -> Result<Self> {
         let initial = collect_container_stats(root, &container_ids)?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -655,6 +663,7 @@ impl ServiceSampler {
         })
     }
 
+    /// Stops the collector thread and returns peak observations.
     fn finish(&mut self) -> Result<ServiceStats> {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
@@ -682,6 +691,7 @@ impl Drop for ServiceSampler {
     }
 }
 
+/// Collects one aggregate Docker CPU and memory observation for owned containers.
 fn collect_container_stats(root: &Path, ids: &[String]) -> Result<ServiceStats> {
     if ids.is_empty() {
         return Ok(ServiceStats::default());
@@ -742,6 +752,7 @@ struct DeterministicAgent {
 }
 
 impl DeterministicAgent {
+    /// Starts a loopback HTTP fixture with a stable response and request counters.
     fn start(run_id: &str, response_text: &str, payload_bytes: usize) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
@@ -782,6 +793,7 @@ impl DeterministicAgent {
         &self.url
     }
 
+    /// Clears counters at a measurement boundary when no request is active.
     fn reset(&self) -> Result<()> {
         if self.counters.active.load(Ordering::Acquire) != 0 {
             bail!("cannot reset HTTP collector while a request is active");
@@ -792,6 +804,7 @@ impl DeterministicAgent {
         Ok(())
     }
 
+    /// Captures request, byte, and peak-concurrency counts for one sample.
     fn snapshot(&self) -> AgentSnapshot {
         AgentSnapshot {
             requests: self.counters.requests.load(Ordering::Acquire),
@@ -810,6 +823,7 @@ impl Drop for DeterministicAgent {
     }
 }
 
+/// Serves one complete HTTP request and accounts for request and response bytes.
 fn handle_agent(
     mut stream: TcpStream,
     response_body: &[u8],
@@ -854,6 +868,7 @@ fn handle_agent(
     result
 }
 
+/// Builds valid agent JSON padded to the requested size when structurally possible.
 fn agent_body(response_text: &str, payload_bytes: usize) -> Vec<u8> {
     let minimum = json!({"text": response_text}).to_string();
     if minimum.len() >= payload_bytes {
@@ -885,6 +900,7 @@ fn parse_content_length(headers: &[u8]) -> Option<usize> {
     None
 }
 
+/// Builds the common Compose argument prefix for one isolated project.
 fn compose_args(compose: &Path, environment: &Path, project: &str) -> Vec<String> {
     vec![
         "compose".into(),
@@ -897,6 +913,7 @@ fn compose_args(compose: &Path, environment: &Path, project: &str) -> Vec<String
     ]
 }
 
+/// Resolves a dynamically assigned service port and requires a loopback binding.
 fn compose_port(root: &Path, compose_args: &[String], service: &str, port: u16) -> Result<u16> {
     let mut args = compose_args.to_vec();
     args.extend(["port".into(), service.into(), port.to_string()]);
@@ -915,6 +932,7 @@ fn compose_port(root: &Path, compose_args: &[String], service: &str, port: u16) 
     Ok(port.parse()?)
 }
 
+/// Returns the sorted live containers owned by one Compose project.
 fn compose_resources(
     root: &Path,
     compose_args: &[String],
@@ -942,6 +960,7 @@ fn labelled_volumes(root: &Path, run_id: &str) -> Result<Vec<OwnedResource>> {
     labelled_resources(root, "volume", run_id)
 }
 
+/// Lists sorted Docker resources carrying both performance ownership labels.
 fn labelled_resources(root: &Path, kind: &str, run_id: &str) -> Result<Vec<OwnedResource>> {
     let output = command_output(
         root,
@@ -969,6 +988,7 @@ fn labelled_resources(root: &Path, kind: &str, run_id: &str) -> Result<Vec<Owned
     Ok(resources)
 }
 
+/// Rechecks live container labels instead of trusting the recorded manifest.
 fn verify_container_labels(root: &Path, run_id: &str, containers: &[OwnedResource]) -> Result<()> {
     for container in containers {
         let labels = command_output(
@@ -991,6 +1011,7 @@ fn verify_container_labels(root: &Path, run_id: &str, containers: &[OwnedResourc
     Ok(())
 }
 
+/// Requires the exact two-container, one-network, two-volume Phase 2 topology.
 fn validate_inventory(
     run_id: &str,
     containers: &[OwnedResource],
@@ -1008,6 +1029,7 @@ fn validate_inventory(
     Ok(())
 }
 
+/// Refuses cleanup unless live resources exactly match the persisted authority.
 fn validate_cleanup_inventory(
     run_id: &str,
     manifest: &ServiceManifest,
@@ -1025,6 +1047,7 @@ fn validate_cleanup_inventory(
     Ok(())
 }
 
+/// Rolls back a partially initialized topology only after live ownership checks pass.
 fn cleanup_started_topology(root: &Path, run_id: &str, compose_args: &[String]) -> Result<()> {
     let containers = compose_resources(root, compose_args, "container")?;
     let networks = labelled_resources(root, "network", run_id)?;

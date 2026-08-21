@@ -154,6 +154,10 @@ pub fn run_single(args: RunArgs) -> Result<u8> {
     run_single_at(&root, args)
 }
 
+/// Runs a single-binary campaign against an explicit workspace root.
+///
+/// Keeping root discovery outside this function lets tests exercise the full
+/// campaign pipeline with isolated registries, manifests, and artifact trees.
 fn run_single_at(root: &Path, args: RunArgs) -> Result<u8> {
     let registry = load_registry(root)?;
     let profile = load_profile(root, &args.profile)?;
@@ -361,6 +365,7 @@ pub fn compare(args: CompareArgs) -> Result<u8> {
     compare_at(&root, args)
 }
 
+/// Runs a baseline/candidate campaign against an explicit workspace root.
 fn compare_at(root: &Path, args: CompareArgs) -> Result<u8> {
     let registry = load_registry(root)?;
     let profile = load_profile(root, &args.profile)?;
@@ -652,6 +657,7 @@ fn compare_at(root: &Path, args: CompareArgs) -> Result<u8> {
     Ok(exit)
 }
 
+/// Loads a manifest and verifies its schema, executable identity, and setup assets.
 fn load_and_verify_manifest(path: &Path, binary: &Path) -> Result<BuildManifest> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let manifest: BuildManifest =
@@ -689,6 +695,7 @@ fn load_and_verify_manifest(path: &Path, binary: &Path) -> Result<BuildManifest>
     Ok(manifest)
 }
 
+/// Detects executable mutation between measurement blocks.
 fn verify_executable_unchanged(binary: &Path, manifest: &BuildManifest) -> Result<()> {
     let digest = digest_file(binary)?;
     if digest != manifest.executable_digest {
@@ -702,6 +709,7 @@ fn verify_executable_unchanged(binary: &Path, manifest: &BuildManifest) -> Resul
     Ok(())
 }
 
+/// Rejects selected workload contracts that do not yet have executable drivers.
 fn require_implemented(selected: &[SelectedWorkload<'_>]) -> Result<()> {
     let planned: Vec<_> = selected
         .iter()
@@ -717,6 +725,7 @@ fn require_implemented(selected: &[SelectedWorkload<'_>]) -> Result<()> {
     Ok(())
 }
 
+/// Requires every measured build to advertise every selected workload capability.
 fn require_capabilities(
     selected: &[SelectedWorkload<'_>],
     manifests: &[&BuildManifest],
@@ -739,6 +748,7 @@ fn has_capability(capabilities: &[String], required: &str) -> bool {
     capabilities.iter().any(|capability| capability == required)
 }
 
+/// Proves planned duration and worst-case retained output fit the profile caps.
 fn validate_campaign_budget(
     profile: &super::model::Profile,
     selected: &[SelectedWorkload<'_>],
@@ -794,6 +804,11 @@ struct ExecutionRequest<'request, 'config> {
     stderr_limit: usize,
 }
 
+/// Executes one scheduled position and converts observations into a raw sample.
+///
+/// Startup is launched directly; service-backed workloads delegate to the lazy
+/// workload runner. This function records measurements but does not decide the
+/// campaign-level exit code.
 fn execute_workload(
     runner: &mut WorkloadRunner,
     request: ExecutionRequest<'_, '_>,
@@ -866,6 +881,10 @@ fn execute_workload(
     })
 }
 
+/// Classifies process and startup-oracle failures according to the measured role.
+///
+/// Baseline failures invalidate a comparison because no trustworthy reference
+/// remains. Candidate and single-binary failures are product failures.
 fn validate_outcome(
     outcome: &ProcessOutcome,
     selected: &SelectedWorkload<'_>,
@@ -915,6 +934,7 @@ fn missing_signature<'a>(output: &str, signatures: &'a [String]) -> Option<&'a s
         .map(String::as_str)
 }
 
+/// Constructs the stable validation payload persisted with a sample.
 fn validation(state: SampleState, code: &str, message: &str) -> Validation {
     Validation {
         state,
@@ -923,6 +943,7 @@ fn validation(state: SampleState, code: &str, message: &str) -> Validation {
     }
 }
 
+/// Maps sample validation state to the public `cargo perf` exit-code contract.
 fn classification_exit(sample: &Sample) -> u8 {
     match sample.validation.state {
         SampleState::Valid => EXIT_PASS,
@@ -931,6 +952,7 @@ fn classification_exit(sample: &Sample) -> u8 {
     }
 }
 
+/// Atomically rewrites resumable raw sample, block, and readiness journals.
 fn checkpoint(
     run_dir: &Path,
     samples: &[Sample],
@@ -942,6 +964,7 @@ fn checkpoint(
     atomic_jsonl(&run_dir.join("readiness.jsonl"), readiness)
 }
 
+/// Persists the failed sample and its bounded output for diagnosis.
 fn write_failure_output(run_dir: &Path, executed: &ExecutedSample, name: &str) -> Result<()> {
     let directory = run_dir
         .join("failures")
@@ -964,6 +987,7 @@ fn binary_for<'a>(role: BinaryRole, baseline: &'a Path, candidate: &'a Path) -> 
     }
 }
 
+/// Captures host identity and whether it qualifies for canonical comparisons.
 fn environment_manifest() -> EnvironmentManifest {
     let environment_id = std::env::var("VIGILO_PERF_ENVIRONMENT_ID").unwrap_or_else(|_| {
         format!(
@@ -1005,6 +1029,7 @@ fn environment_manifest() -> EnvironmentManifest {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Creates the initial campaign contract and its planned execution counts.
 fn campaign_manifest(
     id: &str,
     kind: &str,
@@ -1048,6 +1073,7 @@ fn campaign_manifest(
     }
 }
 
+/// Prevents a new block from starting after the campaign wall-time cap.
 fn ensure_before_deadline(deadline: Instant) -> Result<()> {
     if Instant::now() >= deadline {
         bail!("campaign wall-time cap expired before the next block");
@@ -1055,6 +1081,7 @@ fn ensure_before_deadline(deadline: Instant) -> Result<()> {
     Ok(())
 }
 
+/// Rejects a campaign whose persisted artifact tree exceeds its profile cap.
 fn enforce_artifact_limit(run_dir: &Path, limit: u64) -> Result<()> {
     let bytes = directory_bytes(run_dir)?;
     if bytes > limit {

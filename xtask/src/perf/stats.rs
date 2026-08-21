@@ -155,6 +155,7 @@ pub fn compare_wall_time(
     })
 }
 
+/// Builds an invalid metric result when no trustworthy estimate can be computed.
 fn empty_comparison(
     practical_budget: Option<f64>,
     bootstrap_seed: u64,
@@ -185,6 +186,7 @@ fn empty_comparison(
     }
 }
 
+/// Bootstraps a reproducible confidence interval while preserving orientation strata.
 fn bootstrap_interval(abba: &[f64], baab: &[f64], seed: u64) -> (f64, f64) {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut estimates = Vec::with_capacity(BOOTSTRAP_DRAWS);
@@ -206,6 +208,7 @@ fn bootstrap_interval(abba: &[f64], baab: &[f64], seed: u64) -> (f64, f64) {
     (lower, upper)
 }
 
+/// Applies optional Phase 3 policy to an otherwise informative effect estimate.
 fn decide_verdict(
     lower: f64,
     upper: f64,

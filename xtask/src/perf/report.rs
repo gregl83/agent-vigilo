@@ -59,6 +59,7 @@ pub fn write(run_dir: &std::path::Path, report: &ReportDocument) -> Result<()> {
     Ok(())
 }
 
+/// Prints a concise operator view derived solely from the report contract.
 fn print_terminal(report: &ReportDocument, run_dir: &std::path::Path) {
     println!();
     println!(
@@ -93,6 +94,7 @@ fn print_terminal(report: &ReportDocument, run_dir: &std::path::Path) {
     println!("Artifacts: {}", run_dir.display());
 }
 
+/// Renders the stable Markdown summary derived from a report document.
 fn markdown(report: &ReportDocument) -> String {
     let mut output = format!(
         "# Performance {}\n\n- Status: **{}**\n- Profile: `{}`\n- Run: `{}`\n\n",

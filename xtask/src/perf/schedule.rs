@@ -84,6 +84,7 @@ pub fn validate(blocks: u32, seed: u64, workload_id: &str, tuple_id: &str) -> Re
     validate_orientations(&orientations)
 }
 
+/// Proves each adjacent block pair contains one `ABBA` and one `BAAB` schedule.
 fn validate_orientations(orientations: &[Orientation]) -> Result<()> {
     if orientations.is_empty() || !orientations.len().is_multiple_of(2) {
         bail!("blocking schedules require a positive even block count");

@@ -104,6 +104,7 @@ pub fn execute(args: CheckArgs) -> Result<u8> {
     Ok(EXIT_PASS)
 }
 
+/// Validates the canonical host descriptor used to label comparable results.
 fn validate_environment_contract(root: &Path) -> Result<()> {
     let path = root.join("performance/environments/aws-m6i-2xlarge-al2023-v1.toml");
     let environment: toml::Value = toml::from_str(
@@ -119,6 +120,7 @@ fn validate_environment_contract(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Proves the service-free toolchain commands required by the harness are callable.
 fn validate_external_tools(root: &Path) -> Result<()> {
     for (program, args) in [
         ("cargo", &["-V"][..]),
@@ -130,6 +132,7 @@ fn validate_external_tools(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Rejects zero production limits that would make fixture planning meaningless.
 fn validate_constants(constants: &super::model::RegistryConstants) -> Result<()> {
     let values = [
         constants.database_connections_per_target as u64,
@@ -163,6 +166,7 @@ fn validate_constants(constants: &super::model::RegistryConstants) -> Result<()>
     Ok(())
 }
 
+/// Requires the ordered Phase 2 anchors while permitting additive future workloads.
 fn validate_profile_implementation_contract(
     registry: &super::model::WorkloadRegistry,
 ) -> Result<()> {
@@ -200,6 +204,7 @@ fn validate_profile_implementation_contract(
     Ok(())
 }
 
+/// Checks fixture cardinalities and Compose isolation markers without starting services.
 fn validate_service_configuration(root: &Path) -> Result<()> {
     let fixture = fixture::load(root, "mvp-v1")?;
     if fixture.coordinator.chunks != 512
@@ -226,6 +231,7 @@ fn validate_service_configuration(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Proves production dependencies do not include the performance harness or benchmark crates.
 fn validate_dependency_boundaries(root: &Path) -> Result<()> {
     let output = cargo_output(root, &["metadata", "--locked", "--format-version", "1"])?;
     let metadata: Value = serde_json::from_slice(&output)?;
@@ -280,6 +286,7 @@ fn validate_dependency_boundaries(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Proves the publishable Vigilo package does not contain harness files or artifacts.
 fn validate_package_contents(root: &Path) -> Result<()> {
     let output = cargo_output(
         root,
@@ -305,6 +312,7 @@ fn validate_package_contents(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Rejects oversized, generated, or private-source-importing checked-in fixtures.
 fn validate_fixture_tree(root: &Path) -> Result<()> {
     fn visit(path: &Path) -> Result<()> {
         for entry in fs::read_dir(path)? {
@@ -345,6 +353,7 @@ fn validate_fixture_tree(root: &Path) -> Result<()> {
     visit(&root.join("performance"))
 }
 
+/// Ensures a harness-only bootstrap diff does not modify production runtime paths.
 fn validate_bootstrap_delta(root: &Path, base: &str) -> Result<()> {
     let mut changed = Vec::new();
     for args in [
@@ -384,6 +393,7 @@ fn validate_bootstrap_delta(root: &Path, base: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validates optional destructive endpoints against one explicit ownership marker.
 fn validate_endpoints(endpoints: &[String], marker: Option<&str>) -> Result<()> {
     if endpoints.is_empty() {
         return Ok(());
@@ -402,6 +412,7 @@ fn validate_endpoints(endpoints: &[String], marker: Option<&str>) -> Result<()> 
     Ok(())
 }
 
+/// Requires a destructive endpoint to be loopback-only and run-owned.
 fn validate_endpoint(endpoint: &str, marker: &str) -> Result<()> {
     let lower = endpoint.to_ascii_lowercase();
     let authority = lower
@@ -426,6 +437,7 @@ fn validate_endpoint(endpoint: &str, marker: &str) -> Result<()> {
     Ok(())
 }
 
+/// Exercises success, crash, timeout, truncation, and process-tree cleanup behavior.
 fn process_self_test() -> Result<()> {
     let executable = std::env::current_exe()?;
     let valid = vec!["__perf-fixture".into(), "--delay-ms".into(), "1".into()];
@@ -490,10 +502,12 @@ fn process_self_test() -> Result<()> {
     Ok(())
 }
 
+/// Runs Cargo as a checked byte-producing command in the workspace.
 fn cargo_output(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     command_output(root, "cargo", args)
 }
 
+/// Returns standard output only when an external validation command succeeds.
 fn command_output(root: &Path, program: &str, args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new(program)
         .args(args)
