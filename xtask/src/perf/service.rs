@@ -37,7 +37,10 @@ use std::{
         self,
         JoinHandle,
     },
-    time::Duration,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use anyhow::{
@@ -74,6 +77,9 @@ const POSTGRES_PASSWORD: &str = "vigilo_perf";
 const POSTGRES_USER: &str = "vigilo_perf";
 const RABBIT_PASSWORD: &str = "vigilo_perf";
 const RABBIT_USER: &str = "vigilo_perf";
+const RABBIT_MANAGEMENT_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const RABBIT_MANAGEMENT_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
+const RABBIT_MANAGEMENT_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// Exercises live service ownership, collector reset, and exact cleanup.
 pub fn integration_self_test(root: &Path) -> Result<()> {
@@ -251,6 +257,10 @@ impl ServiceHarness {
                 "postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@127.0.0.1:{postgres_port}/postgres"
             );
             let rabbit_management_url = format!("http://127.0.0.1:{rabbit_management_port}");
+            let http = HttpClient::builder()
+                .timeout(Duration::from_secs(10))
+                .build()?;
+            wait_for_rabbit_management(&http, &rabbit_management_url)?;
             let containers = compose_resources(root, &compose_args, "container")?;
             let networks = labelled_resources(root, "network", run_id)?;
             let volumes = labelled_volumes(root, run_id)?;
@@ -275,10 +285,11 @@ impl ServiceHarness {
                 rabbit_amqp_port,
                 postgres_admin_url,
                 rabbit_management_url,
+                http,
                 manifest,
             ))
         })();
-        let (agent, rabbit_amqp_port, postgres_admin_url, rabbit_management_url, manifest) =
+        let (agent, rabbit_amqp_port, postgres_admin_url, rabbit_management_url, http, manifest) =
             match initialized {
                 Ok(initialized) => initialized,
                 Err(error) => {
@@ -301,9 +312,7 @@ impl ServiceHarness {
             postgres_admin_url,
             rabbit_management_url,
             rabbit_amqp_port,
-            http: HttpClient::builder()
-                .timeout(Duration::from_secs(10))
-                .build()?,
+            http,
             manifest,
             databases: BTreeSet::new(),
             vhosts: BTreeSet::new(),
@@ -542,16 +551,25 @@ impl ServiceHarness {
 
     /// Executes an authenticated RabbitMQ management mutation and requires success.
     fn rabbit(&self, request: reqwest::blocking::RequestBuilder) -> Result<()> {
-        let response = request
-            .basic_auth(RABBIT_USER, Some(RABBIT_PASSWORD))
-            .send()?;
-        if !response.status().is_success() {
-            bail!(
-                "RabbitMQ management request failed with {}",
-                response.status()
-            );
-        }
-        Ok(())
+        retry_until_success(
+            "RabbitMQ management mutation",
+            RABBIT_MANAGEMENT_OPERATION_TIMEOUT,
+            RABBIT_MANAGEMENT_RETRY_DELAY,
+            || {
+                let response = request
+                    .try_clone()
+                    .context("RabbitMQ management request body cannot be retried")?
+                    .basic_auth(RABBIT_USER, Some(RABBIT_PASSWORD))
+                    .send()?;
+                if !response.status().is_success() {
+                    bail!(
+                        "RabbitMQ management request failed with {}",
+                        response.status()
+                    );
+                }
+                Ok(())
+            },
+        )
     }
 
     /// Sums ready and unacknowledged messages across queues in one owned vhost.
@@ -620,6 +638,52 @@ impl ServiceHarness {
         ))?;
         self.databases.remove(name);
         Ok(())
+    }
+}
+
+/// Waits for authenticated RabbitMQ management requests to complete successfully.
+fn wait_for_rabbit_management(http: &HttpClient, management_url: &str) -> Result<()> {
+    let overview_url = format!("{management_url}/api/overview");
+    retry_until_success(
+        "RabbitMQ management API",
+        RABBIT_MANAGEMENT_READY_TIMEOUT,
+        RABBIT_MANAGEMENT_RETRY_DELAY,
+        || {
+            let response = http
+                .get(&overview_url)
+                .basic_auth(RABBIT_USER, Some(RABBIT_PASSWORD))
+                .send()
+                .context("send authenticated RabbitMQ readiness probe")?;
+            if !response.status().is_success() {
+                bail!("RabbitMQ readiness probe failed with {}", response.status());
+            }
+            Ok(())
+        },
+    )
+}
+
+/// Repeats a setup operation until it succeeds or its bounded deadline expires.
+fn retry_until_success(
+    operation: &str,
+    timeout: Duration,
+    retry_delay: Duration,
+    mut probe: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        match probe() {
+            Ok(()) => return Ok(()),
+            Err(error) if started.elapsed() >= timeout => {
+                return Err(error.context(format!(
+                    "{operation} did not succeed within {} ms",
+                    timeout.as_millis()
+                )));
+            }
+            Err(_) => {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                thread::sleep(retry_delay.min(remaining));
+            }
+        }
     }
 }
 
@@ -1336,5 +1400,33 @@ mod tests {
         ];
         assert!(validate_inventory("run", &containers, &network, &volumes).is_ok());
         assert!(validate_inventory("run", &[], &network, &volumes).is_err());
+    }
+
+    #[test]
+    fn bounded_retry_accepts_a_later_success() {
+        let mut attempts = 0;
+        retry_until_success("fixture", Duration::from_secs(1), Duration::ZERO, || {
+            attempts += 1;
+            if attempts < 3 {
+                bail!("fixture is starting");
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn bounded_retry_reports_the_last_failure_at_its_deadline() {
+        let mut attempts = 0;
+        let error = retry_until_success("fixture", Duration::ZERO, Duration::ZERO, || {
+            attempts += 1;
+            bail!("connection reset")
+        })
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert_eq!(attempts, 1);
+        assert!(message.contains("fixture did not succeed within 0 ms"));
+        assert!(message.contains("connection reset"));
     }
 }
