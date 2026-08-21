@@ -82,10 +82,22 @@ jobs:
       - name: Run service-free tests with coverage
         if: matrix.coverage
         run: >-
-          cargo llvm-cov --workspace --locked --lib --bins
+          cargo llvm-cov --no-report --workspace --locked --lib --bins
+      - name: Run performance contract check with coverage
+        if: matrix.coverage
+        run: cargo llvm-cov run --no-report -p xtask --locked -- perf check
+      - name: Run performance service tests with coverage
+        if: matrix.coverage
+        run: >-
+          cargo llvm-cov --no-report -p xtask --locked
+          --features performance-services --test performance_services -- --nocapture
+      - name: Generate unit and performance coverage report
+        if: matrix.coverage
+        run: >-
+          cargo llvm-cov report
           --ignore-filename-regex '[/\\]postgres_tests(\.rs|[/\\])'
           --lcov --output-path lcov-unit.info
-      - name: Store service-free coverage
+      - name: Store unit and performance coverage
         if: matrix.coverage
         uses: actions/upload-artifact@v4
         with:

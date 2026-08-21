@@ -113,7 +113,7 @@ mod tests {
                 output_bytes: 0,
                 exit_code: -1,
             })
-                .unwrap(),
+            .unwrap(),
             0
         );
         assert_eq!(
@@ -122,7 +122,7 @@ mod tests {
                 output_bytes: 0,
                 exit_code: 300,
             })
-                .unwrap(),
+            .unwrap(),
             u8::MAX
         );
         assert_eq!(default_profile_dir(), PathBuf::from("performance/profiles"));

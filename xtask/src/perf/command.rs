@@ -151,8 +151,12 @@ struct ExecutedSample {
 /// Executes an informative single-binary campaign for the selected profile.
 pub fn run_single(args: RunArgs) -> Result<u8> {
     let root = workspace_root()?;
-    let registry = load_registry(&root)?;
-    let profile = load_profile(&root, &args.profile)?;
+    run_single_at(&root, args)
+}
+
+fn run_single_at(root: &Path, args: RunArgs) -> Result<u8> {
+    let registry = load_registry(root)?;
+    let profile = load_profile(root, &args.profile)?;
     let selected = select_workloads(&profile, &registry, &args.workloads)?;
     require_implemented(&selected)?;
     let binary = executable_path(&args.binary)?;
@@ -161,10 +165,10 @@ pub fn run_single(args: RunArgs) -> Result<u8> {
     let planned_millis = estimated_single_millis(&selected);
     validate_campaign_budget(&profile, &selected, planned_millis, false)?;
 
-    let _lease = CampaignLease::acquire(&root)?;
-    let run_dir = create_run_dir(&root, args.output.as_deref(), "run")?;
+    let _lease = CampaignLease::acquire(root)?;
+    let run_dir = create_run_dir(root, args.output.as_deref(), "run")?;
     let id = run_id();
-    let mut workload_runner = WorkloadRunner::new(&root, &run_dir, &id);
+    let mut workload_runner = WorkloadRunner::new(root, &run_dir, &id);
     let seed = args.schedule_seed.unwrap_or(profile.schedule_seed);
     let environment = environment_manifest();
     atomic_json(&run_dir.join("environment.json"), &environment)?;
@@ -354,8 +358,12 @@ pub fn run_single(args: RunArgs) -> Result<u8> {
 /// Executes a counterbalanced baseline/candidate campaign and writes verdicts.
 pub fn compare(args: CompareArgs) -> Result<u8> {
     let root = workspace_root()?;
-    let registry = load_registry(&root)?;
-    let profile = load_profile(&root, &args.profile)?;
+    compare_at(&root, args)
+}
+
+fn compare_at(root: &Path, args: CompareArgs) -> Result<u8> {
+    let registry = load_registry(root)?;
+    let profile = load_profile(root, &args.profile)?;
     let selected = select_workloads(&profile, &registry, &args.workloads)?;
     require_implemented(&selected)?;
     let baseline_binary = executable_path(&args.baseline_binary)?;
@@ -373,10 +381,10 @@ pub fn compare(args: CompareArgs) -> Result<u8> {
     let planned_millis = estimated_compare_millis(&selected);
     validate_campaign_budget(&profile, &selected, planned_millis, true)?;
 
-    let _lease = CampaignLease::acquire(&root)?;
-    let run_dir = create_run_dir(&root, args.output.as_deref(), "compare")?;
+    let _lease = CampaignLease::acquire(root)?;
+    let run_dir = create_run_dir(root, args.output.as_deref(), "compare")?;
     let id = run_id();
-    let mut workload_runner = WorkloadRunner::new(&root, &run_dir, &id);
+    let mut workload_runner = WorkloadRunner::new(root, &run_dir, &id);
     let seed = args.schedule_seed.unwrap_or(profile.schedule_seed);
     atomic_json(&run_dir.join("environment.json"), &environment_manifest())?;
     let mut campaign = campaign_manifest(
@@ -1171,6 +1179,44 @@ mod tests {
         }
     }
 
+    fn startup_campaign(command: &str) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let repository = workspace_root().unwrap();
+        let registry_dir = root.join("performance/registry");
+        let profile_dir = root.join("performance/profiles");
+        fs::create_dir_all(&registry_dir).unwrap();
+        fs::create_dir_all(&profile_dir).unwrap();
+
+        let registry =
+            fs::read_to_string(repository.join("performance/registry/workloads-v1.toml"))
+                .unwrap()
+                .replace(
+                    "help_signatures = [\"Usage:\", \"Commands:\"]",
+                    "help_signatures = [\"Usage:\"]",
+                )
+                .replace(
+                    "command = [\"--help\"]",
+                    &format!("command = [{command:?}]"),
+                );
+        fs::write(registry_dir.join("workloads-v1.toml"), registry).unwrap();
+        fs::copy(
+            repository.join("performance/profiles/developer-v1.toml"),
+            profile_dir.join("developer-v1.toml"),
+        )
+        .unwrap();
+
+        let binary = std::env::current_exe().unwrap();
+        let build_dir = root.join("target/perf/builds/test");
+        let asset = build_dir.join("assets");
+        fs::create_dir_all(&asset).unwrap();
+        fs::write(asset.join("fixture"), "data").unwrap();
+        let manifest_path = build_dir.join("build-manifest.json");
+        atomic_json(&manifest_path, &manifest(&binary, &asset)).unwrap();
+        let run_dir = root.join("target/perf/runs/test");
+        (directory, binary, manifest_path, run_dir)
+    }
+
     #[test]
     fn candidate_failures_are_product_failures_but_baseline_failures_are_invalid() {
         let base = Sample {
@@ -1372,6 +1418,108 @@ mod tests {
         assert_eq!(
             environment_manifest().schema_id,
             super::super::model::ENVIRONMENT_SCHEMA
+        );
+    }
+
+    #[test]
+    fn startup_single_campaign_records_pass_and_product_failure() {
+        let (workspace, binary, build_manifest, run_dir) = startup_campaign("--help");
+        let exit = run_single_at(
+            workspace.path(),
+            RunArgs {
+                profile: "developer-v1".into(),
+                workloads: vec!["startup.cli-help.v1".into()],
+                binary: binary.clone(),
+                build_manifest: build_manifest.clone(),
+                output: Some(run_dir.clone()),
+                schedule_seed: Some(7),
+            },
+        )
+        .unwrap();
+        assert_eq!(exit, EXIT_PASS);
+        assert_eq!(
+            fs::read_to_string(run_dir.join("samples.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            4
+        );
+        assert!(
+            fs::read_to_string(run_dir.join("report.json"))
+                .unwrap()
+                .contains("\"status\": \"pass\"")
+        );
+
+        let (workspace, binary, build_manifest, run_dir) = startup_campaign("--definitely-invalid");
+        let exit = run_single_at(
+            workspace.path(),
+            RunArgs {
+                profile: "developer-v1".into(),
+                workloads: vec!["startup.cli-help.v1".into()],
+                binary,
+                build_manifest,
+                output: Some(run_dir.clone()),
+                schedule_seed: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(exit, EXIT_REGRESSION);
+        assert!(
+            run_dir
+                .join("failures/preconditioning-failure/sample.json")
+                .is_file()
+        );
+        assert!(
+            fs::read_to_string(run_dir.join("report.json"))
+                .unwrap()
+                .contains("\"status\": \"failure\"")
+        );
+    }
+
+    #[test]
+    fn startup_comparison_records_balanced_informative_result() {
+        let (workspace, binary, build_manifest, run_dir) = startup_campaign("--help");
+        let exit = compare_at(
+            workspace.path(),
+            CompareArgs {
+                profile: "developer-v1".into(),
+                workloads: vec!["startup.cli-help.v1".into()],
+                baseline_binary: binary.clone(),
+                baseline_manifest: build_manifest.clone(),
+                candidate_binary: binary,
+                candidate_manifest: build_manifest,
+                output: Some(run_dir.clone()),
+                schedule_seed: Some(11),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(exit, EXIT_PASS);
+        assert_eq!(
+            fs::read_to_string(run_dir.join("samples.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            8
+        );
+        assert_eq!(
+            fs::read_to_string(run_dir.join("blocks.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        assert_eq!(
+            fs::read_to_string(run_dir.join("comparisons.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert!(
+            fs::read_to_string(run_dir.join("report.json"))
+                .unwrap()
+                .contains("informative")
         );
     }
 }

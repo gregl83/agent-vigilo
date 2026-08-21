@@ -182,11 +182,17 @@ fn validate_profile_implementation_contract(
         "worker.execute-wasm.v1",
         "system.lifecycle.v1",
     ];
-    if ids != expected {
+    let mut implemented = ids.iter();
+    if !expected
+        .iter()
+        .all(|expected| implemented.any(|actual| actual == expected))
+    {
         bail!("Phase 2 must implement the complete ordered MVP workload set");
     }
-    let startup = implemented
-        .first()
+    let startup = registry
+        .workloads
+        .iter()
+        .find(|workload| workload.id == "startup.cli-help.v1")
         .context("implemented workload set is empty")?;
     if startup.command != ["--help"] || startup.help_signatures.is_empty() {
         bail!("startup workload must use the supported --help boundary");
@@ -551,5 +557,28 @@ mod tests {
         )
         .unwrap();
         assert!(validate_fixture_tree(directory.path()).is_err());
+    }
+
+    #[test]
+    fn phase_two_contract_requires_mvp_anchors_and_allows_future_workloads() {
+        let root = workspace_root().unwrap();
+        let registry = load_registry(&root).unwrap();
+
+        let mut extended = registry.clone();
+        let mut future = extended.workloads[0].clone();
+        future.id = "future.calibrated-gate.v1".into();
+        future.capability = future.id.clone();
+        extended.workloads.push(future);
+        assert!(validate_profile_implementation_contract(&extended).is_ok());
+
+        let mut incomplete = registry.clone();
+        incomplete
+            .workloads
+            .retain(|workload| workload.id != "worker.execute-wasm.v1");
+        assert!(validate_profile_implementation_contract(&incomplete).is_err());
+
+        let mut reordered = registry;
+        reordered.workloads.swap(1, 2);
+        assert!(validate_profile_implementation_contract(&reordered).is_err());
     }
 }

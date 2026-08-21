@@ -36,7 +36,11 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    let result = match Cli::parse().command {
+    execute(Cli::parse().command)
+}
+
+fn execute(command: Command) -> ExitCode {
+    let result = match command {
         Command::Perf(args) => perf::run(args),
         Command::PerfFixture(args) => perf::run_fixture(args),
         Command::PerfServiceFixture => perf::run_service_fixture(),
@@ -48,5 +52,40 @@ fn main() -> ExitCode {
             eprintln!("error: {error:#}");
             ExitCode::from(perf::EXIT_INVALID)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatcher_propagates_fixture_exit_codes() {
+        let success = Cli::try_parse_from(["xtask", "__perf-fixture"]).unwrap();
+        assert_eq!(execute(success.command), ExitCode::SUCCESS);
+
+        let failure = Cli::try_parse_from([
+            "xtask",
+            "__perf-fixture",
+            "--exit-code",
+            "7",
+            "--output-bytes",
+            "1",
+        ])
+        .unwrap();
+        assert_eq!(execute(failure.command), ExitCode::from(7));
+    }
+
+    #[test]
+    fn dispatcher_maps_command_errors_to_invalid() {
+        let invalid = Cli::try_parse_from([
+            "xtask",
+            "perf",
+            "report",
+            "--run-dir",
+            "target/perf/runs/does-not-exist",
+        ])
+        .unwrap();
+        assert_eq!(execute(invalid.command), ExitCode::from(perf::EXIT_INVALID));
     }
 }

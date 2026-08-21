@@ -60,6 +60,13 @@ struct PreparedDatabase {
     evaluators: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkloadShape {
+    cases: usize,
+    evaluators: usize,
+    create_run: bool,
+}
+
 /// Result of one service-backed workload invocation.
 pub struct WorkloadOutcome {
     /// Aggregate process observations for the measured region.
@@ -241,23 +248,13 @@ impl WorkloadRunner {
         )?;
 
         let fixture = self.fixture.as_ref().context("fixture was not loaded")?;
-        let (cases, evaluators, create) = match workload_id {
-            "run.create.v1" => (fixture.run_create.cases, 1, false),
-            "coordinator.dispatch.v1" => (
-                fixture.coordinator.chunks * fixture.coordinator.cases_per_chunk,
-                1,
-                true,
-            ),
-            "worker.execute-wasm.v1" => match tuple {
-                "cases-8-evaluators-1" => (fixture.worker.cases_many, 1, true),
-                "cases-1-evaluators-8" => (1, fixture.worker.evaluators_many, true),
-                _ => bail!("unsupported worker tuple: {tuple}"),
-            },
-            "system.lifecycle.v1" => (fixture.lifecycle.cases, 1, false),
-            _ => bail!("unsupported service workload: {workload_id}"),
-        };
-        let run_id = if create {
-            let inputs = self.inputs(&format!("{workload_id}:{tuple}"), cases, evaluators)?;
+        let shape = workload_shape(fixture, workload_id, tuple)?;
+        let run_id = if shape.create_run {
+            let inputs = self.inputs(
+                &format!("{workload_id}:{tuple}"),
+                shape.cases,
+                shape.evaluators,
+            )?;
             Some(create_run(
                 binary,
                 &database_url,
@@ -271,12 +268,12 @@ impl WorkloadRunner {
             None
         };
         let actual = structural_counts(&database_url, run_id.as_deref())?;
-        verify_prepared(workload_id, cases, &actual)?;
+        verify_prepared(workload_id, shape.cases, &actual)?;
         Ok(PreparedDatabase {
             url: database_url,
             run_id,
-            cases,
-            evaluators,
+            cases: shape.cases,
+            evaluators: shape.evaluators,
         })
     }
 
@@ -389,11 +386,7 @@ impl WorkloadRunner {
                 require_success_ref(&create, "lifecycle run creation")?;
                 let run_id = parse_run_id(&create.stdout.text())?;
                 let mut outcomes = vec![create];
-                let workers = match tuple {
-                    "workers-1" => 1,
-                    "workers-2" => 2,
-                    _ => bail!("unsupported lifecycle tuple: {tuple}"),
-                };
+                let workers = lifecycle_workers(tuple)?;
                 for _ in 0..fixture.lifecycle.coordinator_cycle_limit {
                     outcomes.push(invoke(
                         binary,
@@ -452,6 +445,53 @@ impl WorkloadRunner {
             cases,
             evaluators,
         )
+    }
+}
+
+fn workload_shape(
+    fixture: &FixtureCatalog,
+    workload_id: &str,
+    tuple: &str,
+) -> Result<WorkloadShape> {
+    let shape = match workload_id {
+        "run.create.v1" => WorkloadShape {
+            cases: fixture.run_create.cases,
+            evaluators: 1,
+            create_run: false,
+        },
+        "coordinator.dispatch.v1" => WorkloadShape {
+            cases: fixture.coordinator.chunks * fixture.coordinator.cases_per_chunk,
+            evaluators: 1,
+            create_run: true,
+        },
+        "worker.execute-wasm.v1" => match tuple {
+            "cases-8-evaluators-1" => WorkloadShape {
+                cases: fixture.worker.cases_many,
+                evaluators: 1,
+                create_run: true,
+            },
+            "cases-1-evaluators-8" => WorkloadShape {
+                cases: 1,
+                evaluators: fixture.worker.evaluators_many,
+                create_run: true,
+            },
+            _ => bail!("unsupported worker tuple: {tuple}"),
+        },
+        "system.lifecycle.v1" => WorkloadShape {
+            cases: fixture.lifecycle.cases,
+            evaluators: 1,
+            create_run: false,
+        },
+        _ => bail!("unsupported service workload: {workload_id}"),
+    };
+    Ok(shape)
+}
+
+fn lifecycle_workers(tuple: &str) -> Result<usize> {
+    match tuple {
+        "workers-1" => Ok(1),
+        "workers-2" => Ok(2),
+        _ => bail!("unsupported lifecycle tuple: {tuple}"),
     }
 }
 
@@ -706,11 +746,9 @@ fn oracle_create(
     chunks: i64,
 ) -> Result<DurableCounts> {
     let mut counts = structural_counts(database_url, Some(run_id))?;
-    require_count(&counts, "runs", 1)?;
-    require_count(&counts, "chunks", chunks)?;
-    require_count(&counts, "executions", cases as i64)?;
     let mut client = Client::connect(database_url, NoTls)?;
-    require_status(&mut client, run_id, "pending")?;
+    let status = run_status_with(&mut client, run_id)?;
+    validate_create_oracle(&counts, &status, cases, chunks)?;
     counts.insert("cases".into(), cases as i64);
     Ok(counts)
 }
@@ -718,16 +756,12 @@ fn oracle_create(
 fn oracle_coordinator(database_url: &str, run_id: &str, chunks: usize) -> Result<DurableCounts> {
     let mut counts = structural_counts(database_url, Some(run_id))?;
     let mut client = Client::connect(database_url, NoTls)?;
-    require_status(&mut client, run_id, "running")?;
+    let status = run_status_with(&mut client, run_id)?;
     let dispatched = scalar(
         &mut client,
         "SELECT COUNT(*)::bigint FROM run_chunks WHERE run_id = $1::uuid AND dispatched_at IS NOT NULL",
         run_id,
     )?;
-    if dispatched != chunks as i64 {
-        bail!("coordinator dispatched {dispatched} chunks; expected {chunks}");
-    }
-    counts.insert("dispatched_chunks".into(), dispatched);
     let started = scalar(
         &mut client,
         "SELECT COUNT(*)::bigint FROM outbox_events WHERE aggregate_id = $1::uuid AND event_type = 'run.started'",
@@ -738,9 +772,8 @@ fn oracle_coordinator(database_url: &str, run_id: &str, chunks: usize) -> Result
         "SELECT COUNT(*)::bigint FROM outbox_events e JOIN run_chunks c ON c.id = e.aggregate_id WHERE c.run_id = $1::uuid AND e.event_type = 'run.chunk.ready'",
         run_id,
     )?;
-    if started != 1 || ready != chunks as i64 {
-        bail!("coordinator outbox counts differ: run.started={started}, run.chunk.ready={ready}");
-    }
+    validate_coordinator_oracle(&status, dispatched, started, ready, chunks)?;
+    counts.insert("dispatched_chunks".into(), dispatched);
     counts.insert("run_started_events".into(), started);
     counts.insert("chunk_ready_events".into(), ready);
     Ok(counts)
@@ -753,22 +786,13 @@ fn oracle_worker(
     evaluators: usize,
 ) -> Result<DurableCounts> {
     let counts = structural_counts(database_url, Some(run_id))?;
-    require_count(&counts, "executions", cases as i64)?;
-    require_count(&counts, "attempts", cases as i64)?;
-    require_count(
-        &counts,
-        "evaluator_results",
-        cases.saturating_mul(evaluators) as i64,
-    )?;
     let mut client = Client::connect(database_url, NoTls)?;
     let completed = scalar(
         &mut client,
         "SELECT COUNT(*)::bigint FROM run_chunks WHERE run_id = $1::uuid AND status = 'completed'",
         run_id,
     )?;
-    if completed != 1 {
-        bail!("worker completed {completed} chunks; expected 1");
-    }
+    validate_worker_oracle(&counts, completed, cases, evaluators)?;
     Ok(counts)
 }
 
@@ -780,7 +804,7 @@ fn oracle_lifecycle(
 ) -> Result<DurableCounts> {
     let counts = oracle_worker(database_url, run_id, cases, evaluators)?;
     let mut client = Client::connect(database_url, NoTls)?;
-    require_status(&mut client, run_id, "completed")?;
+    let status = run_status_with(&mut client, run_id)?;
     let row = client.query_one(
         "SELECT expected_execution_count, terminal_execution_count, passed_execution_count FROM runs WHERE id = $1::uuid",
         &[&run_id],
@@ -788,16 +812,77 @@ fn oracle_lifecycle(
     let expected: i32 = row.get(0);
     let terminal: i32 = row.get(1);
     let passed: i32 = row.get(2);
-    if [expected, terminal, passed] != [cases as i32; 3] {
+    validate_lifecycle_oracle(&status, [expected, terminal, passed], cases)?;
+    Ok(counts)
+}
+
+fn validate_create_oracle(
+    counts: &DurableCounts,
+    status: &str,
+    cases: usize,
+    chunks: i64,
+) -> Result<()> {
+    require_count(counts, "runs", 1)?;
+    require_count(counts, "chunks", chunks)?;
+    require_count(counts, "executions", cases as i64)?;
+    require_status_value(status, "pending")
+}
+
+fn validate_coordinator_oracle(
+    status: &str,
+    dispatched: i64,
+    started: i64,
+    ready: i64,
+    chunks: usize,
+) -> Result<()> {
+    require_status_value(status, "running")?;
+    if dispatched != chunks as i64 {
+        bail!("coordinator dispatched {dispatched} chunks; expected {chunks}");
+    }
+    if started != 1 || ready != chunks as i64 {
+        bail!("coordinator outbox counts differ: run.started={started}, run.chunk.ready={ready}");
+    }
+    Ok(())
+}
+
+fn validate_worker_oracle(
+    counts: &DurableCounts,
+    completed: i64,
+    cases: usize,
+    evaluators: usize,
+) -> Result<()> {
+    require_count(counts, "executions", cases as i64)?;
+    require_count(counts, "attempts", cases as i64)?;
+    require_count(
+        counts,
+        "evaluator_results",
+        cases.saturating_mul(evaluators) as i64,
+    )?;
+    if completed != 1 {
+        bail!("worker completed {completed} chunks; expected 1");
+    }
+    Ok(())
+}
+
+fn validate_lifecycle_oracle(status: &str, totals: [i32; 3], cases: usize) -> Result<()> {
+    require_status_value(status, "completed")?;
+    if totals != [cases as i32; 3] {
         bail!(
-            "lifecycle execution totals differ: expected={expected}, terminal={terminal}, passed={passed}"
+            "lifecycle execution totals differ: expected={}, terminal={}, passed={}",
+            totals[0],
+            totals[1],
+            totals[2]
         );
     }
-    Ok(counts)
+    Ok(())
 }
 
 fn run_status(database_url: &str, run_id: &str) -> Result<String> {
     let mut client = Client::connect(database_url, NoTls)?;
+    run_status_with(&mut client, run_id)
+}
+
+fn run_status_with(client: &mut Client, run_id: &str) -> Result<String> {
     Ok(client
         .query_one(
             "SELECT status::text FROM runs WHERE id = $1::uuid",
@@ -806,15 +891,9 @@ fn run_status(database_url: &str, run_id: &str) -> Result<String> {
         .get(0))
 }
 
-fn require_status(client: &mut Client, run_id: &str, expected: &str) -> Result<()> {
-    let actual: String = client
-        .query_one(
-            "SELECT status::text FROM runs WHERE id = $1::uuid",
-            &[&run_id],
-        )?
-        .get(0);
+fn require_status_value(actual: &str, expected: &str) -> Result<()> {
     if actual != expected {
-        bail!("run {run_id} status is {actual}; expected {expected}");
+        bail!("run status is {actual}; expected {expected}");
     }
     Ok(())
 }
@@ -990,5 +1069,110 @@ mod tests {
             .unwrap()
             .is_empty()
         );
+    }
+
+    #[test]
+    fn completed_phase_workload_shapes_resolve_and_unknown_shapes_fail_closed() {
+        let root = crate::perf::artifact::workspace_root().unwrap();
+        let fixture = load(&root, "mvp-v1").unwrap();
+
+        assert_eq!(
+            workload_shape(&fixture, "run.create.v1", "cases-1001").unwrap(),
+            WorkloadShape {
+                cases: 1001,
+                evaluators: 1,
+                create_run: false,
+            }
+        );
+        assert_eq!(
+            workload_shape(&fixture, "coordinator.dispatch.v1", "chunks-512").unwrap(),
+            WorkloadShape {
+                cases: 51_200,
+                evaluators: 1,
+                create_run: true,
+            }
+        );
+        assert_eq!(
+            workload_shape(&fixture, "worker.execute-wasm.v1", "cases-8-evaluators-1").unwrap(),
+            WorkloadShape {
+                cases: 8,
+                evaluators: 1,
+                create_run: true,
+            }
+        );
+        assert_eq!(
+            workload_shape(&fixture, "worker.execute-wasm.v1", "cases-1-evaluators-8").unwrap(),
+            WorkloadShape {
+                cases: 1,
+                evaluators: 8,
+                create_run: true,
+            }
+        );
+        assert_eq!(
+            workload_shape(&fixture, "system.lifecycle.v1", "workers-2").unwrap(),
+            WorkloadShape {
+                cases: 100,
+                evaluators: 1,
+                create_run: false,
+            }
+        );
+        assert_eq!(lifecycle_workers("workers-1").unwrap(), 1);
+        assert_eq!(lifecycle_workers("workers-2").unwrap(), 2);
+        assert!(workload_shape(&fixture, "worker.execute-wasm.v1", "future-tuple").is_err());
+        assert!(workload_shape(&fixture, "future.workload.v1", "tuple").is_err());
+        assert!(lifecycle_workers("workers-3").is_err());
+    }
+
+    #[test]
+    fn exact_oracles_accept_completed_phase_outcomes() {
+        let create = DurableCounts::from([
+            ("runs".into(), 1),
+            ("chunks".into(), 11),
+            ("executions".into(), 1001),
+        ]);
+        assert!(validate_create_oracle(&create, "pending", 1001, 11).is_ok());
+
+        assert!(validate_coordinator_oracle("running", 512, 1, 512, 512).is_ok());
+
+        let worker = DurableCounts::from([
+            ("executions".into(), 8),
+            ("attempts".into(), 8),
+            ("evaluator_results".into(), 8),
+        ]);
+        assert!(validate_worker_oracle(&worker, 1, 8, 1).is_ok());
+
+        let evaluator_heavy = DurableCounts::from([
+            ("executions".into(), 1),
+            ("attempts".into(), 1),
+            ("evaluator_results".into(), 8),
+        ]);
+        assert!(validate_worker_oracle(&evaluator_heavy, 1, 1, 8).is_ok());
+        assert!(validate_lifecycle_oracle("completed", [100, 100, 100], 100).is_ok());
+    }
+
+    #[test]
+    fn exact_oracles_reject_status_count_and_event_mismatches() {
+        let create = DurableCounts::from([
+            ("runs".into(), 1),
+            ("chunks".into(), 11),
+            ("executions".into(), 1001),
+        ]);
+        assert!(validate_create_oracle(&create, "running", 1001, 11).is_err());
+        assert!(validate_create_oracle(&create, "pending", 1000, 11).is_err());
+
+        assert!(validate_coordinator_oracle("pending", 512, 1, 512, 512).is_err());
+        assert!(validate_coordinator_oracle("running", 511, 1, 512, 512).is_err());
+        assert!(validate_coordinator_oracle("running", 512, 0, 512, 512).is_err());
+        assert!(validate_coordinator_oracle("running", 512, 1, 511, 512).is_err());
+
+        let worker = DurableCounts::from([
+            ("executions".into(), 8),
+            ("attempts".into(), 8),
+            ("evaluator_results".into(), 8),
+        ]);
+        assert!(validate_worker_oracle(&worker, 0, 8, 1).is_err());
+        assert!(validate_worker_oracle(&worker, 1, 8, 2).is_err());
+        assert!(validate_lifecycle_oracle("running", [100, 100, 100], 100).is_err());
+        assert!(validate_lifecycle_oracle("completed", [100, 99, 100], 100).is_err());
     }
 }

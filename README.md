@@ -109,11 +109,13 @@ messaging, and opt-in environment variables.
 
 The pre-commit hook runs nightly rustfmt only. The pre-push hook runs clippy, the service-free Rust tier, and the web typecheck. Database integration, migration, end-to-end, evaluator Wasm, and web production build checks run as separate required CI jobs.
 
-The service-free, PostgreSQL, and end-to-end jobs collect coverage in parallel
-while running their existing test tiers. A final job merges the three reports,
-requires at least 80% aggregate line coverage, and uploads that report under the
-`rust-all` Codecov flag. Project coverage and the repository badge therefore
-reflect code reached through unit, integration, and distributed runtime tests.
+The unit/performance, PostgreSQL, and end-to-end jobs collect coverage in
+parallel while running their existing test tiers. The Linux unit pass also runs
+the performance contract check and Docker-backed service ownership test. A
+final job merges the three reports, requires at least 80% aggregate line
+coverage, and uploads that report under the `rust-all` Codecov flag. Project
+coverage and the repository badge therefore reflect code reached through unit,
+integration, and distributed runtime tests.
 Only PostgreSQL test fixture sources are excluded; production query and table
 modules remain in the coverage denominator.
 
@@ -129,6 +131,8 @@ environment variables required by each tier:
 ```bash
 cargo llvm-cov clean --workspace
 cargo llvm-cov --no-report --workspace --locked --lib --bins
+cargo llvm-cov run --no-report -p xtask --locked -- perf check
+cargo llvm-cov --no-report -p xtask --locked --features performance-services --test performance_services -- --nocapture
 cargo llvm-cov --no-report -p vigilo --locked --bin vigilo -- --ignored --nocapture --test-threads=4
 cargo llvm-cov --no-report -p vigilo --locked --test multi_database_routing -- --nocapture
 VIGILO_E2E_MULTI_DATABASE=1 cargo llvm-cov --no-report -p vigilo --locked --test multi_database_e2e -- --nocapture
