@@ -294,17 +294,14 @@ mod tests {
     use super::*;
 
     fn help_fixture() -> (PathBuf, Vec<&'static str>) {
-        if cfg!(windows) {
-            (
-                PathBuf::from("powershell.exe"),
-                vec!["-NoProfile", "-Command", "Write-Output 'Usage: Commands:'"],
-            )
-        } else {
-            (
-                PathBuf::from("/bin/sh"),
-                vec!["-c", "printf 'Usage: Commands:\\n'"],
-            )
-        }
+        (
+            std::env::current_exe().unwrap(),
+            vec![
+                "--exact",
+                "perf::process::tests::subprocess_fixture",
+                "--nocapture",
+            ],
+        )
     }
 
     #[test]

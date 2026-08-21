@@ -450,55 +450,67 @@ pub fn executable_path(path: &Path) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
-    fn shell(command: &str) -> (PathBuf, Vec<String>) {
-        if cfg!(windows) {
-            (
-                PathBuf::from("powershell.exe"),
-                vec!["-NoProfile".into(), "-Command".into(), command.into()],
-            )
+    const FIXTURE_TEST: &str = "perf::process::tests::subprocess_fixture";
+
+    fn fixture_command() -> (PathBuf, Vec<String>) {
+        (
+            std::env::current_exe().unwrap(),
+            vec!["--exact".into(), FIXTURE_TEST.into(), "--nocapture".into()],
+        )
+    }
+
+    #[test]
+    fn subprocess_fixture() {
+        let delay_ms = std::env::var("VIGILO_PERF_TEST_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let output_bytes = std::env::var("VIGILO_PERF_TEST_OUTPUT_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        if output_bytes == 0 {
+            println!("Usage: Commands:");
         } else {
-            (PathBuf::from("sh"), vec!["-c".into(), command.into()])
+            std::io::stdout()
+                .write_all(&vec![b'x'; output_bytes])
+                .unwrap();
+            std::io::stdout().flush().unwrap();
         }
     }
 
     #[test]
     fn output_is_drained_and_bounded() {
-        let command = if cfg!(windows) {
-            "[Console]::Out.Write(('x' * 4096))"
-        } else {
-            "head -c 4096 /dev/zero | tr '\\0' x"
-        };
-        let (program, args) = shell(command);
+        let (program, args) = fixture_command();
         let outcome = execute(&ProcessSpec {
             program: &program,
             args: &args,
             current_dir: None,
-            env: &[],
-            timeout: Duration::from_secs(5),
+            env: &[("VIGILO_PERF_TEST_OUTPUT_BYTES".into(), "4096".into())],
+            timeout: Duration::from_secs(30),
             stdout_limit: 64,
             stderr_limit: 64,
         })
         .unwrap();
         assert_eq!(outcome.stdout.data.len(), 64);
-        assert_eq!(outcome.stdout.bytes_seen, 4096);
+        assert!(outcome.stdout.bytes_seen >= 4096);
         assert!(outcome.stdout.truncated);
     }
 
     #[test]
     fn timeout_kills_and_reaps_child() {
-        let command = if cfg!(windows) {
-            "Start-Sleep -Seconds 10"
-        } else {
-            "sleep 10"
-        };
-        let (program, args) = shell(command);
+        let (program, args) = fixture_command();
         let outcome = execute(&ProcessSpec {
             program: &program,
             args: &args,
             current_dir: None,
-            env: &[],
+            env: &[("VIGILO_PERF_TEST_DELAY_MS".into(), "10000".into())],
             timeout: Duration::from_millis(30),
             stdout_limit: 64,
             stderr_limit: 64,
