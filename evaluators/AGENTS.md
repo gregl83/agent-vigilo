@@ -1,51 +1,32 @@
-# Creating Evaluators Guidance
+# Evaluator Crate Guidance
 
-This file applies to evaluator crates under `evaluators/`.
+These rules add to the root guidance for crates under `evaluators/`.
 
-## Scope
+## Crate Contract
 
-- Use this file when creating or editing evaluator crates.
-- For core project/runtime changes outside evaluator crates, follow `AGENTS.md`.
-
-## Single-Evaluator Crate Standard
-
-- One crate should implement one evaluator component.
-- Keep one primary evaluator entrypoint (`evaluate`) in crate code.
-- Include `Vigilo.toml` and an `example-input.json` in the crate root.
-- Keep evaluator logic self-contained and deterministic where possible.
-
-## Contract Alignment
-
+- One crate implements one evaluator component through one primary `evaluate`
+  entrypoint. Keep evaluator logic self-contained.
+- Include `Vigilo.toml` and `example-input.json` in the crate root.
+- Make results deterministic for identical declared inputs. If the contract
+  intentionally permits nondeterminism, make its source explicit and controllable
+  in tests.
 - Implement the current contract from `wit/evaluator/v1.0.0/evaluator.wit`.
-- Before the first release, `v1.0.0` is the only supported ABI. Once an ABI is
-  released, freeze its WIT file; later breaking changes require a new versioned
-  contract and host adapter.
-- Evaluator crates select an ABI but never contain host adapters or compatibility
-  dispatch; those remain isolated under `vigilo/src/evaluator_abi/`.
-- Read canonical evaluator `input` fields and return canonical `output`.
-- Return one primary measurement or abstention and zero or more diagnostics;
-  evaluators must not implement dimension, threshold, weight, or blocking policy.
-- Measurements are raw `binary`, `numeric`, or `ordinal` observations. Do not
-  normalize values or assign ordinal utilities inside evaluator code.
-- Do not introduce alternate envelope names for evaluator entrypoints.
+  Evaluator crates select an ABI but never contain host adapters or compatibility
+  dispatch; those remain under `vigilo/src/evaluator_abi/`.
+- Read canonical evaluator `input` fields and return canonical `output`. Do not
+  introduce alternate envelope or entrypoint names.
+- Return one primary raw `binary`, `numeric`, or `ordinal` measurement, or an
+  abstention, plus zero or more diagnostics. Dimension, normalization, threshold,
+  weight, ordinal utility, and blocking policy belong outside evaluator code.
 
-## Build and Test Expectations
+## Verification
 
-- Build target: `wasm32-wasip2`.
-- Validate with `vigilo evaluator test` using `--input` or `--input-file`.
-- If contract shape changes, bump evaluator version before republishing.
+- Build for `wasm32-wasip2` and validate the component with
+  `vigilo evaluator test` using `--input` or `--input-file`.
+- Bump the evaluator version before publishing a changed contract shape.
 
-## Rustfmt and Toolchain
+## References
 
-- Evaluator crates follow the repository toolchain baseline: `stable` by default.
-- Formatting still requires nightly rustfmt because root `rustfmt.toml` uses unstable options.
-- Format evaluator changes with nightly rustfmt (for example from repo root): `cargo +nightly fmt --all`.
-- Keep evaluator build/test flows on stable unless a task explicitly requires otherwise.
-- Do not change rustfmt settings just to force stable-only formatting unless explicitly requested.
-
-## Reference
-
-- Example crate: `evaluators/sentiment-basic-en`
-- Guide: `web/docs/guides/creating-evaluators.mdx`
-- Normalization examples: `web/docs/configuration/measurement-normalization.mdx`
-- Template details: `evaluators/sentiment-basic-en/README.md`
+- Example and template: `evaluators/sentiment-basic-en/README.md`
+- Creation guide: `web/docs/guides/creating-evaluators.mdx`
+- Normalization policy: `web/docs/configuration/measurement-normalization.mdx`
