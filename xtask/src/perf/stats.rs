@@ -208,7 +208,7 @@ fn bootstrap_interval(abba: &[f64], baab: &[f64], seed: u64) -> (f64, f64) {
     (lower, upper)
 }
 
-/// Applies optional Phase 3 policy to an otherwise informative effect estimate.
+/// Applies an optional reviewed budget to an otherwise informative effect estimate.
 fn decide_verdict(
     lower: f64,
     upper: f64,

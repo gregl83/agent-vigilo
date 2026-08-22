@@ -25,6 +25,7 @@ use super::{
         require_artifact_path,
         workspace_root,
     },
+    calibration,
     config::{
         load_profile,
         load_registry,
@@ -39,7 +40,13 @@ use super::{
     schedule,
 };
 
-const PROFILES: [&str; 4] = ["developer-v1", "pr-v1", "reference-v1", "calibration-v1"];
+const PROFILES: [&str; 5] = [
+    "developer-v1",
+    "pr-v1",
+    "reference-v1",
+    "calibration-v1",
+    "capacity-v1",
+];
 
 /// CLI arguments for validating the performance harness.
 #[derive(Debug, Args)]
@@ -47,7 +54,7 @@ pub struct CheckArgs {
     /// Git base used to prove a preparatory harness change leaves product code untouched.
     #[arg(long)]
     bootstrap_base: Option<String>,
-    /// Destructive endpoint to validate; Phase 1 never connects to it.
+    /// Destructive endpoint to validate; the static check never connects to it.
     #[arg(long)]
     endpoint: Vec<String>,
     /// Run-specific marker that must be embedded in every supplied endpoint.
@@ -82,8 +89,10 @@ pub fn execute(args: CheckArgs) -> Result<u8> {
     validate_profile_implementation_contract(&registry)?;
     validate_dependency_boundaries(&root)?;
     validate_package_contents(&root)?;
+    validate_no_roadmap_markers(&root)?;
     validate_fixture_tree(&root)?;
     validate_service_configuration(&root)?;
+    calibration::validate_repository_contract(&root)?;
     if let Some(base) = args.bootstrap_base.as_deref() {
         validate_bootstrap_delta(&root, base)?;
     }
@@ -166,7 +175,7 @@ fn validate_constants(constants: &super::model::RegistryConstants) -> Result<()>
     Ok(())
 }
 
-/// Requires the ordered Phase 2 anchors while permitting additive future workloads.
+/// Requires the ordered MVP anchors while permitting additive future workloads.
 fn validate_profile_implementation_contract(
     registry: &super::model::WorkloadRegistry,
 ) -> Result<()> {
@@ -191,7 +200,7 @@ fn validate_profile_implementation_contract(
         .iter()
         .all(|expected| implemented.any(|actual| actual == expected))
     {
-        bail!("Phase 2 must implement the complete ordered MVP workload set");
+        bail!("the complete ordered MVP workload set must be implemented");
     }
     let startup = registry
         .workloads
@@ -308,6 +317,81 @@ fn validate_package_contents(root: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Keeps numbered implementation-roadmap labels confined to the ignored plan directory.
+fn validate_no_roadmap_markers(root: &Path) -> Result<()> {
+    let output = command_output(
+        root,
+        "git",
+        &[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+    )?;
+    for relative in output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let relative = String::from_utf8_lossy(relative).replace('\\', "/");
+        if relative.starts_with(".agent-plans/") || !is_reviewed_text_path(Path::new(&relative)) {
+            continue;
+        }
+        let path = root.join(&relative);
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("read roadmap policy input {}", path.display()))?;
+        if contains_numbered_roadmap_marker(&content) {
+            bail!("numbered implementation roadmap marker outside ignored plan: {relative}");
+        }
+    }
+    Ok(())
+}
+
+fn is_reviewed_text_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension,
+                "css"
+                    | "html"
+                    | "js"
+                    | "json"
+                    | "md"
+                    | "mdx"
+                    | "mjs"
+                    | "mmd"
+                    | "ps1"
+                    | "rs"
+                    | "sh"
+                    | "toml"
+                    | "ts"
+                    | "tsx"
+                    | "wit"
+                    | "yaml"
+                    | "yml"
+            )
+        })
+}
+
+fn contains_numbered_roadmap_marker(content: &str) -> bool {
+    let content = content.to_ascii_lowercase();
+    let numbers = (0..=9).map(|number| number.to_string());
+    let words = ["zero", "one", "two", "three", "four", "five", "six"]
+        .into_iter()
+        .map(str::to_owned);
+    numbers.chain(words).any(|value| {
+        [
+            format!("phase {value}"),
+            format!("phase-{value}"),
+            format!("phase_{value}"),
+        ]
+        .iter()
+        .any(|marker| content.contains(marker))
+    })
 }
 
 /// Rejects oversized, generated, or private-source-importing checked-in fixtures.
@@ -545,8 +629,20 @@ mod tests {
         validate_profile_implementation_contract(&registry).unwrap();
         validate_dependency_boundaries(&root).unwrap();
         validate_package_contents(&root).unwrap();
+        validate_no_roadmap_markers(&root).unwrap();
         validate_fixture_tree(&root).unwrap();
         validate_service_configuration(&root).unwrap();
+        calibration::validate_repository_contract(&root).unwrap();
+    }
+
+    #[test]
+    fn roadmap_policy_distinguishes_numbered_milestones_from_runtime_language() {
+        let numbered = format!("{} {} calibration", "Phase", 3);
+        assert!(contains_numbered_roadmap_marker(&numbered));
+        let underscored = format!("{}_{}_calibration", "phase", "three");
+        assert!(contains_numbered_roadmap_marker(&underscored));
+        assert!(!contains_numbered_roadmap_marker("evaluation phase"));
+        assert!(!contains_numbered_roadmap_marker("three-phase power"));
     }
 
     #[test]
@@ -572,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_two_contract_requires_mvp_anchors_and_allows_future_workloads() {
+    fn registry_contract_requires_mvp_anchors_and_allows_future_workloads() {
         let root = workspace_root().unwrap();
         let registry = load_registry(&root).unwrap();
 

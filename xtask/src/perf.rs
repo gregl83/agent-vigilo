@@ -10,6 +10,8 @@
 //! - `config` and `model` define the versioned input and output contracts.
 //! - `build` creates immutable Vigilo snapshots and records their provenance.
 //! - `schedule` and `stats` define sampling order and comparison semantics.
+//! - `calibration` turns canonical no-change and bounded-capacity evidence into
+//!   reviewed budget/profile candidates and immutable baseline artifacts.
 //! - `process` owns bounded child execution and platform resource collection.
 //! - `service`, `fixture`, and `workload` provision isolated dependencies,
 //!   render deterministic inputs, execute service-backed workloads, and apply
@@ -25,6 +27,7 @@
 
 mod artifact;
 mod build;
+mod calibration;
 mod check;
 mod command;
 mod config;
@@ -75,6 +78,8 @@ enum PerfCommand {
     Compare(command::CompareArgs),
     /// Re-render a completed run's terminal and Markdown summary.
     Report(report::ReportArgs),
+    /// Analyze canonical noise or bounded capacity evidence.
+    Calibrate(calibration::CalibrateArgs),
 }
 
 /// Arguments for the hidden subprocess fixture used by lifecycle tests.
@@ -96,6 +101,7 @@ pub fn run(args: PerfArgs) -> Result<u8> {
         PerfCommand::Run(args) => command::run_single(args),
         PerfCommand::Compare(args) => command::compare(args),
         PerfCommand::Report(args) => report::execute(args),
+        PerfCommand::Calibrate(args) => calibration::execute(args),
     }
 }
 

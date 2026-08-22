@@ -27,7 +27,7 @@ use uuid::Uuid;
 const FIXTURE_SCHEMA: &str = "performance-fixtures/v1";
 const FIXTURE_NAMESPACE: Uuid = Uuid::from_u128(0x8f17098f_9fd0_4c9f_9164_957940ab5e8d);
 
-/// Complete Phase 2 fixture catalog.
+/// Complete deterministic performance fixture catalog.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FixtureCatalog {
     /// Fixture document shape.
@@ -86,6 +86,8 @@ pub struct LifecycleFixture {
     pub worker_pass_limit: usize,
     /// Maximum coordinator cycles before declaring liveness failure.
     pub coordinator_cycle_limit: usize,
+    /// Maximum coordinator cycles for the bounded capacity staircase.
+    pub capacity_cycle_limit: usize,
 }
 
 /// Rendered run input paths and their deterministic case count.
@@ -124,6 +126,7 @@ pub fn load(root: &Path, id: &str) -> Result<FixtureCatalog> {
         || fixture.lifecycle.cases == 0
         || fixture.lifecycle.worker_pass_limit == 0
         || fixture.lifecycle.coordinator_cycle_limit == 0
+        || fixture.lifecycle.capacity_cycle_limit == 0
     {
         bail!("fixture {id} contains a zero or empty required value");
     }
@@ -178,7 +181,7 @@ fn profile_value(
     json!({
         "profile_id": format!("perf_{identity}"),
         "profile_version": "1.0.0",
-        "description": "Deterministic Phase 2 performance fixture.",
+        "description": "Deterministic performance fixture.",
         "defaults": {
             "max_attempts": 1,
             "request_timeout_secs": 30,
@@ -261,6 +264,7 @@ mod tests {
                 cases: 100,
                 worker_pass_limit: 8,
                 coordinator_cycle_limit: 8,
+                capacity_cycle_limit: 32,
             },
         }
     }

@@ -679,7 +679,7 @@ async fn seed_sentiment_evaluator(primary: &PgPool) -> anyhow::Result<()> {
             'wasmtime',
             'integration',
             'integration',
-            'Phase 23 integration evaluator',
+            'Multi-database integration evaluator',
             '["integration", "sentiment"]'::jsonb,
             '{}'::jsonb,
             'active'::evaluator_state

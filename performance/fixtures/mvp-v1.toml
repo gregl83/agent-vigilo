@@ -20,3 +20,4 @@ evaluators_many = 8
 cases = 100
 worker_pass_limit = 8
 coordinator_cycle_limit = 8
+capacity_cycle_limit = 32

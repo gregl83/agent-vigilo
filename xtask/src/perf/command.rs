@@ -51,6 +51,7 @@ use super::{
         SelectedWorkload,
         estimated_compare_millis,
         estimated_single_millis,
+        load_budget_policy,
         load_profile,
         load_registry,
         select_workloads,
@@ -59,6 +60,8 @@ use super::{
         BUILD_SCHEMA,
         BinaryRole,
         BlockRecord,
+        BudgetEntry,
+        BudgetPolicy,
         BuildManifest,
         CampaignManifest,
         ComparisonDocument,
@@ -127,6 +130,9 @@ pub struct CompareArgs {
     output: Option<PathBuf>,
     #[arg(long)]
     schedule_seed: Option<u64>,
+    /// Prior independent over-budget run to confirm before declaring regression.
+    #[arg(long = "confirmation-of")]
+    confirmation_of: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +152,11 @@ struct ExecutedSample {
     sample: Sample,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+struct ConfirmationEvidence {
+    report: ReportDocument,
+    campaign: CampaignManifest,
 }
 
 /// Executes an informative single-binary campaign for the selected profile.
@@ -168,13 +179,14 @@ fn run_single_at(root: &Path, args: RunArgs) -> Result<u8> {
     require_capabilities(&selected, &[&manifest])?;
     let planned_millis = estimated_single_millis(&selected);
     validate_campaign_budget(&profile, &selected, planned_millis, false)?;
+    let environment = environment_manifest();
+    validate_timing_contract(&selected, &environment, &manifest, &manifest, false)?;
 
     let _lease = CampaignLease::acquire(root)?;
     let run_dir = create_run_dir(root, args.output.as_deref(), "run")?;
     let id = run_id();
     let mut workload_runner = WorkloadRunner::new(root, &run_dir, &id);
     let seed = args.schedule_seed.unwrap_or(profile.schedule_seed);
-    let environment = environment_manifest();
     atomic_json(&run_dir.join("environment.json"), &environment)?;
     let mut campaign = campaign_manifest(
         &id,
@@ -369,6 +381,11 @@ pub fn compare(args: CompareArgs) -> Result<u8> {
 fn compare_at(root: &Path, args: CompareArgs) -> Result<u8> {
     let registry = load_registry(root)?;
     let profile = load_profile(root, &args.profile)?;
+    let budget_policy = profile
+        .budget_reference
+        .as_deref()
+        .map(|id| load_budget_policy(root, id))
+        .transpose()?;
     let selected = select_workloads(&profile, &registry, &args.workloads)?;
     require_implemented(&selected)?;
     let baseline_binary = executable_path(&args.baseline_binary)?;
@@ -385,13 +402,53 @@ fn compare_at(root: &Path, args: CompareArgs) -> Result<u8> {
     require_capabilities(&selected, &[&baseline_manifest, &candidate_manifest])?;
     let planned_millis = estimated_compare_millis(&selected);
     validate_campaign_budget(&profile, &selected, planned_millis, true)?;
+    let environment = environment_manifest();
+    validate_timing_contract(
+        &selected,
+        &environment,
+        &baseline_manifest,
+        &candidate_manifest,
+        true,
+    )?;
+    for selected_workload in &selected {
+        resolve_budget_entry(
+            selected_workload,
+            &environment.environment_id,
+            budget_policy.as_ref(),
+        )?;
+    }
+    let confirmation = args
+        .confirmation_of
+        .as_deref()
+        .map(|run_dir| {
+            load_confirmation(
+                run_dir,
+                &profile.id,
+                &selected,
+                &environment,
+                &baseline_manifest,
+                &candidate_manifest,
+                budget_policy.as_ref(),
+            )
+        })
+        .transpose()?;
+    let seed = match (&confirmation, args.schedule_seed) {
+        (Some(evidence), None) => evidence.campaign.schedule_seed ^ 0xa5a5_5a5a_d3c4_b2e1,
+        (_, Some(seed)) => seed,
+        (None, None) => profile.schedule_seed,
+    };
+    if confirmation
+        .as_ref()
+        .is_some_and(|evidence| evidence.campaign.schedule_seed == seed)
+    {
+        bail!("confirmation run must use an independent schedule seed");
+    }
 
     let _lease = CampaignLease::acquire(root)?;
     let run_dir = create_run_dir(root, args.output.as_deref(), "compare")?;
     let id = run_id();
     let mut workload_runner = WorkloadRunner::new(root, &run_dir, &id);
-    let seed = args.schedule_seed.unwrap_or(profile.schedule_seed);
-    atomic_json(&run_dir.join("environment.json"), &environment_manifest())?;
+    atomic_json(&run_dir.join("environment.json"), &environment)?;
     let mut campaign = campaign_manifest(
         &id,
         "compare",
@@ -585,20 +642,56 @@ fn compare_at(root: &Path, args: CompareArgs) -> Result<u8> {
 
         if exit == EXIT_PASS {
             let workload_samples = &samples[workload_sample_start..];
+            let budget = resolve_budget_entry(
+                selected_workload,
+                &environment.environment_id,
+                budget_policy.as_ref(),
+            )?;
             let wall_time = compare_wall_time(
                 workload_samples,
                 seed ^ u64::from(selected_workload.profile.blocks),
-                None,
-                profile.max_residual_orientation_effect,
-                false,
+                budget.map(|entry| entry.practical_budget),
+                budget
+                    .map(|entry| entry.max_residual_orientation_effect)
+                    .or(profile.max_residual_orientation_effect),
+                budget.is_some_and(|entry| {
+                    confirmation.as_ref().is_some_and(|evidence| {
+                        confirms_prior_signal(
+                            evidence,
+                            &selected_workload.workload.id,
+                            &selected_workload.profile.tuple,
+                            entry,
+                        )
+                    })
+                }),
             )?;
-            if wall_time.verdict == Verdict::Invalid {
-                exit = EXIT_INVALID;
-                failures.push(format!(
-                    "{} retained residual orientation effect {:.2}%",
-                    selected_workload.workload.id,
-                    wall_time.residual_orientation_effect * 100.0
-                ));
+            let comparison_verdict = wall_time.verdict.clone();
+            match comparison_verdict {
+                Verdict::Regression => {
+                    exit = EXIT_REGRESSION;
+                    failures.push(format!(
+                        "{} confirmed wall-time regression {:.2}% exceeds {:.2}% budget",
+                        selected_workload.workload.id,
+                        wall_time.harmful_effect * 100.0,
+                        wall_time.practical_budget.unwrap_or_default() * 100.0
+                    ));
+                }
+                Verdict::Invalid => {
+                    exit = EXIT_INVALID;
+                    failures.push(format!(
+                        "{} retained residual orientation effect {:.2}%",
+                        selected_workload.workload.id,
+                        wall_time.residual_orientation_effect * 100.0
+                    ));
+                }
+                Verdict::Inconclusive => {
+                    exit = EXIT_INVALID;
+                    failures.push(format!(
+                        "{} wall-time result is inconclusive and requires independent confirmation",
+                        selected_workload.workload.id
+                    ));
+                }
+                Verdict::Pass | Verdict::Improvement | Verdict::Informative => {}
             }
             let comparison = ComparisonDocument {
                 schema_id: super::model::COMPARISON_SCHEMA.into(),
@@ -609,11 +702,7 @@ fn compare_at(root: &Path, args: CompareArgs) -> Result<u8> {
                 baseline_digest: baseline_manifest.executable_digest.clone(),
                 candidate_digest: candidate_manifest.executable_digest.clone(),
                 metrics: vec![wall_time],
-                verdict: if exit == EXIT_INVALID {
-                    Verdict::Invalid
-                } else {
-                    Verdict::Informative
-                },
+                verdict: comparison_verdict,
                 extra: no_extra(),
             };
             let name = artifact_name(&comparison.workload_id, &comparison.tuple_id);
@@ -718,7 +807,7 @@ fn require_implemented(selected: &[SelectedWorkload<'_>]) -> Result<()> {
         .collect();
     if !planned.is_empty() {
         bail!(
-            "profile selection includes workloads planned for Phase 2 or later: {}",
+            "profile selection includes workloads that are not implemented: {}",
             planned.join(", ")
         );
     }
@@ -746,6 +835,179 @@ fn require_capabilities(
 
 fn has_capability(capabilities: &[String], required: &str) -> bool {
     capabilities.iter().any(|capability| capability == required)
+}
+
+/// Enforces timing-mode boundaries before creating campaign resources.
+fn validate_timing_contract(
+    selected: &[SelectedWorkload<'_>],
+    environment: &EnvironmentManifest,
+    baseline: &BuildManifest,
+    candidate: &BuildManifest,
+    comparison: bool,
+) -> Result<()> {
+    let timings = selected
+        .iter()
+        .map(|selected| selected.profile.timing.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if timings.len() != 1 {
+        bail!("one campaign cannot mix fixed-load, noise, and capacity timing modes");
+    }
+    match timings.first().copied().unwrap_or("informative") {
+        "calibration" => {
+            if !comparison {
+                bail!("noise calibration requires a same-build comparison campaign");
+            }
+            if baseline.executable_digest != candidate.executable_digest {
+                bail!("noise calibration must compare one identical immutable build");
+            }
+            if selected.iter().any(|selected| selected.profile.blocks < 30) {
+                bail!("noise calibration requires at least 30 blocks per tuple");
+            }
+        }
+        "capacity" => {
+            if comparison {
+                bail!("capacity calibration must remain separate from A/B comparisons");
+            }
+        }
+        "gating" => {
+            if !comparison {
+                bail!("calibrated gating profiles require an A/B comparison");
+            }
+            if !environment.canonical {
+                bail!("calibrated gating requires its canonical environment");
+            }
+        }
+        "informative" => {}
+        timing => bail!("unsupported timing policy: {timing}"),
+    }
+    Ok(())
+}
+
+/// Resolves one exact calibrated wall-time gate for a selected workload tuple.
+fn resolve_budget_entry<'a>(
+    selected: &SelectedWorkload<'_>,
+    environment_id: &str,
+    policy: Option<&'a BudgetPolicy>,
+) -> Result<Option<&'a BudgetEntry>> {
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    if policy.environment_id != environment_id {
+        bail!(
+            "budget {} belongs to environment {}, not {}",
+            policy.id,
+            policy.environment_id,
+            environment_id
+        );
+    }
+    let entry = policy
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.workload_id == selected.workload.id
+                && entry.tuple_id == selected.profile.tuple
+                && entry.metric == "wall_time"
+        })
+        .with_context(|| {
+            format!(
+                "budget {} has no wall_time gate for {}:{}",
+                policy.id, selected.workload.id, selected.profile.tuple
+            )
+        })?;
+    if selected.profile.blocks < entry.minimum_blocks {
+        bail!(
+            "profile provides {} blocks for {}:{}, but budget {} requires {}",
+            selected.profile.blocks,
+            selected.workload.id,
+            selected.profile.tuple,
+            policy.id,
+            entry.minimum_blocks
+        );
+    }
+    Ok(Some(entry))
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Loads and validates the first over-budget run used for confirmation.
+fn load_confirmation(
+    run_dir: &Path,
+    profile_id: &str,
+    selected: &[SelectedWorkload<'_>],
+    environment: &EnvironmentManifest,
+    baseline: &BuildManifest,
+    candidate: &BuildManifest,
+    policy: Option<&BudgetPolicy>,
+) -> Result<ConfirmationEvidence> {
+    let report_path = run_dir.join("report.json");
+    let campaign_path = run_dir.join("campaign.json");
+    let environment_path = run_dir.join("environment.json");
+    let report: ReportDocument = serde_json::from_slice(
+        &fs::read(&report_path).with_context(|| format!("read {}", report_path.display()))?,
+    )?;
+    let campaign: CampaignManifest = serde_json::from_slice(
+        &fs::read(&campaign_path).with_context(|| format!("read {}", campaign_path.display()))?,
+    )?;
+    let prior_environment: EnvironmentManifest = serde_json::from_slice(
+        &fs::read(&environment_path)
+            .with_context(|| format!("read {}", environment_path.display()))?,
+    )?;
+    let expected = selected
+        .iter()
+        .map(|selected| format!("{}:{}", selected.workload.id, selected.profile.tuple))
+        .collect::<Vec<_>>();
+    if report.schema_id != REPORT_SCHEMA
+        || campaign.schema_id != REPORT_SCHEMA
+        || prior_environment.schema_id != super::model::ENVIRONMENT_SCHEMA
+        || report.run_id != campaign.run_id
+        || report.kind != "compare"
+        || campaign.kind != "compare"
+        || report.profile_id != profile_id
+        || campaign.profile_id != profile_id
+        || campaign.selected_workloads != expected
+        || report.status != "invalid"
+        || campaign.status != "invalid"
+        || !prior_environment.canonical
+        || prior_environment.environment_id != environment.environment_id
+    {
+        bail!("confirmation source is not a compatible inconclusive canonical comparison");
+    }
+    for comparison in &report.comparisons {
+        if comparison.baseline_digest != baseline.executable_digest
+            || comparison.candidate_digest != candidate.executable_digest
+        {
+            bail!("confirmation source build digests do not match");
+        }
+    }
+    let evidence = ConfirmationEvidence { report, campaign };
+    let has_signal = policy.is_some_and(|policy| {
+        policy.entries.iter().any(|entry| {
+            confirms_prior_signal(&evidence, &entry.workload_id, &entry.tuple_id, entry)
+        })
+    });
+    if !has_signal {
+        bail!("confirmation source has no independently confirmable over-budget signal");
+    }
+    Ok(evidence)
+}
+
+fn confirms_prior_signal(
+    evidence: &ConfirmationEvidence,
+    workload_id: &str,
+    tuple_id: &str,
+    budget: &BudgetEntry,
+) -> bool {
+    evidence.report.comparisons.iter().any(|comparison| {
+        comparison.workload_id == workload_id
+            && comparison.tuple_id == tuple_id
+            && comparison.metrics.iter().any(|metric| {
+                metric.name == budget.metric
+                    && metric.verdict == Verdict::Inconclusive
+                    && metric.confidence_lower > budget.practical_budget
+                    && metric.practical_budget.is_some_and(|value| {
+                        (value - budget.practical_budget).abs() <= f64::EPSILON
+                    })
+            })
+    })
 }
 
 /// Proves planned duration and worst-case retained output fit the profile caps.
@@ -1013,7 +1275,7 @@ fn environment_manifest() -> EnvironmentManifest {
         collector: if cfg!(windows) {
             "windows-job-object-v1"
         } else {
-            "phase1-wall-time-v1"
+            "counterbalanced-wall-time-v1"
         }
         .into(),
         validity: vec![
@@ -1381,6 +1643,191 @@ mod tests {
     }
 
     #[test]
+    fn calibration_timing_modes_fail_closed_before_execution() {
+        let root = workspace_root().unwrap();
+        let registry = load_registry(&root).unwrap();
+        let calibration = load_profile(&root, "calibration-v1").unwrap();
+        let selected = select_workloads(&calibration, &registry, &[]).unwrap();
+        let mut environment = environment_manifest();
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("binary");
+        let assets = directory.path().join("assets");
+        fs::write(&binary, "binary").unwrap();
+        fs::create_dir(&assets).unwrap();
+        let baseline = manifest(&binary, &assets);
+        let mut candidate = baseline.clone();
+
+        assert!(
+            validate_timing_contract(&selected, &environment, &baseline, &candidate, true,).is_ok()
+        );
+        environment.canonical = true;
+        environment.environment_id = "aws-m6i-2xlarge-al2023-v1".into();
+        assert!(
+            validate_timing_contract(&selected, &environment, &baseline, &candidate, true,).is_ok()
+        );
+        candidate.executable_digest = "different".into();
+        assert!(
+            validate_timing_contract(&selected, &environment, &baseline, &candidate, true,)
+                .is_err()
+        );
+
+        let capacity = load_profile(&root, "capacity-v1").unwrap();
+        let selected = select_workloads(&capacity, &registry, &[]).unwrap();
+        assert!(
+            validate_timing_contract(&selected, &environment, &baseline, &baseline, false,).is_ok()
+        );
+        assert!(
+            validate_timing_contract(&selected, &environment, &baseline, &baseline, true,).is_err()
+        );
+    }
+
+    #[test]
+    fn gating_budget_resolution_requires_exact_tuple_and_environment() {
+        use crate::perf::model::{
+            BudgetEntry,
+            BudgetPolicy,
+        };
+
+        let root = workspace_root().unwrap();
+        let registry = load_registry(&root).unwrap();
+        let profile = load_profile(&root, "developer-v1").unwrap();
+        let selected =
+            select_workloads(&profile, &registry, &["startup.cli-help.v1".into()]).unwrap();
+        let policy = BudgetPolicy {
+            schema_id: super::super::model::BUDGET_SCHEMA.into(),
+            id: "reference-v2-budgets".into(),
+            environment_id: "canonical-v1".into(),
+            calibration_id: "calibration-1".into(),
+            approved_at: "2026-08-21T00:00:00Z".into(),
+            approved_by: "reviewer".into(),
+            entries: vec![BudgetEntry {
+                workload_id: "startup.cli-help.v1".into(),
+                tuple_id: "cold-help".into(),
+                metric: "wall_time".into(),
+                practical_budget: 0.05,
+                minimum_blocks: 2,
+                max_residual_orientation_effect: 0.02,
+            }],
+        };
+        let entry = resolve_budget_entry(&selected[0], "canonical-v1", Some(&policy)).unwrap();
+        assert_eq!(entry.unwrap().practical_budget, 0.05);
+        assert!(resolve_budget_entry(&selected[0], "other", Some(&policy)).is_err());
+
+        let mut missing = policy;
+        missing.entries[0].tuple_id = "other".into();
+        assert!(resolve_budget_entry(&selected[0], "canonical-v1", Some(&missing)).is_err());
+        assert!(
+            resolve_budget_entry(&selected[0], "canonical-v1", None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn confirmation_requires_a_matching_inconclusive_over_budget_signal() {
+        use crate::perf::model::{
+            BudgetEntry,
+            MetricComparison,
+        };
+
+        let budget = BudgetEntry {
+            workload_id: "startup.cli-help.v1".into(),
+            tuple_id: "cold-help".into(),
+            metric: "wall_time".into(),
+            practical_budget: 0.05,
+            minimum_blocks: 2,
+            max_residual_orientation_effect: 0.02,
+        };
+        let metric = MetricComparison {
+            name: "wall_time".into(),
+            unit: "nanoseconds".into(),
+            direction: "positive_is_harmful".into(),
+            baseline_median: 100.0,
+            candidate_median: 120.0,
+            raw_candidate_delta: 0.2,
+            harmful_effect: 0.2,
+            confidence_lower: 0.10,
+            confidence_upper: 0.30,
+            practical_budget: Some(0.05),
+            verdict: Verdict::Inconclusive,
+            valid_abba_blocks: 3,
+            valid_baab_blocks: 3,
+            unmatched_blocks: 0,
+            residual_orientation_effect: 0.0,
+            orientation_medians: BTreeMap::new(),
+            position_medians: BTreeMap::new(),
+            estimator: "test".into(),
+            bootstrap_seed: 1,
+        };
+        let mut evidence = ConfirmationEvidence {
+            report: ReportDocument {
+                schema_id: REPORT_SCHEMA.into(),
+                run_id: "prior".into(),
+                kind: "compare".into(),
+                status: "invalid".into(),
+                profile_id: "reference-v2".into(),
+                generated_at: "2026-08-21T00:00:00Z".into(),
+                comparisons: vec![ComparisonDocument {
+                    schema_id: super::super::model::COMPARISON_SCHEMA.into(),
+                    run_id: "prior".into(),
+                    profile_id: "reference-v2".into(),
+                    workload_id: budget.workload_id.clone(),
+                    tuple_id: budget.tuple_id.clone(),
+                    baseline_digest: "base".into(),
+                    candidate_digest: "candidate".into(),
+                    metrics: vec![metric],
+                    verdict: Verdict::Inconclusive,
+                    extra: BTreeMap::new(),
+                }],
+                failures: vec!["confirmation required".into()],
+                artifact_files: Vec::new(),
+                extra: BTreeMap::new(),
+            },
+            campaign: CampaignManifest {
+                schema_id: REPORT_SCHEMA.into(),
+                run_id: "prior".into(),
+                kind: "compare".into(),
+                status: "invalid".into(),
+                created_at: "2026-08-21T00:00:00Z".into(),
+                completed_at: Some("2026-08-21T00:01:00Z".into()),
+                profile_id: "reference-v2".into(),
+                schedule_seed: 1,
+                selected_workloads: vec!["startup.cli-help.v1:cold-help".into()],
+                planned_measured_executions: 24,
+                planned_preconditioning_executions: 2,
+                artifact_limit_bytes: 1,
+                environment_file: "environment.json".into(),
+                baseline_manifest: Some("base.json".into()),
+                candidate_manifest: "candidate.json".into(),
+                failure: Some("confirmation required".into()),
+                extra: BTreeMap::new(),
+            },
+        };
+        assert!(confirms_prior_signal(
+            &evidence,
+            &budget.workload_id,
+            &budget.tuple_id,
+            &budget
+        ));
+
+        evidence.report.comparisons[0].metrics[0].verdict = Verdict::Pass;
+        assert!(!confirms_prior_signal(
+            &evidence,
+            &budget.workload_id,
+            &budget.tuple_id,
+            &budget
+        ));
+        evidence.report.comparisons[0].metrics[0].verdict = Verdict::Inconclusive;
+        evidence.report.comparisons[0].metrics[0].confidence_lower = 0.01;
+        assert!(!confirms_prior_signal(
+            &evidence,
+            &budget.workload_id,
+            &budget.tuple_id,
+            &budget
+        ));
+    }
+
+    #[test]
     fn startup_oracle_classifies_every_process_failure_mode() {
         let root = workspace_root().unwrap();
         let registry = load_registry(&root).unwrap();
@@ -1517,6 +1964,7 @@ mod tests {
                 candidate_manifest: build_manifest,
                 output: Some(run_dir.clone()),
                 schedule_seed: Some(11),
+                confirmation_of: None,
             },
         )
         .unwrap();

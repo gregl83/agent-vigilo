@@ -389,7 +389,7 @@ impl WorkloadRunner {
                 let counts = oracle_worker(&scope.database_url, &run_id, cases, evaluators)?;
                 finish(service, scope, baseline, process, counts, 0, cases as u64)
             }
-            "system.lifecycle.v1" => {
+            "system.lifecycle.v1" | "system.capacity.v1" => {
                 let inputs = self.inputs(&format!("{workload_id}:{tuple}"), cases, evaluators)?;
                 let baseline = service.begin_measurement(scope)?;
                 let started = Instant::now();
@@ -405,7 +405,12 @@ impl WorkloadRunner {
                 let run_id = parse_run_id(&create.stdout.text())?;
                 let mut outcomes = vec![create];
                 let workers = lifecycle_workers(tuple)?;
-                for _ in 0..fixture.lifecycle.coordinator_cycle_limit {
+                let cycle_limit = if workload_id == "system.capacity.v1" {
+                    fixture.lifecycle.capacity_cycle_limit
+                } else {
+                    fixture.lifecycle.coordinator_cycle_limit
+                };
+                for _ in 0..cycle_limit {
                     outcomes.push(invoke(
                         binary,
                         coordinator_args(&scope.database_url, &scope.messaging_url),
@@ -467,7 +472,7 @@ impl WorkloadRunner {
     }
 }
 
-/// Resolves a registered Phase 2 workload tuple into its setup cardinalities.
+/// Resolves a registered workload tuple into its setup cardinalities.
 ///
 /// Unknown workload IDs and tuples fail closed; future workload versions add
 /// new match arms without changing callers or shared service infrastructure.
@@ -505,6 +510,14 @@ fn workload_shape(
             evaluators: 1,
             create_run: false,
         },
+        "system.capacity.v1" => {
+            let (_, load) = capacity_tuple(tuple)?;
+            WorkloadShape {
+                cases: fixture.lifecycle.cases.saturating_mul(load),
+                evaluators: 1,
+                create_run: false,
+            }
+        }
         _ => bail!("unsupported service workload: {workload_id}"),
     };
     Ok(shape)
@@ -515,8 +528,24 @@ fn lifecycle_workers(tuple: &str) -> Result<usize> {
     match tuple {
         "workers-1" => Ok(1),
         "workers-2" => Ok(2),
-        _ => bail!("unsupported lifecycle tuple: {tuple}"),
+        _ => capacity_tuple(tuple)
+            .map(|(workers, _)| workers)
+            .map_err(|_| anyhow::anyhow!("unsupported lifecycle tuple: {tuple}")),
     }
+}
+
+/// Parses one predeclared worker/load capacity-staircase tuple.
+pub(super) fn capacity_tuple(tuple: &str) -> Result<(usize, usize)> {
+    let parts = tuple.split('-').collect::<Vec<_>>();
+    if parts.len() != 4 || parts[0] != "workers" || parts[2] != "load" {
+        bail!("unsupported capacity tuple: {tuple}");
+    }
+    let workers = parts[1].parse::<usize>()?;
+    let load = parts[3].parse::<usize>()?;
+    if !matches!(workers, 1 | 2) || !matches!(load, 1 | 2 | 4 | 8 | 16) {
+        bail!("unsupported capacity tuple: {tuple}");
+    }
+    Ok((workers, load))
 }
 
 impl Drop for WorkloadRunner {
@@ -1119,7 +1148,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_phase_workload_shapes_resolve_and_unknown_shapes_fail_closed() {
+    fn completed_workload_shapes_resolve_and_unknown_shapes_fail_closed() {
         let root = crate::perf::artifact::workspace_root().unwrap();
         let fixture = load(&root, "mvp-v1").unwrap();
 
@@ -1165,13 +1194,25 @@ mod tests {
         );
         assert_eq!(lifecycle_workers("workers-1").unwrap(), 1);
         assert_eq!(lifecycle_workers("workers-2").unwrap(), 2);
+        assert_eq!(
+            workload_shape(&fixture, "system.capacity.v1", "workers-2-load-16").unwrap(),
+            WorkloadShape {
+                cases: 1600,
+                evaluators: 1,
+                create_run: false,
+            }
+        );
+        assert_eq!(lifecycle_workers("workers-1-load-4").unwrap(), 1);
+        assert_eq!(lifecycle_workers("workers-2-load-8").unwrap(), 2);
+        assert!(lifecycle_workers("workers-3-load-4").is_err());
+        assert!(lifecycle_workers("workers-1-load-3").is_err());
         assert!(workload_shape(&fixture, "worker.execute-wasm.v1", "future-tuple").is_err());
         assert!(workload_shape(&fixture, "future.workload.v1", "tuple").is_err());
         assert!(lifecycle_workers("workers-3").is_err());
     }
 
     #[test]
-    fn exact_oracles_accept_completed_phase_outcomes() {
+    fn exact_oracles_accept_completed_workload_outcomes() {
         let create = DurableCounts::from([
             ("runs".into(), 1),
             ("chunks".into(), 11),

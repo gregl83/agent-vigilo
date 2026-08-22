@@ -27,6 +27,14 @@ pub const SAMPLE_SCHEMA: &str = "sample/v1";
 pub const COMPARISON_SCHEMA: &str = "comparison/v1";
 /// Supported campaign-manifest and report schema identifier.
 pub const REPORT_SCHEMA: &str = "report/v1";
+/// Supported canonical-noise calibration artifact schema identifier.
+pub const CALIBRATION_SCHEMA: &str = "calibration/v1";
+/// Supported bounded-capacity calibration artifact schema identifier.
+pub const CAPACITY_SCHEMA: &str = "capacity-calibration/v1";
+/// Supported reviewed performance-budget schema identifier.
+pub const BUDGET_SCHEMA: &str = "performance-budget/v1";
+/// Supported immutable calibrated-baseline manifest schema identifier.
+pub const BASELINE_SCHEMA: &str = "performance-baseline/v1";
 
 /// Typed catalog of workload contracts and audited production constants.
 #[derive(Debug, Clone, Deserialize)]
@@ -156,7 +164,7 @@ pub struct Workload {
 }
 
 /// Frozen campaign composition and resource limits.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     /// Document shape identifier, currently [`PROFILE_SCHEMA`].
     pub schema_id: String,
@@ -179,6 +187,9 @@ pub struct Profile {
     /// Optional invalidation threshold for unexplained orientation bias.
     #[serde(default)]
     pub max_residual_orientation_effect: Option<f64>,
+    /// Reviewed budget policy used by gating profiles.
+    #[serde(default)]
+    pub budget_reference: Option<String>,
     /// Ordered workload tuples and sampling policies in the campaign.
     pub workloads: Vec<ProfileWorkload>,
     /// Unknown additive fields retained for forward compatibility.
@@ -187,7 +198,7 @@ pub struct Profile {
 }
 
 /// One exact workload tuple selected by a profile.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileWorkload {
     /// Stable workload ID resolved through the registry.
     pub id: String,
@@ -605,4 +616,205 @@ pub struct ReportDocument {
     /// Unknown additive fields retained for forward compatibility.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// Reviewed target used to judge whether a metric can support a budget.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationTarget {
+    /// Stable metric name emitted by the comparison estimator.
+    pub metric: String,
+    /// Maximum acceptable harmful relative effect.
+    pub practical_budget: f64,
+    /// Desired probability of detecting a budget-sized harmful effect.
+    pub target_power: f64,
+    /// Maximum permitted residual schedule-orientation effect.
+    pub max_residual_orientation_effect: f64,
+}
+
+/// Noise and sample-count evidence for one workload metric.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationMetric {
+    /// Stable workload contract ID.
+    pub workload_id: String,
+    /// Exact registered fixture tuple.
+    pub tuple_id: String,
+    /// Stable metric name.
+    pub metric: String,
+    /// Counterbalanced no-change harmful effect.
+    pub observed_effect: f64,
+    /// Lower confidence bound from the no-change comparison.
+    pub confidence_lower: f64,
+    /// Upper confidence bound from the no-change comparison.
+    pub confidence_upper: f64,
+    /// Largest absolute observed effect or confidence bound.
+    pub noise_bound: f64,
+    /// Reviewed practical budget being calibrated.
+    pub practical_budget: f64,
+    /// Number of independent blocks available in the evidence.
+    pub available_blocks: u32,
+    /// Even block count recommended for the reference profile.
+    pub recommended_blocks: u32,
+    /// Reviewed power target used to recommend the block count.
+    pub target_power: f64,
+    /// Approximate power available from the observed block count.
+    pub estimated_power: f64,
+    /// Residual effect attributable to schedule orientation.
+    pub residual_orientation_effect: f64,
+    /// Maximum reviewed orientation effect.
+    pub max_residual_orientation_effect: f64,
+    /// Whether the evidence can support the reviewed budget.
+    pub repeatable: bool,
+}
+
+/// Canonical no-change evidence from which reviewed budgets may be published.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationDocument {
+    /// Document shape identifier, currently [`CALIBRATION_SCHEMA`].
+    pub schema_id: String,
+    /// Stable evidence identity.
+    pub id: String,
+    /// RFC 3339 generation timestamp.
+    pub created_at: String,
+    /// Source comparison campaign ID.
+    pub source_run_id: String,
+    /// Canonical environment contract ID.
+    pub environment_id: String,
+    /// Digest shared by both sides of the no-change campaign.
+    pub build_digest: String,
+    /// Per-workload metric evidence.
+    pub metrics: Vec<CalibrationMetric>,
+    /// Whether every metric supports publication.
+    pub publishable: bool,
+    /// Reasons publication is not allowed.
+    pub failures: Vec<String>,
+}
+
+/// One observed point in a bounded capacity staircase.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapacityPoint {
+    /// Number of worker processes used by the fixture.
+    pub workers: u32,
+    /// Declared offered-load step.
+    pub load_step: u32,
+    /// Useful cases completed by each sample.
+    pub cases: u64,
+    /// Count of independent valid observations.
+    pub samples: usize,
+    /// Median useful-case throughput per second.
+    pub throughput_per_second: f64,
+    /// Sample-level p95 terminal latency in milliseconds.
+    pub p95_latency_ms: f64,
+    /// Peak process CPU percentage normalized by the declared worker count.
+    pub process_cpu_percent_per_worker: f64,
+    /// Peak shared-service CPU percentage, when collected.
+    pub service_cpu_percent: Option<f64>,
+}
+
+/// Result of applying the declared knee rule to one worker-count staircase.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapacityKnee {
+    /// Number of worker processes represented by the staircase.
+    pub workers: u32,
+    /// First load step satisfying the knee rule, if observed.
+    pub knee_step: Option<u32>,
+    /// Useful throughput at the observed knee.
+    pub knee_throughput_per_second: Option<f64>,
+    /// Highest valid observed rate when no knee was found.
+    pub observed_rate_lower_bound: Option<f64>,
+}
+
+/// Bounded one/two-worker capacity evidence kept separate from fixed-load results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapacityDocument {
+    /// Document shape identifier, currently [`CAPACITY_SCHEMA`].
+    pub schema_id: String,
+    /// Source single-binary campaign ID.
+    pub source_run_id: String,
+    /// Immutable build digest under calibration.
+    pub build_digest: String,
+    /// Environment contract ID observed by the source campaign.
+    pub environment_id: String,
+    /// Whether the source campaign ran on the validated canonical host.
+    pub canonical: bool,
+    /// Valid staircase points ordered by worker count and load.
+    pub points: Vec<CapacityPoint>,
+    /// One result for each calibrated worker count.
+    pub knees: Vec<CapacityKnee>,
+    /// Near-origin two-worker scale efficiency when both knees exist.
+    pub scale_efficiency_2: Option<f64>,
+    /// Whether evidence supports a linear worker-count estimate.
+    pub supports_linear_projection: bool,
+    /// External-validity or completeness failures.
+    pub failures: Vec<String>,
+}
+
+/// One reviewed gating rule resolved by workload tuple and metric.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetEntry {
+    /// Stable workload contract ID.
+    pub workload_id: String,
+    /// Exact registered fixture tuple.
+    pub tuple_id: String,
+    /// Stable metric name.
+    pub metric: String,
+    /// Maximum accepted harmful relative effect.
+    pub practical_budget: f64,
+    /// Minimum independent block count required for a verdict.
+    pub minimum_blocks: u32,
+    /// Maximum permitted residual orientation effect.
+    pub max_residual_orientation_effect: f64,
+}
+
+/// Reviewed, environment-specific performance gates derived from calibration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetPolicy {
+    /// Document shape identifier, currently [`BUDGET_SCHEMA`].
+    pub schema_id: String,
+    /// Versioned policy identity referenced by profiles.
+    pub id: String,
+    /// Canonical environment for which the policy is valid.
+    pub environment_id: String,
+    /// Calibration evidence identity supporting this policy.
+    pub calibration_id: String,
+    /// RFC 3339 review timestamp.
+    pub approved_at: String,
+    /// Human or review process that approved the practical budgets.
+    pub approved_by: String,
+    /// Per-workload metric gates.
+    pub entries: Vec<BudgetEntry>,
+}
+
+/// Immutable provenance index for one published calibrated baseline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaselineDocument {
+    /// Document shape identifier, currently [`BASELINE_SCHEMA`].
+    pub schema_id: String,
+    /// Versioned baseline and profile identity.
+    pub id: String,
+    /// RFC 3339 publication timestamp.
+    pub created_at: String,
+    /// Canonical environment for which the baseline is valid.
+    pub environment_id: String,
+    /// Immutable executable digest shared by all evidence.
+    pub build_digest: String,
+    /// Relative canonical noise evidence path.
+    pub calibration_file: String,
+    /// BLAKE3 digest of the noise evidence.
+    pub calibration_digest: String,
+    /// Relative bounded-capacity evidence path.
+    pub capacity_file: String,
+    /// BLAKE3 digest of the capacity evidence.
+    pub capacity_digest: String,
+    /// Relative reviewed budget policy path.
+    pub budget_file: String,
+    /// BLAKE3 digest of the reviewed budget policy.
+    pub budget_digest: String,
+    /// Relative calibrated reference profile path.
+    pub profile_file: String,
+    /// BLAKE3 digest of the reference profile.
+    pub profile_digest: String,
+    /// Relative immutable build-manifest snapshot path.
+    pub build_manifest_file: String,
+    /// BLAKE3 digest of the build-manifest snapshot.
+    pub build_manifest_digest: String,
 }

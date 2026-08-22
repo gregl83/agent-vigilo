@@ -1,0 +1,56 @@
+---
+title: Performance Testing
+sidebar_label: Performance Testing
+sidebar_position: 7
+description: How Vigilo calibrates canonical performance noise, bounded capacity, reviewed budgets, and confirmed regression gates.
+keywords:
+  - Vigilo performance testing
+  - performance calibration
+  - capacity knee
+  - regression budgets
+---
+
+import Mermaid from '@theme/Mermaid';
+import performanceTestingDiagram from './diagram.mmd';
+
+# Performance Testing
+
+Vigilo's performance harness is an external `xtask` package. Production Vigilo
+does not depend on the harness, while the harness measures only supported CLI,
+database, RabbitMQ, HTTP, and evaluator boundaries. Every timed sample must pass
+its exact correctness oracle before it can contribute to statistics.
+
+<Mermaid value={performanceTestingDiagram} />
+
+## Calibration Boundaries
+
+- `calibration-v1` compares one immutable build to itself in 30 balanced blocks
+  for representative CPU, database, broker, Wasm, and end-to-end anchors.
+- Noise analysis checks confidence bounds and residual orientation effects, then
+  uses the 95% interval width and reviewed power target to recommend an even
+  independent block count for each wall-time budget.
+- `capacity-v1` is a single-build load staircase. It remains separate from
+  fixed-load A/B regression results and never claims maximum fleet capacity.
+- A worker knee may come from the throughput/latency rule or the reviewed
+  normalized per-worker CPU ceiling.
+- Shared PostgreSQL, RabbitMQ, agent, or host pressure invalidates a capacity
+  point instead of being reported as Vigilo's worker knee.
+- Publication requires matching build digests and immutable canonical evidence.
+  It generates a versioned budget policy and `reference-v2` candidate.
+
+## Verdict Flow
+
+A gating comparison loads one exact budget for each workload tuple. Results from
+a different environment ID, too few blocks, excessive orientation bias, or an
+invalid correctness oracle are non-green. A confidence interval within budget
+passes. The first interval wholly beyond budget is inconclusive and requires one
+fixed independent confirmation; only the second matching result is a regression.
+
+Shared hosted CI runs service-free contracts and exact correctness checks, not
+wall-clock gates. Canonical blocking comparisons run serially on the exclusive
+versioned host contract.
+
+## Related
+
+- [Scaling](/docs/architecture/scaling)
+- [Failure modes](/docs/architecture/failure-modes)

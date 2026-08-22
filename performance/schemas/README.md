@@ -116,6 +116,7 @@ entries but do not implement workloads.
 | `max_artifact_bytes` | Maximum total size of the generated run directory. |
 | `max_stdout_bytes`, `max_stderr_bytes` | Maximum output retained from each process; total observed bytes are still recorded. |
 | `max_residual_orientation_effect` | Optional limit for unexplained ordering bias after counterbalancing. |
+| `budget_reference` | Reviewed policy required by an all-`gating` profile; absent from informative, calibration, and capacity profiles. |
 | `[[workloads]]` | Ordered workload tuple selections executed by the profile. |
 
 ### Profile Workload Fields
@@ -125,7 +126,7 @@ entries but do not implement workloads.
 | `id` | Workload ID that must exist in the registry and profile. |
 | `tuple` | One exact fixture shape declared by that registry entry. |
 | `blocks` | Positive even number of blocks. A comparison block contains four executions. |
-| `timing` | `informative` for ordinary measurements or `calibration` for no-change noise data. Calibration interpretation is currently manual. |
+| `timing` | `informative` for ordinary measurements, `calibration` for canonical no-change evidence, `capacity` for a single-build staircase, or `gating` for a budgeted fixed-load comparison. Modes cannot be mixed in one campaign. |
 
 `developer-v1` requires explicit workload selection. Other profiles run their
 complete declared list unless repeated `--workload` options filter it. An
@@ -147,7 +148,7 @@ service credentials or provisioning scripts.
 
 ## Generated Artifact Schemas
 
-Phase 1 owns these additive machine-readable contracts:
+The harness owns these additive machine-readable contracts:
 
 | Schema | Responsibility |
 | --- | --- |
@@ -157,6 +158,10 @@ Phase 1 owns these additive machine-readable contracts:
 | `sample/v1` | Raw execution position, process and scoped external measurements, durable counts, and validation state. |
 | `comparison/v1` | Balanced estimator inputs, effects, confidence intervals, diagnostics, and verdict. |
 | `report/v1` | Campaign status, failures, comparison summaries, and artifact links. |
+| `calibration/v1` | Canonical no-change noise bounds, approximate power, repeatability, and recommended independent block counts. |
+| `capacity-calibration/v1` | Bounded one/two-worker staircase points, knees or lower bounds, and scale efficiency. |
+| `performance-budget/v1` | Reviewed environment-specific workload/tuple/metric budgets and minimum block counts. |
+| `performance-baseline/v1` | Digested index of calibration, capacity, budget, profile, and build-manifest evidence. |
 
 Every persisted document carries its schema ID. Readers reject an unknown
 schema ID and preserve unknown additive fields. Retained version fixtures are

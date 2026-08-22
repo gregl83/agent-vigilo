@@ -3,7 +3,9 @@
 `cargo perf` is a repository-local Cargo alias backed by the `xtask` workspace
 package. It is not installed globally and it is not shipped with Vigilo.
 
-Phase 2 implements all five MVP anchors. Startup remains service-free; run
+The harness includes canonical noise analysis, bounded one/two-worker capacity
+calibration, reviewed budget publication, and confirmed regression gates for
+the five MVP anchors. Startup remains service-free; run
 creation, coordinator, worker/Wasm, and lifecycle measurements use a fresh
 run-owned PostgreSQL database clone, RabbitMQ vhost/namespace, and deterministic
 HTTP agent for every sample.
@@ -38,6 +40,13 @@ environment, and generated-artifact field reference.
 | `pr-v1` | Pull-request correctness checks and short, informative timing canaries. |
 | `reference-v1` | Broader repeatable comparison across the complete MVP workload matrix. |
 | `calibration-v1` | Stable no-change campaign used to measure canonical-host and harness noise. |
+| `capacity-v1` | Bounded one/two-worker load staircase, separate from fixed-load comparisons. |
+
+`reference-v2` is generated only after a canonical calibration passes review.
+It references a versioned budget policy and contains only tuples whose block
+counts and wall-time budgets have calibration evidence. Generated candidates
+remain under `target/perf/baselines` until their profile and budget files are
+reviewed and checked into `performance/`.
 
 Profiles configure campaigns; they do not implement workloads. A selection
 fails before provisioning if its workload, tuple, fixture, or binary capability
@@ -46,10 +55,14 @@ is unavailable.
 Calibration compares identical immutable builds under a stable workload and
 sampling configuration. Because the expected product difference is zero, its
 observed A/B effects estimate normal environmental and measurement variation.
-Phase 3 uses repeated calibration results to choose block counts, host-validity
-limits, and practical regression budgets. Calibration results are currently
-reviewed manually; `timing = "calibration"` does not yet calculate or publish
-those limits automatically.
+`cargo perf calibrate noise` converts the comparison into repeatability,
+orientation, noise-bound, estimated-power, and recommended-block evidence. The
+block recommendation uses the observed 95% bootstrap interval width and the
+reviewed power target; it is an approximation over independent blocks, not a
+claim that executions inside one block are independent. Reviewed practical
+budgets come from `performance/budgets/review-targets-v1.toml`; calibration
+validates that the host can resolve those budgets and never raises them to make
+noise pass.
 
 ## Quick Start
 
@@ -101,6 +114,52 @@ The schedule seed and logical block index make position order reproducible.
 Select any workload present in the chosen profile. Docker is provisioned
 lazily, so startup-only campaigns do not start services.
 
+## Calibration And Baselines
+
+Publishable campaigns require the `aws-m6i-2xlarge-al2023-v1` Linux host contract
+and an externally validated `VIGILO_PERF_CANONICAL_VALIDATED=1` declaration.
+Do not set that declaration on local or shared CI hosts. Local runs may produce
+informative diagnostics, but publication rejects their evidence.
+
+Run `calibration-v1` as a same-build comparison, then analyze it:
+
+```bash
+cargo perf compare --profile calibration-v1 \
+  --baseline-bin <vigilo-binary> --baseline-build-manifest <build-manifest.json> \
+  --candidate-bin <same-vigilo-binary> --candidate-build-manifest <same-build-manifest.json>
+cargo perf calibrate noise --run-dir target/perf/runs/<calibration-run>
+```
+
+Run the separately bounded capacity staircase for the same build:
+
+```bash
+cargo perf run --profile capacity-v1 \
+  --bin <vigilo-binary> --build-manifest <build-manifest.json>
+cargo perf calibrate capacity --run-dir target/perf/runs/<capacity-run>
+```
+
+Capacity steps use one and two workers at predeclared load multipliers
+`1`, `2`, `4`, `8`, and `16`. The analyzer identifies the first step with less
+than 10% throughput gain and more than 25% p95 terminal-latency growth, or 90%
+normalized per-worker process CPU. Shared-service CPU at or above 85%
+invalidates the staircase instead of being labeled as worker capacity. When no
+knee appears, the artifact records only an observed rate lower bound.
+
+After review, publish an immutable candidate baseline:
+
+```bash
+cargo perf calibrate publish \
+  --calibration target/perf/runs/<calibration-run>/calibration.json \
+  --capacity target/perf/runs/<capacity-run>/capacity.json \
+  --build-manifest <build-manifest.json> \
+  --approved-by <review-identity>
+```
+
+Publication refuses mismatched build digests, unrepeatable noise, invalid
+capacity evidence, and an existing output directory. It emits digested evidence,
+`reference-v2`, its budget policy, and the frozen build manifest beneath
+`target/perf/baselines/reference-v2`.
+
 ## MVP Workloads
 
 | Workload | Measured region | Exact postcondition |
@@ -144,9 +203,12 @@ Markdown views from `report.json`.
 Exit `0` means all required correctness checks passed. Exit `1` means a
 candidate crash, timeout, output overflow, or exact-oracle failure. Exit `2`
 means the campaign was invalid, unsupported, inconclusive, or incomplete.
-Timing remains informative in the Phase 0 profiles; calibrated numerical
-regression budgets arrive in Phase 3 rather than being invented from local
-noise.
+Timing remains informative in profiles without a reviewed budget; calibrated
+numerical regression budgets apply only through a published gating profile. An initial
+over-budget confidence interval exits `2`; repeat it with
+`--confirmation-of <prior-run-directory>`. The confirmation must match the
+profile, workload set, build digests, and canonical environment and uses an
+independent schedule seed. A second over-budget interval exits `1`.
 
 ## Isolation
 

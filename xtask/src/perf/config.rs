@@ -17,6 +17,8 @@ use anyhow::{
 };
 
 use super::model::{
+    BUDGET_SCHEMA,
+    BudgetPolicy,
     PROFILE_SCHEMA,
     Profile,
     ProfileWorkload,
@@ -46,12 +48,7 @@ pub fn load_registry(root: &Path) -> Result<WorkloadRegistry> {
 
 /// Loads and validates a named profile from `performance/profiles`.
 pub fn load_profile(root: &Path, id: &str) -> Result<Profile> {
-    if !id
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-    {
-        bail!("invalid profile ID: {id}");
-    }
+    validate_file_id(id, "profile")?;
     let path = root
         .join(super::default_profile_dir())
         .join(format!("{id}.toml"));
@@ -61,6 +58,21 @@ pub fn load_profile(root: &Path, id: &str) -> Result<Profile> {
     .with_context(|| format!("parse {}", path.display()))?;
     validate_profile(&profile)?;
     Ok(profile)
+}
+
+/// Loads and validates one reviewed performance-budget policy.
+pub fn load_budget_policy(root: &Path, id: &str) -> Result<BudgetPolicy> {
+    validate_file_id(id, "budget")?;
+    let path = root.join("performance/budgets").join(format!("{id}.toml"));
+    let policy: BudgetPolicy = toml::from_str(
+        &fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?,
+    )
+    .with_context(|| format!("parse {}", path.display()))?;
+    if policy.id != id {
+        bail!("budget file identity {} does not match {id}", policy.id);
+    }
+    validate_budget_policy(&policy)?;
+    Ok(policy)
 }
 
 /// Validates registry schema, uniqueness, and required execution metadata.
@@ -135,9 +147,70 @@ pub fn validate_profile(profile: &Profile) -> Result<()> {
                 workload.id
             );
         }
-        if workload.timing != "informative" && workload.timing != "calibration" {
+        if !matches!(
+            workload.timing.as_str(),
+            "informative" | "calibration" | "capacity" | "gating"
+        ) {
             bail!("unsupported timing policy: {}", workload.timing);
         }
+    }
+    let gating = profile
+        .workloads
+        .iter()
+        .filter(|workload| workload.timing == "gating")
+        .count();
+    if gating > 0 && (gating != profile.workloads.len() || profile.budget_reference.is_none()) {
+        bail!("gating profiles require one budget policy and cannot mix timing modes");
+    }
+    if gating == 0 && profile.budget_reference.is_some() {
+        bail!("only gating profiles may reference a budget policy");
+    }
+    if let Some(reference) = profile.budget_reference.as_deref() {
+        validate_file_id(reference, "budget")?;
+    }
+    Ok(())
+}
+
+/// Validates reviewed budget identity, uniqueness, and finite positive gates.
+pub fn validate_budget_policy(policy: &BudgetPolicy) -> Result<()> {
+    if policy.schema_id != BUDGET_SCHEMA
+        || policy.id.is_empty()
+        || policy.environment_id.is_empty()
+        || policy.calibration_id.is_empty()
+        || policy.approved_at.is_empty()
+        || policy.approved_by.is_empty()
+        || policy.entries.is_empty()
+    {
+        bail!("budget policy has an incompatible or incomplete contract");
+    }
+    validate_file_id(&policy.id, "budget")?;
+    let mut entries = BTreeSet::new();
+    for entry in &policy.entries {
+        if entry.workload_id.is_empty()
+            || entry.tuple_id.is_empty()
+            || entry.metric.is_empty()
+            || !(entry.practical_budget.is_finite() && entry.practical_budget > 0.0)
+            || entry.minimum_blocks == 0
+            || !entry.minimum_blocks.is_multiple_of(2)
+            || !(entry.max_residual_orientation_effect.is_finite()
+                && entry.max_residual_orientation_effect > 0.0)
+        {
+            bail!("budget policy contains an invalid entry");
+        }
+        if !entries.insert((&entry.workload_id, &entry.tuple_id, &entry.metric)) {
+            bail!("budget policy contains a duplicate workload metric");
+        }
+    }
+    Ok(())
+}
+
+fn validate_file_id(id: &str, kind: &str) -> Result<()> {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        bail!("invalid {kind} ID: {id}");
     }
     Ok(())
 }
@@ -288,6 +361,12 @@ timing = "informative"
 
         let pr = load_profile(&root, "pr-v1").unwrap();
         assert_eq!(select_workloads(&pr, &registry, &[]).unwrap().len(), 4);
+
+        let capacity = load_profile(&root, "capacity-v1").unwrap();
+        assert_eq!(
+            select_workloads(&capacity, &registry, &[]).unwrap().len(),
+            10
+        );
     }
 
     #[test]
@@ -327,5 +406,40 @@ timing = "informative"
         let mut invalid = profile;
         invalid.workloads[0].tuple = "unknown".into();
         assert!(validate_profile_registry(&invalid, &registry).is_err());
+    }
+
+    #[test]
+    fn gating_profiles_and_budget_policies_fail_closed() {
+        let root = crate::perf::artifact::workspace_root().unwrap();
+        let mut profile = load_profile(&root, "developer-v1").unwrap();
+        profile.workloads[0].timing = "gating".into();
+        assert!(validate_profile(&profile).is_err());
+        profile.budget_reference = Some("reference-v2-budgets".into());
+        assert!(validate_profile(&profile).is_ok());
+
+        let mut policy: super::super::model::BudgetPolicy = toml::from_str(
+            r#"
+schema_id = "performance-budget/v1"
+id = "reference-v2-budgets"
+environment_id = "aws-m6i-2xlarge-al2023-v1"
+calibration_id = "calibration-1"
+approved_at = "2026-08-21T00:00:00Z"
+approved_by = "reviewer"
+[[entries]]
+workload_id = "startup.cli-help.v1"
+tuple_id = "cold-help"
+metric = "wall_time"
+practical_budget = 0.05
+minimum_blocks = 6
+max_residual_orientation_effect = 0.02
+"#,
+        )
+        .unwrap();
+        assert!(validate_budget_policy(&policy).is_ok());
+        policy.entries.push(policy.entries[0].clone());
+        assert!(validate_budget_policy(&policy).is_err());
+        policy.entries.pop();
+        policy.entries[0].practical_budget = 0.0;
+        assert!(validate_budget_policy(&policy).is_err());
     }
 }

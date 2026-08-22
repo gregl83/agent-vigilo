@@ -1,0 +1,16 @@
+schema_id = "calibration-targets/v1"
+id = "review-targets-v1"
+
+[[metrics]]
+metric = "wall_time"
+practical_budget = 0.05
+target_power = 0.80
+max_residual_orientation_effect = 0.02
+
+[capacity]
+minimum_throughput_gain = 0.10
+latency_growth = 0.25
+maximum_worker_cpu_percent = 90.0
+maximum_service_cpu_percent = 85.0
+minimum_samples_per_point = 8
+minimum_scale_efficiency = 0.85

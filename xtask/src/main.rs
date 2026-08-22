@@ -28,7 +28,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Build, run, and compare Vigilo performance workloads.
-    Perf(perf::PerfArgs),
+    Perf(Box<perf::PerfArgs>),
     #[command(name = "__perf-fixture", hide = true)]
     PerfFixture(perf::FixtureArgs),
     #[command(name = "__perf-service-fixture", hide = true)]
@@ -41,7 +41,7 @@ fn main() -> ExitCode {
 
 fn execute(command: Command) -> ExitCode {
     let result = match command {
-        Command::Perf(args) => perf::run(args),
+        Command::Perf(args) => perf::run(*args),
         Command::PerfFixture(args) => perf::run_fixture(args),
         Command::PerfServiceFixture => perf::run_service_fixture(),
     };

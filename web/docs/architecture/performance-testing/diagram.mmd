@@ -1,0 +1,45 @@
+---
+config:
+  flowchart:
+    nodeSpacing: 90
+    rankSpacing: 80
+  themeVariables:
+    edgeLabelBackground: 'transparent'
+---
+flowchart TD
+    Build[Immutable release build]
+    Lease[Exclusive canonical host lease]
+    Noise[Same-build calibration-v1 comparison]
+    NoiseOracle[Exact workload oracles]
+    NoiseEvidence[Noise bounds, power, orientation effect, block counts]
+    Capacity[Single-build capacity-v1 staircase]
+    CapacityOracle[Exact terminal and service-pressure checks]
+    CapacityEvidence[One/two-worker CPU or latency knees, or lower bounds]
+    Review[Reviewed practical budgets]
+    Publish[Immutable reference-v2 baseline]
+    Compare[Fixed-load baseline/candidate comparison]
+    Gate{Confidence interval versus budget}
+    Pass[Pass or improvement]
+    Confirm[Independent fixed confirmation run]
+    Regression[Confirmed regression]
+    Invalid[Invalid or inconclusive]
+
+    Build --> Lease
+    Lease --> Noise --> NoiseOracle --> NoiseEvidence
+    Lease --> Capacity --> CapacityOracle --> CapacityEvidence
+    NoiseEvidence --> Review
+    CapacityEvidence --> Publish
+    Review --> Publish
+    Publish --> Compare --> Gate
+    Gate -->|within budget| Pass
+    Gate -->|first over-budget signal| Confirm --> Gate
+    Gate -->|confirmed over budget| Regression
+    Gate -->|noise, saturation, or missing evidence| Invalid
+
+    class Build,Lease component
+    class Noise,Capacity,Compare system
+    class NoiseOracle,CapacityOracle,Gate decision
+    class NoiseEvidence,CapacityEvidence,Review,Publish external
+    class Pass success
+    class Regression failure
+    class Invalid warning

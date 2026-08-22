@@ -102,3 +102,28 @@ required_metrics = ["wall_time", "throughput", "process_cpu", "service_cpu", "sq
 watchdog_ms = 600000
 planning_duration_ms = 30000
 preconditioning = "none"
+
+[[workloads]]
+id = "system.capacity.v1"
+owner = "distributed-runtime"
+status = "implemented"
+capability = "system.lifecycle.v1"
+fixture = "mvp-v1"
+tuples = [
+  "workers-1-load-1",
+  "workers-1-load-2",
+  "workers-1-load-4",
+  "workers-1-load-8",
+  "workers-1-load-16",
+  "workers-2-load-1",
+  "workers-2-load-2",
+  "workers-2-load-4",
+  "workers-2-load-8",
+  "workers-2-load-16",
+]
+unit = "useful_case_per_second"
+oracle = "exact_completed_run_and_drained_work"
+required_metrics = ["wall_time", "throughput", "process_cpu", "service_cpu", "peak_rss", "sql", "wal", "http", "queue"]
+watchdog_ms = 600000
+planning_duration_ms = 60000
+preconditioning = "none"

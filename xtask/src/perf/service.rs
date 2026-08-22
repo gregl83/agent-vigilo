@@ -1074,7 +1074,7 @@ fn verify_container_labels(root: &Path, run_id: &str, containers: &[OwnedResourc
     Ok(())
 }
 
-/// Requires the exact two-container, one-network, two-volume Phase 2 topology.
+/// Requires the exact two-container, one-network, two-volume service topology.
 fn validate_inventory(
     run_id: &str,
     containers: &[OwnedResource],
