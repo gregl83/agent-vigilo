@@ -3,12 +3,30 @@
 `cargo perf` is a repository-local Cargo alias backed by the `xtask` workspace
 package. It is not installed globally and it is not shipped with Vigilo.
 
-The harness includes canonical noise analysis, bounded one/two-worker capacity
-calibration, reviewed budget publication, and confirmed regression gates for
-the five MVP anchors. Startup remains service-free; run
-creation, coordinator, worker/Wasm, and lifecycle measurements use a fresh
-run-owned PostgreSQL database clone, RabbitMQ vhost/namespace, and deterministic
-HTTP agent for every sample.
+The harness includes component scaling models, canonical noise analysis,
+bounded one/two-worker capacity calibration, reviewed budget publication, and
+confirmed regression gates. Startup remains service-free; run creation,
+coordinator, HTTP agent, worker/Wasm, persistence, and lifecycle measurements
+use a fresh run-owned PostgreSQL database clone, RabbitMQ vhost/namespace, and
+deterministic HTTP agent for every sample.
+
+## Module Overview
+
+- `build` snapshots the release executable and workspace-independent setup
+  assets, then records their digests and supported CLI capabilities.
+- `config` and `model` own typed registry, profile, sample, comparison,
+  calibration, scaling, and diagnostic contracts.
+- `workload`, `fixture`, and `service` prepare isolated databases and broker
+  scopes, run supported release commands, collect external observations, and
+  enforce exact oracles.
+- `process` bounds and reaps process trees; `schedule` and `stats` implement
+  counterbalanced sampling and comparison estimates.
+- `scaling` accepts fixed-plus-slope or explicit stepped models only from
+  repeated valid samples; `diagnostics` renders non-gating PostgreSQL statement,
+  planning, buffer, and WAL evidence captured after process timing.
+- `calibration`, `command`, `report`, `artifact`, and `check` analyze evidence,
+  orchestrate campaigns, persist artifacts, render results, and enforce
+  repository isolation.
 
 ## Layout And Configuration
 
@@ -26,8 +44,10 @@ HTTP agent for every sample.
   `target/perf`.
 
 The `performance` directory is for the external process and service harness.
-Rust-native microbenchmarks belong in Cargo's conventional `vigilo/benches`
-directory and are a separate measurement tier.
+Criterion targets are added under `vigilo/benches` only when production already
+has a stable library surface worth measuring. Vigilo currently keeps runtime,
+database, and CLI modules binary-private, so there is no Criterion target and no
+API is widened solely for benchmarking.
 
 See [`schemas/README.md`](schemas/README.md) for the registry, profile,
 environment, and generated-artifact field reference.
@@ -41,6 +61,9 @@ environment, and generated-artifact field reference.
 | `reference-v1` | Broader repeatable comparison across the complete MVP workload matrix. |
 | `calibration-v1` | Stable no-change campaign used to measure canonical-host and harness noise. |
 | `capacity-v1` | Bounded one/two-worker load staircase, separate from fixed-load comparisons. |
+| `component-smoke-v1` | Explicitly selected, small exact-oracle checks for each component driver. |
+| `component-reference-v1` | Repeated samples at every registered model point and batching boundary. |
+| `component-nightly-v1` | Broader orthogonal payload, latency, and large-cardinality diagnostics. |
 
 `reference-v2` is generated only after a canonical calibration passes review.
 It references a versioned budget policy and contains only tuples whose block
@@ -114,6 +137,23 @@ The schedule seed and logical block index make position order reproducible.
 Select any workload present in the chosen profile. Docker is provisioned
 lazily, so startup-only campaigns do not start services.
 
+Fit the registered component models after a complete component reference run:
+
+```bash
+cargo perf model --run-dir target/perf/runs/<component-run>
+```
+
+The command writes `component-models.json` and rejects missing repetitions,
+exact-count drift, negative coefficients, or residuals above the registered
+tolerance. Render the post-timing database evidence separately:
+
+```bash
+cargo perf diagnose --run-dir target/perf/runs/<component-run>
+```
+
+`diagnostics.md` is investigative output and never changes a correctness,
+comparison, budget, or model verdict.
+
 ## Calibration And Baselines
 
 Publishable campaigns require the `aws-m6i-2xlarge-al2023-v1` Linux host contract
@@ -170,6 +210,27 @@ capacity evidence, and an existing output directory. It emits digested evidence,
 | `worker.execute-wasm.v1` | One `worker once` pass | Exact attempts/results for either 8x1 or 1x8, one completed chunk, and drained delivery. |
 | `system.lifecycle.v1` | Create through terminal state with one or two worker processes | One completed passing run, exact execution/result counts, and drained delivery. |
 
+## Component Workloads
+
+The component registry crosses selected production discontinuities without
+generating a Cartesian product:
+
+| Family | Registered boundaries | Exact observations |
+| --- | --- | --- |
+| Run creation | Case/page/group points from 1 through 10,000 | Runs, chunks, cases, and zero premature executions. |
+| Dispatch | 1, 512, and 513 chunks | Dispatched chunks, durable events, and worker deliveries. |
+| HTTP agent | 1, 8, and 16 requests; 1/64 KiB payloads; 0/10 ms delay | Requests, bytes, peak concurrency, attempts, and results. |
+| Wasm and persistence | Evaluators 1/8/9 and cases 1/8/9/100 | Attempts, evaluator results, HTTP calls, and drained work. |
+| Outbox | Batches 1/64/65/256/1,000 with parallelism 1/8/64 | Exact published worker deliveries and durable event rows. |
+| Recovery | Expired leases 1/1,000/1,001 | Recovery counts, recovery events, and redeliveries. |
+| Finalization | Terminal runs 1/64/65 | Completed runs, evaluator results, and completion events. |
+
+The router/cache contract remains registered but unavailable because the
+release CLI cannot keep its process-local cache alive across calls. Adding a
+benchmark-only command or exposing binary-private modules would measure a new
+path rather than the shipped one, so selection fails closed until a legitimate
+reusable production boundary exists.
+
 Migration, evaluator publication, fixture creation, database cloning, and
 worker queue preparation occur before collector reset and are excluded from
 measurement. Lifecycle intentionally includes creation and every runtime
@@ -196,6 +257,8 @@ Run output is written only below `target/perf/runs`. Each directory contains:
 - `comparisons.jsonl` and per-workload comparison JSON for A/B results
 - `report.json` as the report contract
 - `summary.md` as the concise human-readable result
+- `component-models.json` after `cargo perf model`
+- `diagnostics.md` after `cargo perf diagnose`
 
 Use `cargo perf report --run-dir <run-directory>` to regenerate the terminal and
 Markdown views from `report.json`.

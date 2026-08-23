@@ -23,6 +23,7 @@ use super::model::{
     Profile,
     ProfileWorkload,
     REGISTRY_SCHEMA,
+    ScalingKind,
     Workload,
     WorkloadRegistry,
 };
@@ -114,6 +115,96 @@ pub fn validate_registry(registry: &WorkloadRegistry) -> Result<()> {
         if workload.extra.keys().any(String::is_empty) {
             bail!("workload {} has an empty extension key", workload.id);
         }
+        if workload.scaling_model.is_some() {
+            validate_scaling_model(workload)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validates that a scaling model is identifiable and covers its workload exactly.
+pub fn validate_scaling_model(workload: &Workload) -> Result<()> {
+    let model = workload
+        .scaling_model
+        .as_ref()
+        .context("scaling-model validation requires a model")?;
+    if model.input_dimension.is_empty()
+        || !(model.max_residual_fraction.is_finite()
+            && model.max_residual_fraction > 0.0
+            && model.max_residual_fraction <= 1.0)
+    {
+        bail!("workload {} has invalid scaling metadata", workload.id);
+    }
+    let minimum_points = match model.kind {
+        ScalingKind::FixedPlusSlope => 3,
+        ScalingKind::Stepped => 2,
+    };
+    if model.points.len() < minimum_points {
+        bail!(
+            "workload {} scaling model needs at least {minimum_points} points",
+            workload.id
+        );
+    }
+    if model.kind == ScalingKind::Stepped && model.discontinuities.is_empty() {
+        bail!(
+            "workload {} stepped model has no discontinuity",
+            workload.id
+        );
+    }
+    if model.kind == ScalingKind::FixedPlusSlope && !model.discontinuities.is_empty() {
+        bail!(
+            "workload {} fixed-plus-slope model cannot declare discontinuities",
+            workload.id
+        );
+    }
+    let tuples = workload.tuples.iter().collect::<BTreeSet<_>>();
+    let point_tuples = model
+        .points
+        .iter()
+        .map(|point| &point.tuple)
+        .collect::<BTreeSet<_>>();
+    let inputs = model
+        .points
+        .iter()
+        .map(|point| point.input)
+        .collect::<BTreeSet<_>>();
+    if tuples != point_tuples || point_tuples.len() != model.points.len() {
+        bail!(
+            "workload {} model must cover every tuple exactly once",
+            workload.id
+        );
+    }
+    if inputs.len() != model.points.len()
+        || model
+            .points
+            .iter()
+            .any(|point| point.input == 0 || point.exact.is_empty())
+    {
+        bail!(
+            "workload {} has duplicate or incomplete scaling points",
+            workload.id
+        );
+    }
+    if model
+        .points
+        .iter()
+        .flat_map(|point| point.exact.keys())
+        .any(String::is_empty)
+    {
+        bail!(
+            "workload {} has an empty exact-observation key",
+            workload.id
+        );
+    }
+    if model
+        .discontinuities
+        .iter()
+        .any(|boundary| !inputs.contains(boundary))
+    {
+        bail!(
+            "workload {} discontinuities must name measured points",
+            workload.id
+        );
     }
     Ok(())
 }
@@ -441,5 +532,47 @@ max_residual_orientation_effect = 0.02
         policy.entries.pop();
         policy.entries[0].practical_budget = 0.0;
         assert!(validate_budget_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn scalable_models_cover_every_tuple_and_exact_observation() {
+        let root = crate::perf::artifact::workspace_root().unwrap();
+        let registry = load_registry(&root).unwrap();
+        let scalable = registry
+            .workloads
+            .iter()
+            .filter(|workload| workload.scaling_model.is_some())
+            .collect::<Vec<_>>();
+        assert!(!scalable.is_empty());
+        for workload in scalable {
+            validate_scaling_model(workload).unwrap();
+            let model = workload.scaling_model.as_ref().unwrap();
+            assert_eq!(model.points.len(), workload.tuples.len());
+            assert!(model.points.iter().all(|point| !point.exact.is_empty()));
+        }
+    }
+
+    #[test]
+    fn scalable_models_reject_missing_points_and_weak_fits() {
+        let root = crate::perf::artifact::workspace_root().unwrap();
+        let registry = load_registry(&root).unwrap();
+        let mut workload = registry
+            .workloads
+            .iter()
+            .find(|workload| workload.scaling_model.is_some())
+            .unwrap()
+            .clone();
+
+        workload.scaling_model.as_mut().unwrap().points.pop();
+        assert!(validate_scaling_model(&workload).is_err());
+
+        let model = workload.scaling_model.as_mut().unwrap();
+        model.points = model.points.iter().take(2).cloned().collect();
+        workload.tuples = model
+            .points
+            .iter()
+            .map(|point| point.tuple.clone())
+            .collect();
+        assert!(validate_scaling_model(&workload).is_err());
     }
 }

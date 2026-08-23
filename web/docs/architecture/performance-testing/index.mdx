@@ -2,7 +2,7 @@
 title: Performance Testing
 sidebar_label: Performance Testing
 sidebar_position: 7
-description: How Vigilo calibrates canonical performance noise, bounded capacity, reviewed budgets, and confirmed regression gates.
+description: How Vigilo measures components, validates scaling models, calibrates capacity, and gates regressions.
 keywords:
   - Vigilo performance testing
   - performance calibration
@@ -21,6 +21,29 @@ database, RabbitMQ, HTTP, and evaluator boundaries. Every timed sample must pass
 its exact correctness oracle before it can contribute to statistics.
 
 <Mermaid value={performanceTestingDiagram} />
+
+## Component Boundaries
+
+Versioned workloads exercise release-binary run creation, dispatch, HTTP agent,
+Wasm evaluation, worker persistence, outbox publication, lease recovery, and
+run finalization. Profiles select explicit tuples around page, batch, and
+concurrency boundaries; the harness never expands dimensions into a Cartesian
+product. Exact HTTP requests, worker deliveries, and durable rows catch lost
+batching or amplification before timing is interpreted.
+
+Continuous workflows use a sample-level fixed-cost-plus-slope fit. Known batch
+boundaries use explicit stepped estimates. Every point requires repeated valid
+samples, exact observations, and residuals within its registered tolerance.
+
+PostgreSQL normalized statements, planning time/counts, shared/temp buffers,
+and WAL counters are captured after the timed process exits. The
+`cargo perf diagnose` command renders them as non-gating evidence. The model
+command writes the owned component-model artifact and fails closed on
+incomplete or nonlinear evidence.
+
+Criterion remains conditional on a legitimate production library surface.
+Runtime and database modules are currently binary-private, so the release
+executable remains the sole component measurement authority.
 
 ## Calibration Boundaries
 

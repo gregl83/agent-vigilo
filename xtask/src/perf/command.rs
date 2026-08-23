@@ -1090,6 +1090,19 @@ fn execute_workload(
             Default::default(),
         )
     } else {
+        let empty_exact = std::collections::BTreeMap::new();
+        let exact = request
+            .selected
+            .workload
+            .scaling_model
+            .as_ref()
+            .and_then(|model| {
+                model
+                    .points
+                    .iter()
+                    .find(|point| point.tuple == request.selected.profile.tuple)
+            })
+            .map_or(&empty_exact, |point| &point.exact);
         let executed = runner.execute(WorkloadRequest {
             workload_id: &request.selected.workload.id,
             tuple: &request.selected.profile.tuple,
@@ -1097,6 +1110,7 @@ fn execute_workload(
             binary: request.binary,
             manifest_path: request.build_manifest,
             manifest: request.manifest,
+            exact,
             limits: ExecutionLimits {
                 watchdog: Duration::from_millis(request.selected.workload.watchdog_ms),
                 stdout: request.stdout_limit,

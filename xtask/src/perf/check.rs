@@ -40,12 +40,15 @@ use super::{
     schedule,
 };
 
-const PROFILES: [&str; 5] = [
+const PROFILES: [&str; 8] = [
     "developer-v1",
     "pr-v1",
     "reference-v1",
     "calibration-v1",
     "capacity-v1",
+    "component-reference-v1",
+    "component-nightly-v1",
+    "component-smoke-v1",
 ];
 
 /// CLI arguments for validating the performance harness.

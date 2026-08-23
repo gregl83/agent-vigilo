@@ -69,6 +69,18 @@ profiles.
 | `preconditioning` | `none`, or `one-per-binary` for one unmeasured execution of each binary before sampling. |
 | `command` | Arguments passed directly to the measured Vigilo executable without shell interpretation. Currently used by the startup workload. |
 | `help_signatures` | Required substrings in startup stdout. A missing signature is a fixture/capability mismatch. |
+| `scaling_model` | Optional fixed-plus-slope or explicit stepped model contract for a scalable component. |
+
+### Scaling Model Fields
+
+| Field | Meaning |
+| --- | --- |
+| `kind` | `fixed_plus_slope` for one intercept and slope, or `stepped` for independently estimated declared cardinalities. |
+| `input_dimension` | Independent quantity represented by each point. |
+| `max_residual_fraction` | Maximum sample-level relative residual accepted by `cargo perf model`. |
+| `discontinuities` | Measured inputs that begin known stepped regions; forbidden for continuous models. |
+| `points` | Complete one-to-one mapping of registered tuples to positive inputs and exact observations. |
+| `points.exact` | Required HTTP, worker-queue, or durable-count values. Unknown keys and count drift invalidate the sample. |
 
 For `startup.cli-help.v1`, the runner launches the release executable with
 `--help`, requires exit `0` and the configured help signatures, and records wall
@@ -162,6 +174,7 @@ The harness owns these additive machine-readable contracts:
 | `capacity-calibration/v1` | Bounded one/two-worker staircase points, knees or lower bounds, and scale efficiency. |
 | `performance-budget/v1` | Reviewed environment-specific workload/tuple/metric budgets and minimum block counts. |
 | `performance-baseline/v1` | Digested index of calibration, capacity, budget, profile, and build-manifest evidence. |
+| `component-models/v1` | Accepted or rejected component fits, coefficients/steps, residuals, and evidence counts. |
 
 Every persisted document carries its schema ID. Readers reject an unknown
 schema ID and preserve unknown additive fields. Retained version fixtures are
@@ -171,10 +184,14 @@ second version exists.
 ### Sample External Measurements
 
 `sample.external` records PostgreSQL calls/time/rows, WAL bytes, database-size
-delta, HTTP request/byte/peak-concurrency counts, RabbitMQ ready/unacknowledged
-counts, peak sampled service memory/CPU observations, and an exact `durable_counts` map from
-the workload oracle. Collectors reset after unmeasured setup and before every
-measured process region.
+delta, HTTP request/byte/peak-concurrency counts, RabbitMQ worker-delivery
+ready/unacknowledged counts, peak sampled service memory/CPU observations, and
+an exact `durable_counts` map from the workload oracle. `query_diagnostics`
+retains normalized statement fingerprints, plan count/time, execution time,
+shared/temp buffer counters, and per-statement WAL records/images/bytes. These
+diagnostics are queried only after process timing ends and are never gates.
+Collectors reset after unmeasured setup and before every measured process
+region.
 
 `services.json` is the teardown authority for one campaign. It records the
 Compose project, redacted endpoints, agent URL, and exact container/network/volume IDs.

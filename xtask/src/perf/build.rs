@@ -130,6 +130,7 @@ pub fn execute(args: BuildArgs) -> Result<u8> {
     }
     let evaluator_asset = assets.join("evaluators/sentiment-basic-en");
     copy_tree(&evaluator_source, &evaluator_asset)?;
+    isolate_copied_crate(&evaluator_asset)?;
     let evaluator_wasm = evaluator_target.join("wasm32-wasip2/release/sentiment_basic_en.wasm");
     let evaluator_asset_wasm =
         evaluator_asset.join("target/wasm32-wasip2/release/sentiment_basic_en.wasm");
@@ -223,6 +224,21 @@ pub fn execute(args: BuildArgs) -> Result<u8> {
     println!("Executable:     {}", executable.display());
     println!("Digest:         {}", manifest.executable_digest);
     Ok(EXIT_PASS)
+}
+
+/// Prevents a copied evaluator beneath the repository target tree from
+/// inheriting the source workspace during later `evaluator publish` commands.
+fn isolate_copied_crate(crate_root: &Path) -> Result<()> {
+    let manifest = crate_root.join("Cargo.toml");
+    let mut content = fs::read_to_string(&manifest)
+        .with_context(|| format!("read copied evaluator manifest {}", manifest.display()))?;
+    let parsed: toml::Value = toml::from_str(&content)?;
+    if parsed.get("workspace").is_none() {
+        content.push_str("\n[workspace]\n");
+        fs::write(&manifest, content)
+            .with_context(|| format!("isolate copied evaluator {}", manifest.display()))?;
+    }
+    Ok(())
 }
 
 /// Probes supported CLI boundaries and returns the capabilities recorded in the snapshot.
@@ -320,5 +336,27 @@ mod tests {
                 .starts_with("rustc ")
         );
         assert!(optional_command_output(&root, "missing-vigilo-test-tool", &[]).is_none());
+    }
+
+    #[test]
+    fn copied_evaluator_is_a_standalone_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        isolate_copied_crate(directory.path()).unwrap();
+        let content = fs::read_to_string(directory.path().join("Cargo.toml")).unwrap();
+        assert!(content.ends_with("[workspace]\n"));
+
+        isolate_copied_crate(directory.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(directory.path().join("Cargo.toml"))
+                .unwrap()
+                .matches("[workspace]")
+                .count(),
+            1
+        );
     }
 }

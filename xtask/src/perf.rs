@@ -10,6 +10,9 @@
 //! - `config` and `model` define the versioned input and output contracts.
 //! - `build` creates immutable Vigilo snapshots and records their provenance.
 //! - `schedule` and `stats` define sampling order and comparison semantics.
+//! - `scaling` fits registered continuous or stepped component models, while
+//!   `diagnostics` renders post-timing PostgreSQL planning, buffer, and WAL
+//!   observations without changing gates.
 //! - `calibration` turns canonical no-change and bounded-capacity evidence into
 //!   reviewed budget/profile candidates and immutable baseline artifacts.
 //! - `process` owns bounded child execution and platform resource collection.
@@ -31,10 +34,12 @@ mod calibration;
 mod check;
 mod command;
 mod config;
+mod diagnostics;
 mod fixture;
 mod model;
 mod process;
 mod report;
+mod scaling;
 mod schedule;
 mod service;
 mod stats;
@@ -80,6 +85,10 @@ enum PerfCommand {
     Report(report::ReportArgs),
     /// Analyze canonical noise or bounded capacity evidence.
     Calibrate(calibration::CalibrateArgs),
+    /// Fit registered component models from repeated raw samples.
+    Model(scaling::ModelArgs),
+    /// Render non-gating PostgreSQL planning, buffer, and WAL diagnostics.
+    Diagnose(diagnostics::DiagnoseArgs),
 }
 
 /// Arguments for the hidden subprocess fixture used by lifecycle tests.
@@ -102,6 +111,8 @@ pub fn run(args: PerfArgs) -> Result<u8> {
         PerfCommand::Compare(args) => command::compare(args),
         PerfCommand::Report(args) => report::execute(args),
         PerfCommand::Calibrate(args) => calibration::execute(args),
+        PerfCommand::Model(args) => scaling::execute(args),
+        PerfCommand::Diagnose(args) => diagnostics::execute(args),
     }
 }
 

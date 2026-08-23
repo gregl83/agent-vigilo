@@ -1,0 +1,201 @@
+schema_id = "profile/v1"
+id = "component-reference-v1"
+description = "Reviewable component boundaries with repeated informative samples."
+requires_workload_selection = false
+campaign_cap_secs = 14400
+schedule_seed = 2107259857
+max_artifact_bytes = 1073741824
+max_stdout_bytes = 262144
+max_stderr_bytes = 262144
+
+[[workloads]]
+id = "run.create-scaling.v1"
+tuple = "cases-1"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "run.create-scaling.v1"
+tuple = "cases-500"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "run.create-scaling.v1"
+tuple = "cases-501"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "run.create-scaling.v1"
+tuple = "cases-1000"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "run.create-scaling.v1"
+tuple = "cases-1001"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "run.create-scaling.v1"
+tuple = "cases-2000"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "run.create-scaling.v1"
+tuple = "cases-2001"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "run.create-scaling.v1"
+tuple = "cases-10000"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.dispatch-scaling.v1"
+tuple = "chunks-1"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.dispatch-scaling.v1"
+tuple = "chunks-512"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.dispatch-scaling.v1"
+tuple = "chunks-513"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "agent.http-scaling.v1"
+tuple = "cases-1-payload-1024-delay-0"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "agent.http-scaling.v1"
+tuple = "cases-8-payload-1024-delay-0"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "agent.http-scaling.v1"
+tuple = "cases-16-payload-1024-delay-0"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "evaluator.wasm-scaling.v1"
+tuple = "evaluators-1"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "evaluator.wasm-scaling.v1"
+tuple = "evaluators-8"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "evaluator.wasm-scaling.v1"
+tuple = "evaluators-9"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "worker.persistence-scaling.v1"
+tuple = "cases-1"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "worker.persistence-scaling.v1"
+tuple = "cases-8"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "worker.persistence-scaling.v1"
+tuple = "cases-9"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "worker.persistence-scaling.v1"
+tuple = "cases-100"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.outbox-scaling.v1"
+tuple = "events-65-batch-64-parallel-8"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.outbox-scaling.v1"
+tuple = "events-2-batch-1-parallel-1"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.outbox-scaling.v1"
+tuple = "events-66-batch-65-parallel-8"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.outbox-scaling.v1"
+tuple = "events-257-batch-256-parallel-8"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.outbox-scaling.v1"
+tuple = "events-1001-batch-1000-parallel-64"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.recovery.v1"
+tuple = "leases-1"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.recovery.v1"
+tuple = "leases-1000"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.recovery.v1"
+tuple = "leases-1001"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.finalization.v1"
+tuple = "runs-1"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.finalization.v1"
+tuple = "runs-64"
+blocks = 4
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.finalization.v1"
+tuple = "runs-65"
+blocks = 4
+timing = "informative"

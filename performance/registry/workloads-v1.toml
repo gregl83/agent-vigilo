@@ -1,7 +1,7 @@
 # `v1` identifies the registry document shape, not a moving "latest" workload.
-# Increment `revision` when this catalog changes without changing that shape.
-# Published workload IDs are immutable semantic contracts: retain an existing
-# `.v1` entry and add `.v2` when its fixture, oracle, or measured meaning changes.
+# Keep the greenfield catalog at revision 1 until its initial contract is frozen.
+# After release, published workload IDs are immutable semantic contracts: retain
+# an existing `.v1` entry and add `.v2` when its measured meaning changes.
 schema_id = "workload-registry/v1"
 revision = 1
 
@@ -127,3 +127,350 @@ required_metrics = ["wall_time", "throughput", "process_cpu", "service_cpu", "pe
 watchdog_ms = 600000
 planning_duration_ms = 60000
 preconditioning = "none"
+
+[[workloads]]
+id = "run.create-scaling.v1"
+owner = "run-creation"
+status = "implemented"
+capability = "run.create.v1"
+fixture = "mvp-v1"
+tuples = ["cases-1", "cases-500", "cases-501", "cases-1000", "cases-1001", "cases-2000", "cases-2001", "cases-10000"]
+unit = "case_and_run"
+oracle = "exact_control_and_execution_rows"
+required_metrics = ["wall_time", "child_cpu", "peak_rss", "sql", "wal"]
+watchdog_ms = 180000
+planning_duration_ms = 10000
+preconditioning = "none"
+
+[workloads.scaling_model]
+kind = "stepped"
+input_dimension = "cases"
+max_residual_fraction = 0.10
+discontinuities = [501, 1001, 2001]
+
+[[workloads.scaling_model.points]]
+tuple = "cases-1"
+input = 1
+exact = { "durable.runs" = 1, "durable.chunks" = 1, "durable.executions" = 0, "durable.cases" = 1, "http_requests" = 0, "queue_ready" = 0, "queue_unacked" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "cases-500"
+input = 500
+exact = { "durable.runs" = 1, "durable.chunks" = 5, "durable.executions" = 0, "durable.cases" = 500, "http_requests" = 0, "queue_ready" = 0, "queue_unacked" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "cases-501"
+input = 501
+exact = { "durable.runs" = 1, "durable.chunks" = 6, "durable.executions" = 0, "durable.cases" = 501, "http_requests" = 0, "queue_ready" = 0, "queue_unacked" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "cases-1000"
+input = 1000
+exact = { "durable.runs" = 1, "durable.chunks" = 10, "durable.executions" = 0, "durable.cases" = 1000, "http_requests" = 0, "queue_ready" = 0, "queue_unacked" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "cases-1001"
+input = 1001
+exact = { "durable.runs" = 1, "durable.chunks" = 11, "durable.executions" = 0, "durable.cases" = 1001, "http_requests" = 0, "queue_ready" = 0, "queue_unacked" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "cases-2000"
+input = 2000
+exact = { "durable.runs" = 1, "durable.chunks" = 20, "durable.executions" = 0, "durable.cases" = 2000, "http_requests" = 0, "queue_ready" = 0, "queue_unacked" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "cases-2001"
+input = 2001
+exact = { "durable.runs" = 1, "durable.chunks" = 21, "durable.executions" = 0, "durable.cases" = 2001, "http_requests" = 0, "queue_ready" = 0, "queue_unacked" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "cases-10000"
+input = 10000
+exact = { "durable.runs" = 1, "durable.chunks" = 100, "durable.executions" = 0, "durable.cases" = 10000, "http_requests" = 0, "queue_ready" = 0, "queue_unacked" = 0 }
+
+[[workloads]]
+id = "coordinator.dispatch-scaling.v1"
+owner = "coordinator-dispatch"
+status = "implemented"
+capability = "coordinator.dispatch.v1"
+fixture = "mvp-v1"
+tuples = ["chunks-1", "chunks-512", "chunks-513"]
+unit = "chunk"
+oracle = "exact_dispatch_and_queue_state"
+required_metrics = ["wall_time", "process_cpu", "service_cpu", "sql", "wal", "queue"]
+watchdog_ms = 180000
+planning_duration_ms = 10000
+preconditioning = "none"
+
+[workloads.scaling_model]
+kind = "stepped"
+input_dimension = "chunks"
+max_residual_fraction = 0.10
+discontinuities = [513]
+
+[[workloads.scaling_model.points]]
+tuple = "chunks-1"
+input = 1
+exact = { "durable.chunks" = 1, "durable.executions" = 0, "queue_ready" = 1, "queue_unacked" = 0, "http_requests" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "chunks-512"
+input = 512
+exact = { "durable.chunks" = 512, "durable.executions" = 0, "queue_ready" = 512, "queue_unacked" = 0, "http_requests" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "chunks-513"
+input = 513
+exact = { "durable.chunks" = 513, "durable.executions" = 0, "queue_ready" = 513, "queue_unacked" = 0, "http_requests" = 0 }
+
+[[workloads]]
+id = "agent.http-scaling.v1"
+owner = "worker-http-agent"
+status = "implemented"
+capability = "worker.execute-wasm.v1"
+fixture = "mvp-v1"
+tuples = ["cases-1-payload-1024-delay-0", "cases-8-payload-1024-delay-0", "cases-16-payload-1024-delay-0"]
+unit = "agent_request"
+oracle = "exact_agent_requests_and_terminal_results"
+required_metrics = ["wall_time", "process_cpu", "service_cpu", "sql", "wal", "http", "queue"]
+watchdog_ms = 180000
+planning_duration_ms = 10000
+preconditioning = "none"
+
+[workloads.scaling_model]
+kind = "fixed_plus_slope"
+input_dimension = "requests"
+max_residual_fraction = 0.10
+
+[[workloads.scaling_model.points]]
+tuple = "cases-1-payload-1024-delay-0"
+input = 1
+exact = { "durable.attempts" = 1, "durable.evaluator_results" = 1, "http_requests" = 1, "queue_ready" = 0, "queue_unacked" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "cases-8-payload-1024-delay-0"
+input = 8
+exact = { "durable.attempts" = 8, "durable.evaluator_results" = 8, "http_requests" = 8, "queue_ready" = 0, "queue_unacked" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "cases-16-payload-1024-delay-0"
+input = 16
+exact = { "durable.attempts" = 16, "durable.evaluator_results" = 16, "http_requests" = 16, "queue_ready" = 0, "queue_unacked" = 0 }
+
+[[workloads]]
+id = "evaluator.wasm-scaling.v1"
+owner = "worker-wasm"
+status = "implemented"
+capability = "worker.execute-wasm.v1"
+fixture = "mvp-v1"
+tuples = ["evaluators-1", "evaluators-8", "evaluators-9"]
+unit = "evaluation"
+oracle = "exact_evaluator_results_and_terminal_attempt"
+required_metrics = ["wall_time", "process_cpu", "service_cpu", "sql", "wal", "http", "queue"]
+watchdog_ms = 180000
+planning_duration_ms = 10000
+preconditioning = "none"
+
+[workloads.scaling_model]
+kind = "stepped"
+input_dimension = "evaluators"
+max_residual_fraction = 0.10
+discontinuities = [9]
+
+[[workloads.scaling_model.points]]
+tuple = "evaluators-1"
+input = 1
+exact = { "durable.attempts" = 1, "durable.evaluator_results" = 1, "http_requests" = 1, "queue_ready" = 0, "queue_unacked" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "evaluators-8"
+input = 8
+exact = { "durable.attempts" = 1, "durable.evaluator_results" = 8, "http_requests" = 1, "queue_ready" = 0, "queue_unacked" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "evaluators-9"
+input = 9
+exact = { "durable.attempts" = 1, "durable.evaluator_results" = 9, "http_requests" = 1, "queue_ready" = 0, "queue_unacked" = 0 }
+
+[[workloads]]
+id = "agent.http-variants.v1"
+owner = "worker-http-agent"
+status = "implemented"
+capability = "worker.execute-wasm.v1"
+fixture = "mvp-v1"
+tuples = ["cases-8-payload-65536-delay-0", "cases-8-payload-1024-delay-10", "cases-8-payload-65536-delay-10"]
+unit = "agent_request"
+oracle = "exact_agent_requests_and_terminal_results"
+required_metrics = ["wall_time", "process_cpu", "service_cpu", "sql", "wal", "http", "queue"]
+watchdog_ms = 180000
+planning_duration_ms = 10000
+preconditioning = "none"
+
+[[workloads]]
+id = "worker.persistence-scaling.v1"
+owner = "worker-persistence"
+status = "implemented"
+capability = "worker.execute-wasm.v1"
+fixture = "mvp-v1"
+tuples = ["cases-1", "cases-8", "cases-9", "cases-100"]
+unit = "case_result"
+oracle = "exact_attempt_result_and_chunk_state"
+required_metrics = ["wall_time", "process_cpu", "service_cpu", "sql", "wal", "http", "queue"]
+watchdog_ms = 180000
+planning_duration_ms = 10000
+preconditioning = "none"
+
+[workloads.scaling_model]
+kind = "stepped"
+input_dimension = "cases"
+max_residual_fraction = 0.10
+discontinuities = [9]
+
+[[workloads.scaling_model.points]]
+tuple = "cases-1"
+input = 1
+exact = { "durable.attempts" = 1, "durable.evaluator_results" = 1, "http_requests" = 1, "queue_ready" = 0, "queue_unacked" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "cases-8"
+input = 8
+exact = { "durable.attempts" = 8, "durable.evaluator_results" = 8, "http_requests" = 8, "queue_ready" = 0, "queue_unacked" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "cases-9"
+input = 9
+exact = { "durable.attempts" = 9, "durable.evaluator_results" = 9, "http_requests" = 9, "queue_ready" = 0, "queue_unacked" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "cases-100"
+input = 100
+exact = { "durable.attempts" = 100, "durable.evaluator_results" = 100, "http_requests" = 100, "queue_ready" = 0, "queue_unacked" = 0 }
+
+[[workloads]]
+id = "coordinator.outbox-scaling.v1"
+owner = "coordinator-messaging"
+status = "implemented"
+capability = "coordinator.dispatch.v1"
+fixture = "mvp-v1"
+tuples = ["events-2-batch-1-parallel-1", "events-65-batch-64-parallel-8", "events-66-batch-65-parallel-8", "events-257-batch-256-parallel-8", "events-1001-batch-1000-parallel-64"]
+unit = "published_delivery"
+oracle = "exact_outbox_delivery_and_queue_state"
+required_metrics = ["wall_time", "process_cpu", "service_cpu", "sql", "wal", "queue"]
+watchdog_ms = 240000
+planning_duration_ms = 15000
+preconditioning = "none"
+
+[workloads.scaling_model]
+kind = "stepped"
+input_dimension = "deliveries"
+max_residual_fraction = 0.10
+discontinuities = [65]
+
+[[workloads.scaling_model.points]]
+tuple = "events-2-batch-1-parallel-1"
+input = 1
+exact = { "durable.chunks" = 2, "queue_ready" = 1, "queue_unacked" = 0, "http_requests" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "events-65-batch-64-parallel-8"
+input = 64
+exact = { "durable.chunks" = 65, "queue_ready" = 64, "queue_unacked" = 0, "http_requests" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "events-66-batch-65-parallel-8"
+input = 65
+exact = { "durable.chunks" = 66, "queue_ready" = 65, "queue_unacked" = 0, "http_requests" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "events-257-batch-256-parallel-8"
+input = 256
+exact = { "durable.chunks" = 257, "queue_ready" = 256, "queue_unacked" = 0, "http_requests" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "events-1001-batch-1000-parallel-64"
+input = 1000
+exact = { "durable.chunks" = 1001, "queue_ready" = 1000, "queue_unacked" = 0, "http_requests" = 0 }
+
+[[workloads]]
+id = "database.route-cache.v1"
+owner = "database-routing"
+status = "planned"
+capability = "run.create.v1"
+fixture = "mvp-v1"
+tuples = ["cold-alias-1", "warm-aliases-32"]
+unit = "route_lookup"
+oracle = "exact_status_projection"
+required_metrics = ["wall_time", "process_cpu", "sql"]
+watchdog_ms = 120000
+planning_duration_ms = 5000
+preconditioning = "none"
+
+[[workloads]]
+id = "coordinator.recovery.v1"
+owner = "coordinator-recovery"
+status = "implemented"
+capability = "coordinator.dispatch.v1"
+fixture = "mvp-v1"
+tuples = ["leases-1", "leases-1000", "leases-1001"]
+unit = "recovered_lease"
+oracle = "exact_recovery_attempt_and_redelivery"
+required_metrics = ["wall_time", "process_cpu", "service_cpu", "sql", "wal", "queue"]
+watchdog_ms = 240000
+planning_duration_ms = 15000
+preconditioning = "none"
+
+[workloads.scaling_model]
+kind = "stepped"
+input_dimension = "expired_leases"
+max_residual_fraction = 0.10
+discontinuities = [1001]
+
+[[workloads.scaling_model.points]]
+tuple = "leases-1"
+input = 1
+exact = { "durable.chunks" = 1, "durable.executions" = 0, "durable.recovered_chunks" = 1, "durable.recovery_events" = 1, "queue_ready" = 1, "queue_unacked" = 0, "http_requests" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "leases-1000"
+input = 1000
+exact = { "durable.chunks" = 1000, "durable.executions" = 0, "durable.recovered_chunks" = 1000, "durable.recovery_events" = 1000, "queue_ready" = 1000, "queue_unacked" = 0, "http_requests" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "leases-1001"
+input = 1001
+exact = { "durable.chunks" = 1001, "durable.executions" = 0, "durable.recovered_chunks" = 1001, "durable.recovery_events" = 1001, "queue_ready" = 1001, "queue_unacked" = 0, "http_requests" = 0 }
+
+[[workloads]]
+id = "coordinator.finalization.v1"
+owner = "coordinator-finalization"
+status = "implemented"
+capability = "coordinator.dispatch.v1"
+fixture = "mvp-v1"
+tuples = ["runs-1", "runs-64", "runs-65"]
+unit = "finalized_run"
+oracle = "exact_terminal_summary_and_event"
+required_metrics = ["wall_time", "process_cpu", "service_cpu", "sql", "wal", "queue"]
+watchdog_ms = 240000
+planning_duration_ms = 15000
+preconditioning = "none"
+
+[workloads.scaling_model]
+kind = "stepped"
+input_dimension = "terminal_runs"
+max_residual_fraction = 0.10
+discontinuities = [65]
+
+[[workloads.scaling_model.points]]
+tuple = "runs-1"
+input = 1
+exact = { "durable.runs" = 1, "durable.completed_runs" = 1, "durable.evaluator_results" = 1, "durable.completion_events" = 1, "queue_ready" = 0, "queue_unacked" = 0, "http_requests" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "runs-64"
+input = 64
+exact = { "durable.runs" = 64, "durable.completed_runs" = 64, "durable.evaluator_results" = 64, "durable.completion_events" = 64, "queue_ready" = 0, "queue_unacked" = 0, "http_requests" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "runs-65"
+input = 65
+exact = { "durable.runs" = 65, "durable.completed_runs" = 65, "durable.evaluator_results" = 65, "durable.completion_events" = 65, "queue_ready" = 0, "queue_unacked" = 0, "http_requests" = 0 }

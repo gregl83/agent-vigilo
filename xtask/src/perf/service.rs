@@ -27,6 +27,7 @@ use std::{
     sync::{
         Arc,
         Mutex,
+        RwLock,
         atomic::{
             AtomicBool,
             AtomicU64,
@@ -68,7 +69,10 @@ use super::{
         atomic_json,
         atomic_text,
     },
-    model::ExternalMeasurements,
+    model::{
+        ExternalMeasurements,
+        QueryDiagnostic,
+    },
 };
 
 const OWNERSHIP_LABEL: &str = "io.vigilo.run-id";
@@ -103,12 +107,18 @@ pub fn integration_self_test(root: &Path) -> Result<()> {
             response.status()
         );
     }
+    let mut client = PgClient::connect(&scope.database_url, NoTls)?;
+    client.simple_query("SELECT 42")?;
     let first_measurement =
         harness.finish_measurement(&scope, first, BTreeMap::from([("sentinel".into(), 1)]))?;
     if first_measurement.http_requests != Some(1)
         || first_measurement.durable_counts.get("sentinel") != Some(&1)
+        || !first_measurement
+            .query_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.plans > 0 && diagnostic.total_plan_time_ms >= 0.0)
     {
-        bail!("first collector sentinel was not observed exactly once");
+        bail!("first collector sentinel or query-planning diagnostic was not observed");
     }
 
     let second = harness.begin_measurement(&scope)?;
@@ -329,6 +339,16 @@ impl ServiceHarness {
         self.agent.url()
     }
 
+    /// Selects deterministic response size and latency before a sample begins.
+    pub fn configure_agent(
+        &self,
+        response_text: &str,
+        payload_bytes: usize,
+        delay: Duration,
+    ) -> Result<()> {
+        self.agent.configure(response_text, payload_bytes, delay)
+    }
+
     /// Creates an empty database owned by this campaign.
     pub fn create_database(&mut self, purpose: &str) -> Result<String> {
         self.sequence += 1;
@@ -410,13 +430,13 @@ impl ServiceHarness {
         self.agent.reset()?;
         let mut client = PgClient::connect(&scope.database_url, NoTls)?;
         client.batch_execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")?;
-        let _ = client.simple_query("SELECT pg_stat_statements_reset()")?;
         let wal_lsn: String = client
             .query_one("SELECT pg_current_wal_lsn()::text", &[])?
             .get(0);
         let database_bytes: i64 = client
             .query_one("SELECT pg_database_size(current_database())", &[])?
             .get(0);
+        let _ = client.simple_query("SELECT pg_stat_statements_reset()")?;
         let service_sampler = ServiceSampler::start(&self.root, self.container_ids())?;
         Ok(MeasurementBaseline {
             wal_lsn,
@@ -435,6 +455,7 @@ impl ServiceHarness {
         self.require_scope(scope)?;
         let services = baseline.service_sampler.finish()?;
         let mut client = PgClient::connect(&scope.database_url, NoTls)?;
+        let query_diagnostics = query_diagnostics(&mut client)?;
         let stats = client.query_one(
             r#"
             SELECT
@@ -469,7 +490,64 @@ impl ServiceHarness {
             service_memory_bytes: services.memory_bytes,
             service_cpu_percent: services.cpu_percent,
             durable_counts,
+            query_diagnostics,
         })
+    }
+
+    /// Purges every queue in one owned sample vhost during fixture preparation.
+    pub fn purge_scope_queues(&self, scope: &SampleScope) -> Result<()> {
+        self.require_scope(scope)?;
+        let response = self
+            .http
+            .get(format!(
+                "{}/api/queues/{}",
+                self.rabbit_management_url, scope.vhost
+            ))
+            .basic_auth(RABBIT_USER, Some(RABBIT_PASSWORD))
+            .send()?;
+        if !response.status().is_success() {
+            bail!("RabbitMQ queue inventory failed with {}", response.status());
+        }
+        let queues: Vec<Value> = response.json()?;
+        for queue in queues {
+            let name = queue["name"]
+                .as_str()
+                .context("RabbitMQ queue omitted name")?;
+            let endpoint = format!(
+                "{}/api/queues/{}/{}/contents",
+                self.rabbit_management_url, scope.vhost, name
+            );
+            self.rabbit(self.http.delete(endpoint))?;
+        }
+        Ok(())
+    }
+
+    /// Waits for RabbitMQ management statistics to expose an exact settled state.
+    pub fn settled_queue_counts(
+        &self,
+        scope: &SampleScope,
+        expected_ready: u64,
+        expected_unacked: u64,
+    ) -> Result<(u64, u64)> {
+        self.require_scope(scope)?;
+        let mut observed = (0, 0);
+        retry_until_success(
+            "RabbitMQ queue settlement",
+            RABBIT_MANAGEMENT_OPERATION_TIMEOUT,
+            RABBIT_MANAGEMENT_RETRY_DELAY,
+            || {
+                observed = self.queue_counts(&scope.vhost)?;
+                if observed != (expected_ready, expected_unacked) {
+                    bail!(
+                        "RabbitMQ counts are ready={}, unacked={}; expected {expected_ready}, {expected_unacked}",
+                        observed.0,
+                        observed.1
+                    );
+                }
+                Ok(())
+            },
+        )?;
+        Ok(observed)
     }
 
     /// Removes one sample's database and RabbitMQ vhost after artifacts are captured.
@@ -585,10 +663,20 @@ impl ServiceHarness {
         let queues: Vec<Value> = response.json()?;
         let ready = queues
             .iter()
+            .filter(|queue| {
+                queue["name"]
+                    .as_str()
+                    .is_some_and(|name| name == "vigilo.worker" || name.ends_with(".worker"))
+            })
             .filter_map(|queue| queue["messages_ready"].as_u64())
             .sum();
         let unacked = queues
             .iter()
+            .filter(|queue| {
+                queue["name"]
+                    .as_str()
+                    .is_some_and(|name| name == "vigilo.worker" || name.ends_with(".worker"))
+            })
             .filter_map(|queue| queue["messages_unacknowledged"].as_u64())
             .sum();
         Ok((ready, unacked))
@@ -637,6 +725,69 @@ impl ServiceHarness {
         ))?;
         self.databases.remove(name);
         Ok(())
+    }
+}
+
+/// Captures normalized statement, planning, buffer, and WAL evidence after timing.
+fn query_diagnostics(client: &mut PgClient) -> Result<Vec<QueryDiagnostic>> {
+    client
+        .query(
+            r#"
+            SELECT
+                query,
+                calls::bigint,
+                plans::bigint,
+                rows::bigint,
+                total_plan_time::double precision,
+                total_exec_time::double precision,
+                shared_blks_hit::bigint,
+                shared_blks_read::bigint,
+                (temp_blks_read + temp_blks_written)::bigint,
+                wal_records::bigint,
+                wal_fpi::bigint,
+                wal_bytes::numeric::text
+            FROM pg_stat_statements
+            WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+              AND query NOT LIKE '%pg_stat_statements%'
+            ORDER BY total_exec_time DESC
+            LIMIT 25
+            "#,
+            &[],
+        )?
+        .into_iter()
+        .map(|row| {
+            let query: String = row.get(0);
+            let wal_bytes = row
+                .get::<_, String>(11)
+                .split_once('.')
+                .map_or_else(|| row.get::<_, String>(11), |(whole, _)| whole.into())
+                .parse::<u64>()?;
+            Ok(QueryDiagnostic {
+                query_digest: blake3::hash(query.as_bytes()).to_hex().to_string(),
+                query: bounded_text(&query, 512),
+                calls: nonnegative_u64(row.get(1))?,
+                plans: nonnegative_u64(row.get(2))?,
+                rows: nonnegative_u64(row.get(3))?,
+                total_plan_time_ms: row.get(4),
+                total_exec_time_ms: row.get(5),
+                shared_blocks_hit: nonnegative_u64(row.get(6))?,
+                shared_blocks_read: nonnegative_u64(row.get(7))?,
+                temporary_blocks: nonnegative_u64(row.get(8))?,
+                wal_records: nonnegative_u64(row.get(9))?,
+                wal_full_page_images: nonnegative_u64(row.get(10))?,
+                wal_bytes,
+            })
+        })
+        .collect()
+}
+
+fn bounded_text(value: &str, max_chars: usize) -> String {
+    let mut characters = value.chars();
+    let bounded = characters.by_ref().take(max_chars).collect::<String>();
+    if characters.next().is_some() {
+        format!("{bounded}...")
+    } else {
+        bounded
     }
 }
 
@@ -810,8 +961,15 @@ struct AgentSnapshot {
 struct DeterministicAgent {
     url: String,
     counters: Arc<AgentCounters>,
+    behavior: Arc<RwLock<AgentBehavior>>,
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct AgentBehavior {
+    body: Vec<u8>,
+    delay: Duration,
 }
 
 impl DeterministicAgent {
@@ -826,15 +984,22 @@ impl DeterministicAgent {
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_counters = counters.clone();
         let thread_shutdown = shutdown.clone();
-        let body = agent_body(response_text, payload_bytes);
+        let behavior = Arc::new(RwLock::new(AgentBehavior {
+            body: agent_body(response_text, payload_bytes),
+            delay: Duration::ZERO,
+        }));
+        let thread_behavior = behavior.clone();
         let thread = thread::spawn(move || {
             while !thread_shutdown.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let counters = thread_counters.clone();
-                        let body = body.clone();
+                        let behavior = thread_behavior.clone();
                         thread::spawn(move || {
-                            let _ = handle_agent(stream, &body, &counters);
+                            let behavior = behavior.read().map(|behavior| behavior.clone());
+                            if let Ok(behavior) = behavior {
+                                let _ = handle_agent(stream, &behavior, &counters);
+                            }
                         });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -847,6 +1012,7 @@ impl DeterministicAgent {
         Ok(Self {
             url,
             counters,
+            behavior,
             shutdown,
             thread: Some(thread),
         })
@@ -854,6 +1020,22 @@ impl DeterministicAgent {
 
     fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Reconfigures the fixture only when no request can observe a partial change.
+    fn configure(&self, response_text: &str, payload_bytes: usize, delay: Duration) -> Result<()> {
+        if self.counters.active.load(Ordering::Acquire) != 0 {
+            bail!("cannot configure HTTP agent while a request is active");
+        }
+        let mut behavior = self
+            .behavior
+            .write()
+            .map_err(|_| anyhow::anyhow!("HTTP agent behavior lock was poisoned"))?;
+        *behavior = AgentBehavior {
+            body: agent_body(response_text, payload_bytes),
+            delay,
+        };
+        Ok(())
     }
 
     /// Clears counters at a measurement boundary when no request is active.
@@ -889,7 +1071,7 @@ impl Drop for DeterministicAgent {
 /// Serves one complete HTTP request and accounts for request and response bytes.
 fn handle_agent(
     mut stream: TcpStream,
-    response_body: &[u8],
+    behavior: &AgentBehavior,
     counters: &AgentCounters,
 ) -> Result<()> {
     let active = counters.active.fetch_add(1, Ordering::AcqRel) + 1;
@@ -916,15 +1098,16 @@ fn handle_agent(
         }
         counters.requests.fetch_add(1, Ordering::AcqRel);
         counters.bytes.fetch_add(
-            (request.len() + response_body.len()) as u64,
+            (request.len() + behavior.body.len()) as u64,
             Ordering::AcqRel,
         );
+        thread::sleep(behavior.delay);
         write!(
             stream,
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            response_body.len()
+            behavior.body.len()
         )?;
-        stream.write_all(response_body)?;
+        stream.write_all(&behavior.body)?;
         Ok(())
     })();
     counters.active.fetch_sub(1, Ordering::AcqRel);
@@ -1302,6 +1485,9 @@ mod tests {
     #[test]
     fn deterministic_agent_serves_requests_and_resets_counters() {
         let agent = DeterministicAgent::start("run-1", "good", 256).unwrap();
+        agent
+            .configure("changed", 512, Duration::from_millis(1))
+            .unwrap();
         let url = Url::parse(agent.url()).unwrap();
         let mut stream =
             TcpStream::connect((url.host_str().unwrap(), url.port().unwrap())).unwrap();
@@ -1314,11 +1500,11 @@ mod tests {
         let mut response = Vec::new();
         stream.read_to_end(&mut response).unwrap();
         assert!(find_bytes(&response, b"HTTP/1.1 200 OK").is_some());
-        assert!(find_bytes(&response, b"\"text\":\"good\"").is_some());
+        assert!(find_bytes(&response, b"\"text\":\"changed\"").is_some());
 
         let snapshot = agent.snapshot();
         assert_eq!(snapshot.requests, 1);
-        assert!(snapshot.bytes >= 258);
+        assert!(snapshot.bytes >= 514);
         assert_eq!(snapshot.peak_concurrency, 1);
         agent.reset().unwrap();
         assert_eq!(agent.snapshot().requests, 0);
@@ -1343,6 +1529,9 @@ mod tests {
         );
         assert_eq!(parse_content_length(b"content-length: nope"), None);
         assert_eq!(find_bytes(b"abcabc", b"bca"), Some(1));
+        assert_eq!(bounded_text("abc", 3), "abc");
+        assert_eq!(bounded_text("abcd", 3), "abc...");
+        assert_eq!(bounded_text("aé日", 2), "aé...");
         assert_eq!(parse_size("1KB"), Some(1_000));
         assert_eq!(parse_size("1KiB"), Some(1_024));
         assert_eq!(parse_size("2MB"), Some(2_000_000));

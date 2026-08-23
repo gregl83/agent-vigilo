@@ -1,0 +1,57 @@
+schema_id = "profile/v1"
+id = "component-smoke-v1"
+description = "Targetable exact-oracle smoke checks for component workload drivers."
+requires_workload_selection = true
+campaign_cap_secs = 3600
+schedule_seed = 294231745
+max_artifact_bytes = 536870912
+max_stdout_bytes = 262144
+max_stderr_bytes = 262144
+
+[[workloads]]
+id = "run.create-scaling.v1"
+tuple = "cases-1"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.dispatch-scaling.v1"
+tuple = "chunks-1"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "agent.http-scaling.v1"
+tuple = "cases-1-payload-1024-delay-0"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "evaluator.wasm-scaling.v1"
+tuple = "evaluators-1"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "worker.persistence-scaling.v1"
+tuple = "cases-1"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.outbox-scaling.v1"
+tuple = "events-2-batch-1-parallel-1"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.recovery.v1"
+tuple = "leases-1"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.finalization.v1"
+tuple = "runs-1"
+blocks = 2
+timing = "informative"
