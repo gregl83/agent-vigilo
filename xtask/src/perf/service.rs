@@ -128,6 +128,9 @@ pub fn integration_self_test(root: &Path) -> Result<()> {
     {
         bail!("sample collector reset retained the prior sentinel");
     }
+    harness.restart_rabbitmq()?;
+    harness.wait_for_queue_counts(&scope, 0, 0, Duration::from_secs(30))?;
+    harness.wait_for_worker_deliveries(&scope, 0, Duration::from_secs(30))?;
     harness.release_scope(scope)?;
     harness.stop()?;
     if !labelled_volumes(root, &run_id)?.is_empty() {
@@ -352,6 +355,46 @@ impl ServiceHarness {
         delay: Duration,
     ) -> Result<()> {
         self.agent.configure(response_text, payload_bytes, delay)
+    }
+
+    /// Restarts the run-owned RabbitMQ application and waits for management readiness.
+    ///
+    /// The container and its ephemeral host ports remain stable while the real
+    /// broker application closes client connections and reopens from its durable
+    /// volume. This lets resident clients exercise reconnect behavior without
+    /// redirecting them to a newly allocated port.
+    pub fn restart_rabbitmq(&self) -> Result<()> {
+        let container = self
+            .manifest
+            .containers
+            .iter()
+            .find(|container| container.name.ends_with("-rabbitmq-1"))
+            .context("service manifest omitted its RabbitMQ container")?;
+        verify_container_labels(&self.root, &self.run_id, std::slice::from_ref(container))?;
+        command_output(
+            &self.root,
+            "docker",
+            &["exec", &container.id, "rabbitmqctl", "stop_app"],
+        )
+        .context("stop RabbitMQ application")?;
+        command_output(
+            &self.root,
+            "docker",
+            &["exec", &container.id, "rabbitmqctl", "start_app"],
+        )
+        .context("start RabbitMQ application")?;
+        wait_for_rabbit_management(&self.http, &self.rabbit_management_url)
+            .context("wait for RabbitMQ after restart")?;
+        let containers = compose_resources(
+            &self.root,
+            &compose_args(&self.compose_file, &self.environment_file, &self.project),
+            "container",
+        )?;
+        verify_container_labels(&self.root, &self.run_id, &containers)?;
+        if containers != self.manifest.containers {
+            bail!("RabbitMQ restart changed the run-owned container inventory");
+        }
+        Ok(())
     }
 
     /// Creates an empty database owned by this campaign.
@@ -600,6 +643,59 @@ impl ServiceHarness {
         Ok(observed)
     }
 
+    /// Waits within an explicit recovery bound for one exact queue state.
+    pub fn wait_for_queue_counts(
+        &self,
+        scope: &SampleScope,
+        expected_ready: u64,
+        expected_unacked: u64,
+        timeout: Duration,
+    ) -> Result<(u64, u64)> {
+        self.require_scope(scope)?;
+        let mut observed = (0, 0);
+        retry_until_success(
+            "RabbitMQ recovery queue settlement",
+            timeout,
+            RABBIT_MANAGEMENT_RETRY_DELAY,
+            || {
+                observed = self.queue_counts(&scope.vhost)?;
+                if observed != (expected_ready, expected_unacked) {
+                    bail!(
+                        "RabbitMQ counts are ready={}, unacked={}; expected {expected_ready}, {expected_unacked}",
+                        observed.0,
+                        observed.1
+                    );
+                }
+                Ok(())
+            },
+        )?;
+        Ok(observed)
+    }
+
+    /// Waits for the run-owned worker queue to expose one exact delivery total.
+    pub fn wait_for_worker_deliveries(
+        &self,
+        scope: &SampleScope,
+        expected: u64,
+        timeout: Duration,
+    ) -> Result<u64> {
+        self.require_scope(scope)?;
+        let mut observed = 0;
+        retry_until_success(
+            "RabbitMQ worker delivery count",
+            timeout,
+            RABBIT_MANAGEMENT_RETRY_DELAY,
+            || {
+                observed = self.worker_delivery_count(&scope.vhost)?;
+                if observed != expected {
+                    bail!("RabbitMQ worker deliveries are {observed}; expected {expected}");
+                }
+                Ok(())
+            },
+        )?;
+        Ok(observed)
+    }
+
     /// Removes one sample's database and RabbitMQ vhost after artifacts are captured.
     pub fn release_scope(&mut self, scope: SampleScope) -> Result<()> {
         self.require_scope(&scope)?;
@@ -634,11 +730,16 @@ impl ServiceHarness {
         if self.stopped {
             return Ok(());
         }
+        let mut cleanup_failures = Vec::new();
         for vhost in self.vhosts.clone() {
-            self.delete_vhost(&vhost)?;
+            if let Err(error) = self.delete_vhost(&vhost) {
+                cleanup_failures.push(format!("delete vhost {vhost}: {error:#}"));
+            }
         }
         for database in self.databases.clone() {
-            self.drop_database(&database)?;
+            if let Err(error) = self.drop_database(&database) {
+                cleanup_failures.push(format!("drop database {database}: {error:#}"));
+            }
         }
         let compose_args = compose_args(&self.compose_file, &self.environment_file, &self.project);
         let live_containers = compose_resources(&self.root, &compose_args, "container")?;
@@ -657,7 +758,14 @@ impl ServiceHarness {
         command_output_owned(&self.root, "docker", &down_args)?;
         atomic_text(&self.run_dir.join("services.stopped"), &self.run_id)?;
         self.stopped = true;
-        Ok(())
+        if cleanup_failures.is_empty() {
+            Ok(())
+        } else {
+            bail!(
+                "topology was removed after scoped cleanup failures: {}",
+                cleanup_failures.join("; ")
+            )
+        }
     }
 
     /// Fences database operations to names derived from this campaign marker.
@@ -726,25 +834,25 @@ impl ServiceHarness {
             bail!("RabbitMQ queue collector failed with {}", response.status());
         }
         let queues: Vec<Value> = response.json()?;
-        let ready = queues
-            .iter()
-            .filter(|queue| {
-                queue["name"]
-                    .as_str()
-                    .is_some_and(|name| name == "vigilo.worker" || name.ends_with(".worker"))
-            })
-            .filter_map(|queue| queue["messages_ready"].as_u64())
-            .sum();
-        let unacked = queues
-            .iter()
-            .filter(|queue| {
-                queue["name"]
-                    .as_str()
-                    .is_some_and(|name| name == "vigilo.worker" || name.ends_with(".worker"))
-            })
-            .filter_map(|queue| queue["messages_unacknowledged"].as_u64())
-            .sum();
+        let (ready, unacked, _) = worker_queue_metrics(&queues);
         Ok((ready, unacked))
+    }
+
+    fn worker_delivery_count(&self, vhost: &str) -> Result<u64> {
+        self.require_owned_vhost(vhost)?;
+        let response = self
+            .http
+            .get(format!("{}/api/queues/{vhost}", self.rabbit_management_url))
+            .basic_auth(RABBIT_USER, Some(RABBIT_PASSWORD))
+            .send()?;
+        if !response.status().is_success() {
+            bail!(
+                "RabbitMQ delivery collector failed with {}",
+                response.status()
+            );
+        }
+        let queues: Vec<Value> = response.json()?;
+        Ok(worker_queue_metrics(&queues).2)
     }
 
     fn container_ids(&self) -> Vec<String> {
@@ -791,6 +899,33 @@ impl ServiceHarness {
         self.databases.remove(name);
         Ok(())
     }
+}
+
+fn worker_queue_metrics(queues: &[Value]) -> (u64, u64, u64) {
+    queues
+        .iter()
+        .filter(|queue| {
+            queue["name"]
+                .as_str()
+                .is_some_and(|name| name == "vigilo.worker" || name.ends_with(".worker"))
+        })
+        .fold((0_u64, 0_u64, 0_u64), |totals, queue| {
+            (
+                totals
+                    .0
+                    .saturating_add(queue["messages_ready"].as_u64().unwrap_or_default()),
+                totals.1.saturating_add(
+                    queue["messages_unacknowledged"]
+                        .as_u64()
+                        .unwrap_or_default(),
+                ),
+                totals.2.saturating_add(
+                    queue["message_stats"]["deliver_get"]
+                        .as_u64()
+                        .unwrap_or_default(),
+                ),
+            )
+        })
 }
 
 /// Captures normalized statement, planning, buffer, and WAL evidence after timing.
@@ -1139,6 +1274,9 @@ fn handle_agent(
     behavior: &AgentBehavior,
     counters: &AgentCounters,
 ) -> Result<()> {
+    // Accepted sockets inherit nonblocking mode on Windows even though the
+    // portable handler below performs bounded blocking reads.
+    stream.set_nonblocking(false)?;
     let active = counters.active.fetch_add(1, Ordering::AcqRel) + 1;
     counters.peak.fetch_max(active, Ordering::AcqRel);
     let result = (|| {
@@ -1576,6 +1714,37 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_agent_serves_concurrent_http_clients_without_drops() {
+        let agent = DeterministicAgent::start("run-concurrent", "good", 1024).unwrap();
+        let client = reqwest::blocking::Client::new();
+        let requests = (0..100)
+            .map(|_| {
+                let client = client.clone();
+                let url = agent.url().to_owned();
+                thread::spawn(move || {
+                    let response = client.post(url).json(&json!({ "input": "case" })).send()?;
+                    anyhow::ensure!(response.status().is_success());
+                    response.bytes().map(|_| ()).map_err(Into::into)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let failures = requests
+            .into_iter()
+            .filter_map(|request| request.join().unwrap().err())
+            .map(|error| format!("{error:#}"))
+            .collect::<Vec<_>>();
+        assert!(
+            failures.is_empty(),
+            "served {} requests at peak {}; failures:\n{}",
+            agent.snapshot().requests,
+            agent.snapshot().peak_concurrency,
+            failures.join("\n"),
+        );
+        assert_eq!(agent.snapshot().requests, 100);
+    }
+
+    #[test]
     fn collectors_and_name_helpers_cover_boundary_values() {
         assert_eq!(
             collect_container_stats(Path::new("."), &[])
@@ -1681,6 +1850,35 @@ mod tests {
         assert_eq!(attempts, 1);
         assert!(message.contains("fixture did not succeed within 0 ms"));
         assert!(message.contains("connection reset"));
+    }
+
+    #[test]
+    fn worker_queue_metrics_exclude_unrelated_queues_and_sum_exact_counters() {
+        let queues = vec![
+            json!({
+                "name": "perf.worker",
+                "messages_ready": 2,
+                "messages_unacknowledged": 1,
+                "message_stats": {"deliver_get": 4}
+            }),
+            json!({
+                "name": "vigilo.worker",
+                "messages_ready": 3,
+                "messages_unacknowledged": 0,
+                "message_stats": {"deliver_get": 5}
+            }),
+            json!({
+                "name": "unrelated",
+                "messages_ready": 100,
+                "messages_unacknowledged": 100,
+                "message_stats": {"deliver_get": 100}
+            }),
+        ];
+        assert_eq!(worker_queue_metrics(&queues), (5, 1, 9));
+        assert_eq!(
+            worker_queue_metrics(&[json!({"name": "perf.worker"})]),
+            (0, 0, 0)
+        );
     }
 
     #[test]

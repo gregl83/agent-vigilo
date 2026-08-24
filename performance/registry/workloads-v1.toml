@@ -1,9 +1,9 @@
 # `v1` identifies the registry document shape, not a moving "latest" workload.
-# Keep the greenfield catalog at revision 1 until its initial contract is frozen.
+# This greenfield catalog is on its second reviewed content revision.
 # After release, published workload IDs are immutable semantic contracts: retain
 # an existing `.v1` entry and add `.v2` when its measured meaning changes.
 schema_id = "workload-registry/v1"
-revision = 1
+revision = 2
 
 [constants]
 database_connections_per_target = 5
@@ -127,6 +127,54 @@ required_metrics = ["wall_time", "throughput", "process_cpu", "service_cpu", "pe
 watchdog_ms = 600000
 planning_duration_ms = 60000
 preconditioning = "none"
+
+[[workloads]]
+id = "system.soak.v1"
+owner = "distributed-runtime"
+status = "implemented"
+capability = "system.reliability.v1"
+fixture = "mvp-v1"
+tuples = ["steady-30m"]
+unit = "useful_case_interval"
+oracle = "exact_terminal_work_drained_queue_and_bounded_resources"
+required_metrics = ["wall_time", "throughput", "process_cpu", "service_cpu", "peak_rss", "file_descriptors", "sql", "wal", "http", "queue"]
+watchdog_ms = 2100000
+planning_duration_ms = 1800000
+preconditioning = "none"
+
+[workloads.reliability]
+duration_secs = 1800
+observation_interval_secs = 30
+recovery_deadline_secs = 120
+max_process_rss_bytes = 2147483648
+max_file_descriptor_growth = 64
+min_throughput_retention = 0.75
+max_attempts_per_case = 1.0
+max_deliveries_per_chunk = 1.0
+
+[[workloads]]
+id = "system.recovery.v1"
+owner = "distributed-runtime"
+status = "implemented"
+capability = "system.reliability.v1"
+fixture = "mvp-v1"
+tuples = ["rabbitmq-restart"]
+unit = "recovered_dependency_and_useful_case"
+oracle = "exact_pre_and_post_fault_work_with_bounded_reconnect"
+required_metrics = ["recovery_time", "process_cpu", "service_cpu", "peak_rss", "file_descriptors", "sql", "wal", "http", "queue"]
+watchdog_ms = 360000
+planning_duration_ms = 300000
+preconditioning = "none"
+
+[workloads.reliability]
+duration_secs = 300
+observation_interval_secs = 10
+recovery_deadline_secs = 120
+max_process_rss_bytes = 2147483648
+max_file_descriptor_growth = 64
+min_throughput_retention = 0.50
+max_attempts_per_case = 1.0
+max_deliveries_per_chunk = 1.0
 
 [[workloads]]
 id = "run.create-scaling.v1"

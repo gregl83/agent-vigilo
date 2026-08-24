@@ -192,6 +192,9 @@ pub struct Workload {
     /// Optional cardinality model and exact amplification contract.
     #[serde(default)]
     pub scaling_model: Option<ScalingModel>,
+    /// Optional long-running stability and recovery acceptance contract.
+    #[serde(default)]
+    pub reliability: Option<ReliabilityContract>,
     /// Arguments passed directly to the measured Vigilo binary.
     #[serde(default)]
     pub command: Vec<String>,
@@ -201,6 +204,27 @@ pub struct Workload {
     /// Unknown additive fields retained for forward compatibility.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// Bounded acceptance policy for a soak or controlled-recovery workload.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReliabilityContract {
+    /// Minimum measured duration for a steady-state soak.
+    pub duration_secs: u64,
+    /// Interval between durable progress and process-resource observations.
+    pub observation_interval_secs: u64,
+    /// Maximum time allowed to return to useful work after an injected fault.
+    pub recovery_deadline_secs: u64,
+    /// Absolute process-tree memory ceiling used as a safety bound.
+    pub max_process_rss_bytes: u64,
+    /// Maximum increase in open file descriptors across the measured window.
+    pub max_file_descriptor_growth: u64,
+    /// Minimum end-window/start-window useful-throughput ratio.
+    pub min_throughput_retention: f64,
+    /// Maximum durable attempts divided by completed useful cases.
+    pub max_attempts_per_case: f64,
+    /// Maximum broker deliveries divided by useful chunks.
+    pub max_deliveries_per_chunk: f64,
 }
 
 /// Frozen campaign composition and resource limits.

@@ -16,6 +16,7 @@ use std::{
     process::{
         Child,
         Command,
+        ExitStatus,
         Stdio,
     },
     thread,
@@ -85,6 +86,27 @@ pub struct CapturedOutput {
     pub last_byte_time: Option<Duration>,
 }
 
+/// Point-in-time observations for a harness-owned long-running process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessSnapshot {
+    /// Whether the process had not exited when sampled.
+    pub running: bool,
+    /// Current resident memory when the platform exposes it.
+    pub rss_bytes: Option<u64>,
+    /// Current open file-descriptor count when the platform exposes it.
+    pub file_descriptors: Option<u64>,
+}
+
+/// Harness-owned child process that can be observed and stopped within a bound.
+pub struct RunningProcess {
+    child: Child,
+    group: ProcessGroup,
+    started: Instant,
+    stdout: Option<thread::JoinHandle<io::Result<CapturedOutput>>>,
+    stderr: Option<thread::JoinHandle<io::Result<CapturedOutput>>>,
+    status: Option<ExitStatus>,
+}
+
 impl CapturedOutput {
     /// Decodes the retained stream prefix with lossy UTF-8 replacement.
     pub fn text(&self) -> String {
@@ -94,65 +116,176 @@ impl CapturedOutput {
 
 /// Executes a child under platform process-tree ownership and resource collection.
 pub fn execute(spec: &ProcessSpec<'_>) -> Result<ProcessOutcome> {
-    let mut command = Command::new(spec.program);
-    command
-        .args(spec.args)
-        .envs(spec.env.iter().map(|(key, value)| (key, value)))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(current_dir) = spec.current_dir {
-        command.current_dir(current_dir);
+    RunningProcess::spawn(spec)?.wait(spec.timeout)
+}
+
+impl RunningProcess {
+    /// Starts a process tree while immediately draining its bounded output streams.
+    pub fn spawn(spec: &ProcessSpec<'_>) -> Result<Self> {
+        let mut command = Command::new(spec.program);
+        command
+            .args(spec.args)
+            .envs(spec.env.iter().map(|(key, value)| (key, value)))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(current_dir) = spec.current_dir {
+            command.current_dir(current_dir);
+        }
+        configure_process_group(&mut command);
+
+        let resource_baseline = capture_resource_baseline()?;
+        let started = Instant::now();
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("spawn {}", spec.program.display()))?;
+        let group = ProcessGroup::attach(&mut child, resource_baseline)?;
+        let stdout = drain(
+            child.stdout.take().context("child stdout was not piped")?,
+            spec.stdout_limit,
+            started,
+        );
+        let stderr = drain(
+            child.stderr.take().context("child stderr was not piped")?,
+            spec.stderr_limit,
+            started,
+        );
+
+        Ok(Self {
+            child,
+            group,
+            started,
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            status: None,
+        })
     }
-    configure_process_group(&mut command);
 
-    let resource_baseline = capture_resource_baseline()?;
-    let started = Instant::now();
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("spawn {}", spec.program.display()))?;
-    let mut group = ProcessGroup::attach(&mut child, resource_baseline)?;
-    let stdout = drain(
-        child.stdout.take().context("child stdout was not piped")?,
-        spec.stdout_limit,
-        started,
-    );
-    let stderr = drain(
-        child.stderr.take().context("child stderr was not piped")?,
-        spec.stderr_limit,
-        started,
-    );
+    /// Samples liveness, current RSS, and descriptor count without changing lifecycle.
+    pub fn snapshot(&mut self) -> Result<ProcessSnapshot> {
+        self.observe()?;
+        let resources = self.group.resources();
+        Ok(ProcessSnapshot {
+            running: self.status.is_none(),
+            rss_bytes: resources
+                .peak_rss_bytes
+                .or_else(|| current_rss_bytes(self.child.id())),
+            file_descriptors: open_file_descriptors(self.child.id()),
+        })
+    }
 
-    let (status, timed_out) = loop {
-        group.observe(child.id());
-        if let Some(status) = child.try_wait().context("poll child")? {
-            break (status, false);
+    /// Requests cooperative shutdown, then forcefully reaps the tree after `grace`.
+    pub fn stop(mut self, grace: Duration) -> Result<ProcessOutcome> {
+        self.observe()?;
+        if self.status.is_none() {
+            self.group.request_shutdown(&mut self.child)?;
+            let deadline = Instant::now() + grace;
+            while self.status.is_none() && Instant::now() < deadline {
+                self.observe()?;
+                thread::sleep(Duration::from_millis(10));
+            }
         }
-        if started.elapsed() >= spec.timeout {
-            group.terminate(&mut child)?;
-            let status = child.wait().context("reap timed-out child")?;
-            break (status, true);
+        if self.status.is_none() {
+            self.group.terminate(&mut self.child)?;
+            self.status = Some(self.child.wait().context("reap stopped child")?);
         }
-        thread::sleep(Duration::from_millis(2));
-    };
-    let resources = group.resources();
-    let stdout = stdout
-        .join()
-        .map_err(|_| anyhow::anyhow!("stdout drain thread panicked"))??;
-    let stderr = stderr
-        .join()
-        .map_err(|_| anyhow::anyhow!("stderr drain thread panicked"))??;
+        self.finish(false)
+    }
 
-    Ok(ProcessOutcome {
-        wall_time: started.elapsed(),
-        cpu_time_ns: resources.cpu_time_ns,
-        peak_rss_bytes: resources.peak_rss_bytes,
-        resource_source: resources.source,
-        exit_code: status.code(),
-        timed_out,
-        stdout,
-        stderr,
-    })
+    fn wait(mut self, timeout: Duration) -> Result<ProcessOutcome> {
+        loop {
+            self.observe()?;
+            if self.status.is_some() {
+                return self.finish(false);
+            }
+            if self.started.elapsed() >= timeout {
+                self.group.terminate(&mut self.child)?;
+                self.status = Some(self.child.wait().context("reap timed-out child")?);
+                return self.finish(true);
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn observe(&mut self) -> Result<()> {
+        self.group.observe(self.child.id());
+        if self.status.is_none() {
+            self.status = self.child.try_wait().context("poll child")?;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, timed_out: bool) -> Result<ProcessOutcome> {
+        let status = self.status.context("cannot finish a running child")?;
+        let resources = self.group.resources();
+        let stdout = self
+            .stdout
+            .take()
+            .context("stdout drain was already consumed")?
+            .join()
+            .map_err(|_| anyhow::anyhow!("stdout drain thread panicked"))??;
+        let stderr = self
+            .stderr
+            .take()
+            .context("stderr drain was already consumed")?
+            .join()
+            .map_err(|_| anyhow::anyhow!("stderr drain thread panicked"))??;
+        Ok(ProcessOutcome {
+            wall_time: self.started.elapsed(),
+            cpu_time_ns: resources.cpu_time_ns,
+            peak_rss_bytes: resources.peak_rss_bytes,
+            resource_source: resources.source,
+            exit_code: status.code(),
+            timed_out,
+            stdout,
+            stderr,
+        })
+    }
+}
+
+impl Drop for RunningProcess {
+    fn drop(&mut self) {
+        if self.status.is_none() {
+            let _ = self.group.terminate(&mut self.child);
+            let _ = self.child.wait();
+        }
+        if let Some(stdout) = self.stdout.take() {
+            let _ = stdout.join();
+        }
+        if let Some(stderr) = self.stderr.take() {
+            let _ = stderr.join();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_rss_bytes(process_id: u32) -> Option<u64> {
+    std::fs::read_to_string(format!("/proc/{process_id}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("VmRSS:")
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|kib| kib.saturating_mul(1024))
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_rss_bytes(_process_id: u32) -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn open_file_descriptors(process_id: u32) -> Option<u64> {
+    std::fs::read_dir(format!("/proc/{process_id}/fd"))
+        .ok()
+        .and_then(|entries| u64::try_from(entries.count()).ok())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_file_descriptors(_process_id: u32) -> Option<u64> {
+    None
 }
 
 /// Drains one output stream without blocking the child and retains at most `limit` bytes.
@@ -276,6 +409,14 @@ impl ProcessGroup {
         Ok(())
     }
 
+    fn request_shutdown(&self, child: &mut Child) -> Result<()> {
+        let result = unsafe { libc::kill(-self.process_group_id, libc::SIGTERM) };
+        if result != 0 && child.try_wait()?.is_none() {
+            bail!("signal child process group: {}", io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn resources(&self) -> Resources {
         let mut usage_after = std::mem::MaybeUninit::uninit();
         let usage_after =
@@ -374,6 +515,10 @@ impl ProcessGroup {
         Ok(())
     }
 
+    fn request_shutdown(&self, child: &mut Child) -> Result<()> {
+        self.terminate(child)
+    }
+
     fn resources(&self) -> Resources {
         use std::{
             ffi::c_void,
@@ -443,6 +588,10 @@ impl ProcessGroup {
 
     fn terminate(&self, child: &mut Child) -> Result<()> {
         child.kill().context("kill timed-out child")
+    }
+
+    fn request_shutdown(&self, child: &mut Child) -> Result<()> {
+        self.terminate(child)
     }
 
     fn resources(&self) -> Resources {
@@ -534,6 +683,25 @@ mod tests {
         })
         .unwrap();
         assert!(outcome.timed_out);
+        assert!(outcome.wall_time < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn long_running_process_can_be_sampled_and_stopped() {
+        let (program, args) = fixture_command();
+        let mut process = RunningProcess::spawn(&ProcessSpec {
+            program: &program,
+            args: &args,
+            current_dir: None,
+            env: &[("VIGILO_PERF_TEST_DELAY_MS".into(), "10000".into())],
+            timeout: Duration::from_secs(30),
+            stdout_limit: 64,
+            stderr_limit: 64,
+        })
+        .unwrap();
+        assert!(process.snapshot().unwrap().running);
+        let outcome = process.stop(Duration::from_millis(50)).unwrap();
+        assert!(!outcome.timed_out);
         assert!(outcome.wall_time < Duration::from_secs(2));
     }
 }

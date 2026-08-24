@@ -118,6 +118,33 @@ pub fn validate_registry(registry: &WorkloadRegistry) -> Result<()> {
         if workload.scaling_model.is_some() {
             validate_scaling_model(workload)?;
         }
+        if let Some(contract) = &workload.reliability {
+            validate_reliability_contract(workload, contract)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_reliability_contract(
+    workload: &Workload,
+    contract: &super::model::ReliabilityContract,
+) -> Result<()> {
+    if contract.duration_secs == 0
+        || contract.observation_interval_secs == 0
+        || contract.observation_interval_secs > contract.duration_secs
+        || contract.recovery_deadline_secs == 0
+        || contract.max_process_rss_bytes == 0
+        || !(contract.min_throughput_retention.is_finite()
+            && contract.min_throughput_retention > 0.0
+            && contract.min_throughput_retention <= 1.0)
+        || !(contract.max_attempts_per_case.is_finite() && contract.max_attempts_per_case >= 1.0)
+        || !(contract.max_deliveries_per_chunk.is_finite()
+            && contract.max_deliveries_per_chunk >= 1.0)
+    {
+        bail!(
+            "workload {} has an invalid reliability contract",
+            workload.id
+        );
     }
     Ok(())
 }
@@ -231,7 +258,8 @@ pub fn validate_profile(profile: &Profile) -> Result<()> {
         bail!("profile {} has an empty extension key", profile.id);
     }
     for workload in &profile.workloads {
-        if workload.blocks == 0 || workload.blocks % 2 != 0 {
+        let reliability = matches!(workload.timing.as_str(), "soak" | "recovery");
+        if workload.blocks == 0 || (!reliability && workload.blocks % 2 != 0) {
             bail!(
                 "profile {} workload {} must declare a positive even block count",
                 profile.id,
@@ -240,7 +268,7 @@ pub fn validate_profile(profile: &Profile) -> Result<()> {
         }
         if !matches!(
             workload.timing.as_str(),
-            "informative" | "calibration" | "capacity" | "gating"
+            "informative" | "calibration" | "capacity" | "gating" | "soak" | "recovery"
         ) {
             bail!("unsupported timing policy: {}", workload.timing);
         }
@@ -255,6 +283,22 @@ pub fn validate_profile(profile: &Profile) -> Result<()> {
     }
     if gating == 0 && profile.budget_reference.is_some() {
         bail!("only gating profiles may reference a budget policy");
+    }
+    let reliability = profile
+        .workloads
+        .iter()
+        .filter(|workload| matches!(workload.timing.as_str(), "soak" | "recovery"))
+        .count();
+    if reliability > 0
+        && (reliability != profile.workloads.len()
+            || profile
+                .workloads
+                .iter()
+                .any(|workload| workload.blocks != 1))
+    {
+        bail!(
+            "reliability profiles require exactly one observation per workload and cannot mix timing modes"
+        );
     }
     if let Some(reference) = profile.budget_reference.as_deref() {
         validate_file_id(reference, "budget")?;
@@ -393,8 +437,12 @@ pub fn estimated_single_millis(selected: &[SelectedWorkload<'_>]) -> u64 {
     selected
         .iter()
         .map(|selected| {
-            let measured =
-                u64::from(selected.profile.blocks) * 2 * selected.workload.planning_duration_ms;
+            let executions = if is_reliability_timing(&selected.profile.timing) {
+                1
+            } else {
+                u64::from(selected.profile.blocks) * 2
+            };
+            let measured = executions * selected.workload.planning_duration_ms;
             let precondition = if selected.workload.preconditioning
                 == super::model::Preconditioning::OnePerBinary
             {
@@ -405,6 +453,11 @@ pub fn estimated_single_millis(selected: &[SelectedWorkload<'_>]) -> u64 {
             measured + precondition
         })
         .sum()
+}
+
+/// Returns whether a timing policy represents one bounded reliability observation.
+pub fn is_reliability_timing(timing: &str) -> bool {
+    matches!(timing, "soak" | "recovery")
 }
 
 #[cfg(test)]
@@ -458,6 +511,12 @@ timing = "informative"
             select_workloads(&capacity, &registry, &[]).unwrap().len(),
             10
         );
+
+        let soak = load_profile(&root, "soak-v1").unwrap();
+        let selected = select_workloads(&soak, &registry, &[]).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(estimated_single_millis(&selected), 1_800_000);
+        assert!(is_reliability_timing(&selected[0].profile.timing));
     }
 
     #[test]
@@ -497,6 +556,22 @@ timing = "informative"
         let mut invalid = profile;
         invalid.workloads[0].tuple = "unknown".into();
         assert!(validate_profile_registry(&invalid, &registry).is_err());
+
+        let mut invalid = load_profile(&root, "soak-v1").unwrap();
+        invalid.workloads[0].blocks = 2;
+        assert!(validate_profile(&invalid).is_err());
+
+        let mut invalid = registry.clone();
+        invalid
+            .workloads
+            .iter_mut()
+            .find(|workload| workload.id == "system.soak.v1")
+            .unwrap()
+            .reliability
+            .as_mut()
+            .unwrap()
+            .duration_secs = 0;
+        assert!(validate_registry(&invalid).is_err());
     }
 
     #[test]

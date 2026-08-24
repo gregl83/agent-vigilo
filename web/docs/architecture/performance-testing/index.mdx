@@ -109,6 +109,24 @@ requiring maximum scale. The current coordinator broker publish/confirm path is
 declared unbounded, so the checked-in planning example remains invalid until a
 separately tested production deadline and settlement contract exists.
 
+## Stability And Recovery
+
+Long-running reliability evidence is separate from fixed-load comparisons.
+The bounded soak holds one production coordinator and worker process open for
+at least 30 minutes while small runs make useful progress at fixed observation
+intervals. It gates exact terminal work, queue drain, process liveness, absolute
+RSS, file-descriptor growth, retry/delivery amplification, and end-window
+throughput retention. These safety limits do not become calibrated performance
+budgets without repeated canonical evidence.
+
+Controlled recovery uses the same isolated topology. It completes work before
+a real run-owned RabbitMQ application restart, retains the resident processes,
+then requires new useful work and a drained backlog within the registered
+deadline. The machine artifact records the fault, recovery time, interval
+observations, exact durable totals, and every failed condition. A deterministic
+pure verdict fixture proves that leaks, stalls, lost work, early exits, and
+missed recovery are not accepted when services are unavailable to unit tests.
+
 ## Verdict Flow
 
 A gating comparison loads one exact budget for each workload tuple. Results from
@@ -117,9 +135,45 @@ invalid correctness oracle are non-green. A confidence interval within budget
 passes. The first interval wholly beyond budget is inconclusive and requires one
 fixed independent confirmation; only the second matching result is a regression.
 
+## First Use
+
+Run `cargo perf check`, create one immutable release snapshot, and begin with
+the service-free `developer-v1` startup workload. When that passes, run `pr-v1`
+against the same snapshot with Docker available. This exercises the small real
+PostgreSQL, RabbitMQ, HTTP-agent, Wasm, and lifecycle paths before committing to
+a reference, capacity, recovery, or soak campaign. Exact-oracle failures take
+priority over timing; `pr-v1` timing is informative rather than a regression
+verdict.
+
+## MadSim Boundary
+
+A future MadSim suite should run first with named scenarios, fixed seeds, and
+exact logical outcomes. It can prove deterministic scheduling, retry, timeout,
+and fault behavior, but its virtual durations must never enter performance
+samples, calibration, or budgets. Each simulated scenario should identify the
+narrow real workload contracts it affects. Those workloads are then compared
+as immutable baseline and candidate release binaries on the exclusive canonical
+host using a published gating profile.
+
+An initial over-budget comparison remains inconclusive until the fixed
+independent confirmation also exceeds the budget. Fault and sustained-operation
+changes additionally run the real recovery or soak profile. A valid conclusion
+is that no regression was detected at the published budget and confidence, not
+that simulation proved performance unchanged. The complete command sequence is
+documented in the repository's `performance/README.md`.
+
 Shared hosted CI runs service-free contracts and exact correctness checks, not
-wall-clock gates. Canonical blocking comparisons run serially on the exclusive
-versioned host contract.
+wall-clock gates. Canonical, nightly, and soak jobs are defined for an exclusive
+self-hosted Linux runner but remain inert until repository variables enable the
+runner and then its schedules. Manual runs are enabled separately so the host
+can be validated before recurring work starts. Reports are appended to the job
+summary and retained as bounded artifacts; no performance badge is claimed
+before canonical repeatability exists. Activation requires an Actions runner
+version `2.327.1` or newer for the workflow's Node 24 actions, the documented
+runner labels, and repository variables; it requires no workflow edit.
+The canonical comparison defaults to informative `reference-v1`; after review,
+`VIGILO_PERF_REFERENCE_PROFILE` selects a committed gating profile without a
+workflow change.
 
 ## Related
 

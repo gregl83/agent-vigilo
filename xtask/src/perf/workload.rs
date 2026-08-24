@@ -49,12 +49,23 @@ use super::{
     model::{
         BuildManifest,
         ExternalMeasurements,
+        ReliabilityContract,
     },
     process::{
         CapturedOutput,
         ProcessOutcome,
         ProcessSpec,
+        RunningProcess,
         execute,
+    },
+    reliability::{
+        RELIABILITY_SCHEMA,
+        ReliabilityArtifact,
+        ReliabilityTotals,
+        StabilityObservation,
+        evaluate_recovery,
+        evaluate_soak,
+        require_pass,
     },
     service::{
         DurableCounts,
@@ -101,6 +112,7 @@ pub(super) struct WorkloadRequest<'a> {
     pub(super) manifest_path: &'a Path,
     pub(super) manifest: &'a BuildManifest,
     pub(super) exact: &'a BTreeMap<String, u64>,
+    pub(super) reliability: Option<&'a ReliabilityContract>,
     pub(super) limits: ExecutionLimits,
 }
 
@@ -181,6 +193,7 @@ impl WorkloadRunner {
             prepared.cases,
             prepared.evaluators,
             request.exact,
+            request.reliability,
             &scope,
             &placement_urls,
             &route_env,
@@ -401,6 +414,7 @@ impl WorkloadRunner {
         cases: usize,
         evaluators: usize,
         exact: &BTreeMap<String, u64>,
+        reliability: Option<&ReliabilityContract>,
         scope: &SampleScope,
         placement_urls: &[String],
         route_env: &[(String, String)],
@@ -1041,8 +1055,354 @@ impl WorkloadRunner {
                 }
                 bail!("lifecycle run {run_id} did not complete within its cycle limit");
             }
+            "system.soak.v1" => self.execute_soak(
+                tuple,
+                binary,
+                cases,
+                evaluators,
+                reliability.context("soak workload omitted its reliability contract")?,
+                scope,
+                &env,
+                watchdog,
+                stdout_limit,
+                stderr_limit,
+            ),
+            "system.recovery.v1" => self.execute_recovery(
+                tuple,
+                binary,
+                cases,
+                evaluators,
+                reliability.context("recovery workload omitted its reliability contract")?,
+                scope,
+                &env,
+                watchdog,
+                stdout_limit,
+                stderr_limit,
+            ),
             _ => bail!("unsupported service workload: {workload_id}"),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_soak(
+        &mut self,
+        tuple: &str,
+        binary: &Path,
+        cases: usize,
+        evaluators: usize,
+        contract: &ReliabilityContract,
+        scope: &SampleScope,
+        env: &[(String, String)],
+        watchdog: Duration,
+        stdout_limit: usize,
+        stderr_limit: usize,
+    ) -> Result<WorkloadOutcome> {
+        if tuple != "steady-30m" {
+            bail!("unsupported soak tuple: {tuple}");
+        }
+        let service = self
+            .service
+            .as_ref()
+            .context("service topology was not started")?;
+        service.configure_agent(
+            &self
+                .fixture
+                .as_ref()
+                .context("fixture was not loaded")?
+                .agent_response_text,
+            self.fixture
+                .as_ref()
+                .context("fixture was not loaded")?
+                .agent_payload_bytes,
+            Duration::ZERO,
+        )?;
+        let baseline = service.begin_measurement(scope)?;
+        let started = Instant::now();
+        let mut coordinator = spawn_resident(
+            binary,
+            coordinator_start_args(&scope.database_url, &scope.messaging_url),
+            env,
+            stdout_limit,
+            stderr_limit,
+        )?;
+        let mut worker = spawn_resident(
+            binary,
+            worker_start_args(&scope.database_url, &scope.messaging_url),
+            env,
+            stdout_limit,
+            stderr_limit,
+        )?;
+        let mut outcomes = Vec::new();
+        let mut run_ids = Vec::new();
+        let mut observations = Vec::new();
+        let duration = Duration::from_secs(contract.duration_secs);
+        let interval = Duration::from_secs(contract.observation_interval_secs);
+        let mut next_observation = interval;
+        while started.elapsed() < duration {
+            let inputs = self.inputs(
+                &format!("system.soak.v1:{tuple}:{}", run_ids.len()),
+                cases,
+                evaluators,
+            )?;
+            let create = invoke(
+                binary,
+                create_args(&scope.database_url, &inputs)?,
+                env,
+                watchdog,
+                stdout_limit,
+                stderr_limit,
+            )?;
+            require_success_ref(&create, "soak run creation")?;
+            let run_id = parse_run_id(&create.stdout.text())?;
+            outcomes.push(create);
+            wait_for_completed_run(
+                &scope.database_url,
+                &run_id,
+                &mut coordinator,
+                &mut worker,
+                Duration::from_secs(contract.recovery_deadline_secs),
+            )?;
+            oracle_lifecycle(&scope.database_url, &run_id, cases, evaluators)?;
+            run_ids.push(run_id);
+            sleep_until(started, next_observation.min(duration));
+            observations.push(stability_observation(
+                started.elapsed(),
+                run_ids.len() as u64 * cases as u64,
+                &mut coordinator,
+                &mut worker,
+            )?);
+            next_observation = next_observation.saturating_add(interval);
+        }
+        if observations
+            .last()
+            .is_some_and(|observation| observation.elapsed_secs < contract.duration_secs as f64)
+        {
+            observations.push(stability_observation(
+                started.elapsed(),
+                run_ids.len() as u64 * cases as u64,
+                &mut coordinator,
+                &mut worker,
+            )?);
+        }
+        let coordinator_running = coordinator.snapshot()?.running;
+        let worker_running = worker.snapshot()?.running;
+        let coordinator = stop_resident(coordinator, coordinator_running, "coordinator")?;
+        let worker = stop_resident(worker, worker_running, "worker")?;
+        outcomes.extend([coordinator, worker]);
+        let queue = service.wait_for_queue_counts(
+            scope,
+            0,
+            0,
+            Duration::from_secs(contract.recovery_deadline_secs),
+        )?;
+        let deliveries = service.wait_for_worker_deliveries(
+            scope,
+            run_ids.len() as u64,
+            Duration::from_secs(contract.recovery_deadline_secs),
+        )?;
+        let (counts, totals) =
+            reliability_counts(&scope.database_url, &run_ids, cases, queue, deliveries)?;
+        let failures = evaluate_soak(contract, &observations, &totals);
+        self.write_reliability_artifact(ReliabilityArtifact {
+            schema_id: RELIABILITY_SCHEMA.into(),
+            workload_id: "system.soak.v1".into(),
+            tuple_id: tuple.into(),
+            kind: "soak".into(),
+            observations,
+            totals,
+            recovery_seconds: None,
+            fault_injected: false,
+            passed: failures.is_empty(),
+            failures: failures.clone(),
+        })?;
+        require_pass(&failures)?;
+        finish(
+            service,
+            scope,
+            baseline,
+            aggregate(outcomes, started.elapsed()),
+            counts,
+            ExternalOracle::new(0, run_ids.len() as u64 * cases as u64, &BTreeMap::new()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_recovery(
+        &mut self,
+        tuple: &str,
+        binary: &Path,
+        cases: usize,
+        evaluators: usize,
+        contract: &ReliabilityContract,
+        scope: &SampleScope,
+        env: &[(String, String)],
+        watchdog: Duration,
+        stdout_limit: usize,
+        stderr_limit: usize,
+    ) -> Result<WorkloadOutcome> {
+        if tuple != "rabbitmq-restart" {
+            bail!("unsupported recovery tuple: {tuple}");
+        }
+        let service = self
+            .service
+            .as_ref()
+            .context("service topology was not started")?;
+        let baseline = service.begin_measurement(scope)?;
+        let started = Instant::now();
+        let mut coordinator = spawn_resident(
+            binary,
+            coordinator_start_args(&scope.database_url, &scope.messaging_url),
+            env,
+            stdout_limit,
+            stderr_limit,
+        )?;
+        let mut worker = spawn_resident(
+            binary,
+            worker_start_args(&scope.database_url, &scope.messaging_url),
+            env,
+            stdout_limit,
+            stderr_limit,
+        )?;
+        let mut outcomes = Vec::new();
+        let mut run_ids = Vec::new();
+        let inputs = self.inputs(
+            &format!("system.recovery.v1:{tuple}:before"),
+            cases,
+            evaluators,
+        )?;
+        let create = invoke(
+            binary,
+            create_args(&scope.database_url, &inputs)?,
+            env,
+            watchdog,
+            stdout_limit,
+            stderr_limit,
+        )?;
+        require_success_ref(&create, "pre-fault recovery run creation")?;
+        let run_id = parse_run_id(&create.stdout.text())?;
+        outcomes.push(create);
+        wait_for_completed_run(
+            &scope.database_url,
+            &run_id,
+            &mut coordinator,
+            &mut worker,
+            Duration::from_secs(contract.recovery_deadline_secs),
+        )?;
+        oracle_lifecycle(&scope.database_url, &run_id, cases, evaluators)?;
+        run_ids.push(run_id);
+        let mut observations = vec![stability_observation(
+            started.elapsed(),
+            cases as u64,
+            &mut coordinator,
+            &mut worker,
+        )?];
+        let pre_fault_deliveries = service.wait_for_worker_deliveries(
+            scope,
+            1,
+            Duration::from_secs(contract.recovery_deadline_secs),
+        )?;
+        let fault_started = Instant::now();
+        service.restart_rabbitmq()?;
+        let inputs = self.inputs(
+            &format!("system.recovery.v1:{tuple}:after"),
+            cases,
+            evaluators,
+        )?;
+        let create = invoke(
+            binary,
+            create_args(&scope.database_url, &inputs)?,
+            env,
+            watchdog,
+            stdout_limit,
+            stderr_limit,
+        )?;
+        require_success_ref(&create, "post-fault recovery run creation")?;
+        let run_id = parse_run_id(&create.stdout.text())?;
+        outcomes.push(create);
+        wait_for_completed_run(
+            &scope.database_url,
+            &run_id,
+            &mut coordinator,
+            &mut worker,
+            Duration::from_secs(contract.recovery_deadline_secs),
+        )?;
+        let recovery_seconds = fault_started.elapsed().as_secs_f64();
+        oracle_lifecycle(&scope.database_url, &run_id, cases, evaluators)?;
+        run_ids.push(run_id);
+        observations.push(stability_observation(
+            started.elapsed(),
+            run_ids.len() as u64 * cases as u64,
+            &mut coordinator,
+            &mut worker,
+        )?);
+        let coordinator_running = coordinator.snapshot()?.running;
+        let worker_running = worker.snapshot()?.running;
+        let coordinator = stop_resident(coordinator, coordinator_running, "coordinator")?;
+        let worker = stop_resident(worker, worker_running, "worker")?;
+        outcomes.extend([coordinator, worker]);
+        let queue = service.wait_for_queue_counts(
+            scope,
+            0,
+            0,
+            Duration::from_secs(contract.recovery_deadline_secs),
+        )?;
+        let post_fault_deliveries = service.wait_for_worker_deliveries(
+            scope,
+            1,
+            Duration::from_secs(contract.recovery_deadline_secs),
+        )?;
+        let (counts, totals) = reliability_counts(
+            &scope.database_url,
+            &run_ids,
+            cases,
+            queue,
+            pre_fault_deliveries.saturating_add(post_fault_deliveries),
+        )?;
+        let failures = evaluate_recovery(
+            contract,
+            &observations,
+            &totals,
+            true,
+            Some(recovery_seconds),
+        );
+        self.write_reliability_artifact(ReliabilityArtifact {
+            schema_id: RELIABILITY_SCHEMA.into(),
+            workload_id: "system.recovery.v1".into(),
+            tuple_id: tuple.into(),
+            kind: "recovery".into(),
+            observations,
+            totals,
+            recovery_seconds: Some(recovery_seconds),
+            fault_injected: true,
+            passed: failures.is_empty(),
+            failures: failures.clone(),
+        })?;
+        require_pass(&failures)?;
+        finish(
+            service,
+            scope,
+            baseline,
+            aggregate(outcomes, started.elapsed()),
+            counts,
+            ExternalOracle::new(0, run_ids.len() as u64 * cases as u64, &BTreeMap::new()),
+        )
+    }
+
+    fn write_reliability_artifact(&self, artifact: ReliabilityArtifact) -> Result<()> {
+        let directory = self.run_dir.join("reliability");
+        std::fs::create_dir_all(&directory)?;
+        let name = format!("{}-{}", artifact.workload_id, artifact.tuple_id)
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '-' {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        super::artifact::atomic_json(&directory.join(format!("{name}.json")), &artifact)?;
+        super::reliability::rerender(&self.run_dir)
     }
 
     /// Renders deterministic profile and dataset inputs beneath the campaign directory.
@@ -1200,6 +1560,11 @@ fn workload_shape(
             create_run: true,
         },
         "system.lifecycle.v1" => WorkloadShape {
+            cases: fixture.lifecycle.cases,
+            evaluators: 1,
+            create_run: false,
+        },
+        "system.soak.v1" | "system.recovery.v1" => WorkloadShape {
             cases: fixture.lifecycle.cases,
             evaluators: 1,
             create_run: false,
@@ -1804,6 +2169,20 @@ fn coordinator_args(database_url: &str, messaging_url: &str) -> Vec<String> {
     coordinator_args_with_outbox(database_url, messaging_url, 1000, 64)
 }
 
+fn coordinator_start_args(database_url: &str, messaging_url: &str) -> Vec<String> {
+    base_args(
+        database_url,
+        [
+            "coordinator".into(),
+            "--messaging-url".into(),
+            messaging_url.into(),
+            "--tick-seconds".into(),
+            "1".into(),
+            "start".into(),
+        ],
+    )
+}
+
 fn coordinator_args_with_outbox(
     database_url: &str,
     messaging_url: &str,
@@ -1890,6 +2269,137 @@ fn worker_args(database_url: &str, messaging_url: &str) -> Vec<String> {
             "once".into(),
         ],
     )
+}
+
+fn worker_start_args(database_url: &str, messaging_url: &str) -> Vec<String> {
+    base_args(
+        database_url,
+        [
+            "worker".into(),
+            "--messaging-url".into(),
+            messaging_url.into(),
+            "start".into(),
+            "--max-inflight-chunks".into(),
+            "4".into(),
+        ],
+    )
+}
+
+fn spawn_resident(
+    binary: &Path,
+    args: Vec<String>,
+    env: &[(String, String)],
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> Result<RunningProcess> {
+    RunningProcess::spawn(&ProcessSpec {
+        program: binary,
+        args: &args,
+        current_dir: None,
+        env,
+        timeout: Duration::MAX,
+        stdout_limit,
+        stderr_limit,
+    })
+}
+
+fn stop_resident(process: RunningProcess, was_running: bool, name: &str) -> Result<ProcessOutcome> {
+    let mut outcome = process.stop(Duration::from_secs(10))?;
+    if !was_running {
+        bail!("resident {name} exited before harness shutdown");
+    }
+    // A harness-requested signal is expected lifecycle, not a product failure.
+    outcome.exit_code = Some(0);
+    outcome.timed_out = false;
+    Ok(outcome)
+}
+
+fn wait_for_completed_run(
+    database_url: &str,
+    run_id: &str,
+    coordinator: &mut RunningProcess,
+    worker: &mut RunningProcess,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = run_status(database_url, run_id)?;
+        if status == "completed" {
+            return Ok(());
+        }
+        if matches!(status.as_str(), "failed" | "cancelled") {
+            bail!("run {run_id} reached terminal status {status} during reliability workload");
+        }
+        if !coordinator.snapshot()?.running || !worker.snapshot()?.running {
+            bail!("resident process exited before run {run_id} completed");
+        }
+        if Instant::now() >= deadline {
+            bail!("run {run_id} did not complete within the recovery deadline");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn stability_observation(
+    elapsed: Duration,
+    completed_cases: u64,
+    coordinator: &mut RunningProcess,
+    worker: &mut RunningProcess,
+) -> Result<StabilityObservation> {
+    let coordinator = coordinator.snapshot()?;
+    let worker = worker.snapshot()?;
+    Ok(StabilityObservation {
+        elapsed_secs: elapsed.as_secs_f64(),
+        completed_cases,
+        process_rss_bytes: sum_optional(coordinator.rss_bytes, worker.rss_bytes),
+        file_descriptors: sum_optional(coordinator.file_descriptors, worker.file_descriptors),
+        processes_running: coordinator.running && worker.running,
+    })
+}
+
+fn sum_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    left.zip(right)
+        .map(|(left, right)| left.saturating_add(right))
+}
+
+fn sleep_until(started: Instant, target: Duration) {
+    if let Some(remaining) = target.checked_sub(started.elapsed()) {
+        std::thread::sleep(remaining);
+    }
+}
+
+fn reliability_counts(
+    database_url: &str,
+    run_ids: &[String],
+    cases: usize,
+    queue: (u64, u64),
+    deliveries: u64,
+) -> Result<(DurableCounts, ReliabilityTotals)> {
+    let mut aggregate = DurableCounts::new();
+    for run_id in run_ids {
+        for (name, count) in oracle_lifecycle(database_url, run_id, cases, 1)? {
+            *aggregate.entry(name).or_default() += count;
+        }
+    }
+    let nonnegative = |name: &str| -> Result<u64> {
+        u64::try_from(aggregate.get(name).copied().unwrap_or_default())
+            .with_context(|| format!("reliability durable count {name} was negative"))
+    };
+    let attempts = nonnegative("attempts")?;
+    let chunks = nonnegative("chunks")?;
+    let completed_cases = nonnegative("executions")?;
+    let totals = ReliabilityTotals {
+        expected_cases: run_ids.len() as u64 * cases as u64,
+        completed_cases,
+        attempts,
+        chunks,
+        deliveries,
+        queue_ready: queue.0,
+        queue_unacked: queue.1,
+    };
+    aggregate.insert("completed_cases".into(), completed_cases as i64);
+    aggregate.insert("worker_deliveries".into(), deliveries as i64);
+    Ok((aggregate, totals))
 }
 
 /// Runs one bounded Vigilo process without a shell.
@@ -2719,8 +3229,69 @@ fn oracle_worker(
         "SELECT COUNT(*)::bigint FROM run_chunks WHERE run_id = $1::text::uuid AND status = 'completed'",
         run_id,
     )?;
-    validate_worker_oracle(&counts, completed, cases, evaluators)?;
+    if let Err(error) = validate_worker_oracle(&counts, completed, cases, evaluators) {
+        let diagnostics = worker_oracle_diagnostics(&mut client, run_id)?;
+        return Err(error.context(diagnostics));
+    }
     Ok(counts)
+}
+
+/// Summarizes persisted execution evidence after an exact worker oracle fails.
+///
+/// This query runs outside the measured region and keeps failure reports useful
+/// even though the isolated service topology is removed during campaign cleanup.
+fn worker_oracle_diagnostics(client: &mut Client, run_id: &str) -> Result<String> {
+    let row = client.query_one(
+        r#"
+        SELECT
+            COUNT(DISTINCT ea.execution_id)::bigint,
+            COALESCE(SUM(ea.evaluator_result_count), 0)::bigint,
+            COUNT(DISTINCT er.id)::bigint,
+            COUNT(DISTINCT e.id) FILTER (WHERE er.id IS NULL)::bigint,
+            COUNT(DISTINCT e.id) FILTER (WHERE e.status = 'completed')::bigint,
+            COUNT(DISTINCT e.id) FILTER (WHERE e.status = 'failed')::bigint
+        FROM executions e
+        LEFT JOIN execution_aggregates ea
+          ON ea.run_id = e.run_id
+         AND ea.run_shard = e.run_shard
+         AND ea.execution_id = e.id
+         AND ea.attempt_id = e.current_attempt_id
+        LEFT JOIN evaluator_results er
+          ON er.run_id = e.run_id
+         AND er.run_shard = e.run_shard
+         AND er.execution_id = e.id
+         AND er.attempt_id = e.current_attempt_id
+        WHERE e.run_id = $1::text::uuid
+        "#,
+        &[&run_id],
+    )?;
+    let failures = client
+        .query(
+            r#"
+            SELECT last_error_message, COUNT(*)::bigint
+            FROM executions
+            WHERE run_id = $1::text::uuid
+              AND last_error_message IS NOT NULL
+            GROUP BY last_error_message
+            ORDER BY COUNT(*) DESC, last_error_message
+            LIMIT 3
+            "#,
+            &[&run_id],
+        )?
+        .into_iter()
+        .map(|row| format!("{}x {}", row.get::<_, i64>(1), row.get::<_, String>(0)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Ok(format!(
+        "worker oracle diagnostics: aggregates={}, aggregate_result_total={}, result_rows={}, executions_without_results={}, completed_executions={}, failed_executions={}, failures=[{}]",
+        row.get::<_, i64>(0),
+        row.get::<_, i64>(1),
+        row.get::<_, i64>(2),
+        row.get::<_, i64>(3),
+        row.get::<_, i64>(4),
+        row.get::<_, i64>(5),
+        failures,
+    ))
 }
 
 /// Extends the worker oracle with terminal passing-run invariants.

@@ -27,6 +27,7 @@ use super::{
         ReportDocument,
     },
     projection,
+    reliability,
 };
 
 /// CLI arguments for re-rendering an existing report document.
@@ -49,6 +50,7 @@ pub fn execute(args: ReportArgs) -> Result<u8> {
     atomic_text(&args.run_dir.join("summary.md"), &markdown(&report))?;
     print_terminal(&report, &args.run_dir);
     projection::rerender(&args.run_dir)?;
+    reliability::rerender(&args.run_dir)?;
     Ok(EXIT_PASS)
 }
 
@@ -57,6 +59,7 @@ pub fn write(run_dir: &std::path::Path, report: &ReportDocument) -> Result<()> {
     atomic_json(&run_dir.join("report.json"), report)?;
     let markdown = markdown(report);
     atomic_text(&run_dir.join("summary.md"), &markdown)?;
+    reliability::rerender(run_dir)?;
     print_terminal(report, run_dir);
     Ok(())
 }

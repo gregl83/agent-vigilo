@@ -70,6 +70,7 @@ profiles.
 | `command` | Arguments passed directly to the measured Vigilo executable without shell interpretation. Currently used by the startup workload. |
 | `help_signatures` | Required substrings in startup stdout. A missing signature is a fixture/capability mismatch. |
 | `scaling_model` | Optional fixed-plus-slope or explicit stepped model contract for a scalable component. |
+| `reliability` | Optional bounded duration, observation interval, recovery deadline, RSS/descriptor ceilings, throughput retention, and attempt/delivery amplification policy. Required by soak and recovery timing modes. |
 
 ### Scaling Model Fields
 
@@ -137,8 +138,8 @@ entries but do not implement workloads.
 | --- | --- |
 | `id` | Workload ID that must exist in the registry and profile. |
 | `tuple` | One exact fixture shape declared by that registry entry. |
-| `blocks` | Positive even number of blocks. A comparison block contains four executions. |
-| `timing` | `informative` for ordinary measurements, `calibration` for canonical no-change evidence, `capacity` for a single-build staircase, or `gating` for a budgeted fixed-load comparison. Modes cannot be mixed in one campaign. |
+| `blocks` | Positive even number of blocks for sampled timing. Reliability modes require exactly one observation. A comparison block contains four executions. |
+| `timing` | `informative` for ordinary measurements, `calibration` for canonical no-change evidence, `capacity` for a single-build staircase, `gating` for a budgeted fixed-load comparison, or `soak`/`recovery` for one long-running operational observation. Modes cannot be mixed. |
 
 `developer-v1` requires explicit workload selection. Other profiles run their
 complete declared list unless repeated `--workload` options filter it. An
@@ -196,6 +197,8 @@ The harness owns these additive machine-readable contracts:
 | `performance-baseline/v1` | Digested index of calibration, capacity, budget, profile, and build-manifest evidence. |
 | `component-models/v1` | Accepted or rejected component fits, coefficients/steps, residuals, and evidence counts. |
 | `projections/v1` | Resolved deployment input, joint-bootstrap intervals, visible equations, demand/limit table, bottleneck, staging error, and confidence label. |
+| `reliability/v1` | Interval process/progress observations, exact useful work, amplification, injected fault, recovery time, and bounded verdict. |
+| `performance-suppressions/v1` | Metric-specific temporary suppression ownership, issue, reason, and expiry. Empty by default. |
 
 Every persisted document carries its schema ID. Readers reject an unknown
 schema ID and preserve unknown additive fields. Retained version fixtures are

@@ -1,0 +1,173 @@
+name: Performance
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 5 * * *"
+    - cron: "41 6 * * 0"
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Performance suite to run
+        required: true
+        default: canonical
+        type: choice
+        options:
+          - canonical
+          - nightly
+          - recovery
+          - soak
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vigilo-performance-host
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  VIGILO_PERF_ENVIRONMENT_ID: aws-m6i-2xlarge-al2023-v1
+  VIGILO_PERF_CANONICAL_VALIDATED: ${{ vars.VIGILO_PERF_CANONICAL_VALIDATED == 'true' && '1' || '0' }}
+  VIGILO_PERF_REFERENCE_PROFILE: ${{ vars.VIGILO_PERF_REFERENCE_PROFILE || 'reference-v1' }}
+
+jobs:
+  canonical:
+    name: Canonical comparison
+    if: >-
+      vars.VIGILO_PERF_RUNNER_ENABLED == 'true' &&
+      ((github.event_name == 'push' && vars.VIGILO_PERF_SCHEDULES_ENABLED == 'true') ||
+       (github.event_name == 'workflow_dispatch' && inputs.suite == 'canonical'))
+    runs-on: [self-hosted, linux, x64, vigilo-performance]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - name: Create immutable baseline source
+        shell: bash
+        run: git worktree add --detach "$RUNNER_TEMP/vigilo-perf-base-$GITHUB_RUN_ID" HEAD^
+      - name: Build baseline and candidate
+        run: |
+          cargo perf build --source "$RUNNER_TEMP/vigilo-perf-base-$GITHUB_RUN_ID" --output target/perf/builds/base
+          cargo perf build --source . --output target/perf/builds/candidate
+      - name: Run canonical comparison
+        run: >-
+          cargo perf compare
+          --baseline-bin target/perf/builds/base/release/vigilo
+          --baseline-build-manifest target/perf/builds/base/build-manifest.json
+          --candidate-bin target/perf/builds/candidate/release/vigilo
+          --candidate-build-manifest target/perf/builds/candidate/build-manifest.json
+          --profile "$VIGILO_PERF_REFERENCE_PROFILE"
+          --output target/perf/runs/canonical
+      - name: Publish job summary
+        if: always()
+        shell: bash
+        run: test ! -f target/perf/runs/canonical/summary.md || cat target/perf/runs/canonical/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload bounded canonical artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: performance-canonical-${{ github.run_id }}
+          path: target/perf/runs/canonical
+          if-no-files-found: error
+          retention-days: 30
+      - name: Remove baseline worktree
+        if: always()
+        shell: bash
+        run: git worktree remove --force "$RUNNER_TEMP/vigilo-perf-base-$GITHUB_RUN_ID" || true
+
+  nightly:
+    name: Nightly components, recovery, and projection
+    if: >-
+      vars.VIGILO_PERF_RUNNER_ENABLED == 'true' &&
+      ((github.event_name == 'schedule' && vars.VIGILO_PERF_SCHEDULES_ENABLED == 'true' && github.event.schedule == '17 5 * * *') ||
+       (github.event_name == 'workflow_dispatch' &&
+        (inputs.suite == 'nightly' || inputs.suite == 'recovery')))
+    runs-on: [self-hosted, linux, x64, vigilo-performance]
+    timeout-minutes: 420
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - name: Validate contracts
+        run: cargo perf check
+      - name: Build immutable candidate
+        run: cargo perf build --source . --output target/perf/builds/nightly
+      - name: Run controlled recovery
+        if: inputs.suite == 'recovery'
+        run: >-
+          cargo perf run --profile recovery-v1
+          --bin target/perf/builds/nightly/release/vigilo
+          --build-manifest target/perf/builds/nightly/build-manifest.json
+          --output target/perf/runs/recovery
+      - name: Run component and administration profiles
+        if: inputs.suite != 'recovery'
+        run: |
+          cargo perf run --profile component-nightly-v1 --bin target/perf/builds/nightly/release/vigilo --build-manifest target/perf/builds/nightly/build-manifest.json --output target/perf/runs/component-nightly
+          cargo perf run --profile admin-nightly-v1 --bin target/perf/builds/nightly/release/vigilo --build-manifest target/perf/builds/nightly/build-manifest.json --output target/perf/runs/admin-nightly
+          cargo perf run --profile recovery-v1 --bin target/perf/builds/nightly/release/vigilo --build-manifest target/perf/builds/nightly/build-manifest.json --output target/perf/runs/recovery
+      - name: Generate capacity projection
+        if: inputs.suite != 'recovery'
+        run: |
+          cargo perf run --profile capacity-v1 --bin target/perf/builds/nightly/release/vigilo --build-manifest target/perf/builds/nightly/build-manifest.json --output target/perf/runs/capacity
+          cargo perf calibrate capacity --run-dir target/perf/runs/capacity
+          cargo perf project --run target/perf/runs/capacity --deployment performance/deployments/planning-example-v1.toml
+      - name: Publish job summaries
+        if: always()
+        shell: bash
+        run: |
+          for summary in target/perf/runs/*/summary.md target/perf/runs/*/reliability.md target/perf/runs/*/projection.md; do
+            test ! -f "$summary" || cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Upload bounded nightly artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: performance-nightly-${{ github.run_id }}
+          path: target/perf/runs
+          if-no-files-found: error
+          retention-days: 14
+
+  soak:
+    name: Scheduled soak
+    if: >-
+      vars.VIGILO_PERF_RUNNER_ENABLED == 'true' &&
+      ((github.event_name == 'schedule' && vars.VIGILO_PERF_SCHEDULES_ENABLED == 'true' && github.event.schedule == '41 6 * * 0') ||
+       (github.event_name == 'workflow_dispatch' && inputs.suite == 'soak'))
+    runs-on: [self-hosted, linux, x64, vigilo-performance]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - name: Validate contracts
+        run: cargo perf check
+      - name: Build immutable candidate
+        run: cargo perf build --source . --output target/perf/builds/soak
+      - name: Run bounded soak
+        run: >-
+          cargo perf run --profile soak-v1
+          --bin target/perf/builds/soak/release/vigilo
+          --build-manifest target/perf/builds/soak/build-manifest.json
+          --output target/perf/runs/soak
+      - name: Publish job summary
+        if: always()
+        shell: bash
+        run: |
+          test ! -f target/perf/runs/soak/summary.md || cat target/perf/runs/soak/summary.md >> "$GITHUB_STEP_SUMMARY"
+          test ! -f target/perf/runs/soak/reliability.md || cat target/perf/runs/soak/reliability.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload bounded soak artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: performance-soak-${{ github.run_id }}
+          path: target/perf/runs/soak
+          if-no-files-found: error
+          retention-days: 30

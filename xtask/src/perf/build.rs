@@ -34,6 +34,7 @@ use super::{
         copy_tree,
         digest_file,
         digest_tree,
+        digest_tree_without,
         require_artifact_subpath,
         workspace_root,
     },
@@ -47,6 +48,8 @@ use super::{
         execute as execute_process,
     },
 };
+
+const EVALUATOR_METADATA_CACHE: &str = "target/.rustc_info.json";
 
 /// CLI arguments for creating a release build snapshot.
 #[derive(Debug, Args)]
@@ -152,7 +155,7 @@ pub fn execute(args: BuildArgs) -> Result<u8> {
     materialize_standalone_metadata(&evaluator_asset)?;
     let migrations_digest = digest_tree(&migrations_source)?;
     let evaluator_abi_digest = digest_tree(&wit_source)?;
-    let evaluator_fixture_digest = digest_tree(&evaluator_asset)?;
+    let evaluator_fixture_digest = setup_asset_digest("evaluator-fixture", &evaluator_asset)?;
     if migrations_digest != digest_tree(&assets.join("migrations"))?
         || evaluator_abi_digest != digest_tree(&assets.join("wit"))?
     {
@@ -230,6 +233,19 @@ pub fn execute(args: BuildArgs) -> Result<u8> {
     Ok(EXIT_PASS)
 }
 
+/// Digests immutable setup content while excluding Cargo's mutable rustc cache.
+///
+/// Evaluator publication runs `cargo metadata`, which may rewrite
+/// `target/.rustc_info.json` for the current environment. That cache does not
+/// affect the frozen source, lockfile, configuration, or Wasm artifact.
+pub(crate) fn setup_asset_digest(name: &str, path: &Path) -> Result<String> {
+    if name == "evaluator-fixture" {
+        digest_tree_without(path, &[Path::new(EVALUATOR_METADATA_CACHE)])
+    } else {
+        digest_tree(path)
+    }
+}
+
 /// Prevents a copied evaluator beneath the repository target tree from
 /// inheriting the source workspace during later `evaluator publish` commands.
 fn isolate_copied_crate(crate_root: &Path) -> Result<()> {
@@ -273,6 +289,12 @@ fn verify_capabilities(executable: &Path) -> Result<Vec<String>> {
     )?;
     verify_help(executable, &["coordinator", "once", "--help"], &["Usage:"])?;
     verify_help(executable, &["worker", "once", "--help"], &["Usage:"])?;
+    verify_help(executable, &["coordinator", "start", "--help"], &["Usage:"])?;
+    verify_help(
+        executable,
+        &["worker", "start", "--help"],
+        &["max-inflight-chunks"],
+    )?;
     verify_help(
         executable,
         &["run", "export", "--help"],
@@ -294,6 +316,7 @@ fn verify_capabilities(executable: &Path) -> Result<Vec<String>> {
         "coordinator.dispatch.v1".into(),
         "worker.execute-wasm.v1".into(),
         "system.lifecycle.v1".into(),
+        "system.reliability.v1".into(),
         "run.admin.v1".into(),
         "shard.admin.v1".into(),
     ])
@@ -418,9 +441,23 @@ mod tests {
         materialize_standalone_metadata(directory.path()).unwrap();
         assert!(directory.path().join("Cargo.lock").is_file());
         assert!(directory.path().join("target/.rustc_info.json").is_file());
-        let first = digest_tree(directory.path()).unwrap();
+        let first = setup_asset_digest("evaluator-fixture", directory.path()).unwrap();
 
         materialize_standalone_metadata(directory.path()).unwrap();
-        assert_eq!(digest_tree(directory.path()).unwrap(), first);
+        fs::write(
+            directory.path().join(EVALUATOR_METADATA_CACHE),
+            "different rustc cache",
+        )
+        .unwrap();
+        assert_eq!(
+            setup_asset_digest("evaluator-fixture", directory.path()).unwrap(),
+            first
+        );
+
+        fs::write(&wasm, b"changed-wasm").unwrap();
+        assert_ne!(
+            setup_asset_digest("evaluator-fixture", directory.path()).unwrap(),
+            first
+        );
     }
 }

@@ -17,6 +17,8 @@
 //!   reviewed budget/profile candidates and immutable baseline artifacts.
 //! - `projection` combines bounded-capacity evidence with a named deployment
 //!   input to expose resource demand, limit provenance, and confidence.
+//! - `reliability` owns soak/recovery evidence and fail-closed verdicts for
+//!   progress, resources, amplification, and reconnect deadlines.
 //! - `process` owns bounded child execution and platform resource collection.
 //! - `service`, `fixture`, and `workload` provision isolated dependencies,
 //!   render deterministic inputs, execute service-backed workloads, and apply
@@ -41,6 +43,7 @@ mod fixture;
 mod model;
 mod process;
 mod projection;
+mod reliability;
 mod report;
 mod scaling;
 mod schedule;

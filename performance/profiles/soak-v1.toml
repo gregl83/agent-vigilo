@@ -1,0 +1,15 @@
+schema_id = "profile/v1"
+id = "soak-v1"
+description = "Bounded steady-state reliability run with resident production processes."
+requires_workload_selection = false
+campaign_cap_secs = 2400
+schedule_seed = 3691699601
+max_artifact_bytes = 268435456
+max_stdout_bytes = 1048576
+max_stderr_bytes = 1048576
+
+[[workloads]]
+id = "system.soak.v1"
+tuple = "steady-30m"
+blocks = 1
+timing = "soak"

@@ -47,10 +47,12 @@ use super::{
         run_id,
         workspace_root,
     },
+    build::setup_asset_digest,
     config::{
         SelectedWorkload,
         estimated_compare_millis,
         estimated_single_millis,
+        is_reliability_timing,
         load_budget_policy,
         load_profile,
         load_registry,
@@ -274,10 +276,17 @@ fn run_single_at(root: &Path, args: RunArgs) -> Result<u8> {
             );
             let scheduled = schedule::executions(orientation);
             let mut block_samples = Vec::new();
-            for execution in scheduled
+            let executions = scheduled
                 .iter()
                 .filter(|execution| execution.role == BinaryRole::Candidate)
-            {
+                .take(
+                    if is_reliability_timing(&selected_workload.profile.timing) {
+                        1
+                    } else {
+                        usize::MAX
+                    },
+                );
+            for execution in executions {
                 let executed = execute_workload(
                     &mut workload_runner,
                     ExecutionRequest {
@@ -331,7 +340,11 @@ fn run_single_at(root: &Path, args: RunArgs) -> Result<u8> {
                 orientation,
                 complete: valid,
                 valid,
-                sample_count: 2,
+                sample_count: if is_reliability_timing(&selected_workload.profile.timing) {
+                    1
+                } else {
+                    2
+                },
             });
             checkpoint(&run_dir, &samples, &blocks, &readiness)?;
             enforce_artifact_limit(&run_dir, profile.max_artifact_bytes)?;
@@ -360,11 +373,16 @@ fn run_single_at(root: &Path, args: RunArgs) -> Result<u8> {
         run_id: id,
         kind: "run".into(),
         status: status.into(),
-        profile_id: profile.id,
+        profile_id: profile.id.clone(),
         generated_at: Utc::now().to_rfc3339(),
         comparisons: Vec::new(),
         failures,
-        artifact_files: artifact_files(false),
+        artifact_files: artifact_files(
+            false,
+            selected
+                .iter()
+                .any(|selected| is_reliability_timing(&selected.profile.timing)),
+        ),
         extra: no_extra(),
     };
     report::write(&run_dir, &report)?;
@@ -738,7 +756,7 @@ fn compare_at(root: &Path, args: CompareArgs) -> Result<u8> {
         generated_at: Utc::now().to_rfc3339(),
         comparisons,
         failures,
-        artifact_files: artifact_files(true),
+        artifact_files: artifact_files(true, false),
         extra: no_extra(),
     };
     report::write(&run_dir, &report)?;
@@ -776,9 +794,15 @@ fn load_and_verify_manifest(path: &Path, binary: &Path) -> Result<BuildManifest>
         {
             bail!("unsafe setup asset path: {}", asset.relative_path);
         }
-        let actual = digest_tree(&manifest_dir.join(relative))?;
+        let actual = setup_asset_digest(&asset.name, &manifest_dir.join(relative))?;
         if actual != asset.digest {
-            bail!("setup asset digest mismatch: {}", asset.name);
+            // Manifests written before evaluator metadata-cache exclusion used
+            // the full tree digest. Accept them only while that exact legacy
+            // tree remains unchanged; new manifests use the reusable digest.
+            let legacy = digest_tree(&manifest_dir.join(relative))?;
+            if legacy != asset.digest {
+                bail!("setup asset digest mismatch: {}", asset.name);
+            }
         }
     }
     Ok(manifest)
@@ -867,6 +891,17 @@ fn validate_timing_contract(
         "capacity" => {
             if comparison {
                 bail!("capacity calibration must remain separate from A/B comparisons");
+            }
+        }
+        "soak" | "recovery" => {
+            if comparison {
+                bail!("reliability workloads are single-build operational checks");
+            }
+            if selected
+                .iter()
+                .any(|selected| selected.workload.reliability.is_none())
+            {
+                bail!("reliability workload is missing its bounded acceptance contract");
             }
         }
         "gating" => {
@@ -1027,7 +1062,11 @@ fn validate_campaign_budget(
     let process_count: u64 = selected
         .iter()
         .map(|selected| {
-            let measured = u64::from(selected.profile.blocks) * if comparison { 4 } else { 2 };
+            let measured = if !comparison && is_reliability_timing(&selected.profile.timing) {
+                1
+            } else {
+                u64::from(selected.profile.blocks) * if comparison { 4 } else { 2 }
+            };
             let precondition = if selected.workload.preconditioning == Preconditioning::OnePerBinary
             {
                 if comparison { 2 } else { 1 }
@@ -1111,6 +1150,7 @@ fn execute_workload(
             manifest_path: request.build_manifest,
             manifest: request.manifest,
             exact,
+            reliability: request.selected.workload.reliability.as_ref(),
             limits: ExecutionLimits {
                 watchdog: Duration::from_millis(request.selected.workload.watchdog_ms),
                 stdout: request.stdout_limit,
@@ -1326,7 +1366,13 @@ fn campaign_manifest(
 ) -> CampaignManifest {
     let measured = selected
         .iter()
-        .map(|selected| u64::from(selected.profile.blocks) * if comparison { 4 } else { 2 })
+        .map(|selected| {
+            if !comparison && is_reliability_timing(&selected.profile.timing) {
+                1
+            } else {
+                u64::from(selected.profile.blocks) * if comparison { 4 } else { 2 }
+            }
+        })
         .sum();
     let precondition = selected
         .iter()
@@ -1377,7 +1423,11 @@ fn enforce_artifact_limit(run_dir: &Path, limit: u64) -> Result<()> {
 fn print_budget(selected: &[SelectedWorkload<'_>], planned_millis: u64, comparison: bool) {
     println!("Execution budget:");
     for selected in selected {
-        let measured = selected.profile.blocks * if comparison { 4 } else { 2 };
+        let measured = if !comparison && is_reliability_timing(&selected.profile.timing) {
+            1
+        } else {
+            selected.profile.blocks * if comparison { 4 } else { 2 }
+        };
         let discarded = if selected.workload.preconditioning == Preconditioning::OnePerBinary {
             if comparison { 2 } else { 1 }
         } else {
@@ -1411,7 +1461,7 @@ fn artifact_name(left: &str, right: &str) -> String {
         .collect()
 }
 
-fn artifact_files(comparison: bool) -> Vec<String> {
+fn artifact_files(comparison: bool, reliability: bool) -> Vec<String> {
     let mut files = vec![
         "campaign.json".into(),
         "environment.json".into(),
@@ -1423,6 +1473,10 @@ fn artifact_files(comparison: bool) -> Vec<String> {
     ];
     if comparison {
         files.insert(5, "comparisons.jsonl".into());
+    }
+    if reliability {
+        files.push("reliability/".into());
+        files.push("reliability.md".into());
     }
     files
 }
@@ -1632,6 +1686,33 @@ mod tests {
         let mut wrong_schema = valid;
         wrong_schema.schema_id = "build-manifest/v2".into();
         atomic_json(&manifest_path, &wrong_schema).unwrap();
+        assert!(load_and_verify_manifest(&manifest_path, &binary).is_err());
+    }
+
+    #[test]
+    fn evaluator_manifest_ignores_only_the_mutable_rustc_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("vigilo-test");
+        let asset = directory.path().join("evaluator");
+        let manifest_path = directory.path().join("build-manifest.json");
+        fs::write(&binary, "binary").unwrap();
+        fs::create_dir_all(asset.join("target")).unwrap();
+        fs::write(asset.join("fixture.wasm"), "wasm").unwrap();
+        fs::write(asset.join("target/.rustc_info.json"), "first cache").unwrap();
+
+        let mut legacy = manifest(&binary, &asset);
+        legacy.setup_assets[0].name = "evaluator-fixture".into();
+        atomic_json(&manifest_path, &legacy).unwrap();
+        assert!(load_and_verify_manifest(&manifest_path, &binary).is_ok());
+        fs::write(asset.join("target/.rustc_info.json"), "second cache").unwrap();
+        assert!(load_and_verify_manifest(&manifest_path, &binary).is_err());
+
+        legacy.setup_assets[0].digest = setup_asset_digest("evaluator-fixture", &asset).unwrap();
+        atomic_json(&manifest_path, &legacy).unwrap();
+        assert!(load_and_verify_manifest(&manifest_path, &binary).is_ok());
+        fs::write(asset.join("target/.rustc_info.json"), "third cache").unwrap();
+        assert!(load_and_verify_manifest(&manifest_path, &binary).is_ok());
+        fs::write(asset.join("fixture.wasm"), "changed wasm").unwrap();
         assert!(load_and_verify_manifest(&manifest_path, &binary).is_err());
     }
 
@@ -1902,8 +1983,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         checkpoint(directory.path(), &[], &[], &[]).unwrap();
         assert!(directory.path().join("samples.jsonl").is_file());
-        assert_eq!(artifact_files(false).len(), 7);
-        assert_eq!(artifact_files(true).len(), 8);
+        assert_eq!(artifact_files(false, false).len(), 7);
+        assert_eq!(artifact_files(true, false).len(), 8);
+        assert_eq!(artifact_files(false, true).len(), 9);
         assert!(ensure_before_deadline(Instant::now() + Duration::from_secs(1)).is_ok());
         assert!(ensure_before_deadline(Instant::now()).is_err());
         assert!(enforce_artifact_limit(directory.path(), u64::MAX).is_ok());

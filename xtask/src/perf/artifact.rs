@@ -303,11 +303,20 @@ pub fn digest_file(path: &Path) -> Result<String> {
 
 /// Computes a deterministic BLAKE3 digest over a directory tree.
 pub fn digest_tree(path: &Path) -> Result<String> {
+    digest_tree_without(path, &[])
+}
+
+/// Computes a tree digest while omitting exact root-relative generated files.
+///
+/// Callers must keep exclusions narrow: this is intended for non-semantic tool
+/// caches, not source, executable, fixture, or configuration content.
+pub fn digest_tree_without(path: &Path, excluded: &[&Path]) -> Result<String> {
     if !path.exists() {
         return Ok(blake3::hash(b"").to_hex().to_string());
     }
     let mut files = Vec::new();
     collect_files(path, path, &mut files)?;
+    files.retain(|(relative, _)| !excluded.contains(&relative.as_path()));
     files.sort_by(|left, right| left.0.cmp(&right.0));
     let mut hasher = blake3::Hasher::new();
     for (relative, file) in files {

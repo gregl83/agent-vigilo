@@ -17,6 +17,7 @@ use anyhow::{
     bail,
 };
 use clap::Args;
+use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
@@ -41,7 +42,7 @@ use super::{
     schedule,
 };
 
-const PROFILES: [&str; 10] = [
+const PROFILES: [&str; 12] = [
     "developer-v1",
     "pr-v1",
     "reference-v1",
@@ -52,6 +53,8 @@ const PROFILES: [&str; 10] = [
     "component-smoke-v1",
     "admin-nightly-v1",
     "admin-smoke-v1",
+    "recovery-v1",
+    "soak-v1",
 ];
 
 /// CLI arguments for validating the performance harness.
@@ -79,6 +82,9 @@ pub fn execute(args: CheckArgs) -> Result<u8> {
         let profile = load_profile(&root, id)?;
         validate_profile_registry(&profile, &registry)?;
         for workload in &profile.workloads {
+            if super::config::is_reliability_timing(&workload.timing) {
+                continue;
+            }
             schedule::validate(
                 profile
                     .workloads
@@ -98,6 +104,8 @@ pub fn execute(args: CheckArgs) -> Result<u8> {
     validate_no_roadmap_markers(&root)?;
     validate_fixture_tree(&root)?;
     validate_service_configuration(&root)?;
+    validate_ci_contract(&root)?;
+    validate_suppressions(&root)?;
     calibration::validate_repository_contract(&root)?;
     let deployments = projection::validate_repository_contract(&root)?;
     if let Some(base) = args.bootstrap_base.as_deref() {
@@ -117,8 +125,94 @@ pub fn execute(args: CheckArgs) -> Result<u8> {
     println!("  production:  no reverse dependency or package leakage");
     println!("  process:     timeout, truncation, exit, and cleanup self-test passed");
     println!("  services:    Compose and fixture contracts valid; no services provisioned");
+    println!("  CI:          hosted check active; self-hosted jobs explicitly gated");
     println!("  deployments: {deployments} named projection input(s) valid");
     Ok(EXIT_PASS)
+}
+
+fn validate_ci_contract(root: &Path) -> Result<()> {
+    let path = root.join(".github/workflows/performance.yaml");
+    let source = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let _: serde_yaml::Value =
+        serde_yaml::from_str(&source).with_context(|| format!("parse {}", path.display()))?;
+    for required in [
+        "vars.VIGILO_PERF_RUNNER_ENABLED == 'true'",
+        "vars.VIGILO_PERF_SCHEDULES_ENABLED == 'true'",
+        "VIGILO_PERF_REFERENCE_PROFILE",
+        "runs-on: [self-hosted, linux, x64, vigilo-performance]",
+        "workflow_dispatch:",
+        "schedule:",
+        "reference-v1",
+        "component-nightly-v1",
+        "recovery-v1",
+        "soak-v1",
+        "GITHUB_STEP_SUMMARY",
+        "actions/upload-artifact@v6",
+    ] {
+        if !source.contains(required) {
+            bail!("performance workflow omitted required contract: {required}");
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct SuppressionPolicy {
+    schema_id: String,
+    suppressions: Vec<Suppression>,
+}
+
+#[derive(Deserialize)]
+struct Suppression {
+    workload_id: String,
+    tuple_id: String,
+    metric: String,
+    issue: String,
+    owner: String,
+    expires_at: String,
+    reason: String,
+}
+
+fn validate_suppressions(root: &Path) -> Result<()> {
+    let path = root.join("performance/suppressions-v1.toml");
+    let source = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let policy: SuppressionPolicy =
+        toml::from_str(&source).with_context(|| format!("parse {}", path.display()))?;
+    validate_suppression_policy(&policy)
+}
+
+fn validate_suppression_policy(policy: &SuppressionPolicy) -> Result<()> {
+    if policy.schema_id != "performance-suppressions/v1" {
+        bail!(
+            "unsupported performance suppression schema: {}",
+            policy.schema_id
+        );
+    }
+    for suppression in &policy.suppressions {
+        if [
+            &suppression.workload_id,
+            &suppression.tuple_id,
+            &suppression.metric,
+            &suppression.issue,
+            &suppression.owner,
+            &suppression.reason,
+        ]
+        .into_iter()
+        .any(|value| value.trim().is_empty() || value == "*")
+        {
+            bail!("performance suppression must be metric-specific, owned, and issue-linked");
+        }
+        let expires = chrono::DateTime::parse_from_rfc3339(&suppression.expires_at)
+            .context("performance suppression expiry must be RFC 3339")?;
+        if expires <= chrono::Utc::now() {
+            bail!(
+                "performance suppression for {}:{} has expired",
+                suppression.workload_id,
+                suppression.metric
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Validates the canonical host descriptor used to label comparable results.
@@ -640,6 +734,8 @@ mod tests {
         validate_no_roadmap_markers(&root).unwrap();
         validate_fixture_tree(&root).unwrap();
         validate_service_configuration(&root).unwrap();
+        validate_ci_contract(&root).unwrap();
+        validate_suppressions(&root).unwrap();
         calibration::validate_repository_contract(&root).unwrap();
     }
 
@@ -696,5 +792,29 @@ mod tests {
         let mut reordered = registry;
         reordered.workloads.swap(1, 2);
         assert!(validate_profile_implementation_contract(&reordered).is_err());
+    }
+
+    #[test]
+    fn suppression_policy_requires_specific_owned_unexpired_entries() {
+        let mut policy = SuppressionPolicy {
+            schema_id: "performance-suppressions/v1".into(),
+            suppressions: vec![Suppression {
+                workload_id: "system.lifecycle.v1".into(),
+                tuple_id: "workers-1".into(),
+                metric: "wall_time".into(),
+                issue: "https://example.test/issues/1".into(),
+                owner: "distributed-runtime".into(),
+                expires_at: "2999-01-01T00:00:00Z".into(),
+                reason: "temporary hardware investigation".into(),
+            }],
+        };
+        assert!(validate_suppression_policy(&policy).is_ok());
+        policy.suppressions[0].metric = "*".into();
+        assert!(validate_suppression_policy(&policy).is_err());
+        policy.suppressions[0].metric = "wall_time".into();
+        policy.suppressions[0].expires_at = "2020-01-01T00:00:00Z".into();
+        assert!(validate_suppression_policy(&policy).is_err());
+        policy.schema_id = "performance-suppressions/v2".into();
+        assert!(validate_suppression_policy(&policy).is_err());
     }
 }

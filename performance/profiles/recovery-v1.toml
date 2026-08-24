@@ -1,0 +1,15 @@
+schema_id = "profile/v1"
+id = "recovery-v1"
+description = "Controlled RabbitMQ restart with resident production-process recovery."
+requires_workload_selection = false
+campaign_cap_secs = 600
+schedule_seed = 1821285621
+max_artifact_bytes = 268435456
+max_stdout_bytes = 1048576
+max_stderr_bytes = 1048576
+
+[[workloads]]
+id = "system.recovery.v1"
+tuple = "rabbitmq-restart"
+blocks = 1
+timing = "recovery"

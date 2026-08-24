@@ -4,9 +4,10 @@
 package. It is not installed globally and it is not shipped with Vigilo.
 
 The harness includes component scaling models, canonical noise analysis,
-bounded one/two-worker capacity calibration, reviewed budget publication, and
+bounded one/two-worker capacity calibration, reviewed budget publication,
 named deployment capacity projections with limit provenance, and confirmed
-regression gates. Startup remains service-free; run creation,
+regression gates. It also owns resident-process soak and controlled-recovery
+checks. Startup remains service-free; run creation,
 coordinator, HTTP agent, worker/Wasm, persistence, and lifecycle measurements
 use a fresh run-owned PostgreSQL database clone, RabbitMQ vhost/namespace, and
 deterministic HTTP agent for every sample.
@@ -34,6 +35,9 @@ requires them. Their setup remains outside the measured process boundary.
 - `projection` combines raw bounded-capacity evidence with a named workload mix,
   jointly bootstraps worker and dependency demand, and rejects unsupported
   capacity labels.
+- `reliability` evaluates interval progress, process resources, exact terminal
+  work, queue settlement, amplification, and recovery deadlines independently
+  from ordinary timing statistics.
 
 ## Layout And Configuration
 
@@ -47,6 +51,8 @@ requires them. Their setup remains outside the measured process boundary.
 - `performance/fixtures/*.toml` define deterministic logical input shapes.
 - `performance/deployments/*.toml` define named workload mixes, topology,
   amplification assumptions, boundedness, and independently sourced limits.
+- `performance/suppressions-v1.toml` is the only suppression registry. Entries
+  must identify one workload tuple and metric, owner, issue, reason, and expiry.
 - `performance/compose.yml` defines the private PostgreSQL and RabbitMQ
   topology created for one campaign.
 - `xtask` implements `cargo perf`; generated builds and results stay under
@@ -75,6 +81,8 @@ environment, and generated-artifact field reference.
 | `component-nightly-v1` | Broader orthogonal payload, latency, and large-cardinality diagnostics. |
 | `admin-smoke-v1` | Explicitly selected exact-oracle checks for routed administration and large-data drivers. |
 | `admin-nightly-v1` | Scheduled cancellation, read/export, movement, placement, and creation-boundary evidence. |
+| `recovery-v1` | One controlled RabbitMQ restart with resident worker/coordinator reconnect and exact pre/post-fault work. |
+| `soak-v1` | One 30-minute steady resident topology with interval progress and resource bounds. |
 
 `reference-v2` is generated only after a canonical calibration passes review.
 It references a versioned budget policy and contains only tuples whose block
@@ -148,6 +156,39 @@ The schedule seed and logical block index make position order reproducible.
 Select any workload present in the chosen profile. Docker is provisioned
 lazily, so startup-only campaigns do not start services.
 
+### Recommended First Run
+
+Start with a correctness smoke rather than the full reference or soak profile:
+
+1. Run `cargo perf check`. Resolve missing tools or invalid contracts before
+   measuring anything.
+2. Build one immutable snapshot as shown above. Reuse that snapshot for every
+   command in this first run.
+3. Run `developer-v1` with `startup.cli-help.v1`. This proves manifest,
+   subprocess, output-bound, and reporting behavior without Docker.
+4. With Docker Engine and Compose available, run the small production-path
+   profile:
+
+   ```bash
+   cargo perf run --profile pr-v1 \
+     --bin <vigilo-binary> \
+     --build-manifest target/perf/builds/current/build-manifest.json \
+     --output target/perf/runs/first-production-path
+   ```
+
+5. Read `summary.md` and inspect any failed workload's raw sample and exact
+   oracle before looking at timing. Regenerate the view with:
+
+   ```bash
+   cargo perf report --run-dir target/perf/runs/first-production-path
+   ```
+
+An exit `0` from `pr-v1` establishes that the selected release commands and
+service paths completed exact work under the harness. Its timing is
+informative; it does not establish that performance is unchanged. Do not begin
+with `reference-v1`, capacity, recovery, or soak unless the small production-
+path run is already reliable.
+
 Fit the registered component models after a complete component reference run:
 
 ```bash
@@ -211,6 +252,67 @@ capacity evidence, and an existing output directory. It emits digested evidence,
 `reference-v2`, its budget policy, and the frozen build manifest beneath
 `target/perf/baselines/reference-v2`.
 
+## Regression Testing With MadSim
+
+MadSim and `cargo perf` answer different questions and must remain separate.
+MadSim validates deterministic state, scheduling, timeout, retry, and fault
+outcomes under virtual time. It must not write virtual durations into
+`samples.jsonl`, calibration evidence, or regression budgets. `cargo perf`
+measures the real release executable, operating-system processes, PostgreSQL,
+RabbitMQ, HTTP, and Wasmtime on the canonical host.
+
+Before calling a result a performance regression test:
+
+1. Establish canonical repeatability, publish and review a gating profile such
+   as `reference-v2`, and commit its profile and budget policy.
+2. Make the MadSim implementation expose a stable test command, named scenarios,
+   fixed seeds, and exact logical outcomes. A failing or flaky simulation is a
+   correctness failure; do not interpret performance measurements until it is
+   resolved.
+3. Record which real workload contracts correspond to each simulated scenario.
+   Use the narrowest affected set:
+
+| Simulated behavior | Real performance contracts to select |
+| --- | --- |
+| Run creation or dispatch scheduling | `run.create.v1`, `coordinator.dispatch.v1` |
+| Worker execution, retry, or evaluator scheduling | `worker.execute-wasm.v1`, `system.lifecycle.v1` |
+| Broker outage or reconnect | `coordinator.recovery.v1`, `system.recovery.v1` |
+| Routed database or administrative behavior | Matching `admin-smoke-v1` or `admin-nightly-v1` workload IDs |
+
+For a candidate change, use this order:
+
+1. Run the documented MadSim command with the checked-in scenarios and fixed
+   seeds. Require exact state and operation counts, not virtual elapsed time.
+2. On the exclusive canonical host, build immutable baseline and candidate
+   snapshots from the merge base and candidate revisions.
+3. Compare the affected workloads with the published gating profile:
+
+   ```bash
+   cargo perf compare \
+     --profile <published-gating-profile> \
+     --workload <affected-workload-id> \
+     --baseline-bin <baseline-vigilo-binary> \
+     --baseline-build-manifest <baseline-build-manifest.json> \
+     --candidate-bin <candidate-vigilo-binary> \
+     --candidate-build-manifest <candidate-build-manifest.json> \
+     --output target/perf/runs/candidate-comparison
+   ```
+
+4. If the first over-budget interval exits `2`, repeat the identical campaign
+   with an independent schedule using
+   `--confirmation-of target/perf/runs/candidate-comparison`. A matching second
+   interval is the performance regression. Do not rerun arbitrary times or
+   change the budget after seeing the result.
+5. When the MadSim scenario covers outage or sustained operation, also run the
+   real `recovery-v1` or `soak-v1` profile against the candidate. Those profiles
+   enforce operational safety bounds; they are not substitutes for the A/B
+   latency and throughput comparison.
+
+Acceptance requires all applicable layers to pass: MadSim exact outcomes, real
+workload exact oracles, the published A/B regression budget, and relevant
+recovery or soak bounds. Report the conclusion as "no regression detected at
+the published budgets and confidence," not "no performance change."
+
 ## Capacity Projection
 
 After `cargo perf calibrate capacity` creates `capacity.json`, project one named
@@ -255,6 +357,71 @@ cannot receive a supported confidence label. A real staging observation may be
 added as `[staging]`; its projected and observed rate, relative error, and
 acceptance limit are retained in the result. Estimates beyond two workers
 remain directional even when that small staging check passes.
+
+## Reliability Runs
+
+Reliability profiles are single-build operational checks. They execute once and
+never enter `ABBA`/`BAAB` comparison statistics:
+
+```bash
+cargo perf run --profile recovery-v1 \
+  --bin <vigilo-binary> --build-manifest <build-manifest.json>
+cargo perf run --profile soak-v1 \
+  --bin <vigilo-binary> --build-manifest <build-manifest.json>
+```
+
+The soak keeps one real `coordinator start` and one real `worker start` process
+alive, creates small terminal runs at fixed intervals for at least 30 minutes,
+and samples liveness, RSS, and Linux file descriptors. It requires monotonic
+useful progress, retained end-window throughput, exact completed cases and
+attempts, a drained broker scope, bounded delivery amplification, and orderly
+harness-owned shutdown.
+
+The recovery workload completes useful work, restarts the run-owned RabbitMQ
+application without replacing its container, ports, volume, or ownership
+identity, and requires the same resident processes to complete new useful work
+before the configured deadline. Fault injection and recovery time are explicit
+evidence; an early process exit, lost work, stranded delivery, or excess
+amplification fails.
+`reliability/<workload>-<tuple>.json` is the machine contract and
+`reliability.md` is its derived operator view. The absolute resource ceilings
+are safety bounds, not calibrated regression budgets; trend-based leak budgets
+remain subject to canonical repeatability evidence.
+
+## GitHub Actions
+
+The normal `Build` workflow keeps `cargo perf check` and the service ownership
+fixture active on hosted runners. `.github/workflows/performance.yaml` defines
+the real canonical comparison, nightly component/recovery/projection run, and
+weekly soak on an exclusive Linux runner labelled `vigilo-performance`.
+
+The self-hosted jobs are inert in a new repository. After provisioning a Linux
+Actions runner version `2.327.1` or newer with Docker Engine and Compose:
+
+1. Confirm it matches `performance/environments/aws-m6i-2xlarge-al2023-v1.toml`
+   and carries the `self-hosted`, `linux`, `x64`, and `vigilo-performance`
+   labels.
+2. Set repository variable `VIGILO_PERF_RUNNER_ENABLED=true`; this enables only
+   manual `workflow_dispatch` runs.
+3. Run `canonical`, `nightly`, `recovery`, and `soak` manually and review their
+   job summaries and artifacts.
+4. After external host certification, set
+   `VIGILO_PERF_CANONICAL_VALIDATED=true` so evidence may identify as canonical.
+5. Calibrate, review, and commit a generated gating profile and budget policy,
+   then set `VIGILO_PERF_REFERENCE_PROFILE` to that profile ID. Until then it
+   defaults to informative `reference-v1`.
+6. Set `VIGILO_PERF_SCHEDULES_ENABLED=true` to activate main, nightly, and
+   weekly triggers.
+
+The workflow uses Node 24 releases of `actions/checkout` and
+`actions/upload-artifact`; an older runner will not execute them. No workflow
+edit is required during activation.
+
+No performance badge or required status check is installed until canonical
+runs have established repeatability. The jobs serialize through one workflow
+concurrency group, append Markdown results to the Actions summary, and retain
+bounded artifacts for 14 or 30 days. Suppressions cannot disable a job and are
+rejected when blank, wildcarded, unowned, issue-free, or expired.
 
 ## MVP Workloads
 
@@ -331,9 +498,11 @@ Run output is written only below `target/perf/runs`. Each directory contains:
 - `component-models.json` after `cargo perf model`
 - `diagnostics.md` after `cargo perf diagnose`
 - `projections.json` and `projection.md` after `cargo perf project`
+- `reliability/*.json` and `reliability.md` for soak or recovery evidence
 
 Use `cargo perf report --run-dir <run-directory>` to regenerate the terminal and
-Markdown views from `report.json` and, when present, `projections.json`.
+Markdown views from `report.json` and, when present, `projections.json` and
+reliability evidence.
 
 Exit `0` means all required correctness checks passed. Exit `1` means a
 candidate crash, timeout, output overflow, or exact-oracle failure. Exit `2`
