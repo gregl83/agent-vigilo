@@ -15,6 +15,8 @@
 //!   observations without changing gates.
 //! - `calibration` turns canonical no-change and bounded-capacity evidence into
 //!   reviewed budget/profile candidates and immutable baseline artifacts.
+//! - `projection` combines bounded-capacity evidence with a named deployment
+//!   input to expose resource demand, limit provenance, and confidence.
 //! - `process` owns bounded child execution and platform resource collection.
 //! - `service`, `fixture`, and `workload` provision isolated dependencies,
 //!   render deterministic inputs, execute service-backed workloads, and apply
@@ -38,6 +40,7 @@ mod diagnostics;
 mod fixture;
 mod model;
 mod process;
+mod projection;
 mod report;
 mod scaling;
 mod schedule;
@@ -87,6 +90,8 @@ enum PerfCommand {
     Calibrate(calibration::CalibrateArgs),
     /// Fit registered component models from repeated raw samples.
     Model(scaling::ModelArgs),
+    /// Project deployment demand from bounded capacity evidence.
+    Project(projection::ProjectArgs),
     /// Render non-gating PostgreSQL planning, buffer, and WAL diagnostics.
     Diagnose(diagnostics::DiagnoseArgs),
 }
@@ -112,6 +117,7 @@ pub fn run(args: PerfArgs) -> Result<u8> {
         PerfCommand::Report(args) => report::execute(args),
         PerfCommand::Calibrate(args) => calibration::execute(args),
         PerfCommand::Model(args) => scaling::execute(args),
+        PerfCommand::Project(args) => projection::execute(args),
         PerfCommand::Diagnose(args) => diagnostics::execute(args),
     }
 }

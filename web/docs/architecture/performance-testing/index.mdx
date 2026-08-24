@@ -87,6 +87,28 @@ executable remains the sole component measurement authority.
 - Publication requires matching build digests and immutable canonical evidence.
   It generates a versioned budget policy and `reference-v2` candidate.
 
+## Deployment Projection
+
+`cargo perf project` combines one completed bounded-capacity run with a
+versioned input under `performance/deployments`. The input names peak and average
+traffic, run and evaluator mix, payloads, retries, topology, utilization policy,
+and usable dependency limits. Each limit retains its measurement, provider, or
+operator provenance rather than being inferred from a missing value.
+
+The projection jointly resamples all one/two-worker points and resource-demand
+coefficients. Its report shows worker, CPU, memory, PostgreSQL, RabbitMQ, HTTP,
+Wasm, storage, retry, and coordinator demand; formulas and 95% intervals remain
+visible beside the limiting resource. Missing limits produce unknown overall
+capacity. Material nonlinearity, shared dependency saturation, operationally
+unbounded paths, and staging error beyond the declared tolerance prevent a
+supported label.
+
+Worker counts above the measured two-process range are directional scenarios,
+not fleet measurements. A small staging observation records model error without
+requiring maximum scale. The current coordinator broker publish/confirm path is
+declared unbounded, so the checked-in planning example remains invalid until a
+separately tested production deadline and settlement contract exists.
+
 ## Verdict Flow
 
 A gating comparison loads one exact budget for each workload tuple. Results from

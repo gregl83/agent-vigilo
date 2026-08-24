@@ -26,6 +26,7 @@ use super::{
         REPORT_SCHEMA,
         ReportDocument,
     },
+    projection,
 };
 
 /// CLI arguments for re-rendering an existing report document.
@@ -47,6 +48,7 @@ pub fn execute(args: ReportArgs) -> Result<u8> {
     // Rendering never rewrites the machine contract, so unknown additive fields survive.
     atomic_text(&args.run_dir.join("summary.md"), &markdown(&report))?;
     print_terminal(&report, &args.run_dir);
+    projection::rerender(&args.run_dir)?;
     Ok(EXIT_PASS)
 }
 

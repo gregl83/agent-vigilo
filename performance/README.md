@@ -5,7 +5,8 @@ package. It is not installed globally and it is not shipped with Vigilo.
 
 The harness includes component scaling models, canonical noise analysis,
 bounded one/two-worker capacity calibration, reviewed budget publication, and
-confirmed regression gates. Startup remains service-free; run creation,
+named deployment capacity projections with limit provenance, and confirmed
+regression gates. Startup remains service-free; run creation,
 coordinator, HTTP agent, worker/Wasm, persistence, and lifecycle measurements
 use a fresh run-owned PostgreSQL database clone, RabbitMQ vhost/namespace, and
 deterministic HTTP agent for every sample.
@@ -30,6 +31,9 @@ requires them. Their setup remains outside the measured process boundary.
 - `calibration`, `command`, `report`, `artifact`, and `check` analyze evidence,
   orchestrate campaigns, persist artifacts, render results, and enforce
   repository isolation.
+- `projection` combines raw bounded-capacity evidence with a named workload mix,
+  jointly bootstraps worker and dependency demand, and rejects unsupported
+  capacity labels.
 
 ## Layout And Configuration
 
@@ -41,6 +45,8 @@ requires them. Their setup remains outside the measured process boundary.
 - `performance/environments/*.toml` describe hosts on which results may be
   considered comparable.
 - `performance/fixtures/*.toml` define deterministic logical input shapes.
+- `performance/deployments/*.toml` define named workload mixes, topology,
+  amplification assumptions, boundedness, and independently sourced limits.
 - `performance/compose.yml` defines the private PostgreSQL and RabbitMQ
   topology created for one campaign.
 - `xtask` implements `cargo perf`; generated builds and results stay under
@@ -205,6 +211,51 @@ capacity evidence, and an existing output directory. It emits digested evidence,
 `reference-v2`, its budget policy, and the frozen build manifest beneath
 `target/perf/baselines/reference-v2`.
 
+## Capacity Projection
+
+After `cargo perf calibrate capacity` creates `capacity.json`, project one named
+deployment from the same run directory:
+
+```bash
+cargo perf project \
+  --run target/perf/runs/<capacity-run> \
+  --deployment performance/deployments/planning-example-v1.toml
+```
+
+The deployment input declares peak and average traffic, run/payload/evaluator
+mixes, agent latency, retry and message amplification, concurrency and placement
+configuration, operational boundedness, and resource limits. Every limit has a
+raw capacity, usable fraction, date, hardware/configuration, and `measured`,
+`provider_documented`, or `operator_declared` provenance. The checked-in file is
+an illustrative shape whose limits must be replaced before use.
+
+The command reproduces the reduced capacity points from `samples.jsonl`, rejects
+materially falling throughput and shared-service saturation, and resamples all
+workload points together. `projections.json` records one/two-worker knees,
+scale efficiency, worker count, CPU, memory, PostgreSQL, RabbitMQ, HTTP, Wasm,
+storage, retry, and coordinator demand with formulas and 95% intervals.
+`projection.md` includes the complete resolved input and a limit/bottleneck
+table.
+
+Projection confidence is explicit:
+
+- `invalid` means required behavior is unbounded, evidence is inconsistent,
+  nonlinear or saturated, or a supplied staging point exceeds its error limit.
+- `directional` means demand is useful but a required limit is missing, the
+  workload differs from the measured fixture, or the worker estimate exceeds
+  the measured one/two-worker range.
+- `planning` means the model is accepted inside the measured range with complete
+  limits, but it is not a direct canonical staging match.
+- `calibrated` additionally requires canonical matching evidence and an accepted
+  staging observation.
+
+The current coordinator RabbitMQ publish/confirm operation has no encompassing
+deadline. The checked-in deployment therefore declares that path unbounded and
+cannot receive a supported confidence label. A real staging observation may be
+added as `[staging]`; its projected and observed rate, relative error, and
+acceptance limit are retained in the result. Estimates beyond two workers
+remain directional even when that small staging check passes.
+
 ## MVP Workloads
 
 | Workload | Measured region | Exact postcondition |
@@ -279,9 +330,10 @@ Run output is written only below `target/perf/runs`. Each directory contains:
 - `summary.md` as the concise human-readable result
 - `component-models.json` after `cargo perf model`
 - `diagnostics.md` after `cargo perf diagnose`
+- `projections.json` and `projection.md` after `cargo perf project`
 
 Use `cargo perf report --run-dir <run-directory>` to regenerate the terminal and
-Markdown views from `report.json`.
+Markdown views from `report.json` and, when present, `projections.json`.
 
 Exit `0` means all required correctness checks passed. Exit `1` means a
 candidate crash, timeout, output overflow, or exact-oracle failure. Exit `2`

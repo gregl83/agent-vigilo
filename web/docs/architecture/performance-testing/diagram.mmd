@@ -20,6 +20,9 @@ flowchart TD
     Model{Scaling model acceptance}
     Compare[Counterbalanced baseline/candidate comparison]
     Capacity[Bounded one/two-worker calibration]
+    Deployment[Named workload mix and sourced limits]
+    Projection{Capacity projection acceptance}
+    Staging[Small staging observation]
     Budget[Reviewed canonical budget]
     Pass[Accepted evidence]
     Invalid[Invalid or incomplete]
@@ -34,15 +37,20 @@ flowchart TD
     Sample --> Model
     Sample --> Compare
     Sample --> Capacity
+    Capacity --> Projection
+    Deployment --> Projection
+    Staging --> Projection
     Model -->|residual and repetition pass| Pass
     Model -->|missing or nonlinear evidence| Invalid
     Capacity --> Budget --> Compare
+    Projection -->|complete bounded evidence| Pass
+    Projection -->|nonlinear, saturated, unbounded, or incomplete| Invalid
     Compare -->|within budget or informative| Pass
     Compare -->|unconfirmed, noisy, or incompatible| Invalid
 
-    class Registry,Profile,Build component
+    class Registry,Profile,Build,Deployment component
     class Isolation,Routed,Process,Sample system
-    class Oracle,Model decision
-    class Diagnostics,DataEvidence,Capacity,Budget,Compare external
+    class Oracle,Model,Projection decision
+    class Diagnostics,DataEvidence,Capacity,Staging,Budget,Compare external
     class Pass success
     class Invalid warning

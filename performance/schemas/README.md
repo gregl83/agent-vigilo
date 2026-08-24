@@ -1,8 +1,8 @@
 # Performance Configuration And Artifact Schemas
 
 This directory documents the contracts consumed and produced by `cargo perf`.
-The Rust models in `xtask/src/perf/model.rs` are authoritative; this document is
-the maintainer-facing field reference.
+The Rust types in `xtask/src/perf/model.rs` and their owning command modules are
+authoritative; this document is the maintainer-facing field reference.
 
 ## Execution Flow
 
@@ -158,6 +158,26 @@ service credentials or provisioning scripts.
 | `os`, `architecture`, `vcpus`, `memory_mib`, `storage` | Required operating system, hardware, and storage characteristics. |
 | `validity` | Readiness observations required before accepting a canonical campaign. |
 
+## Deployment Configuration
+
+Files under `performance/deployments` are versioned inputs to `cargo perf project`.
+They describe a proposed workload and independently sourced usable
+limits; they are not service credentials or measured fleet-capacity claims.
+
+| Field | Meaning |
+| --- | --- |
+| `schema_id`, `id`, `description` | `deployment/v1`, stable input identity, and purpose. |
+| `target_utilization` | Fraction of measured per-worker rate used after two-worker efficiency. |
+| `bootstrap_resamples`, `bootstrap_seed` | Deterministic whole-model resampling count and seed. |
+| `capacity_fixture` | Fixture identity used to judge whether the deployment exactly matches measured evidence. |
+| `[workload]` | Peak rate, duty cycle, concurrency, weighted run/payload/evaluator distributions, and result/diagnostic sizes. Distribution fractions must sum to one. |
+| `[agent]` | Mean/p95 latency and connection policy used for HTTP concurrency demand. |
+| `[amplification]` | Attempts, successful attempts, chunk deliveries, durable events, publish attempts, acknowledgements, retries, and quarantine multipliers. |
+| `[configuration]` | Chunk size, worker/Wasm concurrency, database-pool size, coordinator cadence, and weighted placements. |
+| `[[limits]]` | Typed resource capacity, usable fraction, provenance class, source, date, hardware, and configuration. Missing required limits remain unknown. |
+| `[[boundedness]]` | Required operational path, whether it has a finite bound, and the source of that claim. |
+| `[staging]` | Optional small staging run ID, worker count, observed useful rate, and maximum accepted model error. |
+
 ## Generated Artifact Schemas
 
 The harness owns these additive machine-readable contracts:
@@ -175,6 +195,7 @@ The harness owns these additive machine-readable contracts:
 | `performance-budget/v1` | Reviewed environment-specific workload/tuple/metric budgets and minimum block counts. |
 | `performance-baseline/v1` | Digested index of calibration, capacity, budget, profile, and build-manifest evidence. |
 | `component-models/v1` | Accepted or rejected component fits, coefficients/steps, residuals, and evidence counts. |
+| `projections/v1` | Resolved deployment input, joint-bootstrap intervals, visible equations, demand/limit table, bottleneck, staging error, and confidence label. |
 
 Every persisted document carries its schema ID. Readers reject an unknown
 schema ID and preserve unknown additive fields. Retained version fixtures are

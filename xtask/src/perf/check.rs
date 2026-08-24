@@ -37,6 +37,7 @@ use super::{
         ProcessSpec,
         execute as execute_process,
     },
+    projection,
     schedule,
 };
 
@@ -98,6 +99,7 @@ pub fn execute(args: CheckArgs) -> Result<u8> {
     validate_fixture_tree(&root)?;
     validate_service_configuration(&root)?;
     calibration::validate_repository_contract(&root)?;
+    let deployments = projection::validate_repository_contract(&root)?;
     if let Some(base) = args.bootstrap_base.as_deref() {
         validate_bootstrap_delta(&root, base)?;
     }
@@ -115,6 +117,7 @@ pub fn execute(args: CheckArgs) -> Result<u8> {
     println!("  production:  no reverse dependency or package leakage");
     println!("  process:     timeout, truncation, exit, and cleanup self-test passed");
     println!("  services:    Compose and fixture contracts valid; no services provisioned");
+    println!("  deployments: {deployments} named projection input(s) valid");
     Ok(EXIT_PASS)
 }
 

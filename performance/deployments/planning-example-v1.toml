@@ -1,0 +1,158 @@
+schema_id = "deployment/v1"
+id = "planning-example-v1"
+description = "Illustrative single-placement workload; replace operator-declared limits before use."
+target_utilization = 0.70
+bootstrap_resamples = 2000
+bootstrap_seed = 1414676817
+capacity_fixture = "mvp-v1"
+
+[workload]
+peak_case_rate = 100.0
+duty_cycle = 0.35
+concurrent_runs_peak = 8
+run_classes = [
+  { name = "interactive", cases = 1000, fraction = 0.75 },
+  { name = "batch", cases = 10000, fraction = 0.25 },
+]
+payload_classes = [{ bytes = 1024, fraction = 1.0 }]
+evaluator_mix = [{ name = "sentiment-basic-en", evaluators_per_case = 1, fraction = 1.0 }]
+result_bytes_per_case = 1024
+diagnostic_bytes_per_case = 128
+
+[agent]
+mean_latency_ms = 100.0
+p95_latency_ms = 250.0
+connection_policy = "keepalive"
+
+[amplification]
+attempts_per_useful_case = 1.05
+successful_agent_attempts_per_useful_case = 1.0
+chunk_deliveries_per_useful_chunk = 1.02
+durable_events_per_useful_chunk = 1.0
+publish_attempts_per_durable_event = 1.01
+acknowledgements_per_delivery = 1.0
+retry_publishes_per_useful_chunk = 0.02
+quarantine_publishes_per_useful_chunk = 0.0
+
+[configuration]
+cases_per_chunk = 100
+worker_inflight_chunks = 1
+wasm_concurrency_per_worker = 8
+database_connections_per_target = 5
+coordinator_tick_ms = 5000
+placements = [{ alias = "primary", fraction = 1.0 }]
+
+[[boundedness]]
+path = "coordinator_broker_publish_confirm"
+bounded = false
+provenance = "Current coordinator publish/confirm path has no encompassing operation deadline."
+
+[[limits]]
+resource = "host_cpu_cores"
+capacity = 8.0
+usable_fraction = 0.70
+provenance = "operator_declared"
+source = "Illustrative example; replace before use"
+observed_on = "2026-08-24"
+hardware = "Unspecified planning host"
+configuration = "Unspecified"
+
+[[limits]]
+resource = "host_memory_bytes"
+capacity = 34359738368.0
+usable_fraction = 0.70
+provenance = "operator_declared"
+source = "Illustrative example; replace before use"
+observed_on = "2026-08-24"
+hardware = "Unspecified planning host"
+configuration = "Unspecified"
+
+[[limits]]
+resource = "postgresql_statements_per_second"
+capacity = 10000.0
+usable_fraction = 0.70
+provenance = "operator_declared"
+source = "Illustrative example; replace before use"
+observed_on = "2026-08-24"
+hardware = "Unspecified PostgreSQL host"
+configuration = "Unspecified"
+
+[[limits]]
+resource = "postgresql_wal_bytes_per_second"
+capacity = 104857600.0
+usable_fraction = 0.70
+provenance = "operator_declared"
+source = "Illustrative example; replace before use"
+observed_on = "2026-08-24"
+hardware = "Unspecified PostgreSQL host"
+configuration = "Unspecified"
+
+[[limits]]
+resource = "rabbitmq_publishes_per_second"
+capacity = 5000.0
+usable_fraction = 0.70
+provenance = "operator_declared"
+source = "Illustrative example; replace before use"
+observed_on = "2026-08-24"
+hardware = "Unspecified RabbitMQ host"
+configuration = "Publisher confirms enabled"
+
+[[limits]]
+resource = "rabbitmq_deliveries_per_second"
+capacity = 5000.0
+usable_fraction = 0.70
+provenance = "operator_declared"
+source = "Illustrative example; replace before use"
+observed_on = "2026-08-24"
+hardware = "Unspecified RabbitMQ host"
+configuration = "Manual acknowledgements"
+
+[[limits]]
+resource = "http_requests_per_second"
+capacity = 1000.0
+usable_fraction = 0.70
+provenance = "operator_declared"
+source = "Illustrative example; replace before use"
+observed_on = "2026-08-24"
+hardware = "Unspecified agent service"
+configuration = "Keepalive"
+
+[[limits]]
+resource = "http_concurrency"
+capacity = 256.0
+usable_fraction = 0.70
+provenance = "operator_declared"
+source = "Illustrative example; replace before use"
+observed_on = "2026-08-24"
+hardware = "Unspecified agent service"
+configuration = "Keepalive"
+
+[[limits]]
+resource = "wasm_evaluations_per_second"
+capacity = 1000.0
+usable_fraction = 0.70
+provenance = "operator_declared"
+source = "Illustrative example; replace before use"
+observed_on = "2026-08-24"
+hardware = "Unspecified worker host"
+configuration = "64 MiB memory limit; concurrency 8"
+
+[[limits]]
+resource = "storage_bytes_per_day"
+capacity = 107374182400.0
+usable_fraction = 0.70
+provenance = "operator_declared"
+source = "Illustrative example; replace before use"
+observed_on = "2026-08-24"
+hardware = "Unspecified storage"
+configuration = "One-day usable growth budget"
+
+[[limits]]
+resource = "coordinator_events_per_second"
+capacity = 1000.0
+usable_fraction = 0.70
+provenance = "operator_declared"
+source = "Illustrative example; replace before use"
+observed_on = "2026-08-24"
+hardware = "Unspecified coordinator host"
+configuration = "Five-second coordinator tick"
