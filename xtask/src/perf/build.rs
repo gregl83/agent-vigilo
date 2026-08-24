@@ -11,7 +11,10 @@ use std::{
         Path,
         PathBuf,
     },
-    process::Command,
+    process::{
+        Command,
+        Stdio,
+    },
     time::Duration,
 };
 
@@ -139,13 +142,14 @@ pub fn execute(args: BuildArgs) -> Result<u8> {
             .parent()
             .context("evaluator asset parent")?,
     )?;
-    fs::copy(&evaluator_wasm, &evaluator_asset_wasm).with_context(|| {
+    fs::write(&evaluator_asset_wasm, fs::read(&evaluator_wasm)?).with_context(|| {
         format!(
-            "copy evaluator fixture {} to {}",
+            "snapshot evaluator fixture {} to {}",
             evaluator_wasm.display(),
             evaluator_asset_wasm.display()
         )
     })?;
+    materialize_standalone_metadata(&evaluator_asset)?;
     let migrations_digest = digest_tree(&migrations_source)?;
     let evaluator_abi_digest = digest_tree(&wit_source)?;
     let evaluator_fixture_digest = digest_tree(&evaluator_asset)?;
@@ -241,6 +245,24 @@ fn isolate_copied_crate(crate_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Resolves the standalone crate after its frozen Wasm has been placed.
+///
+/// This intentionally matches the full Cargo metadata request used by evaluator
+/// publication. It creates the lockfile and target rustc cache before the asset
+/// digest is recorded, so publication cannot mutate an otherwise valid snapshot.
+fn materialize_standalone_metadata(crate_root: &Path) -> Result<()> {
+    let metadata_status = Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--manifest-path"])
+        .arg(crate_root.join("Cargo.toml"))
+        .stdout(Stdio::null())
+        .status()
+        .context("materialize standalone evaluator metadata")?;
+    if !metadata_status.success() {
+        bail!("standalone evaluator metadata failed with {metadata_status}");
+    }
+    Ok(())
+}
+
 /// Probes supported CLI boundaries and returns the capabilities recorded in the snapshot.
 fn verify_capabilities(executable: &Path) -> Result<Vec<String>> {
     verify_help(executable, &["--help"], &["Usage:", "Commands:"])?;
@@ -251,12 +273,29 @@ fn verify_capabilities(executable: &Path) -> Result<Vec<String>> {
     )?;
     verify_help(executable, &["coordinator", "once", "--help"], &["Usage:"])?;
     verify_help(executable, &["worker", "once", "--help"], &["Usage:"])?;
+    verify_help(
+        executable,
+        &["run", "export", "--help"],
+        &["batch-size", "format"],
+    )?;
+    verify_help(
+        executable,
+        &["shard", "move", "--help"],
+        &["--alias", "RUN_SHARD"],
+    )?;
+    verify_help(
+        executable,
+        &["rebalance", "plan", "--help"],
+        &["--max-items", "--to"],
+    )?;
     Ok(vec![
         "startup.cli-help.v1".into(),
         "run.create.v1".into(),
         "coordinator.dispatch.v1".into(),
         "worker.execute-wasm.v1".into(),
         "system.lifecycle.v1".into(),
+        "run.admin.v1".into(),
+        "shard.admin.v1".into(),
     ])
 }
 
@@ -358,5 +397,30 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn standalone_metadata_is_materialized_before_snapshot_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[workspace]\n",
+        )
+        .unwrap();
+        fs::create_dir(directory.path().join("src")).unwrap();
+        fs::write(directory.path().join("src/lib.rs"), "").unwrap();
+        let wasm = directory
+            .path()
+            .join("target/wasm32-wasip2/release/fixture.wasm");
+        fs::create_dir_all(wasm.parent().unwrap()).unwrap();
+        fs::write(&wasm, b"frozen-wasm").unwrap();
+
+        materialize_standalone_metadata(directory.path()).unwrap();
+        assert!(directory.path().join("Cargo.lock").is_file());
+        assert!(directory.path().join("target/.rustc_info.json").is_file());
+        let first = digest_tree(directory.path()).unwrap();
+
+        materialize_standalone_metadata(directory.path()).unwrap();
+        assert_eq!(digest_tree(directory.path()).unwrap(), first);
     }
 }

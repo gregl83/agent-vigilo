@@ -142,6 +142,30 @@ pub fn write_run_inputs(
     case_count: usize,
     evaluator_count: usize,
 ) -> Result<RunInputs> {
+    write_run_inputs_with_payload(
+        directory,
+        fixture,
+        identity,
+        agent_url,
+        case_count,
+        evaluator_count,
+        0,
+    )
+}
+
+/// Writes deterministic inputs with an optional per-case string payload.
+///
+/// The payload is used only by byte-boundary workloads; normal fixtures retain
+/// their compact input shape and do not allocate padding.
+pub fn write_run_inputs_with_payload(
+    directory: &Path,
+    fixture: &FixtureCatalog,
+    identity: &str,
+    agent_url: &str,
+    case_count: usize,
+    evaluator_count: usize,
+    payload_bytes: usize,
+) -> Result<RunInputs> {
     if case_count == 0 || evaluator_count == 0 {
         bail!("run inputs require positive case and evaluator counts");
     }
@@ -149,7 +173,7 @@ pub fn write_run_inputs(
     let profile = directory.join("profile.yaml");
     let dataset = directory.join("dataset.yaml");
     let profile_value = profile_value(fixture, identity, agent_url, evaluator_count);
-    let dataset_value = dataset_value(identity, case_count);
+    let dataset_value = dataset_value(identity, case_count, payload_bytes);
     fs::write(&profile, serde_yaml::to_string(&profile_value)?)?;
     fs::write(&dataset, serde_yaml::to_string(&dataset_value)?)?;
     Ok(RunInputs { profile, dataset })
@@ -212,14 +236,18 @@ fn profile_value(
     })
 }
 
-fn dataset_value(identity: &str, case_count: usize) -> Value {
+fn dataset_value(identity: &str, case_count: usize, payload_bytes: usize) -> Value {
     let dataset_id = stable_uuid(&format!("{identity}:dataset"));
+    let padding = "x".repeat(payload_bytes);
     let cases = (0..case_count)
         .map(|ordinal| {
             json!({
                 "id": stable_uuid(&format!("{identity}:case:{ordinal}")),
                 "task_type": "classification",
-                "input": {"user_message": format!("case {ordinal}: good reliable input")},
+                "input": {
+                    "user_message": format!("case {ordinal}: good reliable input"),
+                    "payload": padding,
+                },
                 "expected": {"label": "positive"},
                 "tags": ["performance"],
                 "metadata": {"ordinal": ordinal}
@@ -272,8 +300,8 @@ mod tests {
     #[test]
     fn generated_inputs_are_structurally_deterministic() {
         let fixture = fixture();
-        let first = dataset_value("same", 2);
-        let second = dataset_value("same", 2);
+        let first = dataset_value("same", 2, 0);
+        let second = dataset_value("same", 2, 0);
         assert_eq!(first, second);
         assert_eq!(
             profile_value(&fixture, "same", "http://127.0.0.1", 8)["case_groups"][0]["evaluators"]

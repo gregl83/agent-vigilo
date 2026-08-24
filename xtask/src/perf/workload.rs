@@ -1,9 +1,12 @@
-//! Service-backed MVP workload preparation, execution, and exact oracles.
+//! Service-backed workload preparation, execution, and exact oracles.
 //!
 //! Every measured sample clones a binary-specific prepared PostgreSQL database
 //! and receives a fresh RabbitMQ vhost and namespace. Preparation is outside
 //! the measurement region; collectors are reset only after all prerequisite
 //! work has settled.
+//! Administrative and routed-data workloads may clone additional databases;
+//! their SQL and storage observations are aggregated while cluster-wide WAL is
+//! counted once.
 //!
 //! A workload oracle is the exact correctness postcondition for a measured
 //! operation: durable row counts, lifecycle state, outbox events, and queue or
@@ -41,6 +44,7 @@ use super::{
         RunInputs,
         load,
         write_run_inputs,
+        write_run_inputs_with_payload,
     },
     model::{
         BuildManifest,
@@ -65,6 +69,13 @@ struct PreparedDatabase {
     run_id: Option<String>,
     cases: usize,
     evaluators: usize,
+    placements: Vec<PreparedPlacement>,
+}
+
+#[derive(Clone)]
+struct PreparedPlacement {
+    env_key: String,
+    url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +162,14 @@ impl WorkloadRunner {
             .context("service topology was not started")?;
         let template = service.owned_database_name(&prepared.url)?;
         let database_url = service.clone_database(&template, request.workload_id)?;
+        let mut placement_urls = Vec::with_capacity(prepared.placements.len());
+        let mut route_env = Vec::with_capacity(prepared.placements.len() + 1);
+        for placement in &prepared.placements {
+            let template = service.owned_database_name(&placement.url)?;
+            let url = service.clone_database(&template, request.workload_id)?;
+            route_env.push((placement.env_key.clone(), url.clone()));
+            placement_urls.push(url);
+        }
         let scope = service.create_sample_scope(database_url, request.workload_id)?;
 
         let result = self.execute_scope(
@@ -163,6 +182,8 @@ impl WorkloadRunner {
             prepared.evaluators,
             request.exact,
             &scope,
+            &placement_urls,
+            &route_env,
             request.limits.watchdog,
             request.limits.stdout,
             request.limits.stderr,
@@ -172,13 +193,21 @@ impl WorkloadRunner {
             .as_mut()
             .context("service topology was not started")?
             .release_scope(scope);
-        match (result, release) {
-            (Ok(outcome), Ok(())) => Ok(outcome),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(error)) => Err(error.context("release performance sample scope")),
-            (Err(error), Err(cleanup)) => {
-                Err(error.context(format!("sample cleanup also failed: {cleanup:#}")))
+        let placement_release = self
+            .service
+            .as_mut()
+            .context("service topology was not started")?
+            .release_databases(&placement_urls);
+        match (result, release, placement_release) {
+            (Ok(outcome), Ok(()), Ok(())) => Ok(outcome),
+            (Err(error), Ok(()), Ok(())) => Err(error),
+            (Ok(_), Err(error), _) => Err(error.context("release performance sample scope")),
+            (Ok(_), Ok(()), Err(error)) => {
+                Err(error.context("release routed performance databases"))
             }
+            (Err(error), scope_cleanup, route_cleanup) => Err(error.context(format!(
+                "sample cleanup also returned scope={scope_cleanup:?}, routes={route_cleanup:?}"
+            ))),
         }
     }
 
@@ -216,32 +245,14 @@ impl WorkloadRunner {
         manifest_path: &Path,
         limits: ExecutionLimits,
     ) -> Result<PreparedDatabase> {
-        let service = self
+        let database_url = self
             .service
             .as_mut()
-            .context("service topology was not started")?;
-        let database_url = service.create_database(&format!("template-{}", self.prepared.len()))?;
+            .context("service topology was not started")?
+            .create_database(&format!("template-{}", self.prepared.len()))?;
         let migrations = setup_asset(manifest_path, "setup-assets/migrations")?;
         let evaluator = setup_asset(manifest_path, "setup-assets/evaluators/sentiment-basic-en")?;
-        require_success(
-            invoke(
-                binary,
-                base_args(
-                    &database_url,
-                    [
-                        "setup".into(),
-                        "--migrations-dir".into(),
-                        path_arg(&migrations)?,
-                        "--skip-evaluators".into(),
-                    ],
-                ),
-                &[],
-                Duration::from_secs(120),
-                limits.stdout,
-                limits.stderr,
-            )?,
-            "prepare database schema",
-        )?;
+        setup_database(binary, &database_url, &migrations, limits)?;
         require_success(
             invoke(
                 binary,
@@ -262,26 +273,107 @@ impl WorkloadRunner {
             "publish frozen evaluator fixture",
         )?;
 
-        let fixture = self.fixture.as_ref().context("fixture was not loaded")?;
-        let shape = workload_shape(fixture, workload_id, tuple)?;
-        let run_id = if shape.create_run {
-            let inputs = self.inputs(
-                &format!("{workload_id}:{tuple}"),
-                shape.cases,
-                shape.evaluators,
+        let fixture = self
+            .fixture
+            .as_ref()
+            .context("fixture was not loaded")?
+            .clone();
+        let shape = workload_shape(&fixture, workload_id, tuple)?;
+        let route_count = required_routes(workload_id, tuple)?;
+        let mut placements = Vec::with_capacity(route_count.saturating_sub(1));
+        let mut route_env = Vec::with_capacity(route_count.saturating_sub(1));
+        for index in 1..route_count {
+            let alias = format!("perf_{index:02}");
+            let env_key = format!("VIGILO_PERF_DATABASE_URL_{index:02}");
+            let url = self
+                .service
+                .as_mut()
+                .context("service topology was not started")?
+                .create_database(&format!("route-{index}"))?;
+            setup_database(binary, &url, &migrations, limits)?;
+            route_env.push((env_key.clone(), url.clone()));
+            require_success(
+                invoke(
+                    binary,
+                    database_register_args(&database_url, &alias, &env_key),
+                    &route_env,
+                    Duration::from_secs(120),
+                    limits.stdout,
+                    limits.stderr,
+                )?,
+                "register routed database fixture",
             )?;
+            require_success(
+                invoke(
+                    binary,
+                    database_activate_args(&database_url, &alias),
+                    &route_env,
+                    Duration::from_secs(120),
+                    limits.stdout,
+                    limits.stderr,
+                )?,
+                "activate routed database fixture",
+            )?;
+            placements.push(PreparedPlacement { env_key, url });
+        }
+        let run_id = if shape.create_run {
+            let identity = format!("{workload_id}:{tuple}");
+            let inputs = if workload_id == "shard.move.v1" {
+                self.inputs_with_payload(
+                    &identity,
+                    shape.cases,
+                    shape.evaluators,
+                    parse_move_tuple(tuple)?.payload_bytes,
+                )?
+            } else {
+                self.inputs(&identity, shape.cases, shape.evaluators)?
+            };
             Some(create_run(
                 binary,
                 &database_url,
                 &inputs,
-                &[],
-                Duration::from_secs(180),
+                &route_env,
+                route_count > 1 && !matches!(workload_id, "shard.move.v1" | "shard.rebalance.v1"),
+                Duration::from_secs(600),
                 limits.stdout,
                 limits.stderr,
             )?)
         } else {
             None
         };
+        let route_urls = std::iter::once(database_url.clone())
+            .chain(placements.iter().map(|placement| placement.url.clone()))
+            .collect::<Vec<_>>();
+        if let Some(run_id) = run_id.as_deref() {
+            match workload_id {
+                "run.cancel-scaling.v1" => {
+                    ensure_execution_routes(
+                        binary,
+                        &database_url,
+                        run_id,
+                        route_count,
+                        &route_env,
+                        limits,
+                    )?;
+                    seed_open_executions(&route_urls, run_id)?;
+                }
+                "run.read.v1" | "run.export.v1" => prepare_terminal_run(
+                    self.service
+                        .as_mut()
+                        .context("service topology was not started")?,
+                    binary,
+                    &database_url,
+                    run_id,
+                    &route_urls,
+                    &route_env,
+                    shape.cases,
+                    fixture.lifecycle.worker_pass_limit,
+                    limits,
+                )?,
+                "shard.move.v1" => consolidate_shard_rows(&database_url, run_id)?,
+                _ => {}
+            }
+        }
         let actual = structural_counts(&database_url, run_id.as_deref())?;
         verify_prepared(workload_id, &actual)?;
         Ok(PreparedDatabase {
@@ -289,6 +381,7 @@ impl WorkloadRunner {
             run_id,
             cases: shape.cases,
             evaluators: shape.evaluators,
+            placements,
         })
     }
 
@@ -309,11 +402,14 @@ impl WorkloadRunner {
         evaluators: usize,
         exact: &BTreeMap<String, u64>,
         scope: &SampleScope,
+        placement_urls: &[String],
+        route_env: &[(String, String)],
         watchdog: Duration,
         stdout_limit: usize,
         stderr_limit: usize,
     ) -> Result<WorkloadOutcome> {
-        let env = vec![("VIGILO_MQ_NAMESPACE".into(), scope.mq_namespace.clone())];
+        let mut env = route_env.to_vec();
+        env.push(("VIGILO_MQ_NAMESPACE".into(), scope.mq_namespace.clone()));
         let service = self
             .service
             .as_ref()
@@ -331,9 +427,9 @@ impl WorkloadRunner {
             Duration::from_millis(agent_delay_ms),
         )?;
         match workload_id {
-            "run.create.v1" | "run.create-scaling.v1" => {
+            "run.create.v1" | "run.create-scaling.v1" | "run.create-boundaries.v1" => {
                 let inputs = self.inputs(&format!("{workload_id}:{tuple}"), cases, evaluators)?;
-                let baseline = service.begin_measurement(scope)?;
+                let baseline = service.begin_measurement_with_databases(scope, placement_urls)?;
                 let process = invoke(
                     binary,
                     create_args(&scope.database_url, &inputs)?,
@@ -344,7 +440,11 @@ impl WorkloadRunner {
                 )?;
                 let run_id = parse_run_id(&process.stdout.text())?;
                 let chunks = cases.div_ceil(fixture.coordinator.cases_per_chunk) as i64;
-                let counts = oracle_create(&scope.database_url, &run_id, cases, chunks)?;
+                let counts = if workload_id == "run.create-boundaries.v1" {
+                    oracle_create_boundary(&scope.database_url, &run_id, cases, chunks)?
+                } else {
+                    oracle_create(&scope.database_url, &run_id, cases, chunks)?
+                };
                 finish(
                     service,
                     scope,
@@ -352,6 +452,188 @@ impl WorkloadRunner {
                     process,
                     counts,
                     ExternalOracle::new(0, 0, exact),
+                )
+            }
+            "run.cancel-scaling.v1" => {
+                let run_id = prepared_run_id.context("cancellation fixture has no run")?;
+                let baseline = service.begin_measurement_with_databases(scope, placement_urls)?;
+                let started = Instant::now();
+                let first = invoke(
+                    binary,
+                    run_admin_args(&scope.database_url, "cancel", run_id),
+                    &env,
+                    watchdog,
+                    stdout_limit,
+                    stderr_limit,
+                )?;
+                validate_cancel_output(&first.stdout.text(), cases, false)?;
+                let replay = invoke(
+                    binary,
+                    run_admin_args(&scope.database_url, "cancel", run_id),
+                    &env,
+                    watchdog,
+                    stdout_limit,
+                    stderr_limit,
+                )?;
+                validate_cancel_output(&replay.stdout.text(), 0, true)?;
+                let process = aggregate(vec![first, replay], started.elapsed());
+                let counts =
+                    cancellation_counts(&scope.database_url, placement_urls, run_id, cases)?;
+                finish(
+                    service,
+                    scope,
+                    baseline,
+                    process,
+                    counts,
+                    ExternalOracle::new(0, 0, exact),
+                )
+            }
+            "run.read.v1" | "run.export.v1" => {
+                let run_id = prepared_run_id.context("read/export fixture has no run")?;
+                let shape = parse_read_tuple(tuple)?;
+                let baseline = service.begin_measurement_with_databases(scope, placement_urls)?;
+                let process = invoke(
+                    binary,
+                    read_args(&scope.database_url, run_id, shape),
+                    &env,
+                    watchdog,
+                    stdout_limit,
+                    stderr_limit,
+                )?;
+                if process.stdout.truncated {
+                    bail!("read/export output exceeded the profile retention contract");
+                }
+                validate_read_output(shape.operation, shape.format, &process.stdout.text(), cases)?;
+                validate_read_resources(shape, &process)?;
+                let counts = read_counts(&scope.database_url, placement_urls, run_id, cases)?;
+                finish(
+                    service,
+                    scope,
+                    baseline,
+                    process,
+                    counts,
+                    ExternalOracle::new(0, 0, exact),
+                )
+            }
+            "shard.move.v1" => {
+                let run_id = prepared_run_id.context("shard move fixture has no run")?;
+                let baseline = service.begin_measurement_with_databases(scope, placement_urls)?;
+                let started = Instant::now();
+                let first = invoke(
+                    binary,
+                    shard_move_args(&scope.database_url, run_id, "perf_01"),
+                    &env,
+                    watchdog,
+                    stdout_limit,
+                    stderr_limit,
+                )?;
+                validate_move_output(&first.stdout.text(), "perf_01", true)?;
+                let replay = invoke(
+                    binary,
+                    shard_move_args(&scope.database_url, run_id, "perf_01"),
+                    &env,
+                    watchdog,
+                    stdout_limit,
+                    stderr_limit,
+                )?;
+                validate_move_output(&replay.stdout.text(), "perf_01", false)?;
+                let process = aggregate(vec![first, replay], started.elapsed());
+                let counts = shard_move_counts(&scope.database_url, run_id)?;
+                finish(
+                    service,
+                    scope,
+                    baseline,
+                    process,
+                    counts,
+                    ExternalOracle::new(0, 0, exact),
+                )
+            }
+            "shard.rebalance.v1" => {
+                let run_id = prepared_run_id.context("rebalance fixture has no run")?;
+                let shards = parse_rebalance_tuple(tuple)?;
+                let plan = invoke(
+                    binary,
+                    rebalance_plan_args(&scope.database_url, shards),
+                    &env,
+                    Duration::from_secs(180),
+                    stdout_limit,
+                    stderr_limit,
+                )?;
+                require_success_ref(&plan, "prepare rebalance plan")?;
+                let operation_id = parse_rebalance_operation_id(&plan.stdout.text())?;
+                let baseline = service.begin_measurement_with_databases(scope, placement_urls)?;
+                let started = Instant::now();
+                let mut outcomes = Vec::with_capacity(shards.saturating_add(1));
+                for _ in 0..shards {
+                    outcomes.push(invoke(
+                        binary,
+                        rebalance_apply_args(&scope.database_url, &operation_id, 1),
+                        &env,
+                        watchdog,
+                        stdout_limit,
+                        stderr_limit,
+                    )?);
+                }
+                let verify = invoke(
+                    binary,
+                    rebalance_verify_args(&scope.database_url, &operation_id, shards),
+                    &env,
+                    watchdog,
+                    stdout_limit,
+                    stderr_limit,
+                )?;
+                validate_rebalance_output(&verify.stdout.text(), shards)?;
+                outcomes.push(verify);
+                let process = aggregate(outcomes, started.elapsed());
+                let counts = rebalance_counts(&scope.database_url, &operation_id, run_id, shards)?;
+                finish(
+                    service,
+                    scope,
+                    baseline,
+                    process,
+                    counts,
+                    ExternalOracle::new(0, 0, exact),
+                )
+            }
+            "coordinator.placement-scaling.v1" => {
+                let run_id = prepared_run_id.context("placement fixture has no run")?;
+                let aliases = parse_placement_tuple(tuple)?;
+                let baseline = service.begin_measurement_with_databases(scope, placement_urls)?;
+                let started = Instant::now();
+                let process = aggregate(
+                    vec![
+                        invoke(
+                            binary,
+                            coordinator_args(&scope.database_url, &scope.messaging_url),
+                            &env,
+                            watchdog,
+                            stdout_limit,
+                            stderr_limit,
+                        )?,
+                        invoke(
+                            binary,
+                            coordinator_args(&scope.database_url, &scope.messaging_url),
+                            &env,
+                            watchdog,
+                            stdout_limit,
+                            stderr_limit,
+                        )?,
+                    ],
+                    started.elapsed(),
+                );
+                let counts = routed_coordinator_counts(
+                    &scope.database_url,
+                    placement_urls,
+                    run_id,
+                    aliases,
+                )?;
+                finish(
+                    service,
+                    scope,
+                    baseline,
+                    process,
+                    counts,
+                    ExternalOracle::new(aliases as u64, 0, exact),
                 )
             }
             "coordinator.dispatch.v1" | "coordinator.dispatch-scaling.v1" => {
@@ -558,6 +840,7 @@ impl WorkloadRunner {
                         &scope.database_url,
                         &inputs,
                         &env,
+                        false,
                         Duration::from_secs(180),
                         stdout_limit,
                         stderr_limit,
@@ -782,6 +1065,33 @@ impl WorkloadRunner {
             evaluators,
         )
     }
+
+    fn inputs_with_payload(
+        &self,
+        identity: &str,
+        cases: usize,
+        evaluators: usize,
+        payload_bytes: usize,
+    ) -> Result<RunInputs> {
+        let fixture = self.fixture.as_ref().context("fixture was not loaded")?;
+        let service = self
+            .service
+            .as_ref()
+            .context("service topology was not started")?;
+        let directory = self
+            .run_dir
+            .join("fixtures")
+            .join(identity.replace([':', '\\', '/'], "_"));
+        write_run_inputs_with_payload(
+            &directory,
+            fixture,
+            identity,
+            service.agent_url(),
+            cases,
+            evaluators,
+            payload_bytes,
+        )
+    }
 }
 
 /// Resolves a registered workload tuple into its setup cardinalities.
@@ -799,10 +1109,35 @@ fn workload_shape(
             evaluators: 1,
             create_run: false,
         },
-        "run.create-scaling.v1" => WorkloadShape {
+        "run.create-scaling.v1" | "run.create-boundaries.v1" => WorkloadShape {
             cases: parse_single_dimension(tuple, "cases")?,
             evaluators: 1,
             create_run: false,
+        },
+        "run.cancel-scaling.v1" => WorkloadShape {
+            cases: parse_cancel_tuple(tuple)?.executions,
+            evaluators: 1,
+            create_run: true,
+        },
+        "run.read.v1" | "run.export.v1" => WorkloadShape {
+            cases: parse_read_tuple(tuple)?.executions,
+            evaluators: 1,
+            create_run: true,
+        },
+        "shard.move.v1" => WorkloadShape {
+            cases: parse_move_tuple(tuple)?.rows,
+            evaluators: 1,
+            create_run: true,
+        },
+        "shard.rebalance.v1" => WorkloadShape {
+            cases: parse_rebalance_tuple(tuple)? * fixture.coordinator.cases_per_chunk,
+            evaluators: 1,
+            create_run: true,
+        },
+        "coordinator.placement-scaling.v1" => WorkloadShape {
+            cases: parse_placement_tuple(tuple)? * fixture.coordinator.cases_per_chunk,
+            evaluators: 1,
+            create_run: true,
         },
         "coordinator.dispatch.v1" => WorkloadShape {
             cases: fixture.coordinator.chunks * fixture.coordinator.cases_per_chunk,
@@ -911,6 +1246,284 @@ fn parse_http_tuple(tuple: &str) -> Result<(usize, usize, u64)> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdminShape {
+    routes: usize,
+    executions: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadOperation {
+    Status,
+    Results,
+    Export,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportFormat {
+    Json,
+    Jsonl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadShape {
+    operation: ReadOperation,
+    format: Option<ExportFormat>,
+    routes: usize,
+    executions: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MoveShape {
+    rows: usize,
+    payload_bytes: usize,
+}
+
+/// Parses cancellation fanout without permitting an unreviewed fleet shape.
+fn parse_cancel_tuple(tuple: &str) -> Result<AdminShape> {
+    let parts = tuple.split('-').collect::<Vec<_>>();
+    if parts.len() != 4 || parts[0] != "aliases" || parts[2] != "executions" {
+        bail!("invalid cancellation tuple: {tuple}");
+    }
+    let shape = AdminShape {
+        routes: parts[1].parse()?,
+        executions: parts[3].parse()?,
+    };
+    if !matches!(shape.routes, 1 | 4 | 17) || !matches!(shape.executions, 1024 | 8192) {
+        bail!("unsupported cancellation tuple: {tuple}");
+    }
+    Ok(shape)
+}
+
+/// Parses status, results, and export tuples with their paging boundary.
+fn parse_read_tuple(tuple: &str) -> Result<ReadShape> {
+    let parts = tuple.split('-').collect::<Vec<_>>();
+    if parts.len() != 5 || parts[1] != "executions" || parts[3] != "routes" {
+        bail!("invalid read/export tuple: {tuple}");
+    }
+    let (operation, format) = match parts[0] {
+        "status" => (ReadOperation::Status, None),
+        "results" => (ReadOperation::Results, None),
+        "json" => (ReadOperation::Export, Some(ExportFormat::Json)),
+        "jsonl" => (ReadOperation::Export, Some(ExportFormat::Jsonl)),
+        _ => bail!("unsupported read/export operation in tuple: {tuple}"),
+    };
+    let shape = ReadShape {
+        operation,
+        format,
+        executions: parts[2].parse()?,
+        routes: parts[4].parse()?,
+    };
+    if !matches!(shape.executions, 250 | 251) || !matches!(shape.routes, 1 | 2) {
+        bail!("unsupported read/export tuple: {tuple}");
+    }
+    Ok(shape)
+}
+
+/// Parses the reviewed logical-placement points used by the scaling model.
+fn parse_placement_tuple(tuple: &str) -> Result<usize> {
+    let aliases = parse_single_dimension(tuple, "aliases")?;
+    if !matches!(aliases, 1 | 8 | 16 | 32) {
+        bail!("unsupported placement tuple: {tuple}");
+    }
+    Ok(aliases)
+}
+
+/// Parses row and payload boundaries for one routed shard move.
+fn parse_move_tuple(tuple: &str) -> Result<MoveShape> {
+    let parts = tuple.split('-').collect::<Vec<_>>();
+    if parts.len() != 4 || parts[0] != "rows" || parts[2] != "payload" {
+        bail!("invalid shard move tuple: {tuple}");
+    }
+    let shape = MoveShape {
+        rows: parts[1].parse()?,
+        payload_bytes: parts[3].parse()?,
+    };
+    if !matches!(shape.rows, 4 | 1000 | 1001)
+        || !matches!(shape.payload_bytes, 1024 | 1_048_064 | 1_049_088)
+    {
+        bail!("unsupported shard move tuple: {tuple}");
+    }
+    Ok(shape)
+}
+
+/// Parses the bounded number of shards claimed by a rebalance pass.
+fn parse_rebalance_tuple(tuple: &str) -> Result<usize> {
+    let shards = parse_single_dimension(tuple, "shards")?;
+    if !matches!(shards, 1 | 8) {
+        bail!("unsupported shard rebalance tuple: {tuple}");
+    }
+    Ok(shards)
+}
+
+/// Returns the number of logical database routes a workload fixture must own.
+fn required_routes(workload_id: &str, tuple: &str) -> Result<usize> {
+    match workload_id {
+        "run.cancel-scaling.v1" => Ok(parse_cancel_tuple(tuple)?.routes),
+        "run.read.v1" | "run.export.v1" => Ok(parse_read_tuple(tuple)?.routes),
+        "shard.move.v1" | "shard.rebalance.v1" => Ok(2),
+        "coordinator.placement-scaling.v1" => parse_placement_tuple(tuple),
+        _ => Ok(1),
+    }
+}
+
+/// Validates the semantic record count of machine-readable read output.
+fn validate_read_output(
+    operation: ReadOperation,
+    format: Option<ExportFormat>,
+    stdout: &str,
+    executions: usize,
+) -> Result<()> {
+    if operation == ReadOperation::Export && format == Some(ExportFormat::Jsonl) {
+        let mut run_records = 0_usize;
+        let mut execution_records = 0_usize;
+        for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+            let value: Value = serde_json::from_str(line).context("parse JSONL export record")?;
+            match value["type"].as_str() {
+                Some("run") => run_records += 1,
+                Some("execution") => execution_records += 1,
+                Some(_) => {}
+                None => bail!("JSONL export record omitted type"),
+            }
+        }
+        if run_records != 1 || execution_records != executions {
+            bail!(
+                "JSONL export contained {run_records} run and {execution_records} execution records; expected 1 and {executions}"
+            );
+        }
+        return Ok(());
+    }
+
+    let value: Value = serde_json::from_str(stdout).context("parse read command JSON output")?;
+    match operation {
+        ReadOperation::Status => {
+            let status = value["data"]["status"]
+                .as_str()
+                .or_else(|| value["data"]["run"]["status"].as_str());
+            if status != Some("completed") {
+                bail!("status output did not report a completed run");
+            }
+        }
+        ReadOperation::Results => {
+            require_json_count(&value, &["data", "results", "execution_count"], executions)?;
+            require_json_count(
+                &value,
+                &["data", "results", "evaluator_result_count"],
+                executions,
+            )?;
+        }
+        ReadOperation::Export => {
+            let rows = value["data"]["executions"]
+                .as_array()
+                .or_else(|| value["executions"].as_array())
+                .context("JSON export omitted executions")?;
+            if rows.len() != executions {
+                bail!(
+                    "JSON export contained {} executions; expected {executions}",
+                    rows.len()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Enforces output-stream timing and format-specific export memory contracts.
+fn validate_read_resources(shape: ReadShape, process: &ProcessOutcome) -> Result<()> {
+    let first = process
+        .stdout
+        .first_byte_time
+        .context("read command emitted no first-byte timing")?;
+    let last = process
+        .stdout
+        .last_byte_time
+        .context("read command emitted no last-byte timing")?;
+    if first > last || last > process.wall_time {
+        bail!("read command output timing was not monotonic within process wall time");
+    }
+    if shape.operation == ReadOperation::Export {
+        let peak_rss = process
+            .peak_rss_bytes
+            .context("export memory contract requires a peak-RSS collector")?;
+        let limit = match shape.format {
+            Some(ExportFormat::Jsonl) => 256 * 1024 * 1024,
+            Some(ExportFormat::Json) => 512 * 1024 * 1024,
+            None => unreachable!("export shapes declare a format"),
+        };
+        if peak_rss > limit {
+            bail!(
+                "export peak RSS was {peak_rss} bytes; {:?} contract allows {limit}",
+                shape.format
+            );
+        }
+    }
+    Ok(())
+}
+
+fn require_json_count(value: &Value, path: &[&str], expected: usize) -> Result<()> {
+    let actual = path.iter().fold(value, |value, key| &value[*key]).as_u64();
+    if actual != Some(expected as u64) {
+        bail!(
+            "JSON count {} differed: actual {actual:?}, expected {expected}",
+            path.join(".")
+        );
+    }
+    Ok(())
+}
+
+/// Requires cancellation output to prove terminal state and replay behavior.
+fn validate_cancel_output(stdout: &str, executions: usize, replay: bool) -> Result<()> {
+    let value: Value = serde_json::from_str(stdout).context("parse cancellation JSON output")?;
+    if value["data"]["status"] != "cancelled"
+        || value["meta"]["terminal"] != true
+        || value["meta"]["executions_cancelled"].as_u64() != Some(executions as u64)
+        || value["meta"]["already_cancelled"].as_bool() != Some(replay)
+    {
+        bail!("cancellation output violated the exact terminal/replay contract");
+    }
+    Ok(())
+}
+
+/// Requires every table and the authoritative placement to verify at the target.
+fn validate_move_output(stdout: &str, target: &str, moved: bool) -> Result<()> {
+    let value: Value = serde_json::from_str(stdout).context("parse shard move JSON output")?;
+    let tables = value["data"]["tables"]
+        .as_array()
+        .context("shard move output omitted table reports")?;
+    if value["data"]["target_database_alias"] != target
+        || value["data"]["placement"]["database_alias"] != target
+        || value["meta"]["moved"].as_bool() != Some(moved)
+        || value["meta"]["verified"] != true
+        || tables.is_empty()
+        || tables.iter().any(|table| table["verified"] != true)
+    {
+        bail!("shard move output violated route-switch or verification contract");
+    }
+    Ok(())
+}
+
+/// Extracts the persisted operation identity needed by apply and verify commands.
+fn parse_rebalance_operation_id(stdout: &str) -> Result<String> {
+    let value: Value = serde_json::from_str(stdout).context("parse rebalance plan JSON output")?;
+    value["data"]["operation"]["id"]
+        .as_str()
+        .map(ToOwned::to_owned)
+        .context("rebalance plan omitted persisted operation ID")
+}
+
+/// Requires a completed rebalance with the exact verified item count.
+fn validate_rebalance_output(stdout: &str, shards: usize) -> Result<()> {
+    let value: Value =
+        serde_json::from_str(stdout).context("parse rebalance verify JSON output")?;
+    if value["meta"]["verified"] != true
+        || value["meta"]["verified_item_count"].as_u64() != Some(shards as u64)
+        || value["data"]["operation"]["status"] != "completed"
+    {
+        bail!("rebalance output violated the completed verification contract");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OutboxShape {
     events: usize,
     batch: usize,
@@ -965,6 +1578,11 @@ impl Drop for WorkloadRunner {
     fn drop(&mut self) {
         if let Some(service) = self.service.as_mut() {
             for prepared in self.prepared.values() {
+                for placement in &prepared.placements {
+                    if let Err(error) = service.release_database(&placement.url) {
+                        eprintln!("failed to release prepared routed database: {error:#}");
+                    }
+                }
                 if let Err(error) = service.release_database(&prepared.url) {
                     eprintln!("failed to release prepared performance database: {error:#}");
                 }
@@ -998,8 +1616,169 @@ fn base_args<const N: usize>(database_url: &str, command: [String; N]) -> Vec<St
     args
 }
 
+fn setup_database(
+    binary: &Path,
+    database_url: &str,
+    migrations: &Path,
+    limits: ExecutionLimits,
+) -> Result<()> {
+    require_success(
+        invoke(
+            binary,
+            base_args(
+                database_url,
+                [
+                    "setup".into(),
+                    "--migrations-dir".into(),
+                    path_arg(migrations)?,
+                    "--skip-evaluators".into(),
+                ],
+            ),
+            &[],
+            Duration::from_secs(120),
+            limits.stdout,
+            limits.stderr,
+        )?,
+        "prepare database schema",
+    )
+}
+
+fn database_register_args(database_url: &str, alias: &str, env_key: &str) -> Vec<String> {
+    base_args(
+        database_url,
+        [
+            "database".into(),
+            "register".into(),
+            alias.into(),
+            "--database-url-env".into(),
+            env_key.into(),
+        ],
+    )
+}
+
+fn database_activate_args(database_url: &str, alias: &str) -> Vec<String> {
+    base_args(
+        database_url,
+        ["database".into(), "activate".into(), alias.into()],
+    )
+}
+
+fn shard_assign_args(
+    database_url: &str,
+    run_id: &str,
+    run_shard: usize,
+    target: &str,
+) -> Vec<String> {
+    base_args(
+        database_url,
+        [
+            "run".into(),
+            "shard".into(),
+            "assign".into(),
+            run_id.into(),
+            run_shard.to_string(),
+            "--to".into(),
+            target.into(),
+        ],
+    )
+}
+
+fn run_admin_args(database_url: &str, operation: &str, run_id: &str) -> Vec<String> {
+    base_args(
+        database_url,
+        ["run".into(), operation.into(), run_id.into()],
+    )
+}
+
+fn read_args(database_url: &str, run_id: &str, shape: ReadShape) -> Vec<String> {
+    match (shape.operation, shape.format) {
+        (ReadOperation::Status, None) => run_admin_args(database_url, "status", run_id),
+        (ReadOperation::Results, None) => run_admin_args(database_url, "results", run_id),
+        (ReadOperation::Export, Some(format)) => base_args(
+            database_url,
+            [
+                "run".into(),
+                "export".into(),
+                run_id.into(),
+                "--format".into(),
+                match format {
+                    ExportFormat::Json => "json".into(),
+                    ExportFormat::Jsonl => "jsonl".into(),
+                },
+                "--batch-size".into(),
+                "250".into(),
+            ],
+        ),
+        _ => unreachable!("validated read shape has a matching format"),
+    }
+}
+
+fn shard_move_args(database_url: &str, run_id: &str, target: &str) -> Vec<String> {
+    base_args(
+        database_url,
+        [
+            "shard".into(),
+            "move".into(),
+            run_id.into(),
+            "0".into(),
+            "--alias".into(),
+            target.into(),
+        ],
+    )
+}
+
+fn rebalance_plan_args(database_url: &str, shards: usize) -> Vec<String> {
+    base_args(
+        database_url,
+        [
+            "rebalance".into(),
+            "plan".into(),
+            "--from".into(),
+            "primary".into(),
+            "--to".into(),
+            "perf_01".into(),
+            "--max-items".into(),
+            shards.to_string(),
+        ],
+    )
+}
+
+fn rebalance_apply_args(database_url: &str, operation_id: &str, shards: usize) -> Vec<String> {
+    base_args(
+        database_url,
+        [
+            "rebalance".into(),
+            "apply".into(),
+            operation_id.into(),
+            "--max-items".into(),
+            shards.to_string(),
+        ],
+    )
+}
+
+fn rebalance_verify_args(database_url: &str, operation_id: &str, shards: usize) -> Vec<String> {
+    base_args(
+        database_url,
+        [
+            "rebalance".into(),
+            "verify".into(),
+            operation_id.into(),
+            "--max-items".into(),
+            shards.to_string(),
+        ],
+    )
+}
+
 fn create_args(database_url: &str, inputs: &RunInputs) -> Result<Vec<String>> {
-    Ok(base_args(
+    create_args_with_placement(database_url, inputs, false)
+}
+
+fn create_args_with_placement(
+    database_url: &str,
+    inputs: &RunInputs,
+    spread: bool,
+) -> Result<Vec<String>> {
+    let mut args = base_args(
         database_url,
         [
             "run".into(),
@@ -1009,7 +1788,16 @@ fn create_args(database_url: &str, inputs: &RunInputs) -> Result<Vec<String>> {
             "--dataset-file".into(),
             path_arg(&inputs.dataset)?,
         ],
-    ))
+    );
+    if spread {
+        args.extend([
+            "--default-shard-database-alias".into(),
+            "primary".into(),
+            "--shard-assignment-policy".into(),
+            "spread-active".into(),
+        ]);
+    }
+    Ok(args)
 }
 
 fn coordinator_args(database_url: &str, messaging_url: &str) -> Vec<String> {
@@ -1155,18 +1943,20 @@ fn invoke_workers(
 }
 
 /// Creates a prerequisite run and extracts its stable machine-readable ID.
+#[allow(clippy::too_many_arguments)]
 fn create_run(
     binary: &Path,
     database_url: &str,
     inputs: &RunInputs,
     env: &[(String, String)],
+    spread: bool,
     timeout: Duration,
     stdout_limit: usize,
     stderr_limit: usize,
 ) -> Result<String> {
     let outcome = invoke(
         binary,
-        create_args(database_url, inputs)?,
+        create_args_with_placement(database_url, inputs, spread)?,
         env,
         timeout,
         stdout_limit,
@@ -1174,6 +1964,329 @@ fn create_run(
     )?;
     require_success_ref(&outcome, "prepare run fixture")?;
     parse_run_id(&outcome.stdout.text())
+}
+
+/// Seeds open execution rows from the immutable case projections for cancellation.
+fn ensure_execution_routes(
+    binary: &Path,
+    database_url: &str,
+    run_id: &str,
+    expected_routes: usize,
+    env: &[(String, String)],
+    limits: ExecutionLimits,
+) -> Result<()> {
+    let mut client = Client::connect(database_url, NoTls)?;
+    let existing = scalar(
+        &mut client,
+        "SELECT COUNT(*)::bigint FROM shard_placements WHERE run_id = $1::text::uuid",
+        run_id,
+    )? as usize;
+    for run_shard in existing..expected_routes {
+        let alias = if run_shard == 0 {
+            "primary".to_owned()
+        } else {
+            format!("perf_{:02}", run_shard % expected_routes)
+        };
+        require_success(
+            invoke(
+                binary,
+                shard_assign_args(database_url, run_id, run_shard, &alias),
+                env,
+                Duration::from_secs(120),
+                limits.stdout,
+                limits.stderr,
+            )?,
+            "assign empty cancellation route",
+        )?;
+    }
+    Ok(())
+}
+
+fn seed_open_executions(database_urls: &[String], run_id: &str) -> Result<()> {
+    for database_url in database_urls {
+        let mut client = Client::connect(database_url, NoTls)?;
+        client.execute(
+            r#"
+            INSERT INTO executions (
+                run_id, run_shard, chunk_id, case_id, case_hash,
+                profile_group_id, task_type, tags, input_payload,
+                expected_output, case_metadata, evaluation_profile_id,
+                evaluation_profile_version, evaluator_manifest,
+                expected_evaluator_count, status
+            )
+            SELECT
+                membership.run_id, membership.run_shard, chunk.id,
+                membership.case_id, membership.case_hash, 'sentiment',
+                blob.task_type, blob.tags, blob.input_payload,
+                blob.expected_output, blob.metadata,
+                run.evaluation_profile_id, run.evaluation_profile_version,
+                '[]'::jsonb, 0, 'pending'::execution_status
+            FROM run_shard_cases membership
+            JOIN run_chunks chunk
+              ON chunk.run_id = membership.run_id
+             AND chunk.run_shard = membership.run_shard
+             AND membership.case_ordinal >= chunk.ordinal_start
+             AND membership.case_ordinal < chunk.ordinal_end
+            JOIN case_blobs blob ON blob.case_hash = membership.case_hash
+            JOIN runs run ON run.id = membership.run_id
+            WHERE membership.run_id = $1::text::uuid
+            ON CONFLICT (run_id, run_shard, case_id) DO NOTHING
+            "#,
+            &[&run_id],
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Completes a reusable routed run and adds deterministic diagnostic rows.
+fn prepare_terminal_run(
+    _service: &mut ServiceHarness,
+    _binary: &Path,
+    control_database_url: &str,
+    run_id: &str,
+    database_urls: &[String],
+    _route_env: &[(String, String)],
+    cases: usize,
+    _worker_pass_limit: usize,
+    _limits: ExecutionLimits,
+) -> Result<()> {
+    seed_open_executions(database_urls, run_id)?;
+    for database_url in database_urls {
+        let mut client = Client::connect(database_url, NoTls)?;
+        client.execute(
+            r#"
+            UPDATE executions
+            SET status = 'completed'::execution_status,
+                current_attempt_no = 1,
+                expected_evaluator_count = 1,
+                started_at = now(), completed_at = now(), updated_at = now()
+            WHERE run_id = $1::text::uuid
+            "#,
+            &[&run_id],
+        )?;
+        client.execute(
+            r#"
+            INSERT INTO execution_attempts (
+                execution_id, run_id, run_shard, attempt_no, status,
+                worker_id, worker_host, agent_latency_ms,
+                evaluator_latency_ms, total_latency_ms, token_usage,
+                outcome_summary, started_at, completed_at
+            )
+            SELECT id, run_id, run_shard, 1, 'completed'::attempt_status,
+                   gen_random_uuid(), 'performance-fixture', 1, 1, 2,
+                   '{"input":1,"output":1}'::jsonb,
+                   '{"fixture":true}'::jsonb, now(), now()
+            FROM executions
+            WHERE run_id = $1::text::uuid
+            ON CONFLICT (run_id, run_shard, execution_id, attempt_no) DO NOTHING
+            "#,
+            &[&run_id],
+        )?;
+        client.execute(
+            r#"
+            UPDATE executions execution
+            SET current_attempt_id = attempt.id, updated_at = now()
+            FROM execution_attempts attempt
+            WHERE execution.run_id = $1::text::uuid
+              AND attempt.run_id = execution.run_id
+              AND attempt.run_shard = execution.run_shard
+              AND attempt.execution_id = execution.id
+              AND attempt.attempt_no = 1
+            "#,
+            &[&run_id],
+        )?;
+        client.execute(
+            r#"
+            INSERT INTO evaluator_results (
+                run_id, run_shard, execution_id, attempt_id, binding_id,
+                evaluator_id, evaluator_version, evaluator_profile_id,
+                evaluator_profile_version, evaluator_interface_version,
+                evaluator_runtime_version, dimension, outcome, judgment,
+                blocking, measurement_kind, raw_ordinal, normalized_score,
+                normalization_policy_hash, pass_threshold, weight,
+                raw_evaluator_output
+            )
+            SELECT execution.run_id, execution.run_shard, execution.id,
+                   attempt.id, 'sentiment-00', gen_random_uuid(), '0.1.0',
+                   execution.evaluation_profile_id,
+                   execution.evaluation_profile_version, '1.0.0',
+                   'fixture', 'quality', 'completed'::evaluator_outcome,
+                   'passed'::evaluation_status, true, 'ordinal', 'positive',
+                   1.0, 'performance-fixture-policy', 0.5, 1.0,
+                   '{"label":"positive","fixture":true}'::jsonb
+            FROM executions execution
+            JOIN execution_attempts attempt
+              ON attempt.run_id = execution.run_id
+             AND attempt.run_shard = execution.run_shard
+             AND attempt.execution_id = execution.id
+             AND attempt.attempt_no = 1
+            WHERE execution.run_id = $1::text::uuid
+            ON CONFLICT (run_id, run_shard, attempt_id, binding_id) DO NOTHING
+            "#,
+            &[&run_id],
+        )?;
+        client.execute(
+            r#"
+            INSERT INTO execution_aggregates (
+                execution_id, run_id, run_shard, attempt_id,
+                overall_status, aggregate_score, evaluator_result_count,
+                dimension_scores, blocking_failures, summary
+            )
+            SELECT execution.id, execution.run_id, execution.run_shard,
+                   attempt.id, 'passed'::evaluation_status, 1.0, 1,
+                   '{"quality":1.0}'::jsonb, '[]'::jsonb,
+                   '{"fixture":true}'::jsonb
+            FROM executions execution
+            JOIN execution_attempts attempt
+              ON attempt.run_id = execution.run_id
+             AND attempt.run_shard = execution.run_shard
+             AND attempt.execution_id = execution.id
+             AND attempt.attempt_no = 1
+            WHERE execution.run_id = $1::text::uuid
+            ON CONFLICT (run_id, run_shard, execution_id) DO NOTHING
+            "#,
+            &[&run_id],
+        )?;
+        client.execute(
+            r#"
+            INSERT INTO evaluator_diagnostics (
+                run_id, run_shard, evaluator_result_id, diagnostic_index,
+                severity, category, reason, evidence, tags
+            )
+            SELECT run_id, run_shard, id, 0, 'none'::severity,
+                   'performance_fixture', 'deterministic diagnostic',
+                   '{"source":"performance_fixture"}'::jsonb,
+                   ARRAY['performance']::text[]
+            FROM evaluator_results
+            WHERE run_id = $1::text::uuid
+            ON CONFLICT (run_id, run_shard, evaluator_result_id, diagnostic_index)
+            DO NOTHING
+            "#,
+            &[&run_id],
+        )?;
+        client.execute(
+            r#"
+            INSERT INTO run_snapshots (
+                run_id, run_shard, run_key, dataset_id, dataset_version_id,
+                dataset_version, evaluation_profile_id,
+                evaluation_profile_version, profile_version_id, profile_hash,
+                aggregation_policy_id, aggregation_policy_version,
+                aggregation_policy_hash, agent_provider, agent_name,
+                agent_version, prompt_config_id, prompt_config_version,
+                config_snapshot, expected_execution_count
+            )
+            SELECT run.id, execution.run_shard, run.run_key, run.dataset_id,
+                   run.dataset_version_id, run.dataset_version,
+                   run.evaluation_profile_id, run.evaluation_profile_version,
+                   run.profile_version_id, run.profile_hash,
+                   run.aggregation_policy_id, run.aggregation_policy_version,
+                   run.aggregation_policy_hash, run.agent_provider,
+                   run.agent_name, run.agent_version, run.prompt_config_id,
+                   run.prompt_config_version, run.config_snapshot,
+                   COUNT(*)::integer
+            FROM runs run
+            JOIN executions execution ON execution.run_id = run.id
+            WHERE run.id = $1::text::uuid
+            GROUP BY run.id, execution.run_shard
+            ON CONFLICT (run_id, run_shard) DO UPDATE
+            SET expected_execution_count = EXCLUDED.expected_execution_count,
+                updated_at = now()
+            "#,
+            &[&run_id],
+        )?;
+        client.execute(
+            r#"
+            INSERT INTO run_shard_summaries (
+                run_id, run_shard, expected_execution_count,
+                execution_count, terminal_execution_count, aggregate_count,
+                passed_execution_count, evaluator_result_count,
+                score_count, score_sum, min_score, max_score, status
+            )
+            SELECT run_id, run_shard, COUNT(*)::integer, COUNT(*)::integer,
+                   COUNT(*)::integer, COUNT(*)::integer, COUNT(*)::integer,
+                   COUNT(*)::bigint, COUNT(*)::bigint,
+                   COUNT(*)::double precision, 1.0, 1.0, 'completed'
+            FROM executions
+            WHERE run_id = $1::text::uuid
+            GROUP BY run_id, run_shard
+            ON CONFLICT (run_id, run_shard) DO UPDATE
+            SET expected_execution_count = EXCLUDED.expected_execution_count,
+                execution_count = EXCLUDED.execution_count,
+                terminal_execution_count = EXCLUDED.terminal_execution_count,
+                aggregate_count = EXCLUDED.aggregate_count,
+                passed_execution_count = EXCLUDED.passed_execution_count,
+                evaluator_result_count = EXCLUDED.evaluator_result_count,
+                score_count = EXCLUDED.score_count,
+                score_sum = EXCLUDED.score_sum,
+                min_score = EXCLUDED.min_score,
+                max_score = EXCLUDED.max_score,
+                status = EXCLUDED.status,
+                updated_at = now()
+            "#,
+            &[&run_id],
+        )?;
+        client.execute(
+            "UPDATE run_chunks SET status = 'completed', dispatched_at = COALESCE(dispatched_at, now()), updated_at = now() WHERE run_id = $1::text::uuid",
+            &[&run_id],
+        )?;
+        client.execute(
+            r#"
+            UPDATE runs
+            SET status = 'completed'::run_status,
+                gate_status = 'pass'::gate_status,
+                terminal_execution_count = expected_execution_count,
+                passed_execution_count = expected_execution_count,
+                failed_execution_count = 0,
+                errored_execution_count = 0,
+                summary = '{"fixture":true,"average_score":1.0}'::jsonb,
+                started_at = COALESCE(started_at, now()),
+                dispatched_at = COALESCE(dispatched_at, now()),
+                finalized_at = now(), completed_at = now(), updated_at = now()
+            WHERE id = $1::text::uuid
+            "#,
+            &[&run_id],
+        )?;
+    }
+    let completed = total_run_count(database_urls, run_id, "executions", "status = 'completed'")?;
+    if completed != cases as i64 {
+        bail!("seeded {completed} completed executions; expected {cases}");
+    }
+    require_status_value(&run_status(control_database_url, run_id)?, "completed")
+}
+
+fn total_run_count(
+    database_urls: &[String],
+    run_id: &str,
+    table: &str,
+    predicate: &str,
+) -> Result<i64> {
+    let mut total = 0_i64;
+    for database_url in database_urls {
+        let mut client = Client::connect(database_url, NoTls)?;
+        total += scalar(
+            &mut client,
+            &format!(
+                "SELECT COUNT(*)::bigint FROM {table} WHERE run_id = $1::text::uuid AND {predicate}"
+            ),
+            run_id,
+        )?;
+    }
+    Ok(total)
+}
+
+/// Moves all narrow fixture membership and chunks into logical shard zero.
+fn consolidate_shard_rows(database_url: &str, run_id: &str) -> Result<()> {
+    let mut client = Client::connect(database_url, NoTls)?;
+    client.execute(
+        "UPDATE run_chunks SET run_shard = 0 WHERE run_id = $1::text::uuid AND run_shard <> 0",
+        &[&run_id],
+    )?;
+    client.execute(
+        "UPDATE run_shard_cases SET run_shard = 0 WHERE run_id = $1::text::uuid AND run_shard <> 0",
+        &[&run_id],
+    )?;
+    Ok(())
 }
 
 fn require_success(outcome: ProcessOutcome, context: &str) -> Result<()> {
@@ -1310,6 +2423,184 @@ fn structural_counts(database_url: &str, run_id: Option<&str>) -> Result<Durable
     Ok(counts)
 }
 
+fn routed_urls(control: &str, placements: &[String]) -> Vec<String> {
+    std::iter::once(control.to_owned())
+        .chain(placements.iter().cloned())
+        .collect()
+}
+
+fn cancellation_counts(
+    control_database_url: &str,
+    placements: &[String],
+    run_id: &str,
+    executions: usize,
+) -> Result<DurableCounts> {
+    let urls = routed_urls(control_database_url, placements);
+    let cancelled = total_run_count(&urls, run_id, "executions", "status = 'cancelled'")?;
+    if cancelled != executions as i64 {
+        bail!("cancelled {cancelled} executions; expected {executions}");
+    }
+    let mut client = Client::connect(control_database_url, NoTls)?;
+    require_status_value(&run_status_with(&mut client, run_id)?, "cancelled")?;
+    let routes = scalar(
+        &mut client,
+        "SELECT COUNT(*)::bigint FROM shard_placements WHERE run_id = $1::text::uuid",
+        run_id,
+    )?;
+    Ok(DurableCounts::from([
+        ("runs".into(), 1),
+        ("cancelled_executions".into(), cancelled),
+        ("execution_routes".into(), routes),
+        ("idempotent_replays".into(), 1),
+    ]))
+}
+
+fn read_counts(
+    control_database_url: &str,
+    placements: &[String],
+    run_id: &str,
+    executions: usize,
+) -> Result<DurableCounts> {
+    let urls = routed_urls(control_database_url, placements);
+    let actual_executions = total_run_count(&urls, run_id, "executions", "TRUE")?;
+    let results = total_run_count(&urls, run_id, "evaluator_results", "TRUE")?;
+    let diagnostics = total_run_count(&urls, run_id, "evaluator_diagnostics", "TRUE")?;
+    if actual_executions != executions as i64
+        || results != executions as i64
+        || diagnostics != executions as i64
+    {
+        bail!(
+            "read fixture counts differed: executions={actual_executions}, results={results}, diagnostics={diagnostics}; expected {executions} each"
+        );
+    }
+    Ok(DurableCounts::from([
+        ("executions".into(), actual_executions),
+        ("evaluator_results".into(), results),
+        ("evaluator_diagnostics".into(), diagnostics),
+    ]))
+}
+
+fn shard_move_counts(database_url: &str, run_id: &str) -> Result<DurableCounts> {
+    let mut client = Client::connect(database_url, NoTls)?;
+    let move_row = client.query_one(
+        r#"
+        SELECT id::text, copied_row_count, copied_byte_count
+        FROM shard_move_operations
+        WHERE run_id = $1::text::uuid AND run_shard = 0 AND status = 'completed'
+        ORDER BY completed_at DESC
+        LIMIT 1
+        "#,
+        &[&run_id],
+    )?;
+    let move_id: String = move_row.get(0);
+    let copied_rows: i64 = move_row.get(1);
+    let copied_bytes: i64 = move_row.get(2);
+    let progress = client.query(
+        r#"
+        SELECT table_name, completed_page_count, copied_row_count, copied_byte_count
+        FROM shard_move_table_progress
+        WHERE move_id = $1::text::uuid
+        ORDER BY table_name
+        "#,
+        &[&move_id],
+    )?;
+    if progress.is_empty() {
+        bail!("completed shard move has no durable page distribution");
+    }
+    let mut counts = DurableCounts::from([
+        ("move_operations".into(), 1),
+        ("move_copied_rows".into(), copied_rows),
+        ("move_copied_bytes".into(), copied_bytes),
+        ("idempotent_replays".into(), 1),
+    ]);
+    let mut total_pages = 0_i64;
+    for row in progress {
+        let table: String = row.get(0);
+        let pages: i64 = row.get(1);
+        let rows: i64 = row.get(2);
+        let bytes: i64 = row.get(3);
+        let lower_bound =
+            ((rows + 999) / 1000).max((bytes + (4 * 1024 * 1024 - 1)) / (4 * 1024 * 1024));
+        if pages < lower_bound || pages <= 0 || rows <= 0 || bytes <= 0 {
+            bail!(
+                "invalid shard page distribution for {table}: pages={pages}, rows={rows}, bytes={bytes}, lower_bound={lower_bound}"
+            );
+        }
+        total_pages += pages;
+        counts.insert(format!("move_pages_{table}"), pages);
+        counts.insert(format!("move_rows_{table}"), rows);
+        counts.insert(format!("move_bytes_{table}"), bytes);
+    }
+    counts.insert("move_pages".into(), total_pages);
+    Ok(counts)
+}
+
+fn rebalance_counts(
+    database_url: &str,
+    operation_id: &str,
+    run_id: &str,
+    shards: usize,
+) -> Result<DurableCounts> {
+    let mut client = Client::connect(database_url, NoTls)?;
+    let row = client.query_one(
+        r#"
+        SELECT status, planned_item_count, completed_item_count,
+               failed_item_count, cancelled_item_count
+        FROM shard_rebalance_operations
+        WHERE id = $1::text::uuid
+        "#,
+        &[&operation_id],
+    )?;
+    let status: String = row.get(0);
+    let planned: i32 = row.get(1);
+    let completed: i32 = row.get(2);
+    let failed: i32 = row.get(3);
+    let cancelled: i32 = row.get(4);
+    let target_routes = scalar(
+        &mut client,
+        "SELECT COUNT(*)::bigint FROM shard_placements WHERE run_id = $1::text::uuid AND database_alias = 'perf_01'",
+        run_id,
+    )?;
+    if status != "completed"
+        || planned != shards as i32
+        || completed != shards as i32
+        || failed != 0
+        || cancelled != 0
+        || target_routes != shards as i64
+    {
+        bail!("rebalance durable state violated its exact completion contract");
+    }
+    Ok(DurableCounts::from([
+        ("rebalance_items".into(), i64::from(planned)),
+        ("completed_rebalance_items".into(), i64::from(completed)),
+        ("target_routes".into(), target_routes),
+        ("apply_passes".into(), shards as i64),
+    ]))
+}
+
+fn routed_coordinator_counts(
+    control_database_url: &str,
+    placements: &[String],
+    run_id: &str,
+    aliases: usize,
+) -> Result<DurableCounts> {
+    let urls = routed_urls(control_database_url, placements);
+    let chunks = total_run_count(&urls, run_id, "run_chunks", "TRUE")?;
+    let mut client = Client::connect(control_database_url, NoTls)?;
+    let routes = scalar(
+        &mut client,
+        "SELECT COUNT(*)::bigint FROM shard_placements WHERE run_id = $1::text::uuid",
+        run_id,
+    )?;
+    if chunks != aliases as i64 || routes != aliases as i64 {
+        bail!("placement fixture produced {chunks} chunks and {routes} routes; expected {aliases}");
+    }
+    Ok(DurableCounts::from([
+        ("chunks".into(), chunks),
+        ("execution_routes".into(), routes),
+    ]))
+}
+
 /// Verifies reusable coordinator and worker templates contain no measured results.
 fn verify_prepared(workload_id: &str, counts: &DurableCounts) -> Result<()> {
     if matches!(
@@ -1346,6 +2637,44 @@ fn oracle_create(
     let status = run_status_with(&mut client, run_id)?;
     validate_create_oracle(&counts, &status, chunks)?;
     counts.insert("cases".into(), cases as i64);
+    Ok(counts)
+}
+
+/// Validates both completed creation and the bounded recovery handoff at 64 pages.
+fn oracle_create_boundary(
+    database_url: &str,
+    run_id: &str,
+    cases: usize,
+    chunks: i64,
+) -> Result<DurableCounts> {
+    let mut counts = structural_counts(database_url, Some(run_id))?;
+    let mut client = Client::connect(database_url, NoTls)?;
+    let status = run_status_with(&mut client, run_id)?;
+    let materialized_cases = scalar(
+        &mut client,
+        "SELECT COUNT(*)::bigint FROM run_shard_cases WHERE run_id = $1::text::uuid",
+        run_id,
+    )?;
+    let expected_materialized = cases.min(64_000) as i64;
+    let expected_status = if cases > 64_000 {
+        "creating"
+    } else {
+        "pending"
+    };
+    require_status_value(&status, expected_status)?;
+    require_count(&counts, "runs", 1)?;
+    require_count(&counts, "chunks", chunks)?;
+    require_count(&counts, "executions", 0)?;
+    if materialized_cases != expected_materialized {
+        bail!(
+            "creation boundary materialized {materialized_cases} cases; expected {expected_materialized}"
+        );
+    }
+    counts.insert("cases".into(), materialized_cases);
+    counts.insert(
+        "creation_recovery_pending".into(),
+        i64::from(cases > 64_000),
+    );
     Ok(counts)
 }
 
@@ -1627,11 +2956,15 @@ fn aggregate(outcomes: Vec<ProcessOutcome>, wall_time: Duration) -> ProcessOutco
         bytes_seen: 0,
         truncated: false,
         data: Vec::new(),
+        first_byte_time: None,
+        last_byte_time: None,
     };
     let mut stderr = CapturedOutput {
         bytes_seen: 0,
         truncated: false,
         data: Vec::new(),
+        first_byte_time: None,
+        last_byte_time: None,
     };
     let mut exit_code = Some(0);
     let mut timed_out = false;
@@ -1644,9 +2977,13 @@ fn aggregate(outcomes: Vec<ProcessOutcome>, wall_time: Duration) -> ProcessOutco
             .map(|(left, right)| left.max(right));
         stdout.bytes_seen = stdout.bytes_seen.saturating_add(outcome.stdout.bytes_seen);
         stdout.truncated |= outcome.stdout.truncated;
+        stdout.first_byte_time = stdout.first_byte_time.or(outcome.stdout.first_byte_time);
+        stdout.last_byte_time = outcome.stdout.last_byte_time.or(stdout.last_byte_time);
         stdout.data.extend(outcome.stdout.data);
         stderr.bytes_seen = stderr.bytes_seen.saturating_add(outcome.stderr.bytes_seen);
         stderr.truncated |= outcome.stderr.truncated;
+        stderr.first_byte_time = stderr.first_byte_time.or(outcome.stderr.first_byte_time);
+        stderr.last_byte_time = outcome.stderr.last_byte_time.or(stderr.last_byte_time);
         stderr.data.extend(outcome.stderr.data);
         timed_out |= outcome.timed_out;
         if outcome.exit_code != Some(0) {
@@ -1688,11 +3025,15 @@ mod tests {
                 bytes_seen: text.len() as u64,
                 truncated: false,
                 data: text.as_bytes().to_vec(),
+                first_byte_time: None,
+                last_byte_time: None,
             },
             stderr: CapturedOutput {
                 bytes_seen: 0,
                 truncated: false,
                 data: Vec::new(),
+                first_byte_time: None,
+                last_byte_time: None,
             },
         }
     }
@@ -1912,6 +3253,193 @@ mod tests {
         assert!(workload_shape(&fixture, "worker.execute-wasm.v1", "future-tuple").is_err());
         assert!(workload_shape(&fixture, "future.workload.v1", "tuple").is_err());
         assert!(lifecycle_workers("workers-3").is_err());
+    }
+
+    #[test]
+    fn admin_tuple_shapes_accept_registered_boundaries_and_reject_drift() {
+        assert_eq!(
+            parse_cancel_tuple("aliases-17-executions-8192").unwrap(),
+            AdminShape {
+                routes: 17,
+                executions: 8192,
+            }
+        );
+        assert_eq!(
+            parse_read_tuple("results-executions-251-routes-2").unwrap(),
+            ReadShape {
+                operation: ReadOperation::Results,
+                format: None,
+                routes: 2,
+                executions: 251,
+            }
+        );
+        assert_eq!(
+            parse_read_tuple("jsonl-executions-251-routes-2").unwrap(),
+            ReadShape {
+                operation: ReadOperation::Export,
+                format: Some(ExportFormat::Jsonl),
+                routes: 2,
+                executions: 251,
+            }
+        );
+        assert_eq!(parse_placement_tuple("aliases-32").unwrap(), 32);
+        assert_eq!(
+            parse_move_tuple("rows-4-payload-1049088").unwrap(),
+            MoveShape {
+                rows: 4,
+                payload_bytes: 1_049_088,
+            }
+        );
+        assert_eq!(parse_rebalance_tuple("shards-8").unwrap(), 8);
+        assert_eq!(
+            required_routes("run.read.v1", "status-executions-250-routes-1").unwrap(),
+            1
+        );
+        assert_eq!(
+            required_routes("shard.move.v1", "rows-1000-payload-1024").unwrap(),
+            2
+        );
+        assert!(parse_cancel_tuple("aliases-0-executions-1024").is_err());
+        assert!(parse_cancel_tuple("aliases-18-executions-1024").is_err());
+        assert!(parse_read_tuple("xml-executions-251-routes-2").is_err());
+        assert!(parse_read_tuple("jsonl-executions-0-routes-2").is_err());
+        assert!(parse_placement_tuple("aliases-33").is_err());
+        assert!(parse_move_tuple("rows-999-payload-1024").is_err());
+        assert!(parse_move_tuple("rows-4-payload-4194304").is_err());
+        assert!(parse_rebalance_tuple("shards-9").is_err());
+    }
+
+    #[test]
+    fn admin_output_oracles_reject_incomplete_or_wrong_results() {
+        let status = serde_json::json!({"data": {"run": {"id": "run", "status": "completed"}}});
+        assert!(
+            validate_read_output(ReadOperation::Status, None, &status.to_string(), 251).is_ok()
+        );
+
+        let results = serde_json::json!({
+            "data": {"results": {"execution_count": 251, "evaluator_result_count": 251}}
+        });
+        assert!(
+            validate_read_output(ReadOperation::Results, None, &results.to_string(), 251).is_ok()
+        );
+        assert!(
+            validate_read_output(ReadOperation::Results, None, &results.to_string(), 250).is_err()
+        );
+
+        let json = serde_json::json!({"executions": vec![serde_json::json!({}); 251]});
+        assert!(
+            validate_read_output(
+                ReadOperation::Export,
+                Some(ExportFormat::Json),
+                &json.to_string(),
+                251,
+            )
+            .is_ok()
+        );
+        let jsonl = std::iter::once(serde_json::json!({"type": "run"}))
+            .chain((0..251).map(|_| serde_json::json!({"type": "execution"})))
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            validate_read_output(
+                ReadOperation::Export,
+                Some(ExportFormat::Jsonl),
+                &jsonl,
+                251,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_read_output(
+                ReadOperation::Export,
+                Some(ExportFormat::Jsonl),
+                &jsonl,
+                250,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn admin_state_change_oracles_accept_success_and_reject_partial_state() {
+        let cancelled = serde_json::json!({
+            "data": {"status": "cancelled"},
+            "meta": {
+                "terminal": true,
+                "executions_cancelled": 1024,
+                "already_cancelled": false
+            }
+        });
+        assert!(validate_cancel_output(&cancelled.to_string(), 1024, false).is_ok());
+        assert!(validate_cancel_output(&cancelled.to_string(), 1023, false).is_err());
+
+        let replay = serde_json::json!({
+            "data": {"status": "cancelled"},
+            "meta": {
+                "terminal": true,
+                "executions_cancelled": 0,
+                "already_cancelled": true
+            }
+        });
+        assert!(validate_cancel_output(&replay.to_string(), 0, true).is_ok());
+        assert!(validate_cancel_output(&replay.to_string(), 0, false).is_err());
+
+        let moved = serde_json::json!({
+            "data": {
+                "target_database_alias": "perf_01",
+                "placement": {"database_alias": "perf_01"},
+                "tables": [{"name": "executions", "verified": true}]
+            },
+            "meta": {"moved": true, "verified": true}
+        });
+        assert!(validate_move_output(&moved.to_string(), "perf_01", true).is_ok());
+        assert!(validate_move_output(&moved.to_string(), "perf_01", false).is_err());
+        assert!(validate_move_output(&moved.to_string(), "perf_02", true).is_err());
+        let mut replayed_move = moved.clone();
+        replayed_move["meta"]["moved"] = false.into();
+        assert!(validate_move_output(&replayed_move.to_string(), "perf_01", false).is_ok());
+        let mut unverified_move = moved.clone();
+        unverified_move["data"]["tables"][0]["verified"] = false.into();
+        assert!(validate_move_output(&unverified_move.to_string(), "perf_01", true).is_err());
+
+        let plan = serde_json::json!({"data": {"operation": {"id": "operation-1"}}});
+        assert_eq!(
+            parse_rebalance_operation_id(&plan.to_string()).unwrap(),
+            "operation-1"
+        );
+        assert!(parse_rebalance_operation_id(r#"{"data":{}}"#).is_err());
+
+        let verified = serde_json::json!({
+            "data": {"operation": {"status": "completed"}},
+            "meta": {"verified": true, "verified_item_count": 8}
+        });
+        assert!(validate_rebalance_output(&verified.to_string(), 8).is_ok());
+        assert!(validate_rebalance_output(&verified.to_string(), 7).is_err());
+    }
+
+    #[test]
+    fn read_resource_oracle_enforces_stream_timing_and_export_memory() {
+        let shape = ReadShape {
+            operation: ReadOperation::Export,
+            format: Some(ExportFormat::Jsonl),
+            routes: 1,
+            executions: 250,
+        };
+        let mut process = outcome(Some(0), Some(1), Some(128 * 1024 * 1024), "output");
+        process.wall_time = Duration::from_millis(10);
+        process.stdout.first_byte_time = Some(Duration::from_millis(2));
+        process.stdout.last_byte_time = Some(Duration::from_millis(8));
+        assert!(validate_read_resources(shape, &process).is_ok());
+
+        process.peak_rss_bytes = Some(257 * 1024 * 1024);
+        assert!(validate_read_resources(shape, &process).is_err());
+        process.peak_rss_bytes = Some(128 * 1024 * 1024);
+        process.stdout.first_byte_time = Some(Duration::from_millis(9));
+        process.stdout.last_byte_time = Some(Duration::from_millis(8));
+        assert!(validate_read_resources(shape, &process).is_err());
+        process.stdout.first_byte_time = None;
+        assert!(validate_read_resources(shape, &process).is_err());
     }
 
     #[test]

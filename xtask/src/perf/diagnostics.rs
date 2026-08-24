@@ -178,6 +178,8 @@ mod tests {
                 wall_time_ns: 1,
                 cpu_time_ns: None,
                 peak_rss_bytes: None,
+                stdout_first_byte_ns: None,
+                stdout_last_byte_ns: None,
                 resource_source: "test".into(),
                 exit_code: Some(0),
                 timed_out: false,

@@ -298,7 +298,7 @@ owner = "worker-http-agent"
 status = "implemented"
 capability = "worker.execute-wasm.v1"
 fixture = "mvp-v1"
-tuples = ["cases-8-payload-65536-delay-0", "cases-8-payload-1024-delay-10", "cases-8-payload-65536-delay-10"]
+tuples = ["cases-8-payload-65536-delay-0", "cases-8-payload-1024-delay-10", "cases-8-payload-65536-delay-10", "cases-32-payload-1048576-delay-0"]
 unit = "agent_request"
 oracle = "exact_agent_requests_and_terminal_results"
 required_metrics = ["wall_time", "process_cpu", "service_cpu", "sql", "wal", "http", "queue"]
@@ -474,3 +474,126 @@ exact = { "durable.runs" = 64, "durable.completed_runs" = 64, "durable.evaluator
 tuple = "runs-65"
 input = 65
 exact = { "durable.runs" = 65, "durable.completed_runs" = 65, "durable.evaluator_results" = 65, "durable.completion_events" = 65, "queue_ready" = 0, "queue_unacked" = 0, "http_requests" = 0 }
+
+[[workloads]]
+id = "run.cancel-scaling.v1"
+owner = "run-administration"
+status = "implemented"
+capability = "run.admin.v1"
+fixture = "mvp-v1"
+tuples = ["aliases-1-executions-1024", "aliases-4-executions-1024", "aliases-17-executions-1024", "aliases-17-executions-8192"]
+unit = "cancelled_execution_and_route"
+oracle = "exact_cancelled_run_rows_and_idempotent_replay"
+required_metrics = ["wall_time", "process_cpu", "service_cpu", "peak_rss", "sql", "wal"]
+watchdog_ms = 300000
+planning_duration_ms = 30000
+preconditioning = "none"
+
+[[workloads]]
+id = "run.read.v1"
+owner = "run-administration"
+status = "implemented"
+capability = "run.admin.v1"
+fixture = "mvp-v1"
+tuples = ["status-executions-250-routes-1", "status-executions-251-routes-2", "results-executions-250-routes-1", "results-executions-251-routes-2"]
+unit = "returned_execution_summary"
+oracle = "exact_terminal_status_and_result_counts"
+required_metrics = ["wall_time", "process_cpu", "service_cpu", "peak_rss", "sql"]
+watchdog_ms = 180000
+planning_duration_ms = 15000
+preconditioning = "none"
+
+[[workloads]]
+id = "run.export.v1"
+owner = "run-export"
+status = "implemented"
+capability = "run.admin.v1"
+fixture = "mvp-v1"
+tuples = ["json-executions-250-routes-1", "json-executions-251-routes-2", "jsonl-executions-250-routes-1", "jsonl-executions-251-routes-2"]
+unit = "serialized_execution"
+oracle = "exact_export_record_types_and_counts"
+required_metrics = ["wall_time", "throughput", "process_cpu", "service_cpu", "peak_rss", "sql"]
+watchdog_ms = 240000
+planning_duration_ms = 20000
+preconditioning = "none"
+
+[[workloads]]
+id = "shard.move.v1"
+owner = "shard-administration"
+status = "implemented"
+capability = "shard.admin.v1"
+fixture = "mvp-v1"
+tuples = ["rows-1000-payload-1024", "rows-1001-payload-1024", "rows-4-payload-1048064", "rows-4-payload-1049088"]
+unit = "copied_row_page_and_byte"
+oracle = "exact_route_switch_checksums_and_page_distribution"
+required_metrics = ["wall_time", "throughput", "process_cpu", "service_cpu", "peak_rss", "sql", "wal"]
+watchdog_ms = 600000
+planning_duration_ms = 60000
+preconditioning = "none"
+
+[[workloads]]
+id = "shard.rebalance.v1"
+owner = "shard-administration"
+status = "implemented"
+capability = "shard.admin.v1"
+fixture = "mvp-v1"
+tuples = ["shards-1", "shards-8"]
+unit = "moved_and_verified_shard"
+oracle = "exact_completed_rebalance_items_and_routes"
+required_metrics = ["wall_time", "throughput", "process_cpu", "service_cpu", "peak_rss", "sql", "wal"]
+watchdog_ms = 600000
+planning_duration_ms = 60000
+preconditioning = "none"
+
+[[workloads]]
+id = "coordinator.placement-scaling.v1"
+owner = "coordinator-routing"
+status = "implemented"
+capability = "coordinator.dispatch.v1"
+fixture = "mvp-v1"
+tuples = ["aliases-1", "aliases-8", "aliases-16", "aliases-32"]
+unit = "logical_placement"
+oracle = "exact_bounded_cycle_and_dispatch"
+required_metrics = ["wall_time", "process_cpu", "service_cpu", "sql", "wal", "queue"]
+watchdog_ms = 240000
+planning_duration_ms = 15000
+preconditioning = "none"
+
+[workloads.scaling_model]
+kind = "fixed_plus_slope"
+input_dimension = "logical_placements"
+max_residual_fraction = 0.15
+
+[[workloads.scaling_model.points]]
+tuple = "aliases-1"
+input = 1
+exact = { "durable.chunks" = 1, "queue_ready" = 1, "queue_unacked" = 0, "http_requests" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "aliases-8"
+input = 8
+exact = { "durable.chunks" = 8, "queue_ready" = 8, "queue_unacked" = 0, "http_requests" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "aliases-16"
+input = 16
+exact = { "durable.chunks" = 16, "queue_ready" = 16, "queue_unacked" = 0, "http_requests" = 0 }
+
+[[workloads.scaling_model.points]]
+tuple = "aliases-32"
+input = 32
+exact = { "durable.chunks" = 32, "queue_ready" = 32, "queue_unacked" = 0, "http_requests" = 0 }
+
+[[workloads]]
+id = "run.create-boundaries.v1"
+owner = "run-creation"
+status = "implemented"
+capability = "run.create.v1"
+fixture = "mvp-v1"
+tuples = ["cases-499", "cases-999", "cases-1999", "cases-63999", "cases-64000", "cases-64001"]
+unit = "case_and_creation_page"
+oracle = "exact_creation_progress_at_every_page_boundary"
+required_metrics = ["wall_time", "child_cpu", "peak_rss", "sql", "wal"]
+watchdog_ms = 600000
+planning_duration_ms = 90000
+preconditioning = "none"

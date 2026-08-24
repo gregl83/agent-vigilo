@@ -163,8 +163,13 @@ struct ServiceManifest {
 /// Immutable observations taken immediately before a measured command.
 pub struct MeasurementBaseline {
     wal_lsn: String,
-    database_bytes: i64,
+    databases: Vec<DatabaseBaseline>,
     service_sampler: ServiceSampler,
+}
+
+struct DatabaseBaseline {
+    url: String,
+    database_bytes: i64,
 }
 
 #[derive(Default)]
@@ -426,21 +431,46 @@ impl ServiceHarness {
 
     /// Resets all scoped collectors immediately before the measured command.
     pub fn begin_measurement(&self, scope: &SampleScope) -> Result<MeasurementBaseline> {
+        self.begin_measurement_with_databases(scope, &[])
+    }
+
+    /// Resets collectors for the control database and every routed database.
+    pub fn begin_measurement_with_databases(
+        &self,
+        scope: &SampleScope,
+        routed_database_urls: &[String],
+    ) -> Result<MeasurementBaseline> {
         self.require_scope(scope)?;
         self.agent.reset()?;
-        let mut client = PgClient::connect(&scope.database_url, NoTls)?;
-        client.batch_execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")?;
-        let wal_lsn: String = client
-            .query_one("SELECT pg_current_wal_lsn()::text", &[])?
-            .get(0);
-        let database_bytes: i64 = client
-            .query_one("SELECT pg_database_size(current_database())", &[])?
-            .get(0);
-        let _ = client.simple_query("SELECT pg_stat_statements_reset()")?;
+        let urls = std::iter::once(scope.database_url.clone())
+            .chain(routed_database_urls.iter().cloned())
+            .collect::<Vec<_>>();
+        let mut databases = Vec::with_capacity(urls.len());
+        let mut wal_lsn = None;
+        for url in urls {
+            self.owned_database_name(&url)?;
+            let mut client = PgClient::connect(&url, NoTls)?;
+            client.batch_execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")?;
+            if wal_lsn.is_none() {
+                wal_lsn = Some(
+                    client
+                        .query_one("SELECT pg_current_wal_lsn()::text", &[])?
+                        .get(0),
+                );
+            }
+            let database_bytes: i64 = client
+                .query_one("SELECT pg_database_size(current_database())", &[])?
+                .get(0);
+            let _ = client.simple_query("SELECT pg_stat_statements_reset()")?;
+            databases.push(DatabaseBaseline {
+                url,
+                database_bytes,
+            });
+        }
         let service_sampler = ServiceSampler::start(&self.root, self.container_ids())?;
         Ok(MeasurementBaseline {
-            wal_lsn,
-            database_bytes,
+            wal_lsn: wal_lsn.context("measurement scope omitted its control database")?,
+            databases,
             service_sampler,
         })
     }
@@ -454,34 +484,54 @@ impl ServiceHarness {
     ) -> Result<ExternalMeasurements> {
         self.require_scope(scope)?;
         let services = baseline.service_sampler.finish()?;
-        let mut client = PgClient::connect(&scope.database_url, NoTls)?;
-        let query_diagnostics = query_diagnostics(&mut client)?;
-        let stats = client.query_one(
-            r#"
-            SELECT
-                COALESCE(SUM(calls), 0)::bigint,
-                COALESCE(SUM(total_exec_time), 0)::double precision,
-                COALESCE(SUM(rows), 0)::bigint
-            FROM pg_stat_statements
-            WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
-              AND query NOT LIKE '%pg_stat_statements%'
-            "#,
-            &[],
-        )?;
-        let wal_bytes: i64 = client
+        let mut control = PgClient::connect(&scope.database_url, NoTls)?;
+        let wal_bytes: i64 = control
             .query_one(WAL_BYTES_QUERY, &[&baseline.wal_lsn])?
             .get(0);
-        let database_bytes: i64 = client
-            .query_one("SELECT pg_database_size(current_database())", &[])?
-            .get(0);
+        let mut sql_calls = 0_u64;
+        let mut sql_time_ms = 0.0_f64;
+        let mut sql_rows = 0_u64;
+        let mut database_bytes_delta = 0_i64;
+        let mut diagnostics = Vec::new();
+        for database in baseline.databases {
+            let mut client = PgClient::connect(&database.url, NoTls)?;
+            diagnostics.extend(query_diagnostics(&mut client)?);
+            let stats = client.query_one(
+                r#"
+                SELECT
+                    COALESCE(SUM(calls), 0)::bigint,
+                    COALESCE(SUM(total_exec_time), 0)::double precision,
+                    COALESCE(SUM(rows), 0)::bigint
+                FROM pg_stat_statements
+                WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+                  AND query NOT LIKE '%pg_stat_statements%'
+                "#,
+                &[],
+            )?;
+            sql_calls = sql_calls.saturating_add(nonnegative_u64(stats.get::<_, i64>(0))?);
+            sql_time_ms += stats.get::<_, f64>(1);
+            sql_rows = sql_rows.saturating_add(nonnegative_u64(stats.get::<_, i64>(2))?);
+            let database_bytes: i64 = client
+                .query_one("SELECT pg_database_size(current_database())", &[])?
+                .get(0);
+            database_bytes_delta = database_bytes_delta
+                .saturating_add(database_bytes.saturating_sub(database.database_bytes));
+        }
+        diagnostics.sort_by(|left, right| {
+            right
+                .total_exec_time_ms
+                .total_cmp(&left.total_exec_time_ms)
+                .then_with(|| left.query_digest.cmp(&right.query_digest))
+        });
+        diagnostics.truncate(20);
         let queue = self.queue_counts(&scope.vhost)?;
         let http = self.agent.snapshot();
         Ok(ExternalMeasurements {
-            sql_calls: Some(nonnegative_u64(stats.get::<_, i64>(0))?),
-            sql_time_ms: Some(stats.get(1)),
-            sql_rows: Some(nonnegative_u64(stats.get::<_, i64>(2))?),
+            sql_calls: Some(sql_calls),
+            sql_time_ms: Some(sql_time_ms),
+            sql_rows: Some(sql_rows),
             wal_bytes: Some(nonnegative_u64(wal_bytes)?),
-            database_bytes_delta: Some(database_bytes - baseline.database_bytes),
+            database_bytes_delta: Some(database_bytes_delta),
             http_requests: Some(http.requests),
             http_bytes: Some(http.bytes),
             http_peak_concurrency: Some(http.peak_concurrency),
@@ -490,7 +540,7 @@ impl ServiceHarness {
             service_memory_bytes: services.memory_bytes,
             service_cpu_percent: services.cpu_percent,
             durable_counts,
-            query_diagnostics,
+            query_diagnostics: diagnostics,
         })
     }
 
@@ -562,6 +612,21 @@ impl ServiceHarness {
     pub fn release_database(&mut self, database_url: &str) -> Result<()> {
         let name = self.owned_database_name(database_url)?;
         self.drop_database(&name)
+    }
+
+    /// Drops a set of sample-owned routed databases, attempting every cleanup.
+    pub fn release_databases(&mut self, database_urls: &[String]) -> Result<()> {
+        let mut failures = Vec::new();
+        for database_url in database_urls {
+            if let Err(error) = self.release_database(database_url) {
+                failures.push(format!("{error:#}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            bail!("release routed databases: {}", failures.join("; "))
+        }
     }
 
     /// Stops the topology after verifying the recorded live ownership inventory.

@@ -9,6 +9,9 @@ confirmed regression gates. Startup remains service-free; run creation,
 coordinator, HTTP agent, worker/Wasm, persistence, and lifecycle measurements
 use a fresh run-owned PostgreSQL database clone, RabbitMQ vhost/namespace, and
 deterministic HTTP agent for every sample.
+Cancellation, terminal reads, exports, shard movement, rebalance, and logical
+placement workloads add routed database clones only when their selected tuple
+requires them. Their setup remains outside the measured process boundary.
 
 ## Module Overview
 
@@ -64,6 +67,8 @@ environment, and generated-artifact field reference.
 | `component-smoke-v1` | Explicitly selected, small exact-oracle checks for each component driver. |
 | `component-reference-v1` | Repeated samples at every registered model point and batching boundary. |
 | `component-nightly-v1` | Broader orthogonal payload, latency, and large-cardinality diagnostics. |
+| `admin-smoke-v1` | Explicitly selected exact-oracle checks for routed administration and large-data drivers. |
+| `admin-nightly-v1` | Scheduled cancellation, read/export, movement, placement, and creation-boundary evidence. |
 
 `reference-v2` is generated only after a canonical calibration passes review.
 It references a versioned budget policy and contains only tuples whose block
@@ -205,7 +210,7 @@ capacity evidence, and an existing output directory. It emits digested evidence,
 | Workload | Measured region | Exact postcondition |
 | --- | --- | --- |
 | `startup.cli-help.v1` | One release process executing `--help` | Exit `0` and frozen help signatures. |
-| `run.create.v1` | `run create` for 1,001 cases | One pending run, 1,001 executions, and 11 chunks. |
+| `run.create.v1` | `run create` for 1,001 cases | One pending run, 1,001 case memberships, zero executions, and 11 chunks. |
 | `coordinator.dispatch.v1` | One `coordinator once` cycle | One legal start and all 512 chunks dispatched to the run-owned broker scope. |
 | `worker.execute-wasm.v1` | One `worker once` pass | Exact attempts/results for either 8x1 or 1x8, one completed chunk, and drained delivery. |
 | `system.lifecycle.v1` | Create through terminal state with one or two worker processes | One completed passing run, exact execution/result counts, and drained delivery. |
@@ -224,6 +229,13 @@ generating a Cartesian product:
 | Outbox | Batches 1/64/65/256/1,000 with parallelism 1/8/64 | Exact published worker deliveries and durable event rows. |
 | Recovery | Expired leases 1/1,000/1,001 | Recovery counts, recovery events, and redeliveries. |
 | Finalization | Terminal runs 1/64/65 | Completed runs, evaluator results, and completion events. |
+| Cancellation | 1/4/17 logical routes and 1,024/8,192 open executions | Exact cancelled rows, terminal state, and idempotent replay. |
+| Status and results | 250/251 terminal executions over one/two routes | Completed status plus exact execution, result, and diagnostic counts. |
+| JSON and JSONL export | 250/251 terminal executions with a 250-row page | Exact record types/counts, output bytes, first/last byte, and peak RSS. |
+| Shard move | 1,000/1,001 narrow rows and payloads around 4 MiB | Verified route switch, idempotent replay, and actual per-table rows, bytes, and page counts. |
+| Rebalance | One/eight persisted items across two databases | One claimed item per resumable apply pass, exact verification, and every route on the target. |
+| Placement | 1/8/16/32 logical placements on one PostgreSQL server | Exact bounded dispatch work and a fixed-cost-plus-placement slope. |
+| Creation limits | Both sides of grouping and the 64-page handoff | Exact pending or recoverable-creating state and materialized case count. |
 
 The router/cache contract remains registered but unavailable because the
 release CLI cannot keep its process-local cache alive across calls. Adding a
@@ -235,6 +247,14 @@ Migration, evaluator publication, fixture creation, database cloning, and
 worker queue preparation occur before collector reset and are excluded from
 measurement. Lifecycle intentionally includes creation and every runtime
 process.
+
+Routed samples reset and aggregate PostgreSQL statement counts, rows, database
+growth, and diagnostics across every participating database. Cluster WAL is
+counted once because the reference topology uses one PostgreSQL server. JSONL
+must remain below its 256 MiB peak-RSS contract at the registered page boundary;
+JSON intentionally materializes one document and has a separate 512 MiB tested
+limit. These limits are correctness guards for the registered fixture size, not
+calibrated regression budgets or production capacity claims.
 
 ## Performance Test Tier
 

@@ -11,10 +11,12 @@ flowchart TD
     Profile[Explicit profile tuples]
     Build[Immutable release build and setup assets]
     Isolation[Fresh database clone, broker scope, and HTTP agent]
+    Routed[Optional routed database clones]
     Process[Supported release CLI processes]
     Oracle{Exact durable and amplification oracle}
     Sample[Raw timed sample]
     Diagnostics[Post-timing query, buffer, and WAL diagnostics]
+    DataEvidence[Export stream and per-table page evidence]
     Model{Scaling model acceptance}
     Compare[Counterbalanced baseline/candidate comparison]
     Capacity[Bounded one/two-worker calibration]
@@ -24,10 +26,11 @@ flowchart TD
 
     Registry --> Profile
     Build --> Isolation
-    Profile --> Isolation --> Process --> Oracle
+    Profile --> Isolation --> Routed --> Process --> Oracle
     Oracle -->|match| Sample
     Oracle -->|drift| Invalid
     Sample --> Diagnostics
+    Sample --> DataEvidence
     Sample --> Model
     Sample --> Compare
     Sample --> Capacity
@@ -38,8 +41,8 @@ flowchart TD
     Compare -->|unconfirmed, noisy, or incompatible| Invalid
 
     class Registry,Profile,Build component
-    class Isolation,Process,Sample system
+    class Isolation,Routed,Process,Sample system
     class Oracle,Model decision
-    class Diagnostics,Capacity,Budget,Compare external
+    class Diagnostics,DataEvidence,Capacity,Budget,Compare external
     class Pass success
     class Invalid warning

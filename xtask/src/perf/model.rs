@@ -391,6 +391,12 @@ pub struct ProcessMeasurement {
     pub cpu_time_ns: Option<u64>,
     /// Peak process-tree resident memory in bytes when supported.
     pub peak_rss_bytes: Option<u64>,
+    /// Nanoseconds from launch to the first stdout byte, when output was emitted.
+    #[serde(default)]
+    pub stdout_first_byte_ns: Option<u64>,
+    /// Nanoseconds from launch to the last stdout byte, when output was emitted.
+    #[serde(default)]
+    pub stdout_last_byte_ns: Option<u64>,
     /// Stable resource-collector identity.
     pub resource_source: String,
     /// Process exit code when observable.

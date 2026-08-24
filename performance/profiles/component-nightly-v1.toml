@@ -27,6 +27,12 @@ blocks = 2
 timing = "informative"
 
 [[workloads]]
+id = "agent.http-variants.v1"
+tuple = "cases-32-payload-1048576-delay-0"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
 id = "run.create-scaling.v1"
 tuple = "cases-1"
 blocks = 2

@@ -575,4 +575,45 @@ max_residual_orientation_effect = 0.02
             .collect();
         assert!(validate_scaling_model(&workload).is_err());
     }
+
+    #[test]
+    fn repository_schedules_admin_and_large_data_contracts_as_informative() {
+        let root = crate::perf::artifact::workspace_root().unwrap();
+        let registry = load_registry(&root).unwrap();
+        let profile = load_profile(&root, "admin-nightly-v1").unwrap();
+        let expected = [
+            "run.cancel-scaling.v1",
+            "run.read.v1",
+            "run.export.v1",
+            "shard.move.v1",
+            "shard.rebalance.v1",
+            "coordinator.placement-scaling.v1",
+            "run.create-boundaries.v1",
+        ];
+
+        for id in expected {
+            let workload = registry
+                .workloads
+                .iter()
+                .find(|workload| workload.id == id)
+                .unwrap_or_else(|| panic!("missing registered workload {id}"));
+            let selected = profile
+                .workloads
+                .iter()
+                .filter(|selection| selection.id == id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                selected.len(),
+                workload.tuples.len(),
+                "profile coverage for {id}"
+            );
+            assert!(
+                selected
+                    .iter()
+                    .all(|selection| selection.timing == "informative")
+            );
+        }
+
+        validate_profile_registry(&profile, &registry).unwrap();
+    }
 }

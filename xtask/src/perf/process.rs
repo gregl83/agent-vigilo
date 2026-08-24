@@ -79,6 +79,10 @@ pub struct CapturedOutput {
     pub truncated: bool,
     /// Retained prefix of the stream.
     pub data: Vec<u8>,
+    /// Time from process launch until the first observed byte.
+    pub first_byte_time: Option<Duration>,
+    /// Time from process launch until the most recently observed byte.
+    pub last_byte_time: Option<Duration>,
 }
 
 impl CapturedOutput {
@@ -111,10 +115,12 @@ pub fn execute(spec: &ProcessSpec<'_>) -> Result<ProcessOutcome> {
     let stdout = drain(
         child.stdout.take().context("child stdout was not piped")?,
         spec.stdout_limit,
+        started,
     );
     let stderr = drain(
         child.stderr.take().context("child stderr was not piped")?,
         spec.stderr_limit,
+        started,
     );
 
     let (status, timed_out) = loop {
@@ -153,16 +159,22 @@ pub fn execute(spec: &ProcessSpec<'_>) -> Result<ProcessOutcome> {
 fn drain<R: Read + Send + 'static>(
     mut reader: R,
     limit: usize,
+    started: Instant,
 ) -> thread::JoinHandle<io::Result<CapturedOutput>> {
     thread::spawn(move || {
         let mut data = Vec::with_capacity(limit.min(8192));
         let mut bytes_seen = 0_u64;
+        let mut first_byte_time = None;
+        let mut last_byte_time = None;
         let mut buffer = [0_u8; 8192];
         loop {
             let read = reader.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
+            let observed_at = started.elapsed();
+            first_byte_time.get_or_insert(observed_at);
+            last_byte_time = Some(observed_at);
             bytes_seen = bytes_seen.saturating_add(read as u64);
             let remaining = limit.saturating_sub(data.len());
             data.extend_from_slice(&buffer[..read.min(remaining)]);
@@ -171,6 +183,8 @@ fn drain<R: Read + Send + 'static>(
             bytes_seen,
             truncated: bytes_seen > data.len() as u64,
             data,
+            first_byte_time,
+            last_byte_time,
         })
     })
 }
@@ -501,6 +515,9 @@ mod tests {
         assert_eq!(outcome.stdout.data.len(), 64);
         assert!(outcome.stdout.bytes_seen >= 4096);
         assert!(outcome.stdout.truncated);
+        assert!(outcome.stdout.first_byte_time.is_some());
+        assert!(outcome.stdout.last_byte_time >= outcome.stdout.first_byte_time);
+        assert!(outcome.stdout.last_byte_time <= Some(outcome.wall_time));
     }
 
     #[test]

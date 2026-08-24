@@ -31,6 +31,13 @@ concurrency boundaries; the harness never expands dimensions into a Cartesian
 product. Exact HTTP requests, worker deliveries, and durable rows catch lost
 batching or amplification before timing is interpreted.
 
+Administration workloads cover cancellation fanout, terminal status/results,
+JSON and JSONL export, shard move/rebalance, and coordinator placement scaling.
+They use logical routes backed by isolated databases on one PostgreSQL server,
+so route growth is measured without pretending to reproduce a database fleet.
+Creation and HTTP variants also schedule the remaining page/group boundaries
+and a larger response payload.
+
 Continuous workflows use a sample-level fixed-cost-plus-slope fit. Known batch
 boundaries use explicit stepped estimates. Every point requires repeated valid
 samples, exact observations, and residuals within its registered tolerance.
@@ -40,6 +47,25 @@ and WAL counters are captured after the timed process exits. The
 `cargo perf diagnose` command renders them as non-gating evidence. The model
 command writes the owned component-model artifact and fails closed on
 incomplete or nonlinear evidence.
+
+## Large-Data Contracts
+
+Read and export fixtures contain 250 or 251 completed executions, evaluator
+results, and deterministic diagnostics across one or two routes. Process
+measurements record total output bytes, time to first and last stdout byte, and
+peak RSS. JSONL is checked as streamed typed records with a 256 MiB fixture
+limit; JSON is checked as one materialized document with a separate 512 MiB
+tested limit.
+
+Shard movement persists the actual rows, bytes, and completed page count for
+each copied table. A lower bound derived from 1,000 rows or 4 MiB per page is
+validated, but it is never substituted for the recorded distribution. The move
+command is then replayed and must report the same verified target without moving
+it again. Rebalance samples apply one claimed item per resumable pass, require
+every persisted item to complete verification, and require every selected route
+to point at the target. Database creation,
+migrations, route registration, terminal fixture generation, and rebalance
+planning occur before collector reset.
 
 Criterion remains conditional on a legitimate production library surface.
 Runtime and database modules are currently binary-private, so the release

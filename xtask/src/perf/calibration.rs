@@ -1533,6 +1533,8 @@ mod tests {
                         wall_time_ns: 1_000_000_000,
                         cpu_time_ns: Some(1),
                         peak_rss_bytes: Some(1),
+                        stdout_first_byte_ns: None,
+                        stdout_last_byte_ns: None,
                         resource_source: "test".into(),
                         exit_code: Some(0),
                         timed_out: false,

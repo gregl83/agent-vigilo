@@ -1,0 +1,177 @@
+schema_id = "profile/v1"
+id = "admin-nightly-v1"
+description = "Scheduled admin, routed data movement, export, and large-boundary diagnostics."
+requires_workload_selection = false
+campaign_cap_secs = 43200
+schedule_seed = 1977633961
+max_artifact_bytes = 4294967296
+max_stdout_bytes = 134217728
+max_stderr_bytes = 1048576
+
+[[workloads]]
+id = "run.cancel-scaling.v1"
+tuple = "aliases-1-executions-1024"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "run.cancel-scaling.v1"
+tuple = "aliases-4-executions-1024"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "run.cancel-scaling.v1"
+tuple = "aliases-17-executions-1024"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "run.cancel-scaling.v1"
+tuple = "aliases-17-executions-8192"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "run.read.v1"
+tuple = "status-executions-250-routes-1"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "run.read.v1"
+tuple = "status-executions-251-routes-2"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "run.read.v1"
+tuple = "results-executions-250-routes-1"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "run.read.v1"
+tuple = "results-executions-251-routes-2"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "run.export.v1"
+tuple = "json-executions-250-routes-1"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "run.export.v1"
+tuple = "json-executions-251-routes-2"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "run.export.v1"
+tuple = "jsonl-executions-250-routes-1"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "run.export.v1"
+tuple = "jsonl-executions-251-routes-2"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "shard.move.v1"
+tuple = "rows-1000-payload-1024"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "shard.move.v1"
+tuple = "rows-1001-payload-1024"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "shard.move.v1"
+tuple = "rows-4-payload-1048064"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "shard.move.v1"
+tuple = "rows-4-payload-1049088"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "shard.rebalance.v1"
+tuple = "shards-1"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "shard.rebalance.v1"
+tuple = "shards-8"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.placement-scaling.v1"
+tuple = "aliases-1"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.placement-scaling.v1"
+tuple = "aliases-8"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.placement-scaling.v1"
+tuple = "aliases-16"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "coordinator.placement-scaling.v1"
+tuple = "aliases-32"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "run.create-boundaries.v1"
+tuple = "cases-499"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "run.create-boundaries.v1"
+tuple = "cases-999"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "run.create-boundaries.v1"
+tuple = "cases-1999"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "run.create-boundaries.v1"
+tuple = "cases-63999"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "run.create-boundaries.v1"
+tuple = "cases-64000"
+blocks = 2
+timing = "informative"
+
+[[workloads]]
+id = "run.create-boundaries.v1"
+tuple = "cases-64001"
+blocks = 2
+timing = "informative"

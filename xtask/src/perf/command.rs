@@ -1124,6 +1124,14 @@ fn execute_workload(
         wall_time_ns: outcome.wall_time.as_nanos().min(u128::from(u64::MAX)) as u64,
         cpu_time_ns: outcome.cpu_time_ns,
         peak_rss_bytes: outcome.peak_rss_bytes,
+        stdout_first_byte_ns: outcome
+            .stdout
+            .first_byte_time
+            .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64),
+        stdout_last_byte_ns: outcome
+            .stdout
+            .last_byte_time
+            .map(|duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64),
         resource_source: outcome.resource_source.into(),
         exit_code: outcome.exit_code,
         timed_out: outcome.timed_out,
@@ -1445,11 +1453,15 @@ mod tests {
                 bytes_seen: stdout.len() as u64,
                 truncated: false,
                 data: stdout.as_bytes().to_vec(),
+                first_byte_time: None,
+                last_byte_time: None,
             },
             stderr: CapturedOutput {
                 bytes_seen: 0,
                 truncated: false,
                 data: Vec::new(),
+                first_byte_time: None,
+                last_byte_time: None,
             },
         }
     }
@@ -1540,6 +1552,8 @@ mod tests {
                 wall_time_ns: 1,
                 cpu_time_ns: None,
                 peak_rss_bytes: None,
+                stdout_first_byte_ns: None,
+                stdout_last_byte_ns: None,
                 resource_source: "test".into(),
                 exit_code: Some(1),
                 timed_out: false,

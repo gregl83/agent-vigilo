@@ -40,7 +40,7 @@ use super::{
     schedule,
 };
 
-const PROFILES: [&str; 8] = [
+const PROFILES: [&str; 10] = [
     "developer-v1",
     "pr-v1",
     "reference-v1",
@@ -49,6 +49,8 @@ const PROFILES: [&str; 8] = [
     "component-reference-v1",
     "component-nightly-v1",
     "component-smoke-v1",
+    "admin-nightly-v1",
+    "admin-smoke-v1",
 ];
 
 /// CLI arguments for validating the performance harness.
