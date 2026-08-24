@@ -67,7 +67,7 @@ git config core.hooksPath scripts/hooks
 | Database integration | SQL, migrations, transactions, advisory locks, leases, and concurrency | One PostgreSQL server; `DATABASE_URL` must use a role that can create test databases | `Database Integration Tests` |
 | Migration | Greenfield schema application through the CLI setup path | One fresh PostgreSQL database | `Migration Tests` |
 | End-to-end | Routing and the real distributed runtime across process and protocol boundaries | Two PostgreSQL servers, RabbitMQ, evaluator Wasm, and the test HTTP agent | `End-to-End Tests` |
-| Performance services | Perf topology ownership, collector reset, and cleanup integration | Docker Engine with Compose; images are declared in `performance/compose.yml` | Opt-in local tier |
+| Performance services | Perf topology ownership, collector reset, and cleanup integration | Docker Engine with Compose; images are declared in `infra/performance/compose.yml` | Opt-in local tier |
 
 Run the service-free tier with:
 

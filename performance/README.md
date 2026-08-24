@@ -53,8 +53,9 @@ requires them. Their setup remains outside the measured process boundary.
   amplification assumptions, boundedness, and independently sourced limits.
 - `performance/suppressions-v1.toml` is the only suppression registry. Entries
   must identify one workload tuple and metric, owner, issue, reason, and expiry.
-- `performance/compose.yml` defines the private PostgreSQL and RabbitMQ
-  topology created for one campaign.
+- `infra/performance/compose.yml` defines the private PostgreSQL and RabbitMQ
+  topology created for one campaign; infrastructure definitions remain under
+  `infra`.
 - `xtask` implements `cargo perf`; generated builds and results stay under
   `target/perf`.
 

@@ -324,7 +324,7 @@ fn validate_service_configuration(root: &Path) -> Result<()> {
     {
         bail!("MVP fixture cardinalities do not match the frozen workload contract");
     }
-    let compose = root.join("performance/compose.yml");
+    let compose = root.join("infra/performance/compose.yml");
     let content = fs::read_to_string(&compose)?;
     for required in [
         "127.0.0.1::5432",
@@ -443,6 +443,9 @@ fn validate_no_roadmap_markers(root: &Path) -> Result<()> {
             continue;
         }
         let path = root.join(&relative);
+        if !path.is_file() {
+            continue;
+        }
         let content = fs::read_to_string(&path)
             .with_context(|| format!("read roadmap policy input {}", path.display()))?;
         if contains_numbered_roadmap_marker(&content) {

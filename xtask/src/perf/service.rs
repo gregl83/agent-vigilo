@@ -237,7 +237,7 @@ impl ServiceHarness {
             bail!("performance run ID produced an empty ownership marker");
         }
         let project = truncate_name(&format!("vigilo-perf-{marker}"), 56);
-        let compose_file = root.join("performance/compose.yml");
+        let compose_file = root.join("infra/performance/compose.yml");
         if !compose_file.is_file() {
             bail!(
                 "performance Compose file is missing: {}",
