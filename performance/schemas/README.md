@@ -205,6 +205,13 @@ schema ID and preserve unknown additive fields. Retained version fixtures are
 required before a schema is revised; format migrations are deferred until a
 second version exists.
 
+`campaign.json` links only to run-relative files. Before measurement, the
+harness freezes the validated workload registry, exact resolved profile,
+optional reviewed budget policy, and verified build-manifest metadata beneath
+`provenance/`. Offline calibration, projection, and confirmation revalidate
+those frozen inputs and refuse escaped paths, incomplete links, or identities
+that differ from the campaign.
+
 ### Sample External Measurements
 
 `sample.external` records PostgreSQL calls/time/rows, WAL bytes, database-size

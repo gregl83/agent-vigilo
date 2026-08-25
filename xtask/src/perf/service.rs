@@ -77,6 +77,7 @@ use super::{
 
 const OWNERSHIP_LABEL: &str = "io.vigilo.run-id";
 const PERFORMANCE_LABEL: &str = "io.vigilo.performance";
+const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
 const POSTGRES_PASSWORD: &str = "vigilo_perf";
 const POSTGRES_USER: &str = "vigilo_perf";
 const RABBIT_PASSWORD: &str = "vigilo_perf";
@@ -84,6 +85,9 @@ const RABBIT_USER: &str = "vigilo_perf";
 const RABBIT_MANAGEMENT_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const RABBIT_MANAGEMENT_OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 const RABBIT_MANAGEMENT_RETRY_DELAY: Duration = Duration::from_millis(250);
+const DATABASE_IDENTIFIER_MAX_BYTES: usize = 63;
+const DATABASE_MARKER_PREFIX_BYTES: usize = 7;
+const DATABASE_MARKER_HASH_HEX_CHARS: usize = 16;
 const WAL_BYTES_QUERY: &str =
     "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), $1::text::pg_lsn)::bigint";
 
@@ -261,7 +265,7 @@ impl ServiceHarness {
         let mut up_args = compose_args.clone();
         up_args.extend(["up".into(), "--detach".into(), "--wait".into()]);
         if let Err(error) = command_output_owned(root, "docker", &up_args) {
-            return match cleanup_started_topology(root, run_id, &compose_args) {
+            return match cleanup_started_topology(root, run_id, &project, &compose_args) {
                 Ok(()) => Err(error.context("start performance topology")),
                 Err(cleanup) => Err(error.context(format!(
                     "topology start failed and rollback refused or failed: {cleanup:#}"
@@ -281,10 +285,12 @@ impl ServiceHarness {
                 .timeout(Duration::from_secs(10))
                 .build()?;
             wait_for_rabbit_management(&http, &rabbit_management_url)?;
-            let containers = compose_resources(root, &compose_args, "container")?;
-            let networks = labelled_resources(root, "network", run_id)?;
-            let volumes = labelled_volumes(root, run_id)?;
-            verify_container_labels(root, run_id, &containers)?;
+            let containers = project_resources(root, "container", &project)?;
+            let networks = project_resources(root, "network", &project)?;
+            let volumes = project_resources(root, "volume", &project)?;
+            verify_resource_labels(root, run_id, &project, "container", &containers)?;
+            verify_resource_labels(root, run_id, &project, "network", &networks)?;
+            verify_resource_labels(root, run_id, &project, "volume", &volumes)?;
             validate_inventory(run_id, &containers, &networks, &volumes)?;
             let manifest = ServiceManifest {
                 schema_id: "service-topology/v1".into(),
@@ -313,7 +319,7 @@ impl ServiceHarness {
             match initialized {
                 Ok(initialized) => initialized,
                 Err(error) => {
-                    return match cleanup_started_topology(root, run_id, &compose_args) {
+                    return match cleanup_started_topology(root, run_id, &project, &compose_args) {
                         Ok(()) => Err(error.context("initialize performance topology")),
                         Err(cleanup) => Err(error
                             .context(format!("topology rollback refused or failed: {cleanup:#}"))),
@@ -370,7 +376,13 @@ impl ServiceHarness {
             .iter()
             .find(|container| container.name.ends_with("-rabbitmq-1"))
             .context("service manifest omitted its RabbitMQ container")?;
-        verify_container_labels(&self.root, &self.run_id, std::slice::from_ref(container))?;
+        verify_resource_labels(
+            &self.root,
+            &self.run_id,
+            &self.project,
+            "container",
+            std::slice::from_ref(container),
+        )?;
         command_output(
             &self.root,
             "docker",
@@ -385,12 +397,14 @@ impl ServiceHarness {
         .context("start RabbitMQ application")?;
         wait_for_rabbit_management(&self.http, &self.rabbit_management_url)
             .context("wait for RabbitMQ after restart")?;
-        let containers = compose_resources(
+        let containers = project_resources(&self.root, "container", &self.project)?;
+        verify_resource_labels(
             &self.root,
-            &compose_args(&self.compose_file, &self.environment_file, &self.project),
+            &self.run_id,
+            &self.project,
             "container",
+            &containers,
         )?;
-        verify_container_labels(&self.root, &self.run_id, &containers)?;
         if containers != self.manifest.containers {
             bail!("RabbitMQ restart changed the run-owned container inventory");
         }
@@ -742,10 +756,30 @@ impl ServiceHarness {
             }
         }
         let compose_args = compose_args(&self.compose_file, &self.environment_file, &self.project);
-        let live_containers = compose_resources(&self.root, &compose_args, "container")?;
-        let live_networks = labelled_resources(&self.root, "network", &self.run_id)?;
-        let live_volumes = labelled_volumes(&self.root, &self.run_id)?;
-        verify_container_labels(&self.root, &self.run_id, &live_containers)?;
+        let live_containers = project_resources(&self.root, "container", &self.project)?;
+        let live_networks = project_resources(&self.root, "network", &self.project)?;
+        let live_volumes = project_resources(&self.root, "volume", &self.project)?;
+        verify_resource_labels(
+            &self.root,
+            &self.run_id,
+            &self.project,
+            "container",
+            &live_containers,
+        )?;
+        verify_resource_labels(
+            &self.root,
+            &self.run_id,
+            &self.project,
+            "network",
+            &live_networks,
+        )?;
+        verify_resource_labels(
+            &self.root,
+            &self.run_id,
+            &self.project,
+            "volume",
+            &live_volumes,
+        )?;
         validate_cleanup_inventory(
             &self.run_id,
             &self.manifest,
@@ -753,9 +787,7 @@ impl ServiceHarness {
             &live_networks,
             &live_volumes,
         )?;
-        let mut down_args = compose_args;
-        down_args.extend(["down".into(), "--volumes".into(), "--remove-orphans".into()]);
-        command_output_owned(&self.root, "docker", &down_args)?;
+        remove_topology(&self.root, &self.run_id, &self.project, &compose_args)?;
         atomic_text(&self.run_dir.join("services.stopped"), &self.run_id)?;
         self.stopped = true;
         if cleanup_failures.is_empty() {
@@ -1381,21 +1413,26 @@ fn compose_port(root: &Path, compose_args: &[String], service: &str, port: u16) 
     Ok(port.parse()?)
 }
 
-/// Returns the sorted live containers owned by one Compose project.
-fn compose_resources(
-    root: &Path,
-    compose_args: &[String],
-    kind: &str,
-) -> Result<Vec<OwnedResource>> {
-    if kind != "container" {
-        bail!("unsupported Compose resource kind: {kind}");
-    }
-    let mut args = compose_args.to_vec();
-    args.extend(["ps".into(), "--quiet".into()]);
+/// Returns every sorted Docker resource owned by one Compose project.
+fn project_resources(root: &Path, kind: &str, project: &str) -> Result<Vec<OwnedResource>> {
+    let mut args = match kind {
+        "container" => vec!["container".into(), "ls".into(), "--all".into()],
+        "network" | "volume" => vec![kind.into(), "ls".into()],
+        _ => bail!("unsupported Compose resource kind: {kind}"),
+    };
+    args.extend([
+        "--quiet".into(),
+        "--filter".into(),
+        format!("label={COMPOSE_PROJECT_LABEL}={project}"),
+    ]);
     let ids = command_output_owned(root, "docker", &args)?;
     let mut resources = Vec::new();
     for id in ids.lines().map(str::trim).filter(|id| !id.is_empty()) {
-        let inspected = command_output(root, "docker", &["inspect", "--format", "{{.Name}}", id])?;
+        let inspected = command_output(
+            root,
+            "docker",
+            &["inspect", "--type", kind, "--format", "{{.Name}}", id],
+        )?;
         resources.push(OwnedResource {
             id: id.into(),
             name: inspected.trim_start_matches('/').into(),
@@ -1411,19 +1448,19 @@ fn labelled_volumes(root: &Path, run_id: &str) -> Result<Vec<OwnedResource>> {
 
 /// Lists sorted Docker resources carrying both performance ownership labels.
 fn labelled_resources(root: &Path, kind: &str, run_id: &str) -> Result<Vec<OwnedResource>> {
-    let output = command_output(
-        root,
-        "docker",
-        &[
-            kind,
-            "ls",
-            "--quiet",
-            "--filter",
-            &format!("label={OWNERSHIP_LABEL}={run_id}"),
-            "--filter",
-            &format!("label={PERFORMANCE_LABEL}=true"),
-        ],
-    )?;
+    let mut args = match kind {
+        "container" => vec!["container".into(), "ls".into(), "--all".into()],
+        "network" | "volume" => vec![kind.into(), "ls".into()],
+        _ => bail!("unsupported labelled resource kind: {kind}"),
+    };
+    args.extend([
+        "--quiet".into(),
+        "--filter".into(),
+        format!("label={OWNERSHIP_LABEL}={run_id}"),
+        "--filter".into(),
+        format!("label={PERFORMANCE_LABEL}=true"),
+    ]);
+    let output = command_output_owned(root, "docker", &args)?;
     let mut resources = output
         .lines()
         .map(str::trim)
@@ -1437,24 +1474,64 @@ fn labelled_resources(root: &Path, kind: &str, run_id: &str) -> Result<Vec<Owned
     Ok(resources)
 }
 
-/// Rechecks live container labels instead of trusting the recorded manifest.
-fn verify_container_labels(root: &Path, run_id: &str, containers: &[OwnedResource]) -> Result<()> {
-    for container in containers {
-        let labels = command_output(
+/// Rechecks ownership and fixed Compose component labels before destructive work.
+fn verify_resource_labels(
+    root: &Path,
+    run_id: &str,
+    project: &str,
+    kind: &str,
+    resources: &[OwnedResource],
+) -> Result<()> {
+    let (labels_template, component_label, expected_components): (&str, &str, &[&str]) = match kind
+    {
+        "container" => (
+            "{{json .Config.Labels}}",
+            "com.docker.compose.service",
+            &["postgres", "rabbitmq"],
+        ),
+        "network" => (
+            "{{json .Labels}}",
+            "com.docker.compose.network",
+            &["default"],
+        ),
+        "volume" => (
+            "{{json .Labels}}",
+            "com.docker.compose.volume",
+            &["postgres-data", "rabbitmq-data"],
+        ),
+        _ => bail!("unsupported Compose resource kind: {kind}"),
+    };
+    let mut observed_components = BTreeSet::new();
+    for resource in resources {
+        let output = command_output(
             root,
             "docker",
             &[
                 "inspect",
+                "--type",
+                kind,
                 "--format",
-                "{{index .Config.Labels \"io.vigilo.run-id\"}}|{{index .Config.Labels \"io.vigilo.performance\"}}",
-                &container.id,
+                labels_template,
+                &resource.id,
             ],
         )?;
-        if labels != format!("{run_id}|true") {
+        let labels: BTreeMap<String, String> = serde_json::from_str(&output)
+            .with_context(|| format!("parse labels for {kind} {}", resource.name))?;
+        let component = labels.get(component_label).cloned();
+        if labels.get(OWNERSHIP_LABEL).map(String::as_str) != Some(run_id)
+            || labels.get(PERFORMANCE_LABEL).map(String::as_str) != Some("true")
+            || labels.get(COMPOSE_PROJECT_LABEL).map(String::as_str) != Some(project)
+            || !component
+                .as_deref()
+                .is_some_and(|value| expected_components.contains(&value))
+        {
             bail!(
-                "performance container {} has unexpected ownership labels: {labels}",
-                container.name
+                "performance {kind} {} has unexpected ownership or component labels",
+                resource.name
             );
+        }
+        if !observed_components.insert(component.expect("component was validated")) {
+            bail!("performance topology has duplicate {kind} component labels");
         }
     }
     Ok(())
@@ -1470,6 +1547,24 @@ fn validate_inventory(
     if containers.len() != 2 || networks.len() != 1 || volumes.len() != 2 {
         bail!(
             "performance topology inventory mismatch for {run_id}: expected 2 containers, 1 network, and 2 volumes; found {}, {}, and {}",
+            containers.len(),
+            networks.len(),
+            volumes.len()
+        );
+    }
+    Ok(())
+}
+
+/// Bounds resources that Compose may have created before a failed startup.
+fn validate_partial_inventory(
+    run_id: &str,
+    containers: &[OwnedResource],
+    networks: &[OwnedResource],
+    volumes: &[OwnedResource],
+) -> Result<()> {
+    if containers.len() > 2 || networks.len() > 1 || volumes.len() > 2 {
+        bail!(
+            "partial performance topology inventory exceeded bounds for {run_id}: expected at most 2 containers, 1 network, and 2 volumes; found {}, {}, and {}",
             containers.len(),
             networks.len(),
             volumes.len()
@@ -1497,29 +1592,88 @@ fn validate_cleanup_inventory(
 }
 
 /// Rolls back a partially initialized topology only after live ownership checks pass.
-fn cleanup_started_topology(root: &Path, run_id: &str, compose_args: &[String]) -> Result<()> {
-    let containers = compose_resources(root, compose_args, "container")?;
-    let networks = labelled_resources(root, "network", run_id)?;
-    let volumes = labelled_volumes(root, run_id)?;
-    verify_container_labels(root, run_id, &containers)?;
-    validate_inventory(run_id, &containers, &networks, &volumes)?;
+fn cleanup_started_topology(
+    root: &Path,
+    run_id: &str,
+    project: &str,
+    compose_args: &[String],
+) -> Result<()> {
+    let containers = project_resources(root, "container", project)?;
+    let networks = project_resources(root, "network", project)?;
+    let volumes = project_resources(root, "volume", project)?;
+    verify_resource_labels(root, run_id, project, "container", &containers)?;
+    verify_resource_labels(root, run_id, project, "network", &networks)?;
+    verify_resource_labels(root, run_id, project, "volume", &volumes)?;
+    validate_partial_inventory(run_id, &containers, &networks, &volumes)?;
+    remove_topology(root, run_id, project, compose_args)
+}
+
+/// Removes one validated Compose project and proves that no owned resources remain.
+fn remove_topology(
+    root: &Path,
+    run_id: &str,
+    project: &str,
+    compose_args: &[String],
+) -> Result<()> {
     let mut down_args = compose_args.to_vec();
     down_args.extend(["down".into(), "--volumes".into(), "--remove-orphans".into()]);
     command_output_owned(root, "docker", &down_args)?;
+    let project_resources_remain = ["container", "network", "volume"]
+        .into_iter()
+        .map(|kind| project_resources(root, kind, project))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .any(|resources| !resources.is_empty());
+    let run_resources_remain = ["container", "network", "volume"]
+        .into_iter()
+        .map(|kind| labelled_resources(root, kind, run_id))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .any(|resources| !resources.is_empty());
+    if project_resources_remain || run_resources_remain {
+        bail!("performance topology cleanup left project-owned or run-owned resources");
+    }
     Ok(())
 }
 
+/// Builds a PostgreSQL identifier while retaining its complete unique sequence suffix.
 fn database_name(marker: &str, purpose: &str, sequence: u64) -> String {
     let prefix = database_prefix(marker);
-    let purpose = safe_name(purpose).replace('-', "_");
-    truncate_name(&format!("{prefix}_{purpose}_{sequence}"), 63)
+    let sequence = base36(sequence);
+    let available = DATABASE_IDENTIFIER_MAX_BYTES
+        .checked_sub(prefix.len() + sequence.len() + 2)
+        .expect("database naming constants must leave room for a purpose");
+    let purpose = truncate_name(&safe_name(purpose).replace('-', "_"), available);
+    format!("{prefix}_{purpose}_{sequence}")
 }
 
+/// Produces a compact ownership prefix that hashes the complete, untruncated marker.
 fn database_prefix(marker: &str) -> String {
-    truncate_name(
-        &format!("vigilo_perf_{}", safe_name(marker).replace('-', "_")),
-        42,
+    let readable = truncate_name(
+        &safe_name(marker).replace('-', "_"),
+        DATABASE_MARKER_PREFIX_BYTES,
+    );
+    let digest = blake3::hash(marker.as_bytes()).to_hex();
+    format!(
+        "vigilo_perf_{readable}_{}",
+        &digest[..DATABASE_MARKER_HASH_HEX_CHARS]
     )
+}
+
+/// Encodes the full `u64` sequence in at most thirteen identifier-safe characters.
+fn base36(mut value: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut encoded = [0_u8; 13];
+    let mut position = encoded.len();
+    loop {
+        position -= 1;
+        encoded[position] = DIGITS[(value % 36) as usize];
+        value /= 36;
+        if value == 0 {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&encoded[position..]).into_owned()
 }
 
 fn database_url(admin_url: &str, name: &str) -> Result<String> {
@@ -1631,8 +1785,36 @@ mod tests {
 
     #[test]
     fn database_and_vhost_names_embed_the_ownership_marker() {
-        assert!(database_name("run-123", "worker", 1).starts_with("vigilo_perf_run_123"));
+        let prefix = database_prefix("run-123");
+        assert!(prefix.starts_with("vigilo_perf_run_123_"));
+        assert!(database_name("run-123", "worker", 1).starts_with(&prefix));
         assert!(format!("perf-{}-sample", safe_name("run-123")).starts_with("perf-run-123-"));
+    }
+
+    #[test]
+    fn database_names_preserve_uniqueness_after_purpose_truncation() {
+        let marker = "1724512345678-12345";
+        let purpose = "coordinator.placement-scaling.v1";
+        let first = database_name(marker, purpose, 2);
+        let second = database_name(marker, purpose, 3);
+
+        assert_ne!(first, second);
+        assert!(first.len() <= DATABASE_IDENTIFIER_MAX_BYTES);
+        assert!(second.len() <= DATABASE_IDENTIFIER_MAX_BYTES);
+        assert!(first.ends_with("_2"));
+        assert!(second.ends_with("_3"));
+    }
+
+    #[test]
+    fn database_names_hash_full_markers_and_bound_maximum_sequences() {
+        let shared = "service-test-00000000-0000-7000-8000-";
+        let first = database_name(&format!("{shared}000000000001"), "sentinel", u64::MAX);
+        let second = database_name(&format!("{shared}000000000002"), "sentinel", u64::MAX);
+
+        assert_ne!(first, second);
+        assert!(first.len() <= DATABASE_IDENTIFIER_MAX_BYTES);
+        assert!(second.len() <= DATABASE_IDENTIFIER_MAX_BYTES);
+        assert!(first.ends_with("_3w5e11264sgsf"));
     }
 
     #[test]
@@ -1822,6 +2004,17 @@ mod tests {
         ];
         assert!(validate_inventory("run", &containers, &network, &volumes).is_ok());
         assert!(validate_inventory("run", &[], &network, &volumes).is_err());
+        assert!(validate_partial_inventory("run", &[], &[], &[]).is_ok());
+        assert!(validate_partial_inventory("run", &containers[..1], &network, &volumes).is_ok());
+        assert!(
+            validate_partial_inventory(
+                "run",
+                &[containers.clone(), containers].concat(),
+                &network,
+                &volumes,
+            )
+            .is_err()
+        );
     }
 
     #[test]

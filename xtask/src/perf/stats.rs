@@ -52,10 +52,10 @@ pub fn compare_wall_time(
     let mut by_position: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     for block in blocks.values_mut() {
         block.sort_by_key(|sample| sample.position);
-        if block.len() != 4
-            || block
-                .iter()
-                .any(|sample| sample.validation.state != SampleState::Valid)
+        let orientation = validate_comparison_block(block)?;
+        if block
+            .iter()
+            .any(|sample| sample.validation.state != SampleState::Valid)
         {
             continue;
         }
@@ -77,7 +77,7 @@ pub fn compare_wall_time(
                 .or_default()
                 .push(sample.process.wall_time_ns as f64);
         }
-        let effect = match block[0].orientation {
+        let effect = match orientation {
             Orientation::Abba => {
                 0.5 * ((values[1] / values[0]).ln() + (values[2] / values[3]).ln())
             }
@@ -86,7 +86,7 @@ pub fn compare_wall_time(
             }
             Orientation::Single => bail!("single orientation in comparison"),
         };
-        match block[0].orientation {
+        match orientation {
             Orientation::Abba => abba.push(effect),
             Orientation::Baab => baab.push(effect),
             Orientation::Single => unreachable!(),
@@ -153,6 +153,40 @@ pub fn compare_wall_time(
         estimator: format!("counterbalanced-log-ratio-percentile-bootstrap-v1/{BOOTSTRAP_DRAWS}"),
         bootstrap_seed,
     })
+}
+
+/// Proves that one measured block matches its declared comparison orientation.
+fn validate_comparison_block(block: &[&Sample]) -> Result<Orientation> {
+    if block.len() != 4 {
+        bail!("comparison block must contain exactly four measured samples");
+    }
+    let first = block[0];
+    if first.orientation == Orientation::Single {
+        bail!("comparison block cannot use the single-binary orientation");
+    }
+    if first.orientation_set_id != first.block_id / 2 {
+        bail!("comparison block has an invalid orientation-set identity");
+    }
+    let expected = super::schedule::executions(first.orientation);
+    for (sample, expected) in block.iter().zip(expected) {
+        if sample.run_id != first.run_id
+            || sample.profile_id != first.profile_id
+            || sample.workload_id != first.workload_id
+            || sample.tuple_id != first.tuple_id
+            || sample.block_id != first.block_id
+            || sample.orientation_set_id != first.orientation_set_id
+            || sample.orientation != first.orientation
+        {
+            bail!("comparison block mixes sample identities or orientations");
+        }
+        if sample.position != expected.position
+            || sample.pair_id != expected.pair_id
+            || sample.role != expected.role
+        {
+            bail!("comparison block does not match its declared execution order");
+        }
+    }
+    Ok(first.orientation)
 }
 
 /// Builds an invalid metric result when no trustworthy estimate can be computed.
@@ -342,6 +376,65 @@ mod tests {
         }
         let comparison = compare_wall_time(&biased, 42, None, Some(0.10), false).unwrap();
         assert_eq!(comparison.verdict, Verdict::Invalid);
+    }
+
+    #[test]
+    fn malformed_comparison_blocks_fail_closed() {
+        let fixtures: Vec<(&str, Vec<Sample>)> = vec![
+            ("incomplete", {
+                let mut values = samples(1.0);
+                values.remove(0);
+                values
+            }),
+            ("duplicate position", {
+                let mut values = samples(1.0);
+                values[1].position = values[0].position;
+                values
+            }),
+            ("mixed orientation", {
+                let mut values = samples(1.0);
+                values[1].orientation = Orientation::Baab;
+                values
+            }),
+            ("single orientation", {
+                let mut values = samples(1.0);
+                for sample in values.iter_mut().filter(|sample| sample.block_id == 0) {
+                    sample.orientation = Orientation::Single;
+                }
+                values
+            }),
+            ("wrong orientation set", {
+                let mut values = samples(1.0);
+                for sample in values.iter_mut().filter(|sample| sample.block_id == 0) {
+                    sample.orientation_set_id = 1;
+                }
+                values
+            }),
+            ("wrong pair", {
+                let mut values = samples(1.0);
+                values[1].pair_id = 1;
+                values
+            }),
+            ("wrong role sequence", {
+                let mut values = samples(1.0);
+                for sample in values.iter_mut().filter(|sample| sample.block_id == 0) {
+                    sample.role = BinaryRole::Candidate;
+                }
+                values
+            }),
+            ("mixed tuple", {
+                let mut values = samples(1.0);
+                values[1].tuple_id = "other-tuple".into();
+                values
+            }),
+        ];
+
+        for (name, fixture) in fixtures {
+            assert!(
+                compare_wall_time(&fixture, 42, Some(0.05), Some(0.02), true).is_err(),
+                "{name} block was accepted"
+            );
+        }
     }
 
     #[test]

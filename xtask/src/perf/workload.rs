@@ -16,7 +16,12 @@
 //! input/output behavior remains owned by the versioned evaluator ABI.
 
 use std::{
-    collections::BTreeMap,
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
+    error::Error,
+    fmt,
     path::{
         Path,
         PathBuf,
@@ -102,6 +107,43 @@ pub struct WorkloadOutcome {
     pub process: ProcessOutcome,
     /// Scoped external measurements and exact durable counts.
     pub external: ExternalMeasurements,
+}
+
+/// A measured product or exact-oracle failure, distinct from harness invalidity.
+#[derive(Debug)]
+pub(super) struct ProductFailure {
+    message: String,
+}
+
+impl ProductFailure {
+    /// Human-readable product failure retained in the campaign sample.
+    pub(super) fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for ProductFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for ProductFailure {}
+
+fn product<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|error| {
+        ProductFailure {
+            message: format!("{error:#}"),
+        }
+        .into()
+    })
+}
+
+fn product_failure(message: impl Into<String>) -> anyhow::Error {
+    ProductFailure {
+        message: message.into(),
+    }
+    .into()
 }
 
 pub(super) struct WorkloadRequest<'a> {
@@ -211,17 +253,7 @@ impl WorkloadRunner {
             .as_mut()
             .context("service topology was not started")?
             .release_databases(&placement_urls);
-        match (result, release, placement_release) {
-            (Ok(outcome), Ok(()), Ok(())) => Ok(outcome),
-            (Err(error), Ok(()), Ok(())) => Err(error),
-            (Ok(_), Err(error), _) => Err(error.context("release performance sample scope")),
-            (Ok(_), Ok(()), Err(error)) => {
-                Err(error.context("release routed performance databases"))
-            }
-            (Err(error), scope_cleanup, route_cleanup) => Err(error.context(format!(
-                "sample cleanup also returned scope={scope_cleanup:?}, routes={route_cleanup:?}"
-            ))),
-        }
+        combine_sample_cleanup(result, release, placement_release)
     }
 
     /// Lazily starts one topology and prevents a campaign from mixing fixture catalogs.
@@ -452,12 +484,17 @@ impl WorkloadRunner {
                     stdout_limit,
                     stderr_limit,
                 )?;
-                let run_id = parse_run_id(&process.stdout.text())?;
+                let run_id = product(parse_run_id(&process.stdout.text()))?;
                 let chunks = cases.div_ceil(fixture.coordinator.cases_per_chunk) as i64;
                 let counts = if workload_id == "run.create-boundaries.v1" {
-                    oracle_create_boundary(&scope.database_url, &run_id, cases, chunks)?
+                    product(oracle_create_boundary(
+                        &scope.database_url,
+                        &run_id,
+                        cases,
+                        chunks,
+                    ))?
                 } else {
-                    oracle_create(&scope.database_url, &run_id, cases, chunks)?
+                    product(oracle_create(&scope.database_url, &run_id, cases, chunks))?
                 };
                 finish(
                     service,
@@ -480,7 +517,7 @@ impl WorkloadRunner {
                     stdout_limit,
                     stderr_limit,
                 )?;
-                validate_cancel_output(&first.stdout.text(), cases, false)?;
+                product(validate_cancel_output(&first.stdout.text(), cases, false))?;
                 let replay = invoke(
                     binary,
                     run_admin_args(&scope.database_url, "cancel", run_id),
@@ -489,10 +526,14 @@ impl WorkloadRunner {
                     stdout_limit,
                     stderr_limit,
                 )?;
-                validate_cancel_output(&replay.stdout.text(), 0, true)?;
+                product(validate_cancel_output(&replay.stdout.text(), 0, true))?;
                 let process = aggregate(vec![first, replay], started.elapsed());
-                let counts =
-                    cancellation_counts(&scope.database_url, placement_urls, run_id, cases)?;
+                let counts = product(cancellation_counts(
+                    &scope.database_url,
+                    placement_urls,
+                    run_id,
+                    cases,
+                ))?;
                 finish(
                     service,
                     scope,
@@ -515,11 +556,18 @@ impl WorkloadRunner {
                     stderr_limit,
                 )?;
                 if process.stdout.truncated {
-                    bail!("read/export output exceeded the profile retention contract");
+                    return Err(product_failure(
+                        "read/export output exceeded the profile retention contract",
+                    ));
                 }
-                validate_read_output(shape.operation, shape.format, &process.stdout.text(), cases)?;
-                validate_read_resources(shape, &process)?;
-                let counts = read_counts(&scope.database_url, placement_urls, run_id, cases)?;
+                product(validate_read_output(shape, &process.stdout.text(), run_id))?;
+                product(validate_read_resources(shape, &process))?;
+                let counts = product(read_counts(
+                    &scope.database_url,
+                    placement_urls,
+                    run_id,
+                    cases,
+                ))?;
                 finish(
                     service,
                     scope,
@@ -541,7 +589,7 @@ impl WorkloadRunner {
                     stdout_limit,
                     stderr_limit,
                 )?;
-                validate_move_output(&first.stdout.text(), "perf_01", true)?;
+                product(validate_move_output(&first.stdout.text(), "perf_01", true))?;
                 let replay = invoke(
                     binary,
                     shard_move_args(&scope.database_url, run_id, "perf_01"),
@@ -550,9 +598,13 @@ impl WorkloadRunner {
                     stdout_limit,
                     stderr_limit,
                 )?;
-                validate_move_output(&replay.stdout.text(), "perf_01", false)?;
+                product(validate_move_output(
+                    &replay.stdout.text(),
+                    "perf_01",
+                    false,
+                ))?;
                 let process = aggregate(vec![first, replay], started.elapsed());
-                let counts = shard_move_counts(&scope.database_url, run_id)?;
+                let counts = product(shard_move_counts(&scope.database_url, run_id))?;
                 finish(
                     service,
                     scope,
@@ -596,10 +648,15 @@ impl WorkloadRunner {
                     stdout_limit,
                     stderr_limit,
                 )?;
-                validate_rebalance_output(&verify.stdout.text(), shards)?;
+                product(validate_rebalance_output(&verify.stdout.text(), shards))?;
                 outcomes.push(verify);
                 let process = aggregate(outcomes, started.elapsed());
-                let counts = rebalance_counts(&scope.database_url, &operation_id, run_id, shards)?;
+                let counts = product(rebalance_counts(
+                    &scope.database_url,
+                    &operation_id,
+                    run_id,
+                    shards,
+                ))?;
                 finish(
                     service,
                     scope,
@@ -635,12 +692,12 @@ impl WorkloadRunner {
                     ],
                     started.elapsed(),
                 );
-                let counts = routed_coordinator_counts(
+                let counts = product(routed_coordinator_counts(
                     &scope.database_url,
                     placement_urls,
                     run_id,
                     aliases,
-                )?;
+                ))?;
                 finish(
                     service,
                     scope,
@@ -678,7 +735,7 @@ impl WorkloadRunner {
                     started.elapsed(),
                 );
                 let chunks = cases.div_ceil(fixture.coordinator.cases_per_chunk);
-                let counts = oracle_coordinator(&scope.database_url, &run_id, chunks)?;
+                let counts = product(oracle_coordinator(&scope.database_url, &run_id, chunks))?;
                 finish(
                     service,
                     scope,
@@ -740,7 +797,11 @@ impl WorkloadRunner {
                     stdout_limit,
                     stderr_limit,
                 )?;
-                let counts = oracle_coordinator(&scope.database_url, &run_id, shape.events)?;
+                let counts = product(oracle_coordinator(
+                    &scope.database_url,
+                    &run_id,
+                    shape.events,
+                ))?;
                 finish(
                     service,
                     scope,
@@ -830,7 +891,7 @@ impl WorkloadRunner {
                     ],
                     started.elapsed(),
                 );
-                let counts = oracle_recovery(&scope.database_url, &run_id, leases)?;
+                let counts = product(oracle_recovery(&scope.database_url, &run_id, leases))?;
                 finish(
                     service,
                     scope,
@@ -931,7 +992,7 @@ impl WorkloadRunner {
                     stdout_limit,
                     stderr_limit,
                 )?;
-                let counts = oracle_finalization(&scope.database_url, runs)?;
+                let counts = product(oracle_finalization(&scope.database_url, runs))?;
                 let _ = run_ids;
                 finish(
                     service,
@@ -981,7 +1042,12 @@ impl WorkloadRunner {
                     stdout_limit,
                     stderr_limit,
                 )?;
-                let counts = oracle_worker(&scope.database_url, &run_id, cases, evaluators)?;
+                let counts = product(oracle_worker(
+                    &scope.database_url,
+                    &run_id,
+                    cases,
+                    evaluators,
+                ))?;
                 finish(
                     service,
                     scope,
@@ -1003,8 +1069,8 @@ impl WorkloadRunner {
                     stdout_limit,
                     stderr_limit,
                 )?;
-                require_success_ref(&create, "lifecycle run creation")?;
-                let run_id = parse_run_id(&create.stdout.text())?;
+                product(require_success_ref(&create, "lifecycle run creation"))?;
+                let run_id = product(parse_run_id(&create.stdout.text()))?;
                 let mut outcomes = vec![create];
                 let workers = lifecycle_workers(tuple)?;
                 let cycle_limit = if workload_id == "system.capacity.v1" {
@@ -1040,8 +1106,12 @@ impl WorkloadRunner {
                         stderr_limit,
                     )?);
                     if run_status(&scope.database_url, &run_id)? == "completed" {
-                        let counts =
-                            oracle_lifecycle(&scope.database_url, &run_id, cases, evaluators)?;
+                        let counts = product(oracle_lifecycle(
+                            &scope.database_url,
+                            &run_id,
+                            cases,
+                            evaluators,
+                        ))?;
                         let process = aggregate(outcomes, started.elapsed());
                         return finish(
                             service,
@@ -1053,7 +1123,9 @@ impl WorkloadRunner {
                         );
                     }
                 }
-                bail!("lifecycle run {run_id} did not complete within its cycle limit");
+                Err(product_failure(format!(
+                    "lifecycle run {run_id} did not complete within its cycle limit"
+                )))
             }
             "system.soak.v1" => self.execute_soak(
                 tuple,
@@ -1152,17 +1224,22 @@ impl WorkloadRunner {
                 stdout_limit,
                 stderr_limit,
             )?;
-            require_success_ref(&create, "soak run creation")?;
-            let run_id = parse_run_id(&create.stdout.text())?;
+            product(require_success_ref(&create, "soak run creation"))?;
+            let run_id = product(parse_run_id(&create.stdout.text()))?;
             outcomes.push(create);
-            wait_for_completed_run(
+            product(wait_for_completed_run(
                 &scope.database_url,
                 &run_id,
                 &mut coordinator,
                 &mut worker,
                 Duration::from_secs(contract.recovery_deadline_secs),
-            )?;
-            oracle_lifecycle(&scope.database_url, &run_id, cases, evaluators)?;
+            ))?;
+            product(oracle_lifecycle(
+                &scope.database_url,
+                &run_id,
+                cases,
+                evaluators,
+            ))?;
             run_ids.push(run_id);
             sleep_until(started, next_observation.min(duration));
             observations.push(stability_observation(
@@ -1215,7 +1292,7 @@ impl WorkloadRunner {
             passed: failures.is_empty(),
             failures: failures.clone(),
         })?;
-        require_pass(&failures)?;
+        product(require_pass(&failures))?;
         finish(
             service,
             scope,
@@ -1278,17 +1355,25 @@ impl WorkloadRunner {
             stdout_limit,
             stderr_limit,
         )?;
-        require_success_ref(&create, "pre-fault recovery run creation")?;
-        let run_id = parse_run_id(&create.stdout.text())?;
+        product(require_success_ref(
+            &create,
+            "pre-fault recovery run creation",
+        ))?;
+        let run_id = product(parse_run_id(&create.stdout.text()))?;
         outcomes.push(create);
-        wait_for_completed_run(
+        product(wait_for_completed_run(
             &scope.database_url,
             &run_id,
             &mut coordinator,
             &mut worker,
             Duration::from_secs(contract.recovery_deadline_secs),
-        )?;
-        oracle_lifecycle(&scope.database_url, &run_id, cases, evaluators)?;
+        ))?;
+        product(oracle_lifecycle(
+            &scope.database_url,
+            &run_id,
+            cases,
+            evaluators,
+        ))?;
         run_ids.push(run_id);
         let mut observations = vec![stability_observation(
             started.elapsed(),
@@ -1316,18 +1401,26 @@ impl WorkloadRunner {
             stdout_limit,
             stderr_limit,
         )?;
-        require_success_ref(&create, "post-fault recovery run creation")?;
-        let run_id = parse_run_id(&create.stdout.text())?;
+        product(require_success_ref(
+            &create,
+            "post-fault recovery run creation",
+        ))?;
+        let run_id = product(parse_run_id(&create.stdout.text()))?;
         outcomes.push(create);
-        wait_for_completed_run(
+        product(wait_for_completed_run(
             &scope.database_url,
             &run_id,
             &mut coordinator,
             &mut worker,
             Duration::from_secs(contract.recovery_deadline_secs),
-        )?;
+        ))?;
         let recovery_seconds = fault_started.elapsed().as_secs_f64();
-        oracle_lifecycle(&scope.database_url, &run_id, cases, evaluators)?;
+        product(oracle_lifecycle(
+            &scope.database_url,
+            &run_id,
+            cases,
+            evaluators,
+        ))?;
         run_ids.push(run_id);
         observations.push(stability_observation(
             started.elapsed(),
@@ -1377,7 +1470,7 @@ impl WorkloadRunner {
             passed: failures.is_empty(),
             failures: failures.clone(),
         })?;
-        require_pass(&failures)?;
+        product(require_pass(&failures))?;
         finish(
             service,
             scope,
@@ -1451,6 +1544,23 @@ impl WorkloadRunner {
             evaluators,
             payload_bytes,
         )
+    }
+}
+
+fn combine_sample_cleanup<T>(
+    result: Result<T>,
+    scope_cleanup: Result<()>,
+    route_cleanup: Result<()>,
+) -> Result<T> {
+    match (result, scope_cleanup, route_cleanup) {
+        (Ok(outcome), Ok(()), Ok(())) => Ok(outcome),
+        (Err(error), Ok(()), Ok(())) => Err(error),
+        (Ok(_), scope_cleanup, route_cleanup) => {
+            bail!("sample cleanup failed: scope={scope_cleanup:?}, routes={route_cleanup:?}")
+        }
+        (Err(error), scope_cleanup, route_cleanup) => Err(error.context(format!(
+            "sample cleanup also returned scope={scope_cleanup:?}, routes={route_cleanup:?}"
+        ))),
     }
 }
 
@@ -1732,35 +1842,76 @@ fn required_routes(workload_id: &str, tuple: &str) -> Result<usize> {
 }
 
 /// Validates the semantic record count of machine-readable read output.
-fn validate_read_output(
-    operation: ReadOperation,
-    format: Option<ExportFormat>,
-    stdout: &str,
-    executions: usize,
-) -> Result<()> {
-    if operation == ReadOperation::Export && format == Some(ExportFormat::Jsonl) {
+fn validate_read_output(shape: ReadShape, stdout: &str, run_id: &str) -> Result<()> {
+    if shape.operation == ReadOperation::Export && shape.format == Some(ExportFormat::Jsonl) {
         let mut run_records = 0_usize;
+        let mut summary_records = 0_usize;
         let mut execution_records = 0_usize;
+        let mut execution_ids = BTreeSet::new();
         for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
             let value: Value = serde_json::from_str(line).context("parse JSONL export record")?;
-            match value["type"].as_str() {
-                Some("run") => run_records += 1,
-                Some("execution") => execution_records += 1,
-                Some(_) => {}
-                None => bail!("JSONL export record omitted type"),
+            let record_type = value["type"]
+                .as_str()
+                .context("JSONL export record omitted type")?;
+            match record_type {
+                "run" => {
+                    require_run_id(&value, &["/run/id"], run_id, "JSONL run record")?;
+                    run_records += 1;
+                }
+                "results_summary" => {
+                    require_run_id(&value, &["/run_id"], run_id, "JSONL results summary")?;
+                    require_json_count(&value, &["results", "execution_count"], shape.executions)?;
+                    summary_records += 1;
+                }
+                "execution" => {
+                    require_run_id(&value, &["/run_id"], run_id, "JSONL execution record")?;
+                    require_run_id(
+                        &value,
+                        &["/execution/run_id"],
+                        run_id,
+                        "JSONL execution payload",
+                    )?;
+                    let execution_id = value["execution"]["id"]
+                        .as_str()
+                        .context("JSONL execution record omitted execution.id")?;
+                    if !execution_ids.insert(execution_id.to_owned()) {
+                        bail!("JSONL export repeated execution {execution_id}");
+                    }
+                    execution_records += 1;
+                }
+                "run_scorecard"
+                | "execution_route"
+                | "execution_aggregate"
+                | "execution_attempt"
+                | "evaluator_result"
+                | "evaluator_diagnostic" => {
+                    require_run_id(&value, &["/run_id"], run_id, "JSONL export record")?;
+                }
+                other => bail!("JSONL export contained unsupported record type {other:?}"),
             }
         }
-        if run_records != 1 || execution_records != executions {
+        if run_records != 1
+            || summary_records != 1
+            || execution_records != shape.executions
+            || execution_ids.len() != shape.executions
+        {
             bail!(
-                "JSONL export contained {run_records} run and {execution_records} execution records; expected 1 and {executions}"
+                "JSONL export contained {run_records} run, {summary_records} summary, and {execution_records} unique execution records; expected 1, 1, and {}",
+                shape.executions
             );
         }
         return Ok(());
     }
 
     let value: Value = serde_json::from_str(stdout).context("parse read command JSON output")?;
-    match operation {
+    match shape.operation {
         ReadOperation::Status => {
+            require_run_id(
+                &value,
+                &["/data/run_id", "/data/run/run_id", "/data/run/id"],
+                run_id,
+                "status output",
+            )?;
             let status = value["data"]["status"]
                 .as_str()
                 .or_else(|| value["data"]["run"]["status"].as_str());
@@ -1769,25 +1920,68 @@ fn validate_read_output(
             }
         }
         ReadOperation::Results => {
-            require_json_count(&value, &["data", "results", "execution_count"], executions)?;
+            require_run_id(
+                &value,
+                &["/data/run/run_id", "/data/run/id"],
+                run_id,
+                "results output",
+            )?;
+            require_json_count(
+                &value,
+                &["data", "results", "execution_count"],
+                shape.executions,
+            )?;
             require_json_count(
                 &value,
                 &["data", "results", "evaluator_result_count"],
-                executions,
+                shape.executions,
             )?;
         }
         ReadOperation::Export => {
+            require_run_id(
+                &value,
+                &["/data/run/run_id", "/data/run/id"],
+                run_id,
+                "JSON export",
+            )?;
+            require_json_count(
+                &value,
+                &["data", "results", "execution_count"],
+                shape.executions,
+            )?;
             let rows = value["data"]["executions"]
                 .as_array()
                 .or_else(|| value["executions"].as_array())
                 .context("JSON export omitted executions")?;
-            if rows.len() != executions {
+            if rows.len() != shape.executions {
                 bail!(
-                    "JSON export contained {} executions; expected {executions}",
-                    rows.len()
+                    "JSON export contained {} executions; expected {}",
+                    rows.len(),
+                    shape.executions
                 );
             }
+            let mut execution_ids = BTreeSet::new();
+            for row in rows {
+                require_run_id(row, &["/execution/run_id"], run_id, "JSON export execution")?;
+                let execution_id = row["execution"]["id"]
+                    .as_str()
+                    .context("JSON export execution omitted execution.id")?;
+                if !execution_ids.insert(execution_id) {
+                    bail!("JSON export repeated execution {execution_id}");
+                }
+            }
         }
+    }
+    Ok(())
+}
+
+fn require_run_id(value: &Value, pointers: &[&str], expected: &str, context: &str) -> Result<()> {
+    let actual = pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .with_context(|| format!("{context} omitted run identity"))?;
+    if actual != expected {
+        bail!("{context} returned run {actual}, expected {expected}");
     }
     Ok(())
 }
@@ -2854,25 +3048,25 @@ fn finish(
     counts: DurableCounts,
     oracle: ExternalOracle<'_>,
 ) -> Result<WorkloadOutcome> {
-    require_success_ref(&process, "measured workload")?;
+    product(require_success_ref(&process, "measured workload"))?;
     let mut external = service.finish_measurement(scope, baseline, counts)?;
-    let queue = service.settled_queue_counts(scope, oracle.ready, 0)?;
+    let queue = product(service.settled_queue_counts(scope, oracle.ready, 0))?;
     external.queue_ready = Some(queue.0);
     external.queue_unacked = Some(queue.1);
     if external.queue_ready != Some(oracle.ready)
         || external.queue_unacked != Some(0)
         || external.http_requests != Some(oracle.http)
     {
-        bail!(
+        return Err(product_failure(format!(
             "scoped external counts differ: ready={:?}, unacked={:?}, http={:?}; expected {}, 0, {}",
             external.queue_ready,
             external.queue_unacked,
             external.http_requests,
             oracle.ready,
             oracle.http,
-        );
+        )));
     }
-    verify_exact_observations(&external, oracle.exact)?;
+    product(verify_exact_observations(&external, oracle.exact))?;
     Ok(WorkloadOutcome { process, external })
 }
 
@@ -3882,54 +4076,89 @@ mod tests {
 
     #[test]
     fn admin_output_oracles_reject_incomplete_or_wrong_results() {
-        let status = serde_json::json!({"data": {"run": {"id": "run", "status": "completed"}}});
-        assert!(
-            validate_read_output(ReadOperation::Status, None, &status.to_string(), 251).is_ok()
-        );
-
-        let results = serde_json::json!({
-            "data": {"results": {"execution_count": 251, "evaluator_result_count": 251}}
+        let status_shape = ReadShape {
+            operation: ReadOperation::Status,
+            format: None,
+            routes: 1,
+            executions: 251,
+        };
+        let status = serde_json::json!({
+            "data": {"run_id": "run", "status": "completed"}
         });
-        assert!(
-            validate_read_output(ReadOperation::Results, None, &results.to_string(), 251).is_ok()
-        );
-        assert!(
-            validate_read_output(ReadOperation::Results, None, &results.to_string(), 250).is_err()
-        );
+        assert!(validate_read_output(status_shape, &status.to_string(), "run").is_ok());
+        assert!(validate_read_output(status_shape, &status.to_string(), "other").is_err());
 
-        let json = serde_json::json!({"executions": vec![serde_json::json!({}); 251]});
-        assert!(
-            validate_read_output(
-                ReadOperation::Export,
-                Some(ExportFormat::Json),
-                &json.to_string(),
-                251,
-            )
-            .is_ok()
-        );
-        let jsonl = std::iter::once(serde_json::json!({"type": "run"}))
-            .chain((0..251).map(|_| serde_json::json!({"type": "execution"})))
-            .map(|value| value.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            validate_read_output(
-                ReadOperation::Export,
-                Some(ExportFormat::Jsonl),
-                &jsonl,
-                251,
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_read_output(
-                ReadOperation::Export,
-                Some(ExportFormat::Jsonl),
-                &jsonl,
-                250,
-            )
-            .is_err()
-        );
+        let results_shape = ReadShape {
+            operation: ReadOperation::Results,
+            format: None,
+            routes: 1,
+            executions: 251,
+        };
+        let results = serde_json::json!({
+            "data": {
+                "run": {"run_id": "run"},
+                "results": {"execution_count": 251, "evaluator_result_count": 251}
+            }
+        });
+        assert!(validate_read_output(results_shape, &results.to_string(), "run").is_ok());
+        let mut wrong_results_shape = results_shape;
+        wrong_results_shape.executions = 250;
+        assert!(validate_read_output(wrong_results_shape, &results.to_string(), "run").is_err());
+
+        let json_shape = ReadShape {
+            operation: ReadOperation::Export,
+            format: Some(ExportFormat::Json),
+            routes: 1,
+            executions: 251,
+        };
+        let executions = (0..251)
+            .map(|index| {
+                serde_json::json!({
+                    "execution": {"id": format!("execution-{index}"), "run_id": "run"}
+                })
+            })
+            .collect::<Vec<_>>();
+        let json = serde_json::json!({
+            "data": {
+                "run": {"run_id": "run"},
+                "results": {"execution_count": 251},
+                "executions": executions,
+            }
+        });
+        assert!(validate_read_output(json_shape, &json.to_string(), "run").is_ok());
+        let mut duplicate = json.clone();
+        duplicate["data"]["executions"][1] = duplicate["data"]["executions"][0].clone();
+        assert!(validate_read_output(json_shape, &duplicate.to_string(), "run").is_err());
+
+        let jsonl_shape = ReadShape {
+            operation: ReadOperation::Export,
+            format: Some(ExportFormat::Jsonl),
+            routes: 1,
+            executions: 251,
+        };
+        let jsonl = [
+            serde_json::json!({"type": "run", "run": {"id": "run"}}),
+            serde_json::json!({
+                "type": "results_summary",
+                "run_id": "run",
+                "results": {"execution_count": 251}
+            }),
+        ]
+        .into_iter()
+        .chain((0..251).map(|index| {
+            serde_json::json!({
+                "type": "execution",
+                "run_id": "run",
+                "execution": {"id": format!("execution-{index}"), "run_id": "run"}
+            })
+        }))
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(validate_read_output(jsonl_shape, &jsonl, "run").is_ok());
+        let mut wrong_jsonl_shape = jsonl_shape;
+        wrong_jsonl_shape.executions = 250;
+        assert!(validate_read_output(wrong_jsonl_shape, &jsonl, "run").is_err());
     }
 
     #[test]
@@ -4091,5 +4320,28 @@ mod tests {
         assert!(verify_exact_observations(&external, &drift).is_err());
         let unsupported = BTreeMap::from([("internal_counter".into(), 1)]);
         assert!(verify_exact_observations(&external, &unsupported).is_err());
+    }
+
+    #[test]
+    fn product_failures_remain_typed_for_campaign_classification() {
+        let error = product::<()>(Err(anyhow::anyhow!("exact oracle differed"))).unwrap_err();
+        let failure = error.downcast_ref::<ProductFailure>().unwrap();
+        assert!(failure.message().contains("exact oracle differed"));
+
+        let generic = anyhow::anyhow!("collector unavailable");
+        assert!(generic.downcast_ref::<ProductFailure>().is_none());
+
+        let combined = combine_sample_cleanup::<()>(
+            Err(product_failure("exact oracle differed")),
+            Err(anyhow::anyhow!("scope cleanup failed")),
+            Err(anyhow::anyhow!("route cleanup failed")),
+        )
+        .unwrap_err();
+        assert!(combined.downcast_ref::<ProductFailure>().is_some());
+        assert!(
+            combined
+                .to_string()
+                .contains("sample cleanup also returned")
+        );
     }
 }

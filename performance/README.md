@@ -424,8 +424,9 @@ remain subject to canonical repeatability evidence.
 
 The normal `Build` workflow keeps `cargo perf check` and the service ownership
 fixture active on hosted runners. `.github/workflows/performance.yaml` defines
-the real canonical comparison, nightly component/recovery/projection run, and
-weekly soak on an exclusive Linux runner labelled `vigilo-performance`.
+the real canonical comparison, nightly component/recovery/capacity run, an
+optional configured projection, and weekly soak on an exclusive Linux runner
+labelled `vigilo-performance`.
 
 The self-hosted jobs are inert in a new repository. After provisioning a Linux
 Actions runner version `2.327.1` or newer with Docker Engine and Compose:
@@ -439,10 +440,14 @@ Actions runner version `2.327.1` or newer with Docker Engine and Compose:
    job summaries and artifacts.
 4. After external host certification, set
    `VIGILO_PERF_CANONICAL_VALIDATED=true` so evidence may identify as canonical.
-5. Calibrate, review, and commit a generated gating profile and budget policy,
+5. To add nightly capacity projections, commit a reviewed deployment input and
+   set `VIGILO_PERF_DEPLOYMENT` to its repository-relative path. Leaving the
+   variable unset skips projection while retaining capacity evidence; the
+   checked-in planning example is intentionally invalid and must not be used.
+6. Calibrate, review, and commit a generated gating profile and budget policy,
    then set `VIGILO_PERF_REFERENCE_PROFILE` to that profile ID. Until then it
    defaults to informative `reference-v1`.
-6. Set `VIGILO_PERF_SCHEDULES_ENABLED=true` to activate main, nightly, and
+7. Set `VIGILO_PERF_SCHEDULES_ENABLED=true` to activate main, nightly, and
    weekly triggers.
 
 The workflow uses Node 24 releases of `actions/checkout` and
@@ -522,7 +527,9 @@ unit, PostgreSQL, migration, or end-to-end tiers.
 
 Run output is written only below `target/perf/runs`. Each directory contains:
 
-- `campaign.json` and `environment.json` for execution provenance
+- `campaign.json` and `environment.json` for execution identity and host provenance
+- `provenance/` with the validated registry, exact resolved profile, optional
+  budget policy, and build-manifest metadata frozen before measurement
 - `readiness.jsonl`, `samples.jsonl`, and `blocks.jsonl` for raw evidence
 - `comparisons.jsonl` and per-workload comparison JSON for A/B results
 - `report.json` as the report contract
@@ -543,8 +550,9 @@ Timing remains informative in profiles without a reviewed budget; reviewed
 numerical regression budgets apply only through a published gating profile. An
 initial over-budget confidence interval exits `2`; repeat it with
 `--confirmation-of <prior-run-directory>`. The confirmation must match the
-profile, workload set, build digests, and canonical environment and uses an
-independent schedule seed. A second over-budget interval exits `1`.
+frozen registry, resolved profile, budget policy, build digests, and canonical
+environment and uses an independent schedule seed. A second over-budget
+interval exits `1`.
 
 ## Isolation
 
@@ -556,11 +564,17 @@ independent schedule seed. A second over-budget interval exits `1`.
   database-name prefix, RabbitMQ vhost, and queue namespace.
 - Build snapshots include digested migrations, WIT, evaluator metadata, and
   evaluator Wasm; the harness never mutates the source copies.
+- Offline calibration, projection, and confirmation load campaign inputs from
+  the retained run-relative `provenance/` snapshot, not mutable repository or
+  build-directory files.
 - Process output, time, and artifacts are bounded. Timeout cleanup targets the
   Windows Job Object or Unix process group and always reaps the child.
 - A workspace host lease prevents release builds and measurement campaigns from
   overlapping and contaminating one another; a stale owner is recovered by PID.
 
-Teardown compares the live container and volume inventory to `services.json`
-and rechecks live ownership labels. A mismatch refuses destructive cleanup;
-only the exact recorded resources can be removed.
+Normal teardown compares the complete live container, network, and volume
+inventory to `services.json` and rechecks the run, performance, Compose project,
+and component labels. Failed startup permits only a bounded subset of that fixed
+topology before rollback. Both paths verify that no project-owned or run-owned
+resources remain after Compose removal; any unexpected resource refuses
+destructive cleanup.

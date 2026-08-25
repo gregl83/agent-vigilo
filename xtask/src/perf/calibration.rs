@@ -42,7 +42,6 @@ use super::{
         require_artifact_subpath,
         workspace_root,
     },
-    config::load_profile,
     model::{
         BASELINE_SCHEMA,
         BUDGET_SCHEMA,
@@ -72,6 +71,7 @@ use super::{
         Sample,
         SampleState,
     },
+    provenance,
     workload::capacity_tuple,
 };
 
@@ -205,7 +205,9 @@ fn analyze_noise_run(root: &Path, args: NoiseArgs) -> Result<u8> {
         "compare",
         "calibration-v1",
     )?;
-    let profile = load_profile(root, &report.profile_id)?;
+    let frozen = provenance::load(&args.run_dir, &campaign)
+        .context("load noise-calibration campaign provenance")?;
+    let profile = &frozen.profile;
     if profile
         .workloads
         .iter()
@@ -215,6 +217,13 @@ fn analyze_noise_run(root: &Path, args: NoiseArgs) -> Result<u8> {
     }
     if report.comparisons.len() != campaign.selected_workloads.len() {
         bail!("noise calibration is missing a selected workload comparison");
+    }
+    let baseline_manifest = frozen
+        .baseline_manifest
+        .as_ref()
+        .context("noise calibration omitted its frozen baseline manifest")?;
+    if baseline_manifest.executable_digest != frozen.candidate_manifest.executable_digest {
+        bail!("noise calibration must use one identical frozen build");
     }
     let targets = load_targets(root, args.targets.as_deref())?;
     let mut build_digest = None;
@@ -226,6 +235,9 @@ fn analyze_noise_run(root: &Path, args: NoiseArgs) -> Result<u8> {
     for comparison in &report.comparisons {
         if comparison.baseline_digest != comparison.candidate_digest {
             bail!("noise calibration must compare one identical immutable build");
+        }
+        if comparison.baseline_digest != baseline_manifest.executable_digest {
+            bail!("noise calibration comparison digest differs from frozen build provenance");
         }
         match &build_digest {
             Some(digest) if digest != &comparison.baseline_digest => {
@@ -305,7 +317,9 @@ fn analyze_capacity_run(root: &Path, args: CapacityArgs) -> Result<u8> {
     let campaign: CampaignManifest = read_json(&args.run_dir.join("campaign.json"))?;
     let environment: EnvironmentManifest = read_json(&args.run_dir.join("environment.json"))?;
     validate_source_documents(&report, &campaign, &environment, "run", "capacity-v1")?;
-    let profile = load_profile(root, &report.profile_id)?;
+    let frozen =
+        provenance::load(&args.run_dir, &campaign).context("load capacity campaign provenance")?;
+    let profile = &frozen.profile;
     if profile
         .workloads
         .iter()
@@ -416,11 +430,10 @@ fn analyze_capacity_run(root: &Path, args: CapacityArgs) -> Result<u8> {
         .map(|(one, two)| (two / (2.0 * one)).min(1.0));
     let supports_linear_projection = scale_efficiency_2
         .is_some_and(|efficiency| efficiency >= targets.capacity.minimum_scale_efficiency);
-    let build_manifest = resolve_manifest(root, &campaign.candidate_manifest)?;
     let document = CapacityDocument {
         schema_id: CAPACITY_SCHEMA.into(),
         source_run_id: report.run_id,
-        build_digest: build_manifest.executable_digest,
+        build_digest: frozen.candidate_manifest.executable_digest,
         environment_id: environment.environment_id,
         canonical: environment.canonical,
         points,
@@ -801,20 +814,6 @@ fn validate_capacity_policy(policy: &CapacityPolicy) -> Result<()> {
     Ok(())
 }
 
-fn resolve_manifest(root: &Path, value: &str) -> Result<BuildManifest> {
-    let path = PathBuf::from(value);
-    let path = if path.is_absolute() {
-        path
-    } else {
-        root.join(path)
-    };
-    let manifest: BuildManifest = read_json(&path)?;
-    if manifest.schema_id != BUILD_SCHEMA {
-        bail!("capacity source build manifest has an unsupported schema");
-    }
-    Ok(manifest)
-}
-
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     serde_json::from_slice(&fs::read(path).with_context(|| format!("read {}", path.display()))?)
         .with_context(|| format!("parse {}", path.display()))
@@ -974,8 +973,8 @@ fn positive_finite(value: f64) -> bool {
     value.is_finite() && value > 0.0
 }
 
-/// Locates a capacity knee without treating shared-service saturation as product capacity.
-fn find_knee(
+/// Locates the earliest capacity knee without treating shared-service saturation as product capacity.
+pub(super) fn find_knee(
     workers: u32,
     points: &[CapacityPoint],
     minimum_throughput_gain: f64,
@@ -1024,24 +1023,16 @@ fn find_knee(
             );
         }
     }
-    if let Some(point) = points
-        .iter()
-        .find(|point| point.process_cpu_percent_per_worker >= maximum_worker_cpu_percent)
-    {
-        return Ok(CapacityKnee {
-            workers,
-            knee_step: Some(point.load_step),
-            knee_throughput_per_second: Some(point.throughput_per_second),
-            observed_rate_lower_bound: None,
-        });
-    }
-
-    for pair in points.windows(2) {
-        let previous = pair[0];
-        let current = pair[1];
-        let throughput_gain = current.throughput_per_second / previous.throughput_per_second - 1.0;
-        let latency_increase = current.p95_latency_ms / previous.p95_latency_ms - 1.0;
-        if throughput_gain < minimum_throughput_gain && latency_increase > latency_growth {
+    for (index, current) in points.iter().enumerate() {
+        let cpu_limited = current.process_cpu_percent_per_worker >= maximum_worker_cpu_percent;
+        let throughput_and_latency_limited = index > 0 && {
+            let previous = points[index - 1];
+            let throughput_gain =
+                current.throughput_per_second / previous.throughput_per_second - 1.0;
+            let latency_increase = current.p95_latency_ms / previous.p95_latency_ms - 1.0;
+            throughput_gain < minimum_throughput_gain && latency_increase > latency_growth
+        };
+        if cpu_limited || throughput_and_latency_limited {
             return Ok(CapacityKnee {
                 workers,
                 knee_step: Some(current.load_step),
@@ -1072,6 +1063,7 @@ mod tests {
     use super::*;
     use crate::perf::{
         artifact::atomic_jsonl,
+        config::load_profile,
         model::{
             BinaryRole,
             COMPARISON_SCHEMA,
@@ -1162,7 +1154,7 @@ mod tests {
         kind: &str,
         profile_id: &str,
         selected_workloads: Vec<String>,
-        candidate_manifest: String,
+        frozen: &super::super::provenance::FrozenPaths,
     ) -> CampaignManifest {
         CampaignManifest {
             schema_id: REPORT_SCHEMA.into(),
@@ -1178,8 +1170,11 @@ mod tests {
             planned_preconditioning_executions: 0,
             artifact_limit_bytes: 1_000_000,
             environment_file: "environment.json".into(),
-            baseline_manifest: None,
-            candidate_manifest,
+            registry_file: frozen.registry_file.clone(),
+            profile_file: frozen.profile_file.clone(),
+            budget_policy_file: frozen.budget_policy_file.clone(),
+            baseline_manifest: frozen.baseline_manifest.clone(),
+            candidate_manifest: frozen.candidate_manifest.clone(),
             failure: None,
             extra: BTreeMap::new(),
         }
@@ -1335,6 +1330,47 @@ mod tests {
     }
 
     #[test]
+    fn capacity_knee_uses_the_earliest_load_that_triggers_either_rule() {
+        let points = vec![
+            CapacityPoint {
+                workers: 1,
+                load_step: 1,
+                cases: 100,
+                samples: 8,
+                throughput_per_second: 100.0,
+                p95_latency_ms: 100.0,
+                process_cpu_percent_per_worker: 50.0,
+                service_cpu_percent: Some(30.0),
+            },
+            CapacityPoint {
+                workers: 1,
+                load_step: 2,
+                cases: 200,
+                samples: 8,
+                throughput_per_second: 105.0,
+                p95_latency_ms: 130.0,
+                process_cpu_percent_per_worker: 60.0,
+                service_cpu_percent: Some(40.0),
+            },
+            CapacityPoint {
+                workers: 1,
+                load_step: 4,
+                cases: 400,
+                samples: 8,
+                throughput_per_second: 110.0,
+                p95_latency_ms: 140.0,
+                process_cpu_percent_per_worker: 95.0,
+                service_cpu_percent: Some(50.0),
+            },
+        ];
+
+        let knee = find_knee(1, &points, 0.10, 0.25, 90.0, 85.0).unwrap();
+
+        assert_eq!(knee.knee_step, Some(2));
+        assert_eq!(knee.knee_throughput_per_second, Some(105.0));
+    }
+
+    #[test]
     fn no_observed_knee_is_reported_only_as_a_lower_bound() {
         let points = [1, 2, 4]
             .into_iter()
@@ -1422,6 +1458,17 @@ mod tests {
             .iter()
             .map(|workload| format!("{}:{}", workload.id, workload.tuple))
             .collect();
+        let registry = super::super::config::load_registry(&root).unwrap();
+        let manifest = build_manifest("same-build");
+        let frozen = provenance::freeze(
+            directory.path(),
+            &registry,
+            &profile,
+            None,
+            Some(&manifest),
+            &manifest,
+        )
+        .unwrap();
         atomic_json(
             &directory.path().join("report.json"),
             &report("compare", &profile.id, comparisons),
@@ -1429,7 +1476,7 @@ mod tests {
         .unwrap();
         atomic_json(
             &directory.path().join("campaign.json"),
-            &campaign("compare", &profile.id, selected, "unused".into()),
+            &campaign("compare", &profile.id, selected, &frozen),
         )
         .unwrap();
         atomic_json(
@@ -1479,8 +1526,11 @@ mod tests {
         let root = workspace_root().unwrap();
         let profile = load_profile(&root, "capacity-v1").unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let manifest_path = directory.path().join("build-manifest.json");
-        atomic_json(&manifest_path, &build_manifest("capacity-build")).unwrap();
+        let registry = super::super::config::load_registry(&root).unwrap();
+        let manifest = build_manifest("capacity-build");
+        let frozen =
+            provenance::freeze(directory.path(), &registry, &profile, None, None, &manifest)
+                .unwrap();
         let selected = profile
             .workloads
             .iter()
@@ -1493,12 +1543,7 @@ mod tests {
         .unwrap();
         atomic_json(
             &directory.path().join("campaign.json"),
-            &campaign(
-                "run",
-                &profile.id,
-                selected,
-                manifest_path.display().to_string(),
-            ),
+            &campaign("run", &profile.id, selected, &frozen),
         )
         .unwrap();
         atomic_json(

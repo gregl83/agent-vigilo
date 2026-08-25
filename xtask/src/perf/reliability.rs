@@ -262,6 +262,18 @@ fn common_failures(
     {
         failures.push("resident worker or coordinator exited before harness shutdown".into());
     }
+    if observations
+        .iter()
+        .any(|observation| observation.process_rss_bytes.is_none())
+    {
+        failures.push("required process RSS observation is missing".into());
+    }
+    if observations
+        .iter()
+        .any(|observation| observation.file_descriptors.is_none())
+    {
+        failures.push("required file descriptor observation is missing".into());
+    }
     if let Some(rss) = observations
         .iter()
         .filter_map(|observation| observation.process_rss_bytes)
@@ -406,6 +418,25 @@ mod tests {
         );
         let late = evaluate_recovery(&contract(), &observations(), &totals(), true, Some(20.001));
         assert!(late.iter().any(|failure| failure.contains("deadline")));
+    }
+
+    #[test]
+    fn missing_required_resource_observations_fail_closed() {
+        let mut missing_rss = observations();
+        missing_rss[1].process_rss_bytes = None;
+        assert!(
+            evaluate_soak(&contract(), &missing_rss, &totals())
+                .iter()
+                .any(|failure| failure.contains("RSS observation"))
+        );
+
+        let mut missing_descriptors = observations();
+        missing_descriptors[1].file_descriptors = None;
+        assert!(
+            evaluate_soak(&contract(), &missing_descriptors, &totals())
+                .iter()
+                .any(|failure| failure.contains("descriptor observation"))
+        );
     }
 
     #[test]

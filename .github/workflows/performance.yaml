@@ -31,6 +31,7 @@ env:
   VIGILO_PERF_ENVIRONMENT_ID: aws-m6i-2xlarge-al2023-v1
   VIGILO_PERF_CANONICAL_VALIDATED: ${{ vars.VIGILO_PERF_CANONICAL_VALIDATED == 'true' && '1' || '0' }}
   VIGILO_PERF_REFERENCE_PROFILE: ${{ vars.VIGILO_PERF_REFERENCE_PROFILE || 'reference-v1' }}
+  VIGILO_PERF_DEPLOYMENT: ${{ vars.VIGILO_PERF_DEPLOYMENT }}
 
 jobs:
   canonical:
@@ -82,7 +83,7 @@ jobs:
         run: git worktree remove --force "$RUNNER_TEMP/vigilo-perf-base-$GITHUB_RUN_ID" || true
 
   nightly:
-    name: Nightly components, recovery, and projection
+    name: Nightly components, recovery, and capacity
     if: >-
       vars.VIGILO_PERF_RUNNER_ENABLED == 'true' &&
       ((github.event_name == 'schedule' && vars.VIGILO_PERF_SCHEDULES_ENABLED == 'true' && github.event.schedule == '17 5 * * *') ||
@@ -112,12 +113,16 @@ jobs:
           cargo perf run --profile component-nightly-v1 --bin target/perf/builds/nightly/release/vigilo --build-manifest target/perf/builds/nightly/build-manifest.json --output target/perf/runs/component-nightly
           cargo perf run --profile admin-nightly-v1 --bin target/perf/builds/nightly/release/vigilo --build-manifest target/perf/builds/nightly/build-manifest.json --output target/perf/runs/admin-nightly
           cargo perf run --profile recovery-v1 --bin target/perf/builds/nightly/release/vigilo --build-manifest target/perf/builds/nightly/build-manifest.json --output target/perf/runs/recovery
-      - name: Generate capacity projection
+      - name: Generate capacity evidence
         if: inputs.suite != 'recovery'
         run: |
           cargo perf run --profile capacity-v1 --bin target/perf/builds/nightly/release/vigilo --build-manifest target/perf/builds/nightly/build-manifest.json --output target/perf/runs/capacity
           cargo perf calibrate capacity --run-dir target/perf/runs/capacity
-          cargo perf project --run target/perf/runs/capacity --deployment performance/deployments/planning-example-v1.toml
+      - name: Generate configured capacity projection
+        if: inputs.suite != 'recovery' && env.VIGILO_PERF_DEPLOYMENT != ''
+        run: >-
+          cargo perf project --run target/perf/runs/capacity
+          --deployment "$VIGILO_PERF_DEPLOYMENT"
       - name: Publish job summaries
         if: always()
         shell: bash

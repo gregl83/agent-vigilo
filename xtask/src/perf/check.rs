@@ -133,12 +133,17 @@ pub fn execute(args: CheckArgs) -> Result<u8> {
 fn validate_ci_contract(root: &Path) -> Result<()> {
     let path = root.join(".github/workflows/performance.yaml");
     let source = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    validate_ci_contract_source(&source).with_context(|| format!("validate {}", path.display()))
+}
+
+fn validate_ci_contract_source(source: &str) -> Result<()> {
     let _: serde_yaml::Value =
-        serde_yaml::from_str(&source).with_context(|| format!("parse {}", path.display()))?;
+        serde_yaml::from_str(source).context("parse performance workflow")?;
     for required in [
         "vars.VIGILO_PERF_RUNNER_ENABLED == 'true'",
         "vars.VIGILO_PERF_SCHEDULES_ENABLED == 'true'",
         "VIGILO_PERF_REFERENCE_PROFILE",
+        "VIGILO_PERF_DEPLOYMENT",
         "runs-on: [self-hosted, linux, x64, vigilo-performance]",
         "workflow_dispatch:",
         "schedule:",
@@ -148,10 +153,17 @@ fn validate_ci_contract(root: &Path) -> Result<()> {
         "soak-v1",
         "GITHUB_STEP_SUMMARY",
         "actions/upload-artifact@v6",
+        "env.VIGILO_PERF_DEPLOYMENT != ''",
+        "--deployment \"$VIGILO_PERF_DEPLOYMENT\"",
     ] {
         if !source.contains(required) {
             bail!("performance workflow omitted required contract: {required}");
         }
+    }
+    if source.contains("--deployment performance/deployments/planning-example-v1.toml") {
+        bail!(
+            "performance workflow must not schedule the intentionally invalid example deployment"
+        );
     }
     Ok(())
 }
@@ -750,6 +762,23 @@ mod tests {
         assert!(contains_numbered_roadmap_marker(&underscored));
         assert!(!contains_numbered_roadmap_marker("evaluation phase"));
         assert!(!contains_numbered_roadmap_marker("three-phase power"));
+    }
+
+    #[test]
+    fn ci_projection_requires_an_explicit_nonexample_deployment() {
+        let root = workspace_root().unwrap();
+        let source = fs::read_to_string(root.join(".github/workflows/performance.yaml")).unwrap();
+        validate_ci_contract_source(&source).unwrap();
+
+        let unguarded = source.replace(
+            "inputs.suite != 'recovery' && env.VIGILO_PERF_DEPLOYMENT != ''",
+            "inputs.suite != 'recovery'",
+        );
+        assert!(validate_ci_contract_source(&unguarded).is_err());
+
+        let example =
+            format!("{source}\n# --deployment performance/deployments/planning-example-v1.toml\n");
+        assert!(validate_ci_contract_source(&example).is_err());
     }
 
     #[test]

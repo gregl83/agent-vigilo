@@ -47,7 +47,6 @@ use super::{
         require_artifact_path,
         workspace_root,
     },
-    config::load_registry,
     fixture,
     model::{
         CAPACITY_SCHEMA,
@@ -61,7 +60,9 @@ use super::{
         SAMPLE_SCHEMA,
         Sample,
         SampleState,
+        WorkloadRegistry,
     },
+    provenance,
     workload::capacity_tuple,
 };
 
@@ -402,10 +403,15 @@ pub fn execute(args: ProjectArgs) -> Result<u8> {
     let campaign: CampaignManifest = read_json(&run_dir.join("campaign.json"))?;
     let environment: EnvironmentManifest = read_json(&run_dir.join("environment.json"))?;
     validate_sources(&capacity, &report, &campaign, &environment)?;
+    let frozen = provenance::load(&run_dir, &campaign)
+        .context("load projection source campaign provenance")?;
+    if capacity.build_digest != frozen.candidate_manifest.executable_digest {
+        bail!("capacity evidence build digest differs from frozen campaign provenance");
+    }
     let policy = load_capacity_policy(&root)?;
     let context = ProjectionContext {
         canonical_environment: environment.canonical,
-        exact_fixture_match: exact_fixture_match(&root, &deployment, &capacity)?,
+        exact_fixture_match: exact_fixture_match(&root, &deployment, &capacity, &frozen.registry)?,
     };
     let document = project(&deployment, &capacity, &samples, &policy, context)?;
     atomic_json(&run_dir.join("projections.json"), &document)?;
@@ -982,7 +988,9 @@ fn validate_sources(
         || report.run_id != campaign.run_id
         || report.run_id != capacity.source_run_id
         || report.kind != "run"
+        || campaign.kind != "run"
         || report.status != "pass"
+        || campaign.status != "pass"
         || report.profile_id != REQUIRED_PROFILE
         || campaign.profile_id != REQUIRED_PROFILE
     {
@@ -1297,38 +1305,29 @@ fn exact_cases(sample: &Sample) -> Result<u64> {
 }
 
 fn find_knee_rate(workers: u32, points: &[CapacityPoint], policy: &CapacityPolicy) -> Result<f64> {
-    let mut points = points
+    let mut selected = points
         .iter()
         .filter(|point| point.workers == workers)
         .collect::<Vec<_>>();
-    points.sort_by_key(|point| point.load_step);
-    if points.len() < 3 {
+    selected.sort_by_key(|point| point.load_step);
+    if selected.len() < 3 {
         bail!("capacity evidence has fewer than three points for {workers} worker(s)");
     }
-    for point in &points {
+    for point in &selected {
         if point.samples < policy.minimum_samples_per_point {
             bail!("capacity point has fewer than the required samples");
         }
-        if point
-            .service_cpu_percent
-            .is_some_and(|cpu| cpu >= policy.maximum_service_cpu_percent)
-        {
-            bail!("shared-service saturation invalidates the capacity knee");
-        }
-        if point.process_cpu_percent_per_worker >= policy.maximum_worker_cpu_percent {
-            return Ok(point.throughput_per_second);
-        }
     }
-    for pair in points.windows(2) {
-        let throughput_gain = pair[1].throughput_per_second / pair[0].throughput_per_second - 1.0;
-        let latency_growth = pair[1].p95_latency_ms / pair[0].p95_latency_ms - 1.0;
-        if throughput_gain < policy.minimum_throughput_gain
-            && latency_growth > policy.latency_growth
-        {
-            return Ok(pair[1].throughput_per_second);
-        }
-    }
-    bail!("bounded staircase found no sustainable knee for {workers} worker(s)")
+    super::calibration::find_knee(
+        workers,
+        points,
+        policy.minimum_throughput_gain,
+        policy.latency_growth,
+        policy.maximum_worker_cpu_percent,
+        policy.maximum_service_cpu_percent,
+    )?
+    .knee_throughput_per_second
+    .with_context(|| format!("bounded staircase found no sustainable knee for {workers} worker(s)"))
 }
 
 fn bootstrap_evidence(
@@ -1611,8 +1610,8 @@ fn exact_fixture_match(
     root: &Path,
     deployment: &DeploymentInput,
     capacity: &CapacityDocument,
+    registry: &WorkloadRegistry,
 ) -> Result<bool> {
-    let registry = load_registry(root)?;
     let fixture = fixture::load(root, &deployment.capacity_fixture)?;
     let fixture_cases = u64::try_from(fixture.lifecycle.cases)?;
     let knee_cases = capacity
@@ -1809,11 +1808,14 @@ mod tests {
     use crate::perf::{
         artifact::no_extra,
         model::{
+            BUILD_SCHEMA,
             BinaryRole,
+            BuildManifest,
             CapacityKnee,
             ExternalMeasurements,
             Orientation,
             ProcessMeasurement,
+            SetupAsset,
             Validation,
         },
     };
@@ -1923,6 +1925,44 @@ mod tests {
     }
 
     #[test]
+    fn projection_uses_the_earliest_capacity_knee_rule() {
+        let points = vec![
+            CapacityPoint {
+                workers: 1,
+                load_step: 1,
+                cases: 100,
+                samples: 8,
+                throughput_per_second: 100.0,
+                p95_latency_ms: 100.0,
+                process_cpu_percent_per_worker: 50.0,
+                service_cpu_percent: Some(30.0),
+            },
+            CapacityPoint {
+                workers: 1,
+                load_step: 2,
+                cases: 200,
+                samples: 8,
+                throughput_per_second: 105.0,
+                p95_latency_ms: 130.0,
+                process_cpu_percent_per_worker: 60.0,
+                service_cpu_percent: Some(40.0),
+            },
+            CapacityPoint {
+                workers: 1,
+                load_step: 4,
+                cases: 400,
+                samples: 8,
+                throughput_per_second: 110.0,
+                p95_latency_ms: 140.0,
+                process_cpu_percent_per_worker: 95.0,
+                service_cpu_percent: Some(50.0),
+            },
+        ];
+
+        assert_eq!(find_knee_rate(1, &points, &policy()).unwrap(), 105.0);
+    }
+
+    #[test]
     fn command_records_current_unbounded_path_and_regenerates_its_view() {
         let root = workspace_root().unwrap();
         fs::create_dir_all(root.join("target/perf/runs")).unwrap();
@@ -1962,6 +2002,11 @@ mod tests {
                 extra: no_extra(),
             },
         );
+        let registry = super::super::config::load_registry(&root).unwrap();
+        let profile = super::super::config::load_profile(&root, REQUIRED_PROFILE).unwrap();
+        let manifest = build_manifest("build");
+        let frozen =
+            provenance::freeze(run.path(), &registry, &profile, None, None, &manifest).unwrap();
         write_json(
             run.path(),
             "campaign.json",
@@ -1969,18 +2014,25 @@ mod tests {
                 schema_id: REPORT_SCHEMA.into(),
                 run_id: "capacity-run".into(),
                 kind: "run".into(),
-                status: "complete".into(),
+                status: "pass".into(),
                 created_at: "2026-08-24T00:00:00Z".into(),
                 completed_at: Some("2026-08-24T00:01:00Z".into()),
                 profile_id: REQUIRED_PROFILE.into(),
                 schedule_seed: 1,
-                selected_workloads: vec![CAPACITY_WORKLOAD.into()],
+                selected_workloads: profile
+                    .workloads
+                    .iter()
+                    .map(|workload| format!("{}:{}", workload.id, workload.tuple))
+                    .collect(),
                 planned_measured_executions: samples.len() as u64,
                 planned_preconditioning_executions: 0,
                 artifact_limit_bytes: 1_000_000,
                 environment_file: "environment.json".into(),
-                baseline_manifest: None,
-                candidate_manifest: "build-manifest.json".into(),
+                registry_file: frozen.registry_file,
+                profile_file: frozen.profile_file,
+                budget_policy_file: frozen.budget_policy_file,
+                baseline_manifest: frozen.baseline_manifest,
+                candidate_manifest: frozen.candidate_manifest,
                 failure: None,
                 extra: no_extra(),
             },
@@ -2087,6 +2139,30 @@ mod tests {
             scale_efficiency_2: base.map(|draw| draw.scale_efficiency_2).or(Some(0.95)),
             supports_linear_projection: true,
             failures: Vec::new(),
+        }
+    }
+
+    fn build_manifest(digest: &str) -> BuildManifest {
+        BuildManifest {
+            schema_id: BUILD_SCHEMA.into(),
+            created_at: "2026-08-24T00:00:00Z".into(),
+            executable_name: "vigilo".into(),
+            executable_digest: digest.into(),
+            executable_bytes: 1,
+            source_commit: Some("commit".into()),
+            source_dirty: false,
+            source_label: "test".into(),
+            cargo_lock_digest: "lock".into(),
+            dependency_tree_digest: "dependencies".into(),
+            migrations_digest: "migrations".into(),
+            evaluator_abi_digest: "abi".into(),
+            rustc: "rustc test".into(),
+            cargo: "cargo test".into(),
+            target: "test-target".into(),
+            profile: "release".into(),
+            capabilities: Vec::new(),
+            setup_assets: Vec::<SetupAsset>::new(),
+            extra: no_extra(),
         }
     }
 

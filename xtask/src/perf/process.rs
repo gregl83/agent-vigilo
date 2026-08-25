@@ -105,6 +105,7 @@ pub struct RunningProcess {
     stdout: Option<thread::JoinHandle<io::Result<CapturedOutput>>>,
     stderr: Option<thread::JoinHandle<io::Result<CapturedOutput>>>,
     status: Option<ExitStatus>,
+    tree_terminated: bool,
 }
 
 impl CapturedOutput {
@@ -158,6 +159,7 @@ impl RunningProcess {
             stdout: Some(stdout),
             stderr: Some(stderr),
             status: None,
+            tree_terminated: false,
         })
     }
 
@@ -186,7 +188,7 @@ impl RunningProcess {
             }
         }
         if self.status.is_none() {
-            self.group.terminate(&mut self.child)?;
+            self.terminate_tree()?;
             self.status = Some(self.child.wait().context("reap stopped child")?);
         }
         self.finish(false)
@@ -199,7 +201,7 @@ impl RunningProcess {
                 return self.finish(false);
             }
             if self.started.elapsed() >= timeout {
-                self.group.terminate(&mut self.child)?;
+                self.terminate_tree()?;
                 self.status = Some(self.child.wait().context("reap timed-out child")?);
                 return self.finish(true);
             }
@@ -215,8 +217,20 @@ impl RunningProcess {
         Ok(())
     }
 
+    /// Closes the complete owned process tree once, including descendants left by an exited leader.
+    fn terminate_tree(&mut self) -> Result<()> {
+        if !self.tree_terminated {
+            self.group.terminate(&mut self.child)?;
+            self.tree_terminated = true;
+        }
+        Ok(())
+    }
+
     fn finish(&mut self, timed_out: bool) -> Result<ProcessOutcome> {
         let status = self.status.context("cannot finish a running child")?;
+        // A leader can exit while a descendant keeps an inherited output pipe open.
+        // Close the owned group before joining drains so completion remains bounded.
+        self.terminate_tree()?;
         let resources = self.group.resources();
         let stdout = self
             .stdout
@@ -245,8 +259,8 @@ impl RunningProcess {
 
 impl Drop for RunningProcess {
     fn drop(&mut self) {
+        let _ = self.terminate_tree();
         if self.status.is_none() {
-            let _ = self.group.terminate(&mut self.child);
             let _ = self.child.wait();
         }
         if let Some(stdout) = self.stdout.take() {
@@ -404,6 +418,10 @@ impl ProcessGroup {
         // The child is the process-group leader, so a negative PID reaches descendants too.
         let result = unsafe { libc::kill(-self.process_group_id, libc::SIGKILL) };
         if result != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) && child.try_wait()?.is_some() {
+                return Ok(());
+            }
             child.kill().context("kill timed-out child")?;
         }
         Ok(())
@@ -628,6 +646,22 @@ mod tests {
 
     #[test]
     fn subprocess_fixture() {
+        if std::env::var_os("VIGILO_PERF_TEST_SPAWN_DESCENDANT").is_some() {
+            let (program, args) = fixture_command();
+            let descendant = Command::new(program)
+                .args(args)
+                .env_remove("VIGILO_PERF_TEST_SPAWN_DESCENDANT")
+                .env("VIGILO_PERF_TEST_DELAY_MS", "5000")
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            println!("leader-exited-with-descendant={}", descendant.id());
+            std::io::stdout().flush().unwrap();
+            drop(descendant);
+            return;
+        }
+
         let delay_ms = std::env::var("VIGILO_PERF_TEST_DELAY_MS")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -684,6 +718,32 @@ mod tests {
         .unwrap();
         assert!(outcome.timed_out);
         assert!(outcome.wall_time < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn leader_exit_terminates_descendant_that_retains_output_pipes() {
+        let (program, args) = fixture_command();
+        let watchdog = Duration::from_secs(1);
+        let outcome = execute(&ProcessSpec {
+            program: &program,
+            args: &args,
+            current_dir: None,
+            env: &[("VIGILO_PERF_TEST_SPAWN_DESCENDANT".into(), "1".into())],
+            timeout: watchdog,
+            stdout_limit: 4096,
+            stderr_limit: 4096,
+        })
+        .unwrap();
+
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(!outcome.timed_out);
+        assert!(outcome.wall_time < watchdog);
+        assert!(
+            outcome
+                .stdout
+                .text()
+                .contains("leader-exited-with-descendant=")
+        );
     }
 
     #[test]

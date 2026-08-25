@@ -57,6 +57,9 @@ pub fn load_profile(root: &Path, id: &str) -> Result<Profile> {
         &fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?,
     )
     .with_context(|| format!("parse {}", path.display()))?;
+    if profile.id != id {
+        bail!("profile file identity {} does not match {id}", profile.id);
+    }
     validate_profile(&profile)?;
     Ok(profile)
 }
@@ -102,6 +105,7 @@ pub fn validate_registry(registry: &WorkloadRegistry) -> Result<()> {
             );
         }
         if workload.owner.is_empty()
+            || workload.capability.is_empty()
             || workload.fixture.is_empty()
             || workload.unit.is_empty()
             || workload.oracle.is_empty()
@@ -111,6 +115,34 @@ pub fn validate_registry(registry: &WorkloadRegistry) -> Result<()> {
                 "workload {} has incomplete ownership or measurement metadata",
                 workload.id
             );
+        }
+        let tuples = workload.tuples.iter().collect::<BTreeSet<_>>();
+        if tuples.len() != workload.tuples.len() {
+            bail!("workload {} contains a duplicate tuple", workload.id);
+        }
+        let Some((unit, oracle)) = driver_contract(&workload.id) else {
+            bail!("workload {} has no registered harness driver", workload.id);
+        };
+        if workload.unit != unit || workload.oracle != oracle {
+            bail!(
+                "workload {} unit or oracle does not match its harness driver",
+                workload.id
+            );
+        }
+        let mut metrics = BTreeSet::new();
+        for metric in &workload.required_metrics {
+            if !metrics.insert(metric) {
+                bail!(
+                    "workload {} contains a duplicate required metric",
+                    workload.id
+                );
+            }
+            if !is_supported_metric(metric) {
+                bail!(
+                    "workload {} requires unsupported metric {metric}",
+                    workload.id
+                );
+            }
         }
         if workload.extra.keys().any(String::is_empty) {
             bail!("workload {} has an empty extension key", workload.id);
@@ -257,7 +289,24 @@ pub fn validate_profile(profile: &Profile) -> Result<()> {
     if profile.extra.keys().any(String::is_empty) {
         bail!("profile {} has an empty extension key", profile.id);
     }
+    if profile
+        .max_residual_orientation_effect
+        .is_some_and(|value| !value.is_finite() || value <= 0.0)
+    {
+        bail!("profile {} has an invalid orientation limit", profile.id);
+    }
+    let mut selections = BTreeSet::new();
+    let mut timing_modes = BTreeSet::new();
     for workload in &profile.workloads {
+        if !selections.insert((&workload.id, &workload.tuple)) {
+            bail!(
+                "profile {} contains duplicate workload tuple {}:{}",
+                profile.id,
+                workload.id,
+                workload.tuple
+            );
+        }
+        timing_modes.insert(workload.timing.as_str());
         let reliability = matches!(workload.timing.as_str(), "soak" | "recovery");
         if workload.blocks == 0 || (!reliability && workload.blocks % 2 != 0) {
             bail!(
@@ -272,6 +321,9 @@ pub fn validate_profile(profile: &Profile) -> Result<()> {
         ) {
             bail!("unsupported timing policy: {}", workload.timing);
         }
+    }
+    if timing_modes.len() != 1 {
+        bail!("profile {} cannot mix timing modes", profile.id);
     }
     let gating = profile
         .workloads
@@ -414,45 +466,139 @@ pub fn select_workloads<'a>(
 }
 
 /// Estimates comparison campaign time from declared planning durations.
-pub fn estimated_compare_millis(selected: &[SelectedWorkload<'_>]) -> u64 {
-    selected
-        .iter()
-        .map(|selected| {
-            let measured =
-                u64::from(selected.profile.blocks) * 4 * selected.workload.planning_duration_ms;
-            let precondition = if selected.workload.preconditioning
-                == super::model::Preconditioning::OnePerBinary
-            {
-                2 * selected.workload.planning_duration_ms
-            } else {
-                0
-            };
-            measured + precondition
-        })
-        .sum()
+pub fn estimated_compare_millis(selected: &[SelectedWorkload<'_>]) -> Result<u64> {
+    estimate_millis(selected, 4, 2, false)
 }
 
 /// Estimates single-binary campaign time from declared planning durations.
-pub fn estimated_single_millis(selected: &[SelectedWorkload<'_>]) -> u64 {
-    selected
-        .iter()
-        .map(|selected| {
-            let executions = if is_reliability_timing(&selected.profile.timing) {
-                1
-            } else {
-                u64::from(selected.profile.blocks) * 2
-            };
-            let measured = executions * selected.workload.planning_duration_ms;
-            let precondition = if selected.workload.preconditioning
-                == super::model::Preconditioning::OnePerBinary
-            {
-                selected.workload.planning_duration_ms
+pub fn estimated_single_millis(selected: &[SelectedWorkload<'_>]) -> Result<u64> {
+    estimate_millis(selected, 2, 1, true)
+}
+
+fn estimate_millis(
+    selected: &[SelectedWorkload<'_>],
+    executions_per_block: u64,
+    precondition_executions: u64,
+    reliability_is_single: bool,
+) -> Result<u64> {
+    selected.iter().try_fold(0_u64, |total, selected| {
+        let executions = if reliability_is_single && is_reliability_timing(&selected.profile.timing)
+        {
+            1
+        } else {
+            u64::from(selected.profile.blocks)
+                .checked_mul(executions_per_block)
+                .context("performance execution-count estimate overflowed")?
+        };
+        let measured = executions
+            .checked_mul(selected.workload.planning_duration_ms)
+            .context("performance measured-duration estimate overflowed")?;
+        let precondition =
+            if selected.workload.preconditioning == super::model::Preconditioning::OnePerBinary {
+                precondition_executions
+                    .checked_mul(selected.workload.planning_duration_ms)
+                    .context("performance precondition-duration estimate overflowed")?
             } else {
                 0
             };
-            measured + precondition
-        })
-        .sum()
+        total
+            .checked_add(measured)
+            .and_then(|total| total.checked_add(precondition))
+            .context("performance campaign-duration estimate overflowed")
+    })
+}
+
+/// Returns the semantic unit and exact oracle implemented by a workload driver.
+fn driver_contract(workload_id: &str) -> Option<(&'static str, &'static str)> {
+    Some(match workload_id {
+        "startup.cli-help.v1" => ("process_start", "exit_0_and_help_signature"),
+        "run.create.v1" | "run.create-scaling.v1" => {
+            ("case_and_run", "exact_control_and_execution_rows")
+        }
+        "coordinator.dispatch.v1" => ("cycle_and_chunk", "exact_dispatch_and_queue_state"),
+        "worker.execute-wasm.v1" => (
+            "useful_case_and_evaluation",
+            "exact_attempt_result_and_chunk_state",
+        ),
+        "system.lifecycle.v1" => (
+            "useful_case_chunk_and_run",
+            "exact_completed_run_and_drained_work",
+        ),
+        "system.capacity.v1" => (
+            "useful_case_per_second",
+            "exact_completed_run_and_drained_work",
+        ),
+        "system.soak.v1" => (
+            "useful_case_interval",
+            "exact_terminal_work_drained_queue_and_bounded_resources",
+        ),
+        "system.recovery.v1" => (
+            "recovered_dependency_and_useful_case",
+            "exact_pre_and_post_fault_work_with_bounded_reconnect",
+        ),
+        "coordinator.dispatch-scaling.v1" => ("chunk", "exact_dispatch_and_queue_state"),
+        "agent.http-scaling.v1" | "agent.http-variants.v1" => {
+            ("agent_request", "exact_agent_requests_and_terminal_results")
+        }
+        "evaluator.wasm-scaling.v1" => {
+            ("evaluation", "exact_evaluator_results_and_terminal_attempt")
+        }
+        "worker.persistence-scaling.v1" => ("case_result", "exact_attempt_result_and_chunk_state"),
+        "coordinator.outbox-scaling.v1" => (
+            "published_delivery",
+            "exact_outbox_delivery_and_queue_state",
+        ),
+        "database.route-cache.v1" => ("route_lookup", "exact_status_projection"),
+        "coordinator.recovery.v1" => ("recovered_lease", "exact_recovery_attempt_and_redelivery"),
+        "coordinator.finalization.v1" => ("finalized_run", "exact_terminal_summary_and_event"),
+        "run.cancel-scaling.v1" => (
+            "cancelled_execution_and_route",
+            "exact_cancelled_run_rows_and_idempotent_replay",
+        ),
+        "run.read.v1" => (
+            "returned_execution_summary",
+            "exact_terminal_status_and_result_counts",
+        ),
+        "run.export.v1" => (
+            "serialized_execution",
+            "exact_export_record_types_and_counts",
+        ),
+        "shard.move.v1" => (
+            "copied_row_page_and_byte",
+            "exact_route_switch_checksums_and_page_distribution",
+        ),
+        "shard.rebalance.v1" => (
+            "moved_and_verified_shard",
+            "exact_completed_rebalance_items_and_routes",
+        ),
+        "coordinator.placement-scaling.v1" => {
+            ("logical_placement", "exact_bounded_cycle_and_dispatch")
+        }
+        "run.create-boundaries.v1" => (
+            "case_and_creation_page",
+            "exact_creation_progress_at_every_page_boundary",
+        ),
+        _ => return None,
+    })
+}
+
+fn is_supported_metric(metric: &str) -> bool {
+    matches!(
+        metric,
+        "wall_time"
+            | "child_cpu"
+            | "process_cpu"
+            | "peak_rss"
+            | "executable_bytes"
+            | "service_cpu"
+            | "sql"
+            | "wal"
+            | "http"
+            | "queue"
+            | "throughput"
+            | "file_descriptors"
+            | "recovery_time"
+    )
 }
 
 /// Returns whether a timing policy represents one bounded reliability observation.
@@ -500,8 +646,8 @@ timing = "informative"
         let selected =
             select_workloads(&developer, &registry, &["startup.cli-help.v1".into()]).unwrap();
         assert_eq!(selected.len(), 1);
-        assert_eq!(estimated_single_millis(&selected), 5_000);
-        assert_eq!(estimated_compare_millis(&selected), 10_000);
+        assert_eq!(estimated_single_millis(&selected).unwrap(), 5_000);
+        assert_eq!(estimated_compare_millis(&selected).unwrap(), 10_000);
 
         let pr = load_profile(&root, "pr-v1").unwrap();
         assert_eq!(select_workloads(&pr, &registry, &[]).unwrap().len(), 4);
@@ -515,7 +661,7 @@ timing = "informative"
         let soak = load_profile(&root, "soak-v1").unwrap();
         let selected = select_workloads(&soak, &registry, &[]).unwrap();
         assert_eq!(selected.len(), 1);
-        assert_eq!(estimated_single_millis(&selected), 1_800_000);
+        assert_eq!(estimated_single_millis(&selected).unwrap(), 1_800_000);
         assert!(is_reliability_timing(&selected[0].profile.timing));
     }
 
@@ -540,6 +686,20 @@ timing = "informative"
         let mut invalid = registry.clone();
         invalid.workloads[0].owner.clear();
         assert!(validate_registry(&invalid).is_err());
+        let mut invalid = registry.clone();
+        let duplicate = invalid.workloads[0].tuples[0].clone();
+        invalid.workloads[0].tuples.push(duplicate);
+        assert!(validate_registry(&invalid).is_err());
+        let mut invalid = registry.clone();
+        invalid.workloads[0].oracle = "misspelled_oracle".into();
+        assert!(validate_registry(&invalid).is_err());
+        let mut invalid = registry.clone();
+        invalid.workloads[0].required_metrics.push("unknown".into());
+        assert!(validate_registry(&invalid).is_err());
+        let mut invalid = registry.clone();
+        let duplicate = invalid.workloads[0].required_metrics[0].clone();
+        invalid.workloads[0].required_metrics.push(duplicate);
+        assert!(validate_registry(&invalid).is_err());
 
         let mut invalid = profile.clone();
         invalid.schema_id = "profile/v2".into();
@@ -551,6 +711,9 @@ timing = "informative"
         invalid.workloads[0].timing = "unknown".into();
         assert!(validate_profile(&invalid).is_err());
         let mut invalid = profile.clone();
+        invalid.workloads.push(invalid.workloads[0].clone());
+        assert!(validate_profile(&invalid).is_err());
+        let mut invalid = profile.clone();
         invalid.workloads[0].id = "unknown.v1".into();
         assert!(validate_profile_registry(&invalid, &registry).is_err());
         let mut invalid = profile;
@@ -559,6 +722,10 @@ timing = "informative"
 
         let mut invalid = load_profile(&root, "soak-v1").unwrap();
         invalid.workloads[0].blocks = 2;
+        assert!(validate_profile(&invalid).is_err());
+
+        let mut invalid = load_profile(&root, "capacity-v1").unwrap();
+        invalid.workloads[0].timing = "informative".into();
         assert!(validate_profile(&invalid).is_err());
 
         let mut invalid = registry.clone();
@@ -572,6 +739,48 @@ timing = "informative"
             .unwrap()
             .duration_secs = 0;
         assert!(validate_registry(&invalid).is_err());
+    }
+
+    #[test]
+    fn profile_file_identity_must_match_requested_id() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join(super::super::default_profile_dir());
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("requested-v1.toml"),
+            r#"
+schema_id = "profile/v1"
+id = "different-v1"
+description = "identity mismatch"
+requires_workload_selection = false
+campaign_cap_secs = 1
+schedule_seed = 1
+max_artifact_bytes = 1
+max_stdout_bytes = 1
+max_stderr_bytes = 1
+[[workloads]]
+id = "startup.cli-help.v1"
+tuple = "cold-help"
+blocks = 2
+timing = "informative"
+"#,
+        )
+        .unwrap();
+
+        assert!(load_profile(root.path(), "requested-v1").is_err());
+    }
+
+    #[test]
+    fn duration_estimates_reject_arithmetic_overflow() {
+        let root = crate::perf::artifact::workspace_root().unwrap();
+        let mut registry = load_registry(&root).unwrap();
+        let profile = load_profile(&root, "developer-v1").unwrap();
+        registry.workloads[0].planning_duration_ms = u64::MAX;
+        let selected =
+            select_workloads(&profile, &registry, &["startup.cli-help.v1".into()]).unwrap();
+
+        assert!(estimated_single_millis(&selected).is_err());
+        assert!(estimated_compare_millis(&selected).is_err());
     }
 
     #[test]

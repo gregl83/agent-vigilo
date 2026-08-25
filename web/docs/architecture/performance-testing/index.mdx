@@ -64,6 +64,12 @@ and WAL counters are captured after the timed process exits. The
 The model command writes the owned component-model artifact and fails closed on
 incomplete or nonlinear evidence.
 
+Before measurement, each campaign freezes its validated workload registry,
+exact resolved profile, optional reviewed budget, and verified build manifests
+inside the retained run directory. Calibration, projection, and confirmation
+reload those run-relative contracts, so later repository edits cannot silently
+change the meaning of existing evidence.
+
 ## Large-Data Contracts
 
 Read and export fixtures contain 250 or 251 completed executions, evaluator
@@ -153,6 +159,13 @@ observations, exact durable totals, and every failed condition. A deterministic
 pure verdict fixture proves that leaks, stalls, lost work, early exits, and
 missed recovery are not accepted when services are unavailable to unit tests.
 
+Topology teardown inventories all containers, networks, and volumes by the exact
+Compose project, including stopped containers, and validates their run,
+performance, project, and component labels. Normal cleanup must match the
+persisted inventory exactly. Startup rollback accepts only a bounded subset of
+the fixed topology, and both paths prove that no project-owned or run-owned
+resource remains.
+
 ## Verdict Flow
 
 A comparison using a <GlossaryTerm term="gating-profile">gating profile</GlossaryTerm>
@@ -200,6 +213,10 @@ summary and retained as bounded artifacts; no performance badge is claimed
 before canonical repeatability exists. Activation requires an Actions runner
 version `2.327.1` or newer for the workflow's Node 24 actions, the documented
 runner labels, and repository variables; it requires no workflow edit.
+Nightly capacity evidence runs without a deployment assumption. Setting
+`VIGILO_PERF_DEPLOYMENT` to a reviewed checked-in input additionally enables its
+projection; the intentionally invalid planning example is never scheduled by
+default.
 The comparison on the
 <GlossaryTerm term="canonical-environment">canonical environment</GlossaryTerm>
 defaults to informative `reference-v1`; after review,

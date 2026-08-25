@@ -68,6 +68,7 @@ use super::{
         CampaignManifest,
         ComparisonDocument,
         EnvironmentManifest,
+        ExternalMeasurements,
         ImplementationStatus,
         Orientation,
         Preconditioning,
@@ -81,16 +82,22 @@ use super::{
         Verdict,
     },
     process::{
+        CapturedOutput,
         ProcessOutcome,
         ProcessSpec,
         executable_path,
         execute,
+    },
+    provenance::{
+        self,
+        FrozenPaths,
     },
     report,
     schedule,
     stats::compare_wall_time,
     workload::{
         ExecutionLimits,
+        ProductFailure,
         WorkloadRequest,
         WorkloadRunner,
     },
@@ -193,7 +200,7 @@ fn run_single_at(root: &Path, args: RunArgs) -> Result<u8> {
     let binary = executable_path(&args.binary)?;
     let manifest = load_and_verify_manifest(&args.build_manifest, &binary)?;
     require_capabilities(&selected, &[&manifest])?;
-    let planned_millis = estimated_single_millis(&selected);
+    let planned_millis = estimated_single_millis(&selected)?;
     validate_campaign_budget(&profile, &selected, planned_millis, false)?;
     let environment = environment_manifest();
     validate_timing_contract(&selected, &environment, &manifest, &manifest, false)?;
@@ -204,20 +211,22 @@ fn run_single_at(root: &Path, args: RunArgs) -> Result<u8> {
     let mut workload_runner = WorkloadRunner::new(root, &run_dir, &id);
     let seed = args.schedule_seed.unwrap_or(profile.schedule_seed);
     atomic_json(&run_dir.join("environment.json"), &environment)?;
-    let mut campaign = campaign_manifest(
-        &id,
-        "run",
-        &profile,
-        seed,
-        &selected,
+    let resolved_profile = resolved_profile(&profile, &selected);
+    let frozen = provenance::freeze(
+        &run_dir,
+        &registry,
+        &resolved_profile,
         None,
-        &args.build_manifest,
-        false,
-    );
+        None,
+        &manifest,
+    )?;
+    let mut campaign = campaign_manifest(&id, "run", &profile, seed, &selected, &frozen, false);
     atomic_json(&run_dir.join("campaign.json"), &campaign)?;
     print_budget(&selected, planned_millis, false);
 
-    let deadline = Instant::now() + Duration::from_secs(profile.campaign_cap_secs);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(profile.campaign_cap_secs))
+        .context("campaign deadline exceeds the platform clock range")?;
     let mut readiness = vec![ReadinessEvent {
         schema_id: REPORT_SCHEMA.into(),
         run_id: id.clone(),
@@ -432,7 +441,7 @@ fn compare_at(root: &Path, args: CompareArgs) -> Result<u8> {
         );
     }
     require_capabilities(&selected, &[&baseline_manifest, &candidate_manifest])?;
-    let planned_millis = estimated_compare_millis(&selected);
+    let planned_millis = estimated_compare_millis(&selected)?;
     validate_campaign_budget(&profile, &selected, planned_millis, true)?;
     let environment = environment_manifest();
     validate_timing_contract(
@@ -455,7 +464,8 @@ fn compare_at(root: &Path, args: CompareArgs) -> Result<u8> {
         .map(|run_dir| {
             load_confirmation(
                 run_dir,
-                &profile.id,
+                &registry,
+                &profile,
                 &selected,
                 &environment,
                 &baseline_manifest,
@@ -481,20 +491,22 @@ fn compare_at(root: &Path, args: CompareArgs) -> Result<u8> {
     let id = run_id();
     let mut workload_runner = WorkloadRunner::new(root, &run_dir, &id);
     atomic_json(&run_dir.join("environment.json"), &environment)?;
-    let mut campaign = campaign_manifest(
-        &id,
-        "compare",
-        &profile,
-        seed,
-        &selected,
-        Some(&args.baseline_manifest),
-        &args.candidate_manifest,
-        true,
-    );
+    let resolved_profile = resolved_profile(&profile, &selected);
+    let frozen = provenance::freeze(
+        &run_dir,
+        &registry,
+        &resolved_profile,
+        budget_policy.as_ref(),
+        Some(&baseline_manifest),
+        &candidate_manifest,
+    )?;
+    let mut campaign = campaign_manifest(&id, "compare", &profile, seed, &selected, &frozen, true);
     atomic_json(&run_dir.join("campaign.json"), &campaign)?;
     print_budget(&selected, planned_millis, true);
 
-    let deadline = Instant::now() + Duration::from_secs(profile.campaign_cap_secs);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(profile.campaign_cap_secs))
+        .context("campaign deadline exceeds the platform clock range")?;
     let mut readiness = vec![ReadinessEvent {
         schema_id: REPORT_SCHEMA.into(),
         run_id: id.clone(),
@@ -980,7 +992,8 @@ fn resolve_budget_entry<'a>(
 /// Loads and validates the first over-budget run used for confirmation.
 fn load_confirmation(
     run_dir: &Path,
-    profile_id: &str,
+    registry: &super::model::WorkloadRegistry,
+    profile: &super::model::Profile,
     selected: &[SelectedWorkload<'_>],
     environment: &EnvironmentManifest,
     baseline: &BuildManifest,
@@ -996,6 +1009,8 @@ fn load_confirmation(
     let campaign: CampaignManifest = serde_json::from_slice(
         &fs::read(&campaign_path).with_context(|| format!("read {}", campaign_path.display()))?,
     )?;
+    let frozen =
+        provenance::load(run_dir, &campaign).context("load confirmation campaign provenance")?;
     let prior_environment: EnvironmentManifest = serde_json::from_slice(
         &fs::read(&environment_path)
             .with_context(|| format!("read {}", environment_path.display()))?,
@@ -1010,8 +1025,8 @@ fn load_confirmation(
         || report.run_id != campaign.run_id
         || report.kind != "compare"
         || campaign.kind != "compare"
-        || report.profile_id != profile_id
-        || campaign.profile_id != profile_id
+        || report.profile_id != profile.id
+        || campaign.profile_id != profile.id
         || campaign.selected_workloads != expected
         || report.status != "invalid"
         || campaign.status != "invalid"
@@ -1019,6 +1034,22 @@ fn load_confirmation(
         || prior_environment.environment_id != environment.environment_id
     {
         bail!("confirmation source is not a compatible inconclusive canonical comparison");
+    }
+    let expected_profile = resolved_profile(profile, selected);
+    if serde_json::to_value(&frozen.registry)? != serde_json::to_value(registry)?
+        || serde_json::to_value(&frozen.profile)? != serde_json::to_value(&expected_profile)?
+        || serde_json::to_value(&frozen.budget_policy)? != serde_json::to_value(policy)?
+    {
+        bail!("confirmation source frozen registry, profile, or budget policy does not match");
+    }
+    let prior_baseline = frozen
+        .baseline_manifest
+        .as_ref()
+        .context("confirmation source omitted its frozen baseline manifest")?;
+    if prior_baseline.executable_digest != baseline.executable_digest
+        || frozen.candidate_manifest.executable_digest != candidate.executable_digest
+    {
+        bail!("confirmation source frozen build digests do not match");
     }
     for comparison in &report.comparisons {
         if comparison.baseline_digest != baseline.executable_digest
@@ -1066,7 +1097,11 @@ fn validate_campaign_budget(
     planned_millis: u64,
     comparison: bool,
 ) -> Result<()> {
-    if planned_millis > profile.campaign_cap_secs * 1000 {
+    let campaign_cap_millis = profile
+        .campaign_cap_secs
+        .checked_mul(1_000)
+        .context("profile campaign cap overflows milliseconds")?;
+    if planned_millis > campaign_cap_millis {
         bail!(
             "planned duration {}s exceeds profile cap {}s",
             planned_millis.div_ceil(1000),
@@ -1090,8 +1125,17 @@ fn validate_campaign_budget(
             measured + precondition
         })
         .sum();
-    let worst_case_output =
-        process_count.saturating_mul((profile.max_stdout_bytes + profile.max_stderr_bytes) as u64);
+    let output_per_process = u64::try_from(profile.max_stdout_bytes)
+        .ok()
+        .and_then(|stdout| {
+            u64::try_from(profile.max_stderr_bytes)
+                .ok()
+                .and_then(|stderr| stdout.checked_add(stderr))
+        })
+        .context("profile output limits overflow the artifact estimate")?;
+    let worst_case_output = process_count
+        .checked_mul(output_per_process)
+        .context("profile output estimate overflowed")?;
     if worst_case_output > profile.max_artifact_bytes {
         bail!(
             "worst-case captured output {} bytes exceeds artifact cap {} bytes",
@@ -1129,51 +1173,78 @@ fn execute_workload(
     request: ExecutionRequest<'_, '_>,
 ) -> Result<ExecutedSample> {
     let started_at = Utc::now().to_rfc3339();
-    let (outcome, external) = if request.selected.workload.id == "startup.cli-help.v1" {
-        (
-            execute(&ProcessSpec {
-                program: request.binary,
-                args: &request.selected.workload.command,
-                current_dir: None,
-                env: &[],
-                timeout: Duration::from_millis(request.selected.workload.watchdog_ms),
-                stdout_limit: request.stdout_limit,
-                stderr_limit: request.stderr_limit,
-            })?,
-            Default::default(),
-        )
-    } else {
-        let empty_exact = std::collections::BTreeMap::new();
-        let exact = request
-            .selected
-            .workload
-            .scaling_model
-            .as_ref()
-            .and_then(|model| {
-                model
-                    .points
-                    .iter()
-                    .find(|point| point.tuple == request.selected.profile.tuple)
-            })
-            .map_or(&empty_exact, |point| &point.exact);
-        let executed = runner.execute(WorkloadRequest {
-            workload_id: &request.selected.workload.id,
-            tuple: &request.selected.profile.tuple,
-            fixture_id: &request.selected.workload.fixture,
-            binary: request.binary,
-            manifest_path: request.build_manifest,
-            manifest: request.manifest,
-            exact,
-            reliability: request.selected.workload.reliability.as_ref(),
-            limits: ExecutionLimits {
-                watchdog: Duration::from_millis(request.selected.workload.watchdog_ms),
-                stdout: request.stdout_limit,
-                stderr: request.stderr_limit,
-            },
-        })?;
-        (executed.process, executed.external)
-    };
-    let validation = validate_outcome(&outcome, request.selected, request.role);
+    let (outcome, external, workload_failure) =
+        if request.selected.workload.id == "startup.cli-help.v1" {
+            (
+                execute(&ProcessSpec {
+                    program: request.binary,
+                    args: &request.selected.workload.command,
+                    current_dir: None,
+                    env: &[],
+                    timeout: Duration::from_millis(request.selected.workload.watchdog_ms),
+                    stdout_limit: request.stdout_limit,
+                    stderr_limit: request.stderr_limit,
+                })?,
+                Default::default(),
+                None,
+            )
+        } else {
+            let empty_exact = std::collections::BTreeMap::new();
+            let exact = request
+                .selected
+                .workload
+                .scaling_model
+                .as_ref()
+                .and_then(|model| {
+                    model
+                        .points
+                        .iter()
+                        .find(|point| point.tuple == request.selected.profile.tuple)
+                })
+                .map_or(&empty_exact, |point| &point.exact);
+            let executed = runner.execute(WorkloadRequest {
+                workload_id: &request.selected.workload.id,
+                tuple: &request.selected.profile.tuple,
+                fixture_id: &request.selected.workload.fixture,
+                binary: request.binary,
+                manifest_path: request.build_manifest,
+                manifest: request.manifest,
+                exact,
+                reliability: request.selected.workload.reliability.as_ref(),
+                limits: ExecutionLimits {
+                    watchdog: Duration::from_millis(request.selected.workload.watchdog_ms),
+                    stdout: request.stdout_limit,
+                    stderr: request.stderr_limit,
+                },
+            });
+            match executed {
+                Ok(executed) => (executed.process, executed.external, None),
+                Err(error) => {
+                    let Some(failure) = error.downcast_ref::<ProductFailure>() else {
+                        return Err(error);
+                    };
+                    (
+                        failed_workload_outcome(),
+                        ExternalMeasurements::default(),
+                        Some(failure.message().to_owned()),
+                    )
+                }
+            }
+        };
+    let mut sample_validation = workload_failure.map_or_else(
+        || validate_outcome(&outcome, request.selected, request.role),
+        |message| workload_failure_validation(request.role, &message),
+    );
+    if sample_validation.state == SampleState::Valid
+        && let Some(metric) =
+            missing_required_metric(request.selected, request.manifest, &outcome, &external)
+    {
+        sample_validation = validation(
+            SampleState::Invalid,
+            "missing_required_metric",
+            &format!("required metric {metric:?} was not observed"),
+        );
+    }
     let measurement = ProcessMeasurement {
         wall_time_ns: outcome.wall_time.as_nanos().min(u128::from(u64::MAX)) as u64,
         cpu_time_ns: outcome.cpu_time_ns,
@@ -1211,12 +1282,49 @@ fn execute_workload(
             started_at,
             process: measurement,
             external,
-            validation,
+            validation: sample_validation,
             extra: no_extra(),
         },
         stdout: outcome.stdout.data,
         stderr: outcome.stderr.data,
     })
+}
+
+fn failed_workload_outcome() -> ProcessOutcome {
+    ProcessOutcome {
+        wall_time: Duration::ZERO,
+        cpu_time_ns: None,
+        peak_rss_bytes: None,
+        resource_source: "workload_oracle",
+        exit_code: None,
+        timed_out: false,
+        stdout: CapturedOutput {
+            bytes_seen: 0,
+            truncated: false,
+            data: Vec::new(),
+            first_byte_time: None,
+            last_byte_time: None,
+        },
+        stderr: CapturedOutput {
+            bytes_seen: 0,
+            truncated: false,
+            data: Vec::new(),
+            first_byte_time: None,
+            last_byte_time: None,
+        },
+    }
+}
+
+fn workload_failure_validation(role: BinaryRole, message: &str) -> Validation {
+    validation(
+        if role == BinaryRole::Baseline {
+            SampleState::Invalid
+        } else {
+            SampleState::ProductFailure
+        },
+        "workload_oracle",
+        message,
+    )
 }
 
 /// Classifies process and startup-oracle failures according to the measured role.
@@ -1269,6 +1377,50 @@ fn missing_signature<'a>(output: &str, signatures: &'a [String]) -> Option<&'a s
     signatures
         .iter()
         .find(|signature| !output.contains(signature.as_str()))
+        .map(String::as_str)
+}
+
+/// Returns the first declared metric absent from a successful raw observation.
+fn missing_required_metric<'a>(
+    selected: &'a SelectedWorkload<'_>,
+    manifest: &BuildManifest,
+    outcome: &ProcessOutcome,
+    external: &ExternalMeasurements,
+) -> Option<&'a str> {
+    selected
+        .workload
+        .required_metrics
+        .iter()
+        .find(|metric| {
+            !match metric.as_str() {
+                "wall_time" => !outcome.wall_time.is_zero(),
+                "child_cpu" | "process_cpu" => outcome.cpu_time_ns.is_some(),
+                "peak_rss" => outcome.peak_rss_bytes.is_some(),
+                "executable_bytes" => manifest.executable_bytes > 0,
+                "service_cpu" => external.service_cpu_percent.is_some(),
+                "sql" => {
+                    external.sql_calls.is_some()
+                        && external.sql_time_ms.is_some()
+                        && external.sql_rows.is_some()
+                }
+                "wal" => external.wal_bytes.is_some(),
+                "http" => {
+                    external.http_requests.is_some()
+                        && external.http_bytes.is_some()
+                        && external.http_peak_concurrency.is_some()
+                }
+                "queue" => external.queue_ready.is_some() && external.queue_unacked.is_some(),
+                "throughput" => !outcome.wall_time.is_zero() && !external.durable_counts.is_empty(),
+                // Successful reliability drivers have already required these
+                // observations through their exact reliability artifact.
+                "file_descriptors" => matches!(
+                    selected.workload.id.as_str(),
+                    "system.soak.v1" | "system.recovery.v1"
+                ),
+                "recovery_time" => selected.workload.id == "system.recovery.v1",
+                _ => false,
+            }
+        })
         .map(String::as_str)
 }
 
@@ -1374,8 +1526,7 @@ fn campaign_manifest(
     profile: &super::model::Profile,
     seed: u64,
     selected: &[SelectedWorkload<'_>],
-    baseline_manifest: Option<&Path>,
-    candidate_manifest: &Path,
+    frozen: &FrozenPaths,
     comparison: bool,
 ) -> CampaignManifest {
     let measured = selected
@@ -1410,11 +1561,27 @@ fn campaign_manifest(
         planned_preconditioning_executions: precondition,
         artifact_limit_bytes: profile.max_artifact_bytes,
         environment_file: "environment.json".into(),
-        baseline_manifest: baseline_manifest.map(|path| path.display().to_string()),
-        candidate_manifest: candidate_manifest.display().to_string(),
+        registry_file: frozen.registry_file.clone(),
+        profile_file: frozen.profile_file.clone(),
+        budget_policy_file: frozen.budget_policy_file.clone(),
+        baseline_manifest: frozen.baseline_manifest.clone(),
+        candidate_manifest: frozen.candidate_manifest.clone(),
         failure: None,
         extra: no_extra(),
     }
+}
+
+/// Materializes the exact profile subset selected for one campaign.
+fn resolved_profile(
+    profile: &super::model::Profile,
+    selected: &[SelectedWorkload<'_>],
+) -> super::model::Profile {
+    let mut resolved = profile.clone();
+    resolved.workloads = selected
+        .iter()
+        .map(|selected| selected.profile.clone())
+        .collect();
+    resolved
 }
 
 /// Prevents a new block from starting after the campaign wall-time cap.
@@ -1484,6 +1651,7 @@ fn artifact_files(comparison: bool, reliability: bool) -> Vec<String> {
         "blocks.jsonl".into(),
         "report.json".into(),
         "summary.md".into(),
+        "provenance/".into(),
     ];
     if comparison {
         files.insert(5, "comparisons.jsonl".into());
@@ -1643,6 +1811,12 @@ mod tests {
         candidate.role = BinaryRole::Candidate;
         candidate.validation.state = SampleState::ProductFailure;
         assert_eq!(classification_exit(&candidate), EXIT_REGRESSION);
+
+        let baseline = workload_failure_validation(BinaryRole::Baseline, "oracle differed");
+        assert_eq!(baseline.state, SampleState::Invalid);
+        assert_eq!(baseline.code, "workload_oracle");
+        let candidate = workload_failure_validation(BinaryRole::Candidate, "oracle differed");
+        assert_eq!(candidate.state, SampleState::ProductFailure);
     }
 
     #[test]
@@ -1920,6 +2094,9 @@ mod tests {
                 planned_preconditioning_executions: 2,
                 artifact_limit_bytes: 1,
                 environment_file: "environment.json".into(),
+                registry_file: "provenance/workload-registry.json".into(),
+                profile_file: "provenance/profile.json".into(),
+                budget_policy_file: Some("provenance/budget-policy.json".into()),
                 baseline_manifest: Some("base.json".into()),
                 candidate_manifest: "candidate.json".into(),
                 failure: Some("confirmation required".into()),
@@ -1993,13 +2170,76 @@ mod tests {
     }
 
     #[test]
+    fn required_metrics_must_be_present_before_a_sample_is_valid() {
+        let root = workspace_root().unwrap();
+        let registry = load_registry(&root).unwrap();
+        let profile = load_profile(&root, "developer-v1").unwrap();
+        let selected =
+            select_workloads(&profile, &registry, &["startup.cli-help.v1".into()]).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("binary");
+        let assets = directory.path().join("assets");
+        fs::write(&binary, "binary").unwrap();
+        fs::create_dir(&assets).unwrap();
+        let manifest = manifest(&binary, &assets);
+        let mut outcome = process_outcome("Usage: vigilo\nCommands:");
+
+        assert!(
+            missing_required_metric(
+                &selected[0],
+                &manifest,
+                &outcome,
+                &ExternalMeasurements::default(),
+            )
+            .is_none()
+        );
+        outcome.peak_rss_bytes = None;
+        assert_eq!(
+            missing_required_metric(
+                &selected[0],
+                &manifest,
+                &outcome,
+                &ExternalMeasurements::default(),
+            ),
+            Some("peak_rss")
+        );
+
+        let mut registry = registry;
+        let workload = registry
+            .workloads
+            .iter_mut()
+            .find(|workload| workload.id == "run.create.v1")
+            .unwrap();
+        workload.required_metrics = vec!["sql".into()];
+        let profile_workload = super::super::model::ProfileWorkload {
+            id: workload.id.clone(),
+            tuple: workload.tuples[0].clone(),
+            blocks: 2,
+            timing: "informative".into(),
+        };
+        let selected = SelectedWorkload {
+            profile: &profile_workload,
+            workload,
+        };
+        assert_eq!(
+            missing_required_metric(
+                &selected,
+                &manifest,
+                &process_outcome(""),
+                &ExternalMeasurements::default(),
+            ),
+            Some("sql")
+        );
+    }
+
+    #[test]
     fn campaign_helpers_write_bounded_artifacts() {
         let directory = tempfile::tempdir().unwrap();
         checkpoint(directory.path(), &[], &[], &[]).unwrap();
         assert!(directory.path().join("samples.jsonl").is_file());
-        assert_eq!(artifact_files(false, false).len(), 7);
-        assert_eq!(artifact_files(true, false).len(), 8);
-        assert_eq!(artifact_files(false, true).len(), 9);
+        assert_eq!(artifact_files(false, false).len(), 8);
+        assert_eq!(artifact_files(true, false).len(), 9);
+        assert_eq!(artifact_files(false, true).len(), 10);
         assert!(ensure_before_deadline(Instant::now() + Duration::from_secs(1)).is_ok());
         assert!(ensure_before_deadline(Instant::now()).is_err());
         assert!(enforce_artifact_limit(directory.path(), u64::MAX).is_ok());

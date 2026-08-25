@@ -24,7 +24,8 @@
 //!   render deterministic inputs, execute service-backed workloads, and apply
 //!   exact correctness oracles.
 //! - `command` orchestrates run and comparison campaigns; `artifact` persists
-//!   checkpoints, and `report` derives human-readable views from JSON results.
+//!   checkpoints, `provenance` freezes their validated input contracts, and
+//!   `report` derives human-readable views from JSON results.
 //! - `check` validates these contracts and isolation boundaries without
 //!   provisioning benchmark services.
 //!
@@ -43,6 +44,7 @@ mod fixture;
 mod model;
 mod process;
 mod projection;
+mod provenance;
 mod reliability;
 mod report;
 mod scaling;

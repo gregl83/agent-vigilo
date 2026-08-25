@@ -37,7 +37,7 @@ pub const BUDGET_SCHEMA: &str = "performance-budget/v1";
 pub const BASELINE_SCHEMA: &str = "performance-baseline/v1";
 
 /// Typed catalog of workload contracts and audited production constants.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkloadRegistry {
     /// Document shape identifier, currently [`REGISTRY_SCHEMA`].
     pub schema_id: String,
@@ -53,7 +53,7 @@ pub struct WorkloadRegistry {
 }
 
 /// Audited production constants that affect fixture shape or capacity models.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistryConstants {
     /// Maximum pooled connections allocated per database target.
     pub database_connections_per_target: u32,
@@ -106,7 +106,7 @@ pub struct RegistryConstants {
 }
 
 /// Whether the harness has an executable driver for a workload contract.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ImplementationStatus {
     /// The runner can provision, execute, and validate the workload.
@@ -116,7 +116,7 @@ pub enum ImplementationStatus {
 }
 
 /// Unmeasured warmup policy applied before a workload campaign.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Preconditioning {
     /// Start measurement without an additional harness warmup execution.
@@ -126,7 +126,7 @@ pub enum Preconditioning {
 }
 
 /// Shape used to interpret repeated component measurements across cardinalities.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ScalingKind {
     /// One fixed intercept plus a per-unit slope over a continuous measured range.
@@ -136,7 +136,7 @@ pub enum ScalingKind {
 }
 
 /// One registered cardinality and its exact externally observable effects.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScalingPoint {
     /// Registered workload tuple represented by this point.
     pub tuple: String,
@@ -147,7 +147,7 @@ pub struct ScalingPoint {
 }
 
 /// Declarative scaling contract for one component workload.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScalingModel {
     /// Model family used for interpolation and discontinuity checks.
     pub kind: ScalingKind,
@@ -163,7 +163,7 @@ pub struct ScalingModel {
 }
 
 /// One stable semantic workload and its execution requirements.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workload {
     /// Versioned workload identity recorded in every dependent artifact.
     pub id: String,
@@ -207,7 +207,7 @@ pub struct Workload {
 }
 
 /// Bounded acceptance policy for a soak or controlled-recovery workload.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReliabilityContract {
     /// Minimum measured duration for a steady-state soak.
     pub duration_secs: u64,
@@ -687,6 +687,12 @@ pub struct CampaignManifest {
     pub artifact_limit_bytes: u64,
     /// Relative path to the captured environment manifest.
     pub environment_file: String,
+    /// Relative path to the frozen workload registry.
+    pub registry_file: String,
+    /// Relative path to the frozen resolved profile.
+    pub profile_file: String,
+    /// Relative path to the frozen reviewed budget policy, when one applied.
+    pub budget_policy_file: Option<String>,
     /// Relative baseline manifest path for comparison campaigns.
     pub baseline_manifest: Option<String>,
     /// Relative candidate or single-binary manifest path.
