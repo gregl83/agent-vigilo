@@ -109,33 +109,64 @@ noise pass.
 
 ## Quick Start
 
+### 1. Validate The Harness
+
 Validate the harness, package boundary, profiles, scheduler, and process cleanup:
 
 ```bash
 cargo perf check
 ```
 
-Build an immutable release snapshot and provenance manifest:
+### 2. Create A Test Subject
+
+`cargo perf build` does not run a performance test. It compiles one Vigilo
+revision outside the measured interval and saves everything needed to test that
+exact revision together:
 
 ```bash
-cargo perf build --source . --output target/perf/builds/current
+cargo perf build --output target/perf/builds/current
 ```
 
-A clean production release can take several minutes because Vigilo enables LTO
-and one codegen unit. Build snapshots once per revision and reuse them.
-`cargo perf build` also compiles and snapshots the frozen sentiment evaluator;
-`run` and `compare` never invoke Cargo inside a measured campaign.
+Here, `current` is only a local name for the snapshot. The command creates:
 
-On Linux, the binary is `target/perf/builds/current/release/vigilo`. On Windows,
-append `.exe`. Measure one binary:
+| Path | Purpose |
+| --- | --- |
+| `target/perf/builds/current/release/vigilo` | Release executable that is measured; it ends in `.exe` on Windows. |
+| `target/perf/builds/current/build-manifest.json` | Binary digest, source revision, toolchain, dependencies, capabilities, and setup-asset digests. |
+| `target/perf/builds/current/setup-assets/` | Frozen migrations, evaluator contract, evaluator source, and evaluator Wasm used by service workloads. |
+
+The default `--source .` means the current checkout. For A/B testing,
+`--source` can instead name a separate baseline worktree. `--output` must be a
+unique directory below this workspace's `target/perf/builds`; it is not the
+test-results directory. Use `--force` only when deliberately replacing a local
+snapshot.
+
+A clean production release can take several minutes because Vigilo enables LTO
+and one codegen unit. Build once per revision and reuse the snapshot. `run` and
+`compare` verify its manifest and never invoke Cargo inside a measured campaign.
+
+### 3. Run The First Test
+
+On Linux and macOS, run:
 
 ```bash
 cargo perf run \
   --profile developer-v1 \
   --workload startup.cli-help.v1 \
-  --bin <vigilo-binary> \
-  --build-manifest target/perf/builds/current/build-manifest.json
+  --bin target/perf/builds/current/release/vigilo \
+  --build-manifest target/perf/builds/current/build-manifest.json \
+  --output target/perf/runs/first-startup
 ```
+
+On Windows, use the same command with
+`target/perf/builds/current/release/vigilo.exe`. The `--bin` and
+`--build-manifest` paths must come from the same snapshot directory.
+
+This startup test is service-free. A pass means the executable identity,
+capability, process, output, and exact help oracle all passed. Its timing is
+informative rather than a performance-regression verdict.
+
+### 4. Compare Two Revisions
 
 Compare two immutable snapshots on the same host:
 
