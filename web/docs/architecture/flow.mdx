@@ -34,6 +34,33 @@ At a high level, the system follows a fan-out / fan-in pattern:
 
 ---
 
+## Evaluation Counts And Relationships
+
+The runtime uses the following <GlossaryTerm term="cardinality">cardinalities</GlossaryTerm>:
+
+```text
+one run
+  -> many chunks
+       -> many dataset cases
+            -> one expected execution per case
+                 -> one or more attempts over time
+  -> one or more used run shards
+       -> one shard placement per used shard
+       -> one dispatch cursor per used shard
+       -> many chunk dispatch windows over time
+            -> one run.chunk.ready outbox record per selected chunk
+
+one run.started outbox record per run
+one broker message per publish attempt, with possible redelivery
+```
+
+Multiple run shards can share one database alias. A coordinator pass can report
+counts for several aliases even though each routed operation targets one
+database at a time. See [Scaling](./scaling/index.mdx) for routing and placement
+details.
+
+---
+
 ## End-to-End Flow
 
 ### 1. Run Creation

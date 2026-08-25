@@ -59,6 +59,7 @@ export const glossarySections: readonly GlossarySection[] = [
       {id: 'attempt', term: 'Attempt', definition: 'One worker\'s effort to complete an execution. Retries create later attempts.', scope: 'Many attempts can belong to one execution; only the current attempt is authoritative.'},
       {id: 'current-attempt', term: 'Current attempt', definition: 'Attempt ID and number selected by an execution as its current worker effort.', scope: 'Terminal writes also require the matching worker ID and a live attempt lease; zero or one attempt is authoritative per execution.'},
       {id: 'run', term: 'Run', definition: 'One durable evaluation of a dataset version with a run profile and agent target.', scope: 'A run contains chunks and expected executions.'},
+      {id: 'cardinality', term: 'Cardinality', definition: 'Exact number of items in a set or the multiplicity of a relationship, such as one run containing many chunks.', scope: 'In performance workloads, cardinality is the declared input size for a scaling dimension, such as cases, chunks, or events.'},
       {id: 'run-status', term: 'Run status', definition: 'Operational lifecycle state: `creating`, `pending`, `running`, `finalizing`, `completed`, `failed`, or `cancelled`.', scope: 'One current value per run.'},
       {id: 'gate-status', term: 'Gate status', definition: 'Policy outcome such as `unknown`, `pass`, or `fail`.', scope: 'One current value per run; distinct from run status.'},
     ],

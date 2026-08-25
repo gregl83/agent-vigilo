@@ -48,23 +48,3 @@ the same time.
 ## Evaluator Packaging
 
 <GlossarySection section="evaluator-packaging" />
-
-## Evaluation Cardinality At A Glance
-
-```text
-one run
-  -> many chunks
-  -> one expected execution per dataset case
-  -> one or more used run shards
-       -> one shard placement per used shard
-       -> one dispatch cursor per used shard
-       -> many chunk dispatch windows over time
-            -> one run.chunk.ready outbox record per selected chunk
-
-one run.started outbox record per run
-one broker message per publish attempt, with possible redelivery
-```
-
-Multiple run shards can share one database alias. A coordinator pass can report
-counts for several aliases even though each routed operation targets one
-database at a time.
