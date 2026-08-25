@@ -195,15 +195,23 @@ async fn activation_rejects_existing_local_shard_ownership(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires a PostgreSQL DATABASE_URL for sqlx shard admin tests"]
 async fn activation_rejects_read_only_target(pool: PgPool) {
-    let (target_name, target_url) = create_migrated_target_database().await;
-    sqlx::query(&format!(
-        "ALTER DATABASE \"{target_name}\" SET default_transaction_read_only = on"
-    ))
-    .execute(&pool)
-    .await
-    .unwrap();
+    let (_, target_url) = create_migrated_target_database().await;
+    let mut read_only_url = url::Url::parse(&target_url).unwrap();
+    read_only_url
+        .query_pairs_mut()
+        .append_pair("options[default_transaction_read_only]", "on");
+    let read_only_url = read_only_url.to_string();
+    let read_only_pool = PgPool::connect(&read_only_url).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SHOW transaction_read_only")
+            .fetch_one(&read_only_pool)
+            .await
+            .unwrap(),
+        "on"
+    );
+    read_only_pool.close().await;
     insert_provisioning_placement(&pool, DEFAULT_DATABASE_URL_ENV).await;
-    let database_router = database_router_with_control_pool(pool.clone(), target_url.clone());
+    let database_router = database_router_with_control_pool(pool.clone(), read_only_url);
 
     let error = activate_database_placement(&database_router, "shard_001")
         .await
@@ -217,12 +225,6 @@ async fn activation_rejects_read_only_target(pool: PgPool) {
         .unwrap();
     target_pool.close().await;
     drop(database_router);
-    sqlx::query(&format!(
-        "ALTER DATABASE \"{target_name}\" RESET default_transaction_read_only"
-    ))
-    .execute(&pool)
-    .await
-    .unwrap();
     drop_target_database(&target_url).await;
 }
 
