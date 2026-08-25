@@ -575,7 +575,7 @@ pub struct BlockRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
-    /// Candidate remained within the calibrated harmful-effect budget.
+    /// Candidate remained within the reviewed harmful-effect budget.
     Pass,
     /// Candidate exceeded the budget with required confirmation.
     Regression,
@@ -871,7 +871,7 @@ pub struct BudgetEntry {
     pub max_residual_orientation_effect: f64,
 }
 
-/// Reviewed, environment-specific performance gates derived from calibration.
+/// Reviewed, environment-specific performance gates supported by calibration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BudgetPolicy {
     /// Document shape identifier, currently [`BUDGET_SCHEMA`].

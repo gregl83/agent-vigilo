@@ -54,8 +54,8 @@ flowchart TD
     Database[("<b>Database Placements</b> <br/> <small>[Container: PostgreSQL]</small> <br/> <small>Store control metadata, creation ledgers, routed execution rows, outbox ledgers, delivery rows, and migrations.</small>")]:::component
     Queue[("<b>Queue</b> <br/> <small>[Container: RabbitMQ]</small> <br/> <small>Distributes run chunk-ready broker messages to workers.</small>")]:::component
     Coordinator["fa:fa-compass <br/> <b>Coordinator</b> <br/> <small>[Container: Rust]</small> <br/> <small>Owns run-creation recovery, dispatch, finalization, and outbox publication.</small>"]:::component
-    Worker["fa:fa-gear <br/> <b>Worker</b> <br/> <small>[Container: Rust]</small> <br/> <small>Consumes chunks, invokes the target agent, runs evaluators, and persists results.</small>"]:::component
-    EvaluatorPackages["fa:fa-folder-tree <br/> <b>Evaluator Packages</b> <br/> <small>[External Files]</small> <br/> <small>Local evaluator crates, Vigilo.toml manifests, WIT references, and compiled WASM artifacts.</small>"]:::external
+    Worker["fa:fa-gear <br/> <b>Worker</b> <br/> <small>[Container: Rust]</small> <br/> <small>Consumes chunks, invokes the agent target, runs evaluators, and persists results.</small>"]:::component
+    EvaluatorPackages["fa:fa-folder-tree <br/> <b>Evaluator Packages</b> <br/> <small>[External Files]</small> <br/> <small>Local evaluator crates, Vigilo.toml manifests, WIT references, and compiled Wasm artifacts.</small>"]:::external
 
     %% edges
     User & AgentClient -->|"Manages evaluators, runs, and services using"| CliRouter
@@ -76,7 +76,7 @@ flowchart TD
     SetupManager -->|"Bootstraps built-in packages through"| EvaluatorRegistry
 
     EvaluatorRegistry -->|"Prepares packages with"| EvaluatorPreparer
-    EvaluatorPackages -->|"Provides manifests and WASM artifacts to"| EvaluatorPreparer
+    EvaluatorPackages -->|"Provides manifests and Wasm artifacts to"| EvaluatorPreparer
     EvaluatorRegistry -->|"Reads from and writes to <br> <small>[SQL/TCP]</small>"| Database
     EvaluatorPreparer -->|"Uses Wasm runtime from"| RuntimeContext
 

@@ -417,7 +417,7 @@ evidence; an early process exit, lost work, stranded delivery, or excess
 amplification fails.
 `reliability/<workload>-<tuple>.json` is the machine contract and
 `reliability.md` is its derived operator view. The absolute resource ceilings
-are safety bounds, not calibrated regression budgets; trend-based leak budgets
+are safety bounds, not reviewed regression budgets; trend-based leak budgets
 remain subject to canonical repeatability evidence.
 
 ## GitHub Actions
@@ -504,7 +504,7 @@ counted once because the reference topology uses one PostgreSQL server. JSONL
 must remain below its 256 MiB peak-RSS contract at the registered page boundary;
 JSON intentionally materializes one document and has a separate 512 MiB tested
 limit. These limits are correctness guards for the registered fixture size, not
-calibrated regression budgets or production capacity claims.
+reviewed regression budgets or production capacity claims.
 
 ## Performance Test Tier
 
@@ -539,9 +539,9 @@ reliability evidence.
 Exit `0` means all required correctness checks passed. Exit `1` means a
 candidate crash, timeout, output overflow, or exact-oracle failure. Exit `2`
 means the campaign was invalid, unsupported, inconclusive, or incomplete.
-Timing remains informative in profiles without a reviewed budget; calibrated
-numerical regression budgets apply only through a published gating profile. An initial
-over-budget confidence interval exits `2`; repeat it with
+Timing remains informative in profiles without a reviewed budget; reviewed
+numerical regression budgets apply only through a published gating profile. An
+initial over-budget confidence interval exits `2`; repeat it with
 `--confirmation-of <prior-run-directory>`. The confirmation must match the
 profile, workload set, build digests, and canonical environment and uses an
 independent schedule seed. A second over-budget interval exits `1`.

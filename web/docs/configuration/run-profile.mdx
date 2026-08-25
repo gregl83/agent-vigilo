@@ -4,7 +4,7 @@ title: Run Profile Configuration Reference
 description: Reference for the run profile YAML/JSON format used by `vigilo run validate`.
 keywords:
   - Agent Vigilo run profile
-  - AI evaluation profile
+  - AI run profile
   - evaluator gate configuration
   - LLM evaluation config
   - vigilo run validate profile
@@ -77,7 +77,7 @@ Top-level shape:
 ```yaml
 profile_id: mixed_agent_release
 profile_version: 1.0.0
-description: Release-grade evaluation profile for mixed generative AI agent tasks.
+description: Release-grade run profile for mixed generative AI agent tasks.
 defaults: {}
 persistence: {}
 agent:
@@ -297,7 +297,9 @@ Aggregation behavior:
 
 ## `scorecard.gates`
 
-Scorecard gates apply after all executions finish. They enforce run-wide rules without loading every execution into the control database.
+<GlossaryTerm term="scorecard-gate">Scorecard gates</GlossaryTerm> apply after
+all executions finish. They enforce run-wide rules without loading every
+execution into the control database.
 
 ```yaml
 scorecard:
@@ -327,7 +329,9 @@ A gate with no matching executions fails. Any failed scorecard gate fails the ru
 
 ## Evaluation Plan Resolution
 
-For every dataset case, Vigilo resolves an evaluation plan before invoking the target agent. The plan determines:
+For every dataset case, Vigilo resolves an
+<GlossaryTerm term="evaluation-plan">evaluation plan</GlossaryTerm> before
+invoking the agent target. The plan determines:
 
 - the profile case group or groups applied to the case
 - the evaluator bindings to run

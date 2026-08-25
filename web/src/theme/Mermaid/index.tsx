@@ -1,5 +1,4 @@
 import ErrorBoundary from '@docusaurus/ErrorBoundary';
-import {useLocation} from '@docusaurus/router';
 import {ErrorBoundaryErrorMessageFallback} from '@docusaurus/theme-common';
 import {
   MermaidContainerClassName,
@@ -20,18 +19,6 @@ import DiagramViewport from '@site/src/components/DiagramViewport';
 
 let iconRegistrationPromise: Promise<void> | undefined;
 
-const VIEWPORT_DOC_PATH_PREFIXES = [
-  '/docs/architecture/flows',
-  '/docs/architecture/state',
-  '/docs/architecture/structure',
-];
-
-function shouldUseDiagramViewport(pathname: string): boolean {
-  return VIEWPORT_DOC_PATH_PREFIXES.some((prefix) =>
-    pathname.startsWith(prefix),
-  );
-}
-
 function registerFontAwesomeIcons(): Promise<void> {
   iconRegistrationPromise ??= Promise.all([
     import('mermaid'),
@@ -48,10 +35,8 @@ function registerFontAwesomeIcons(): Promise<void> {
 
 function MermaidRenderResult({
   renderResult,
-  useViewport,
 }: {
   renderResult: RenderResult;
-  useViewport: boolean;
 }): ReactNode {
   const ref = useRef<HTMLDivElement>(null);
 
@@ -72,33 +57,21 @@ function MermaidRenderResult({
     />
   );
 
-  if (!useViewport) {
-    return diagram;
-  }
-
   return <DiagramViewport>{diagram}</DiagramViewport>;
 }
 
-function MermaidRenderer({
-  value,
-  useViewport,
-}: Props & {
-  useViewport: boolean;
-}): ReactNode {
+function MermaidRenderer({value}: Props): ReactNode {
   const defaultMermaidConfig = useMermaidConfig();
-  const mermaidConfig = useMemo(() => {
-    if (!useViewport) {
-      return defaultMermaidConfig;
-    }
-
-    return {
+  const mermaidConfig = useMemo(
+    () => ({
       ...defaultMermaidConfig,
       flowchart: {
         ...defaultMermaidConfig.flowchart,
         useMaxWidth: false,
       },
-    };
-  }, [defaultMermaidConfig, useViewport]);
+    }),
+    [defaultMermaidConfig],
+  );
 
   const renderResult = useMermaidRenderResult({
     config: mermaidConfig,
@@ -108,18 +81,11 @@ function MermaidRenderer({
     return null;
   }
 
-  return (
-    <MermaidRenderResult
-      renderResult={renderResult}
-      useViewport={useViewport}
-    />
-  );
+  return <MermaidRenderResult renderResult={renderResult} />;
 }
 
 function MermaidWithIcons(props: Props): ReactNode {
-  const {pathname} = useLocation();
   const [iconsReady, setIconsReady] = useState(false);
-  const useViewport = shouldUseDiagramViewport(pathname);
 
   useEffect(() => {
     let mounted = true;
@@ -143,7 +109,7 @@ function MermaidWithIcons(props: Props): ReactNode {
     return null;
   }
 
-  return <MermaidRenderer {...props} useViewport={useViewport} />;
+  return <MermaidRenderer {...props} />;
 }
 
 export default function Mermaid(props: Props): ReactNode {

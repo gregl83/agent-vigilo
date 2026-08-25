@@ -12,8 +12,8 @@ sequenceDiagram
     participant Queue as RabbitMQ
     participant ControlDB as Control DB
     participant ExecutionDB as Execution DB
-    participant Agent as Target Agent
-    participant WASM as WASM Runtime
+    participant Agent as Agent Target
+    participant WASM as Wasm Runtime
 
     User->>Vigilo: vigilo worker start
     activate Vigilo

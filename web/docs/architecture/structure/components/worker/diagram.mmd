@@ -88,7 +88,7 @@ flowchart TD
     MessageHandler -->|"Loads verified profile and execution plan through"| RunContextCache
     RunContextCache -->|"Reads the immutable run snapshot from <br> <small>[SQL/TCP]</small>"| Database
     RunContextCache -->|"Warms pinned evaluator artifacts with"| EvaluatorLoader
-    EvaluatorLoader -->|"Reads exact evaluator WASM by pinned id and hash from <br> <small>[SQL/TCP]</small>"| Database
+    EvaluatorLoader -->|"Reads exact evaluator Wasm by pinned id and hash from <br> <small>[SQL/TCP]</small>"| Database
 
     MessageHandler -->|"Loads cases with"| CaseBatchLoader
     CaseBatchLoader -->|"Reads dataset case rows from <br> <small>[SQL/TCP]</small>"| Database

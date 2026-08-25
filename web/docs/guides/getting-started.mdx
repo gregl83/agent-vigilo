@@ -7,7 +7,7 @@ keywords:
   - Agent Vigilo getting started
   - AI evaluation quickstart
   - generative AI evaluation workflow
-  - WASM evaluator tutorial
+  - Wasm evaluator tutorial
   - deployment gate quickstart
   - durable evaluation runs
 ---
@@ -16,15 +16,15 @@ keywords:
 
 Agent Vigilo turns generative AI evaluation into release infrastructure.
 
-Instead of a one-off script that prints a score, Vigilo gives you a system for publishing versioned WASM evaluators, creating durable evaluation runs, processing work through coordinator and worker services, and using pass/fail gates before an agent change ships.
+Instead of a one-off script that prints a score, Vigilo gives you a system for publishing versioned Wasm evaluators, creating durable evaluation runs, processing work through coordinator and worker services, and using pass/fail gates before an agent change ships.
 
 ## Why It Is Different
 
 - **Evaluators are versioned artifacts.** Publish reusable
-  <GlossaryTerm term="evaluator">WASM evaluators</GlossaryTerm> and refer to them
+  <GlossaryTerm term="evaluator">Wasm evaluators</GlossaryTerm> and refer to them
   by stable identifiers like `vigilo/sentiment-basic-en:0.1.0`.
 - **Runs are durable.** Profiles, datasets, chunks, attempts, evaluator results, summaries, and gate outcomes are stored in Postgres.
-- **Execution is distributed.** Coordinators create chunk-ready outbox event records that are published through RabbitMQ; workers claim the identified chunks, call the target agent, run evaluators, and persist normalized results.
+- **Execution is distributed.** Coordinators create chunk-ready outbox event records that are published through RabbitMQ; workers claim the identified chunks, call the agent target, run evaluators, and persist normalized results.
 - **The CLI is automation-friendly.** Commands return structured output, support quiet mode, and expose watch/status/results/export flows for CI and agentic clients.
 
 ## The Mental Model
@@ -36,7 +36,7 @@ profile + dataset
 vigilo run create
       |
       v
-coordinator -> queue -> worker -> target agent -> WASM evaluators
+coordinator -> queue -> worker -> agent target -> Wasm evaluators
       |
       v
 run outcome: completed/pass, completed/fail, running, cancelled, or failed
@@ -103,7 +103,7 @@ The bundled example expects this model path:
 models/qwen2.5-0.5b-instruct-q4_k_m.gguf
 ```
 
-Install the WASM target if you do not already have it:
+Install the Wasm target if you do not already have it:
 
 ```bash
 rustup target add wasm32-wasip2

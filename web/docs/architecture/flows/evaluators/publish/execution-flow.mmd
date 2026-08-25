@@ -15,14 +15,14 @@ sequenceDiagram
     activate Vigilo
 
     Vigilo->>Vigilo: Resolve exact supported WIT ABI
-    Vigilo->>Vigilo: Compile WASM and typed-link selected adapter
+    Vigilo->>Vigilo: Compile Wasm and typed-link selected adapter
     Vigilo->>DB: Check evaluator version uniqueness
     DB-->>Vigilo: Version available
 
     Vigilo->>DB: Check evaluator hash uniqueness
     DB-->>Vigilo: Hash available
 
-    Vigilo->>DB: Insert WASM, artifact hash, contract hash, and adapter id
+    Vigilo->>DB: Insert Wasm, artifact hash, contract hash, and adapter id
     DB-->>Vigilo: Saved
 
     Vigilo-->>User: Success response

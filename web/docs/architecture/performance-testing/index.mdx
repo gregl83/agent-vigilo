@@ -15,21 +15,33 @@ import performanceTestingDiagram from './diagram.mmd';
 
 # Performance Testing
 
-Vigilo's performance harness is an external `xtask` package. Production Vigilo
-does not depend on the harness, while the harness measures only supported CLI,
-database, RabbitMQ, HTTP, and evaluator boundaries. Every timed sample must pass
-its exact correctness oracle before it can contribute to statistics.
+Vigilo's <GlossaryTerm term="performance-harness">performance harness</GlossaryTerm>
+is an external `xtask` package. Production Vigilo does not depend on the
+harness, while the harness measures only supported CLI, database, RabbitMQ,
+HTTP, and evaluator boundaries. Every
+<GlossaryTerm term="measured-sample">measured sample</GlossaryTerm> must pass its
+<GlossaryTerm term="exact-correctness-oracle">exact correctness oracle</GlossaryTerm>
+before it can contribute to statistics.
+
+A <GlossaryTerm term="performance-campaign">performance campaign</GlossaryTerm>
+resolves one performance profile against one or two test subjects and verifies
+each subject's <GlossaryTerm term="performance-build-manifest">build manifest</GlossaryTerm>
+before execution.
 
 <Mermaid value={performanceTestingDiagram} />
 
 ## Component Boundaries
 
-Versioned workloads exercise release-binary run creation, dispatch, HTTP agent,
-Wasm evaluation, worker persistence, outbox publication, lease recovery, and
-run finalization. Profiles select explicit tuples around page, batch, and
-concurrency boundaries; the harness never expands dimensions into a Cartesian
-product. Exact HTTP requests, worker deliveries, and durable rows catch lost
-batching or amplification before timing is interpreted.
+Versioned <GlossaryTerm term="performance-workload">performance workloads</GlossaryTerm>
+exercise release-binary run creation, dispatch, HTTP agent, Wasm evaluation,
+worker persistence, outbox publication, lease recovery, and run finalization.
+<GlossaryTerm term="performance-profile">Performance profiles</GlossaryTerm>
+select explicit <GlossaryTerm term="workload-tuple">workload tuples</GlossaryTerm>
+around page, batch, and concurrency boundaries; the harness never expands
+dimensions into a Cartesian product. Exact HTTP requests, worker deliveries,
+and durable rows catch lost batching or
+<GlossaryTerm term="amplification">amplification</GlossaryTerm> before timing is
+interpreted.
 
 Administration workloads cover cancellation fanout, terminal status/results,
 JSON and JSONL export, shard move/rebalance, and coordinator placement scaling.
@@ -38,14 +50,18 @@ so route growth is measured without pretending to reproduce a database fleet.
 Creation and HTTP variants also schedule the remaining page/group boundaries
 and a larger response payload.
 
-Continuous workflows use a sample-level fixed-cost-plus-slope fit. Known batch
-boundaries use explicit stepped estimates. Every point requires repeated valid
-samples, exact observations, and residuals within its registered tolerance.
+Each <GlossaryTerm term="component-scaling-model">component scaling model</GlossaryTerm>
+uses either a sample-level fixed-cost-plus-slope fit or explicit stepped
+estimates at known batch boundaries. Every
+<GlossaryTerm term="model-point">model point</GlossaryTerm> requires repeated
+valid samples, exact observations, and residuals within its registered
+tolerance.
 
 PostgreSQL normalized statements, planning time/counts, shared/temp buffers,
 and WAL counters are captured after the timed process exits. The
-`cargo perf diagnose` command renders them as non-gating evidence. The model
-command writes the owned component-model artifact and fails closed on
+`cargo perf diagnose` command renders them as
+<GlossaryTerm term="performance-diagnostics">non-gating diagnostics</GlossaryTerm>.
+The model command writes the owned component-model artifact and fails closed on
 incomplete or nonlinear evidence.
 
 ## Large-Data Contracts
@@ -73,26 +89,35 @@ executable remains the sole component measurement authority.
 
 ## Calibration Boundaries
 
-- `calibration-v1` compares one immutable build to itself in 30 balanced blocks
-  for representative CPU, database, broker, Wasm, and end-to-end anchors.
+- `calibration-v1` performs
+  <GlossaryTerm term="noise-calibration">noise calibration</GlossaryTerm> by
+  comparing one immutable build to itself in 30
+  <GlossaryTerm term="counterbalanced-block">counterbalanced blocks</GlossaryTerm> for
+  representative CPU, database, broker, Wasm, and end-to-end anchors.
 - Noise analysis checks confidence bounds and residual orientation effects, then
   uses the 95% interval width and reviewed power target to recommend an even
   independent block count for each wall-time budget.
-- `capacity-v1` is a single-build load staircase. It remains separate from
-  fixed-load A/B regression results and never claims maximum fleet capacity.
-- A worker knee may come from the throughput/latency rule or the reviewed
-  normalized per-worker CPU ceiling.
+- `capacity-v1` is a single-build
+  <GlossaryTerm term="capacity-staircase">capacity staircase</GlossaryTerm>. It
+  remains separate from fixed-load A/B regression results and never claims
+  maximum fleet capacity.
+- A <GlossaryTerm term="worker-knee">worker knee</GlossaryTerm> may come from
+  the throughput/latency rule or the reviewed normalized per-worker CPU ceiling.
 - Shared PostgreSQL, RabbitMQ, agent, or host pressure invalidates a capacity
   point instead of being reported as Vigilo's worker knee.
 - Publication requires matching build digests and immutable canonical evidence.
-  It generates a versioned budget policy and `reference-v2` candidate.
+  It binds a reviewed <GlossaryTerm term="practical-performance-budget">performance
+  budget</GlossaryTerm> into a versioned policy and
+  <GlossaryTerm term="performance-baseline">`reference-v2` baseline candidate</GlossaryTerm>.
 
 ## Deployment Projection
 
-`cargo perf project` combines one completed bounded-capacity run with a
-versioned input under `performance/deployments`. The input names peak and average
-traffic, run and evaluator mix, payloads, retries, topology, utilization policy,
-and usable dependency limits. Each limit retains its measurement, provider, or
+`cargo perf project` creates a
+<GlossaryTerm term="capacity-projection">capacity projection</GlossaryTerm> from
+one completed bounded-capacity campaign and a versioned input under
+`performance/deployments`. The input names peak and average traffic, evaluation
+run and evaluator mix, payloads, retries, topology, utilization policy, and
+usable dependency limits. Each limit retains its measurement, provider, or
 operator provenance rather than being inferred from a missing value.
 
 The projection jointly resamples all one/two-worker points and resource-demand
@@ -111,12 +136,13 @@ separately tested production deadline and settlement contract exists.
 
 ## Stability And Recovery
 
-Long-running reliability evidence is separate from fixed-load comparisons.
+Each long-running <GlossaryTerm term="reliability-run">reliability run</GlossaryTerm>
+is separate from fixed-load comparisons.
 The bounded soak holds one production coordinator and worker process open for
 at least 30 minutes while small runs make useful progress at fixed observation
 intervals. It gates exact terminal work, queue drain, process liveness, absolute
 RSS, file-descriptor growth, retry/delivery amplification, and end-window
-throughput retention. These safety limits do not become calibrated performance
+throughput retention. These safety limits do not become reviewed performance
 budgets without repeated canonical evidence.
 
 Controlled recovery uses the same isolated topology. It completes work before
@@ -129,21 +155,24 @@ missed recovery are not accepted when services are unavailable to unit tests.
 
 ## Verdict Flow
 
-A gating comparison loads one exact budget for each workload tuple. Results from
-a different environment ID, too few blocks, excessive orientation bias, or an
-invalid correctness oracle are non-green. A confidence interval within budget
-passes. The first interval wholly beyond budget is inconclusive and requires one
-fixed independent confirmation; only the second matching result is a regression.
+A comparison using a <GlossaryTerm term="gating-profile">gating profile</GlossaryTerm>
+loads one exact budget for each workload tuple. Results from a different
+environment ID, too few blocks, excessive orientation bias, or a failed
+correctness oracle are non-green. A confidence interval within budget passes.
+The first interval wholly beyond budget is inconclusive and requires one fixed
+independent confirmation; only the second matching result is a regression.
 
 ## First Use
 
-Run `cargo perf check`, create one immutable release snapshot, and begin with
-the service-free `developer-v1` startup workload. When that passes, run `pr-v1`
-against the same snapshot with Docker available. This exercises the small real
-PostgreSQL, RabbitMQ, HTTP-agent, Wasm, and lifecycle paths before committing to
-a reference, capacity, recovery, or soak campaign. Exact-oracle failures take
-priority over timing; `pr-v1` timing is informative rather than a regression
-verdict.
+Run `cargo perf check`, create one
+<GlossaryTerm term="performance-test-subject">immutable release snapshot</GlossaryTerm>,
+and begin with the service-free `developer-v1` startup workload. When that
+passes, run `pr-v1` against the same snapshot with Docker available. This
+exercises the small real PostgreSQL, RabbitMQ, HTTP-agent, Wasm, and lifecycle
+paths before committing to a reference, capacity, recovery, or soak campaign.
+Exact-oracle failures take priority over timing; `pr-v1` produces
+<GlossaryTerm term="informative-timing">informative timing</GlossaryTerm> rather
+than a regression verdict.
 
 ## MadSim Boundary
 
@@ -171,11 +200,14 @@ summary and retained as bounded artifacts; no performance badge is claimed
 before canonical repeatability exists. Activation requires an Actions runner
 version `2.327.1` or newer for the workflow's Node 24 actions, the documented
 runner labels, and repository variables; it requires no workflow edit.
-The canonical comparison defaults to informative `reference-v1`; after review,
+The comparison on the
+<GlossaryTerm term="canonical-environment">canonical environment</GlossaryTerm>
+defaults to informative `reference-v1`; after review,
 `VIGILO_PERF_REFERENCE_PROFILE` selects a committed gating profile without a
 workflow change.
 
 ## Related
 
+- [Performance harness operator guide](https://github.com/gregl83/agent-vigilo/blob/main/performance/README.md)
 - [Scaling](/docs/architecture/scaling)
 - [Failure modes](/docs/architecture/failure-modes)

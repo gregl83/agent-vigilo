@@ -17,14 +17,14 @@ keywords:
 
 This section describes the static structure of Agent Vigilo: the CLI runtime, coordinator, worker, PostgreSQL placement model, RabbitMQ message broker, evaluator registry, and Wasmtime evaluator boundary.
 
-Agent Vigilo is structured as a distributed AI evaluation system. Runs are created through the CLI, dispatched by coordinators, processed by workers, evaluated through isolated WASM components, persisted through routed PostgreSQL workflows, and signaled through durable outbox publication.
+Agent Vigilo is structured as a distributed AI evaluation system. Runs are created through the CLI, dispatched by coordinators, processed by workers, evaluated through isolated Wasm components, persisted through routed PostgreSQL workflows, and signaled through durable outbox publication.
 
 ## What This Section Covers
 
-- **Runtime boundaries**: which responsibilities live in the CLI, coordinator, worker, database, broker, target agent, and evaluator packages.
+- **Runtime boundaries**: which responsibilities live in the CLI, coordinator, worker, database, broker, agent target, and evaluator packages.
 - **Container relationships**: how PostgreSQL, RabbitMQ, workers, coordinators, and the command runtime collaborate.
 - **Component ownership**: which subsystem owns evaluator publishing, run creation, dispatch, finalization, worker execution, result persistence, and outbox publishing.
-- **Isolation boundaries**: how WASM evaluator execution is separated from the host by Wasmtime store limits, fuel, timeout, log caps, and worker-local concurrency permits.
+- **Isolation boundaries**: how Wasm evaluator execution is separated from the host by Wasmtime store limits, fuel, timeout, log caps, and worker-local concurrency permits.
 - **Reliability boundaries**: where chunk leases, attempt authority checks, durable outbox delivery rows, RabbitMQ confirms, and idempotency keys protect state.
 
 ## Structure Views
@@ -34,7 +34,7 @@ Agent Vigilo is structured as a distributed AI evaluation system. Runs are creat
     <div className="card">
       <div className="card__body">
         <h3>System Context</h3>
-        <p>External actors and systems around Agent Vigilo, including engineers, CI/CD, agent clients, target agents, evaluator packages, PostgreSQL, and RabbitMQ.</p>
+        <p>External actors and systems around Agent Vigilo, including engineers, CI/CD, agent clients, agent targets, evaluator packages, PostgreSQL, and RabbitMQ.</p>
       </div>
       <div className="card__footer">
         <a className="button button--primary button--block" href="/docs/architecture/structure/context/">Open Context</a>
@@ -45,7 +45,7 @@ Agent Vigilo is structured as a distributed AI evaluation system. Runs are creat
     <div className="card">
       <div className="card__body">
         <h3>Container View</h3>
-        <p>Deployable runtime boundaries for the CLI, coordinator, worker, database, queue, evaluator packages, and target agent integration.</p>
+        <p>Deployable runtime boundaries for the CLI, coordinator, worker, database, queue, evaluator packages, and agent target integration.</p>
       </div>
       <div className="card__footer">
         <a className="button button--primary button--block" href="/docs/architecture/structure/containers/">Open Containers</a>
@@ -78,7 +78,7 @@ Agent Vigilo is structured as a distributed AI evaluation system. Runs are creat
     <div className="card">
       <div className="card__body">
         <h3>Worker Components</h3>
-        <p>Chunk claiming, run-context caching, target-agent invocation, sandboxed WASM evaluator execution, result persistence, and message settlement.</p>
+        <p>Chunk claiming, run-context caching, agent-target invocation, sandboxed Wasm evaluator execution, result persistence, and message settlement.</p>
       </div>
       <div className="card__footer">
         <a className="button button--primary button--block" href="/docs/architecture/structure/components/worker/">Open Worker Components</a>
@@ -102,10 +102,10 @@ Agent Vigilo is structured as a distributed AI evaluation system. Runs are creat
 
 - **CLI runtime** parses commands, initializes shared context, applies migrations, publishes evaluators, creates runs, starts services, and renders JSON or TOON output.
 - **Coordinator** recovers expired chunk leases, marks abandoned running attempts stale, claims coordinator-owned work, dispatches bounded chunk windows, finalizes completed runs, and publishes outbox event records as broker messages.
-- **Worker** consumes `run.chunk.ready` broker messages, claims chunk leases, allocates due attempts with worker and message ownership, renews chunk and attempt leases, delays retry-scheduled chunks until `retry_after`, invokes target agents, runs evaluator bindings, verifies required evaluator completeness, persists results, and settles RabbitMQ deliveries.
+- **Worker** consumes `run.chunk.ready` broker messages, claims chunk leases, allocates due attempts with worker and message ownership, renews chunk and attempt leases, delays retry-scheduled chunks until `retry_after`, invokes agent targets, runs evaluator bindings, verifies required evaluator completeness, persists results, and settles RabbitMQ deliveries.
 - **PostgreSQL placements** hold control metadata and routed execution data: evaluators, datasets, runs, shard-partitioned chunks, attempts, evaluator results, execution aggregates, coordinator leases, outbox ledger rows, and hot delivery rows.
 - **RabbitMQ** distributes chunk-ready broker messages published from durable outbox event records.
-- **Wasmtime** executes versioned WASI Preview 2 evaluator components with per-invocation store limits and a process-wide active-evaluation semaphore.
+- **Wasmtime** executes versioned WASI 0.2 (Preview 2) evaluator components with per-invocation store limits and a process-wide active-evaluation semaphore.
 
 ## Reliability Boundaries
 
@@ -124,6 +124,7 @@ Runtime behavior and state transitions are documented outside the structure sect
 - [Execution flow and state model](/docs/architecture/flow)
 - [Failure modes](/docs/architecture/failure-modes)
 - [Scale-out and shard migration](/docs/architecture/scaling)
+- [Performance testing](/docs/architecture/performance-testing)
 - [Command flows](/docs/architecture/flows/)
 - [Coordinator flows](/docs/architecture/flows/coordinator/)
 - [Worker flows](/docs/architecture/flows/worker/)

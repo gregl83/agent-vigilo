@@ -16,6 +16,10 @@ The CLI uses singular resource groups. Database commands manage global
 execution placements, shard commands live under their owning run, and
 rebalance commands operate across runs.
 
+Commands default to JSON output. Use
+<GlossaryTerm term="toon-output">TOON output</GlossaryTerm> for compact agent
+inspection, and keep JSON when exact standard parsing is required.
+
 ```text
 vigilo
 |-- setup
@@ -43,6 +47,7 @@ vigilo
 |-- database
 |   |-- list
 |   |-- register <alias> --database-url-env <ENV>
+|   |-- activate <alias>
 |   |-- drain <alias>
 |   `-- disable <alias>
 |-- rebalance
@@ -58,9 +63,11 @@ vigilo
     `-- once
 ```
 
-Use `run shard assign` only for an empty or new shard. Use `run shard move`
-when the shard owns data. Draining a database stops new ownership but does not
-move existing shards; use `rebalance` to evacuate them before disabling it.
+Registering a database creates a non-routable `provisioning` placement;
+`database activate` verifies readiness before it can receive ownership. Use
+`run shard assign` only for an empty or new shard, and use `run shard move` when
+the shard owns data. Draining a database stops new ownership but does not move
+existing shards; use `rebalance` to evacuate them before disabling it.
 
 The former plural evaluator command, `run test`, and `shard ...` hierarchy
 remain accepted as compatibility paths but are omitted from canonical help.

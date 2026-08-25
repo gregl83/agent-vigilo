@@ -20,6 +20,10 @@ observation means for scoring.
 raw measurement -> profile normalization -> normalized score -> pass threshold -> judgment
 ```
 
+The host derives the <GlossaryTerm term="normalized-score">normalized score</GlossaryTerm>
+and <GlossaryTerm term="judgment">judgment</GlossaryTerm>; evaluators report only
+their raw measurement.
+
 This separation keeps evaluator code reusable while dimensions, scoring, and
 release policy remain under the run owner's control.
 

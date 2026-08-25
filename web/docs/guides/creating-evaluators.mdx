@@ -1,10 +1,10 @@
 ---
 sidebar_label: Creating Evaluators
 title: Creating Evaluators
-description: Build, test, and publish a single WASM evaluator crate for Agent Vigilo.
+description: Build, test, and publish a single Wasm evaluator crate for Agent Vigilo.
 sidebar_position: 2
 keywords:
-  - create WASM evaluator
+  - create Wasm evaluator
   - Agent Vigilo evaluator
   - AI evaluator crate
   - evaluator WIT interface
@@ -16,7 +16,7 @@ keywords:
 
 This guide is the recommended path for creating a single
 <GlossaryTerm term="evaluator">evaluator</GlossaryTerm> crate that can be built
-to WASM and executed by Agent Vigilo.
+to Wasm and executed by Agent Vigilo.
 
 ## What You Build
 
@@ -58,9 +58,12 @@ The reference evaluator uses `wit-bindgen`, imports `evaluator-world`, implement
 
 Implement the current contract at `wit/evaluator/v1.0.0/evaluator.wit`.
 
-- Read fields from `input` (run IDs, case, actual output, evaluator config)
+- Read fields from the <GlossaryTerm term="evaluator-input">evaluator input</GlossaryTerm>,
+  including run IDs, the test case, captured
+  <GlossaryTerm term="agent-output">agent output</GlossaryTerm>, and evaluator config.
 - Return exactly one primary <GlossaryTerm term="measurement">measurement</GlossaryTerm>
-  in `output.outcome.completed`, or explicitly return `output.outcome.abstained`.
+  in the <GlossaryTerm term="evaluator-output">evaluator output</GlossaryTerm> as
+  `output.outcome.completed`, or explicitly return `output.outcome.abstained`.
 - Emit zero or more <GlossaryTerm term="finding">diagnostic findings</GlossaryTerm>
   in `output.diagnostics`. Diagnostics provide evidence but cannot choose dimensions,
   thresholds, weights, blocking behavior, or pass/fail policy.
@@ -81,7 +84,7 @@ copyable evaluator returns and the matching profile policy for every type.
 
 ## Build and Test Loop
 
-Build your evaluator for WASI Preview 2:
+Build your evaluator for WASI 0.2 (Preview 2):
 
 ```bash
 cargo build --manifest-path evaluators/my-evaluator/Cargo.toml --target wasm32-wasip2 --release

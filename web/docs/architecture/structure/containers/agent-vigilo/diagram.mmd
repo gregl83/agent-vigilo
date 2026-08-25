@@ -18,7 +18,7 @@ flowchart TD
     %% components
     Vigilo["fa:fa-terminal <br/> <b>Vigilo</b> <br/> <small>[Container: Rust]</small> <br/> <small>Provides evaluator and run management functionality via CLI.</small>"]:::component
     Coordinator["fa:fa-compass <br/> <b>Coordinator</b> <br/> <small>[Container: Rust]</small> <br/> <small>Recovers durable work, dispatches chunk windows, finalizes runs, and publishes outbox records.</small>"]:::component
-    Worker["fa:fa-gear <br/> <b>Worker</b> <br/> <small>[Container: Rust]</small> <br/> <small>Consumes chunk-ready broker messages, claims chunks, invokes the target agent and evaluators, and persists results.</small>"]:::component
+    Worker["fa:fa-gear <br/> <b>Worker</b> <br/> <small>[Container: Rust]</small> <br/> <small>Consumes chunk-ready broker messages, claims chunks, invokes the agent target and evaluators, and persists results.</small>"]:::component
     Database[("<b>Database Placements</b> <br/> <small>[Container: PostgreSQL]</small> <br/> <small>Store control metadata and routed execution data across one or more placements.</small>")]:::component
     Queue[("<b>Queue</b> <br/> <small>[Container: RabbitMQ]</small> <br/> <small>Stores and distributes routed broker messages.</small>")]:::component
 

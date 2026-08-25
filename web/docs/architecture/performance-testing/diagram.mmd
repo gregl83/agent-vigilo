@@ -13,12 +13,13 @@ flowchart TD
     Isolation[Fresh database clone, broker scope, and HTTP agent]
     Routed[Optional routed database clones]
     Process[Supported release CLI processes]
-    Oracle{Exact durable and amplification oracle}
+    Oracle{Exact correctness oracle}
     Sample[Raw timed sample]
     Diagnostics[Post-timing query, buffer, and WAL diagnostics]
     DataEvidence[Export stream and per-table page evidence]
     Model{Scaling model acceptance}
     Compare[Counterbalanced baseline/candidate comparison]
+    Noise[Canonical same-build noise calibration]
     Capacity[Bounded one/two-worker calibration]
     Deployment[Named workload mix and sourced limits]
     Projection{Capacity projection acceptance}
@@ -27,39 +28,52 @@ flowchart TD
     Fault[Run-owned dependency restart]
     Reliability{Stability and recovery oracle}
     Actions[Manual, main, nightly, and soak jobs]
-    Budget[Reviewed canonical budget]
+    Targets[Reviewed practical targets]
+    Budget[Published performance budget]
     Pass[Accepted evidence]
+    Informative[Informative evidence]
+    Inconclusive[Independent confirmation required]
+    Regression[Confirmed performance regression]
+    ProductFailure[Product correctness or reliability failure]
     Invalid[Invalid or incomplete]
 
     Registry --> Profile
     Build --> Isolation
     Profile --> Isolation --> Routed --> Process --> Oracle
-    Oracle -->|match| Sample
-    Oracle -->|drift| Invalid
+    Oracle -->|exact match| Sample
+    Oracle -->|product failure| ProductFailure
+    Oracle -->|invalid observation| Invalid
     Sample --> Diagnostics
     Sample --> DataEvidence
     Sample --> Model
     Sample --> Compare
+    Sample --> Noise
     Sample --> Capacity
+    Noise --> Budget
+    Targets --> Budget
+    Budget --> Compare
     Capacity --> Projection
     Deployment --> Projection
     Staging --> Projection
     Profile --> Resident --> Reliability
     Fault --> Reliability
     Reliability -->|bounded progress and recovery| Pass
-    Reliability -->|leak, stall, lost work, or missed deadline| Invalid
+    Reliability -->|leak, stall, lost work, or missed deadline| ProductFailure
     Actions --> Profile
     Model -->|residual and repetition pass| Pass
     Model -->|missing or nonlinear evidence| Invalid
-    Capacity --> Budget --> Compare
     Projection -->|complete bounded evidence| Pass
     Projection -->|nonlinear, saturated, unbounded, or incomplete| Invalid
-    Compare -->|within budget or informative| Pass
-    Compare -->|unconfirmed, noisy, or incompatible| Invalid
+    Compare -->|within budget or improvement| Pass
+    Compare -->|no published budget| Informative
+    Compare -->|first over-budget interval| Inconclusive
+    Compare -->|confirmed over-budget interval| Regression
+    Compare -->|noisy, incompatible, or incomplete| Invalid
 
-    class Registry,Profile,Build,Deployment component
+    class Registry,Profile,Build,Deployment,Targets component
     class Isolation,Routed,Process,Sample,Resident system
     class Oracle,Model,Projection,Reliability decision
-    class Diagnostics,DataEvidence,Capacity,Staging,Budget,Compare,Fault,Actions external
+    class Diagnostics,DataEvidence,Noise,Capacity,Staging,Budget,Compare,Fault,Actions external
     class Pass success
-    class Invalid warning
+    class Informative,Inconclusive warning
+    class Regression,ProductFailure,Invalid error

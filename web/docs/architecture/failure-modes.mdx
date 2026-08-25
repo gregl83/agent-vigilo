@@ -80,7 +80,8 @@ channel loss, and publish operations retry once on a fresh session before
 returning failure. Unroutable or negatively acknowledged publishes leave the
 delivery row pending for retry instead of marking the ledger event published.
 
-Each coordinator and worker process also keeps one message-broker circuit.
+Each coordinator and worker process also keeps one
+<GlossaryTerm term="broker-circuit-breaker">broker circuit breaker</GlossaryTerm>.
 Repeated connection, channel, I/O, or heartbeat failures from publishing,
 one-shot receipt, or consumer creation open the circuit. Availability
 classification uses preserved Lapin error types rather than formatted error
@@ -90,7 +91,8 @@ outbox rows remain pending, unacknowledged deliveries remain eligible for
 redelivery, and long-running workers pace consumer reopening with bounded
 exponential backoff. Broker responses that prove RabbitMQ is reachable do not
 open the circuit, even when the operation is unroutable or negatively
-acknowledged. Message processing retries and quarantine budgets remain separate
+acknowledged. Message processing retries and
+<GlossaryTerm term="quarantine">quarantine</GlossaryTerm> budgets remain separate
 from transport availability.
 
 ## Partial persistence

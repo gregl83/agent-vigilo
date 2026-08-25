@@ -91,10 +91,13 @@ added and selected for new or moved run shards.
 Agent Vigilo separates database responsibility from database location.
 
 - The **control database** owns evaluator registry rows, global run metadata,
-  placement catalog rows, recoverable run-creation plans, dispatch cursors,
+  placement catalog rows, recoverable
+  <GlossaryTerm term="run-creation-plan">run creation plans</GlossaryTerm>, dispatch cursors,
   coordinator leases, and global run lifecycle updates.
-- An **execution database** owns high-volume run work: chunks, run snapshots,
-  executions, attempts, aggregates, evaluator results, shard summaries, and
+- An **execution database** owns high-volume run work: chunks,
+  <GlossaryTerm term="run-snapshot">run snapshots</GlossaryTerm>, executions,
+  attempts, aggregates, evaluator results,
+  <GlossaryTerm term="run-shard-summary">run shard summaries</GlossaryTerm>, and
   chunk-ready outbox event records.
 - <GlossaryTerm term="database-placement">**Database placements**</GlossaryTerm> name PostgreSQL targets such as `primary` or `shard_001`.
 - **Shard placements** map one `run_id + run_shard` pair to a database
@@ -196,8 +199,9 @@ Coordinator dispatch is route-constrained:
 
 Workers stay chunk-local:
 
-- Worker messages carry `run_id`, `run_shard`, `chunk_id`, `database_alias`, and
-  a <GlossaryTerm term="write-epoch">`write_epoch`</GlossaryTerm>.
+- Each <GlossaryTerm term="route-hint">route hint</GlossaryTerm> in a worker
+  message carries `run_id`, `run_shard`, `chunk_id`, `database_alias`, and a
+  <GlossaryTerm term="write-epoch">`write_epoch`</GlossaryTerm>.
 - The worker resolves the hinted database pool locally and validates the
   execution database's <GlossaryTerm term="local-shard-admission">admission row</GlossaryTerm>
   in the chunk-claim transaction. A valid

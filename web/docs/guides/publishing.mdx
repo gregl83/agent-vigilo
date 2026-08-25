@@ -5,7 +5,7 @@ description: End-to-end guide for building and publishing evaluators to the Agen
 keywords:
   - publish evaluator
   - evaluator registry
-  - WASM component publishing
+  - Wasm component publishing
   - Agent Vigilo CLI
   - versioned evaluators
   - AI evaluation artifacts
@@ -37,7 +37,7 @@ vigilo --version
 
 Evaluator publishing currently reads package identity from `Cargo.toml`,
 validates the declared WIT contract, and expects a prebuilt
-<GlossaryTerm term="evaluator-artifact">WASI Preview 2 WebAssembly component artifact</GlossaryTerm>.
+<GlossaryTerm term="evaluator-artifact">WASI 0.2 (Preview 2) WebAssembly component artifact</GlossaryTerm>.
 
 ---
 
@@ -73,7 +73,7 @@ See the [`Vigilo.toml` reference](../configuration/vigilo-toml.mdx) for all fiel
 ## Build
 
 Build the evaluator for
-<GlossaryTerm term="wasi-preview-2">WASI Preview 2</GlossaryTerm>:
+<GlossaryTerm term="wasi-preview-2">WASI 0.2 (Preview 2)</GlossaryTerm>:
 
 ```bash
 cargo build --manifest-path evaluators/my-evaluator/Cargo.toml --target wasm32-wasip2 --release
