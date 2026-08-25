@@ -86,11 +86,11 @@ pub struct CalibrateArgs {
 
 #[derive(Debug, Subcommand)]
 enum CalibrateCommand {
-    /// Analyze a canonical same-build comparison for repeatability and block counts.
+    /// Check whether a canonical host is stable enough to resolve regression budgets.
     Noise(NoiseArgs),
-    /// Analyze a canonical single-build bounded capacity staircase.
+    /// Find bounded one- and two-worker capacity without comparing revisions.
     Capacity(CapacityArgs),
-    /// Publish reviewed budgets, `reference-v2`, and immutable baseline evidence.
+    /// Freeze reviewed calibration evidence into a gating profile and budget policy.
     Publish(PublishArgs),
 }
 

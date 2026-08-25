@@ -27,7 +27,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Build, run, and compare Vigilo performance workloads.
+    /// Create verified test subjects, execute workloads, and detect Vigilo regressions.
     Perf(Box<perf::PerfArgs>),
     #[command(name = "__perf-fixture", hide = true)]
     PerfFixture(perf::FixtureArgs),
@@ -57,7 +57,44 @@ fn execute(command: Command) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     use super::*;
+
+    fn command_help(path: &[&str]) -> String {
+        let mut root = Cli::command();
+        let mut command = &mut root;
+        for name in path {
+            command = command
+                .find_subcommand_mut(name)
+                .unwrap_or_else(|| panic!("missing command in help contract: {name}"));
+        }
+        command.render_help().to_string()
+    }
+
+    fn assert_visible_help_is_documented(command: &clap::Command) {
+        assert!(
+            command.get_about().is_some(),
+            "{} is missing a use-case summary",
+            command.get_name()
+        );
+        for argument in command.get_arguments().filter(|argument| {
+            argument.get_long().is_some() && argument.get_id().as_str() != "help"
+        }) {
+            assert!(
+                argument.get_help().is_some(),
+                "{} --{} is missing help",
+                command.get_name(),
+                argument.get_long().unwrap()
+            );
+        }
+        for subcommand in command
+            .get_subcommands()
+            .filter(|subcommand| subcommand.get_name() != "help")
+        {
+            assert_visible_help_is_documented(subcommand);
+        }
+    }
 
     #[test]
     fn dispatcher_propagates_fixture_exit_codes() {
@@ -87,5 +124,16 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(execute(invalid.command), ExitCode::from(perf::EXIT_INVALID));
+    }
+
+    #[test]
+    fn performance_help_explains_operator_use_cases_and_every_option() {
+        let root = Cli::command();
+        let perf = root.find_subcommand("perf").unwrap();
+        assert_visible_help_is_documented(perf);
+
+        assert!(command_help(&["perf", "build"]).contains("test subject"));
+        assert!(command_help(&["perf", "run"]).contains("does not compare revisions"));
+        assert!(command_help(&["perf", "compare"]).contains("Regression-test"));
     }
 }

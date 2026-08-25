@@ -33,7 +33,7 @@ use super::{
 /// CLI arguments for re-rendering an existing report document.
 #[derive(Debug, Args)]
 pub struct ReportArgs {
-    /// Completed performance run directory.
+    /// Run directory containing `report.json`; rendering does not execute workloads.
     #[arg(long)]
     run_dir: PathBuf,
 }

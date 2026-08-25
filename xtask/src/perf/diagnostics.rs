@@ -33,7 +33,7 @@ use super::{
 /// Arguments for rendering captured query, buffer, and WAL observations.
 #[derive(Debug, Args)]
 pub struct DiagnoseArgs {
-    /// Completed run directory containing `samples.jsonl`.
+    /// Completed service-backed run whose samples contain PostgreSQL counters.
     #[arg(long)]
     run_dir: PathBuf,
 }

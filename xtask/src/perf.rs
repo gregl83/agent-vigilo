@@ -79,23 +79,23 @@ pub struct PerfArgs {
 
 #[derive(Debug, Subcommand)]
 enum PerfCommand {
-    /// Validate harness contracts and isolation boundaries.
+    /// Verify that the harness is safe and ready before local or CI use.
     Check(check::CheckArgs),
-    /// Build and snapshot a release binary with provenance.
+    /// Create a reusable, verified test subject from one Vigilo revision.
     Build(build::BuildArgs),
-    /// Measure one release binary without a regression verdict.
+    /// Exercise one test subject; this does not compare revisions.
     Run(command::RunArgs),
-    /// Compare baseline and candidate release binaries.
+    /// Regression-test a candidate against a baseline on the same host.
     Compare(command::CompareArgs),
-    /// Re-render a completed run's terminal and Markdown summary.
+    /// Recreate readable output from an existing report without rerunning workloads.
     Report(report::ReportArgs),
-    /// Analyze canonical noise or bounded capacity evidence.
+    /// Turn canonical stability and capacity runs into reviewed gating inputs.
     Calibrate(calibration::CalibrateArgs),
-    /// Fit registered component models from repeated raw samples.
+    /// Derive component cost and scaling models from a completed reference run.
     Model(scaling::ModelArgs),
-    /// Project deployment demand from bounded capacity evidence.
+    /// Estimate a named deployment's resource needs from measured capacity.
     Project(projection::ProjectArgs),
-    /// Render non-gating PostgreSQL planning, buffer, and WAL diagnostics.
+    /// Investigate captured PostgreSQL behavior without changing the run verdict.
     Diagnose(diagnostics::DiagnoseArgs),
 }
 

@@ -60,13 +60,13 @@ const PROFILES: [&str; 12] = [
 /// CLI arguments for validating the performance harness.
 #[derive(Debug, Args)]
 pub struct CheckArgs {
-    /// Git base used to prove a preparatory harness change leaves product code untouched.
+    /// Optional Git base for proving that bootstrap-only changes leave product code untouched.
     #[arg(long)]
     bootstrap_base: Option<String>,
-    /// Destructive endpoint to validate; the static check never connects to it.
+    /// Optional endpoint string to audit for loopback and ownership; it is never contacted.
     #[arg(long)]
     endpoint: Vec<String>,
-    /// Run-specific marker that must be embedded in every supplied endpoint.
+    /// Required with `--endpoint`; every endpoint must contain this run-owned marker.
     #[arg(long)]
     ownership_marker: Option<String>,
 }

@@ -54,13 +54,13 @@ const EVALUATOR_METADATA_CACHE: &str = "target/.rustc_info.json";
 /// CLI arguments for creating a release build snapshot.
 #[derive(Debug, Args)]
 pub struct BuildArgs {
-    /// Source worktree containing the Vigilo workspace.
+    /// Vigilo worktree to compile; use `.` for the current checkout.
     #[arg(long, default_value = ".")]
     source: PathBuf,
-    /// Unique target directory under this workspace's target/perf/builds.
+    /// New snapshot directory under `target/perf/builds` for the executable and manifest.
     #[arg(long)]
     output: PathBuf,
-    /// Replace an existing harness-owned build directory.
+    /// Replace an existing harness-owned local snapshot at `--output`.
     #[arg(long)]
     force: bool,
 }

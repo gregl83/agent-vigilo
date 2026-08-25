@@ -99,16 +99,22 @@ use super::{
 /// CLI arguments for measuring one immutable release binary.
 #[derive(Debug, Args)]
 pub struct RunArgs {
+    /// Checked-in profile selecting workload tuples, repetitions, and limits.
     #[arg(long)]
     profile: String,
+    /// Restrict the profile to this workload ID; repeat to select multiple workloads.
     #[arg(long = "workload")]
     workloads: Vec<String>,
+    /// Release executable from the build snapshot being measured.
     #[arg(long = "bin")]
     binary: PathBuf,
+    /// `build-manifest.json` from the same snapshot as `--bin`.
     #[arg(long = "build-manifest")]
     build_manifest: PathBuf,
+    /// New run directory under `target/perf/runs`; defaults to a generated run ID.
     #[arg(long)]
     output: Option<PathBuf>,
+    /// Override the profile's seed when a reproducible independent schedule is needed.
     #[arg(long)]
     schedule_seed: Option<u64>,
 }
@@ -116,23 +122,31 @@ pub struct RunArgs {
 /// CLI arguments for a counterbalanced baseline/candidate comparison.
 #[derive(Debug, Args)]
 pub struct CompareArgs {
+    /// Checked-in comparison profile; numerical gating requires a published budget policy.
     #[arg(long)]
     profile: String,
+    /// Restrict the profile to this workload ID; repeat to select multiple workloads.
     #[arg(long = "workload")]
     workloads: Vec<String>,
+    /// Release executable for the known reference revision.
     #[arg(long = "baseline-bin")]
     baseline_binary: PathBuf,
+    /// `build-manifest.json` from the same snapshot as `--baseline-bin`.
     #[arg(long = "baseline-build-manifest")]
     baseline_manifest: PathBuf,
+    /// Release executable for the revision being evaluated.
     #[arg(long = "candidate-bin")]
     candidate_binary: PathBuf,
+    /// `build-manifest.json` from the same snapshot as `--candidate-bin`.
     #[arg(long = "candidate-build-manifest")]
     candidate_manifest: PathBuf,
+    /// New comparison directory under `target/perf/runs`; defaults to a generated run ID.
     #[arg(long)]
     output: Option<PathBuf>,
+    /// Override the profile's seed for a reproducible counterbalanced schedule.
     #[arg(long)]
     schedule_seed: Option<u64>,
-    /// Prior independent over-budget run to confirm before declaring regression.
+    /// Prior matching over-budget comparison to confirm before declaring a regression.
     #[arg(long = "confirmation-of")]
     confirmation_of: Option<PathBuf>,
 }

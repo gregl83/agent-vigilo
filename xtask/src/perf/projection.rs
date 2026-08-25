@@ -75,10 +75,10 @@ const REQUIRED_BOUNDED_PATH: &str = "coordinator_broker_publish_confirm";
 /// Arguments for projecting a named deployment from a completed capacity run.
 #[derive(Debug, Args)]
 pub struct ProjectArgs {
-    /// Completed capacity run directory containing raw samples and capacity evidence.
+    /// Completed `capacity-v1` run with raw samples and analyzed capacity evidence.
     #[arg(long = "run", alias = "run-dir")]
     run_dir: PathBuf,
-    /// Versioned deployment input under `performance/deployments`.
+    /// Named workload and infrastructure assumptions under `performance/deployments`.
     #[arg(long)]
     deployment: PathBuf,
 }

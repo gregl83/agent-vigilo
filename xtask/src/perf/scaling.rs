@@ -45,7 +45,7 @@ const MODEL_SCHEMA: &str = "component-models/v1";
 /// Arguments for fitting registered component models from a completed run.
 #[derive(Debug, Args)]
 pub struct ModelArgs {
-    /// Completed run directory containing `samples.jsonl`.
+    /// Completed component-reference run containing repeated registered model points.
     #[arg(long)]
     run_dir: PathBuf,
 }
