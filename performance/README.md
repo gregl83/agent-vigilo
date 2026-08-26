@@ -293,6 +293,23 @@ outcomes under virtual time. It must not write virtual durations into
 measures the real release executable, operating-system processes, PostgreSQL,
 RabbitMQ, HTTP, and Wasmtime on the canonical host.
 
+The simulation rollout must not change Tokio, task supervision, shared workflow
+engines, or another measured production path until canonical calibration has
+published and review has accepted a gating profile such as `reference-v2` plus
+an immutable direct-Tokio baseline. Every later production-path change runs the
+affected workload IDs as an immutable same-host comparison under that published
+policy; resident lifecycle changes also run the applicable recovery or soak
+profile.
+
+Recurring simulation has separate fixed-regression and discovery lanes. Fixed
+corpus seeds repeat; scheduled exploration uses persisted deterministic,
+non-overlapping epochs so later runs search new scenario/runtime pairs. A
+bounded longevity family also keeps one simulated system across repeated work,
+expiry, reconnect, fault/heal, and restart epochs to detect logical accumulation
+and starvation. Real RSS, descriptor, socket, dependency, and throughput
+behavior remains the authority of `system.soak.v1`, `system.recovery.v1`, and
+the release-binary comparison suite.
+
 Before calling a result a performance regression test:
 
 1. Establish canonical repeatability, publish and review a gating profile such

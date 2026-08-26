@@ -189,7 +189,11 @@ impl RunningProcess {
         }
         if self.status.is_none() {
             self.terminate_tree()?;
-            self.status = Some(self.child.wait().context("reap stopped child")?);
+            self.status = Some(
+                self.group
+                    .wait(&mut self.child)
+                    .context("reap stopped child")?,
+            );
         }
         self.finish(false)
     }
@@ -202,7 +206,11 @@ impl RunningProcess {
             }
             if self.started.elapsed() >= timeout {
                 self.terminate_tree()?;
-                self.status = Some(self.child.wait().context("reap timed-out child")?);
+                self.status = Some(
+                    self.group
+                        .wait(&mut self.child)
+                        .context("reap timed-out child")?,
+                );
                 return self.finish(true);
             }
             thread::sleep(Duration::from_millis(2));
@@ -212,7 +220,7 @@ impl RunningProcess {
     fn observe(&mut self) -> Result<()> {
         self.group.observe(self.child.id());
         if self.status.is_none() {
-            self.status = self.child.try_wait().context("poll child")?;
+            self.status = self.group.try_wait(&mut self.child).context("poll child")?;
         }
         Ok(())
     }
@@ -261,7 +269,7 @@ impl Drop for RunningProcess {
     fn drop(&mut self) {
         let _ = self.terminate_tree();
         if self.status.is_none() {
-            let _ = self.child.wait();
+            let _ = self.group.wait(&mut self.child);
         }
         if let Some(stdout) = self.stdout.take() {
             let _ = stdout.join();
@@ -343,20 +351,12 @@ struct Resources {
 }
 
 #[cfg(unix)]
-type ResourceBaseline = libc::rusage;
+struct ResourceBaseline;
 
 #[cfg(unix)]
-/// Captures cumulative child usage before launch so one execution can be isolated.
+/// Uses exact per-child `wait4` usage, so no cumulative baseline is required.
 fn capture_resource_baseline() -> Result<ResourceBaseline> {
-    let mut usage = std::mem::MaybeUninit::uninit();
-    let result = unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, usage.as_mut_ptr()) };
-    if result != 0 {
-        bail!(
-            "capture child resource baseline: {}",
-            io::Error::last_os_error()
-        );
-    }
-    Ok(unsafe { usage.assume_init() })
+    Ok(ResourceBaseline)
 }
 
 #[cfg(not(unix))]
@@ -386,16 +386,16 @@ fn configure_process_group(_command: &mut Command) {}
 #[cfg(unix)]
 struct ProcessGroup {
     process_group_id: i32,
-    usage_before: ResourceBaseline,
+    completion_usage: Option<libc::rusage>,
     peak_rss_bytes: u64,
 }
 
 #[cfg(unix)]
 impl ProcessGroup {
-    fn attach(child: &mut Child, usage_before: ResourceBaseline) -> Result<Self> {
+    fn attach(child: &mut Child, _baseline: ResourceBaseline) -> Result<Self> {
         Ok(Self {
             process_group_id: child.id() as i32,
-            usage_before,
+            completion_usage: None,
             peak_rss_bytes: 0,
         })
     }
@@ -414,12 +414,55 @@ impl ProcessGroup {
         }
     }
 
+    fn try_wait(&mut self, _child: &mut Child) -> Result<Option<ExitStatus>> {
+        self.wait4(libc::WNOHANG)
+    }
+
+    fn wait(&mut self, _child: &mut Child) -> Result<ExitStatus> {
+        self.wait4(0)?
+            .context("wait4 returned no status while blocking")
+    }
+
+    fn wait4(&mut self, options: libc::c_int) -> Result<Option<ExitStatus>> {
+        use std::os::unix::process::ExitStatusExt;
+
+        loop {
+            let mut status = 0;
+            let mut usage = std::mem::MaybeUninit::uninit();
+            let waited = unsafe {
+                libc::wait4(
+                    self.process_group_id,
+                    &mut status,
+                    options,
+                    usage.as_mut_ptr(),
+                )
+            };
+            if waited == 0 {
+                return Ok(None);
+            }
+            if waited == self.process_group_id {
+                let usage = unsafe { usage.assume_init() };
+                if let Some(peak_rss_bytes) = rusage_peak_rss_bytes(&usage) {
+                    self.peak_rss_bytes = self.peak_rss_bytes.max(peak_rss_bytes);
+                }
+                self.completion_usage = Some(usage);
+                return Ok(Some(ExitStatus::from_raw(status)));
+            }
+
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            bail!("wait for child process: {error}");
+        }
+    }
+
     fn terminate(&self, child: &mut Child) -> Result<()> {
         // The child is the process-group leader, so a negative PID reaches descendants too.
         let result = unsafe { libc::kill(-self.process_group_id, libc::SIGKILL) };
         if result != 0 {
             let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) && child.try_wait()?.is_some() {
+            if error.raw_os_error() == Some(libc::ESRCH) {
                 return Ok(());
             }
             child.kill().context("kill timed-out child")?;
@@ -436,30 +479,57 @@ impl ProcessGroup {
     }
 
     fn resources(&self) -> Resources {
-        let mut usage_after = std::mem::MaybeUninit::uninit();
-        let usage_after =
-            if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, usage_after.as_mut_ptr()) } == 0 {
-                Some(unsafe { usage_after.assume_init() })
-            } else {
-                None
-            };
-        let cpu_time_ns = usage_after.map(|usage_after| {
-            let before = timeval_ns(self.usage_before.ru_utime)
-                .saturating_add(timeval_ns(self.usage_before.ru_stime));
-            let after =
-                timeval_ns(usage_after.ru_utime).saturating_add(timeval_ns(usage_after.ru_stime));
-            after.saturating_sub(before).max(0) as u64
+        let cpu_time_ns = self.completion_usage.as_ref().map(|usage| {
+            timeval_ns(usage.ru_utime)
+                .saturating_add(timeval_ns(usage.ru_stime))
+                .max(0) as u64
         });
         Resources {
             cpu_time_ns,
             peak_rss_bytes: (self.peak_rss_bytes > 0).then_some(self.peak_rss_bytes),
             source: if cfg!(target_os = "linux") {
-                "linux-proc-rusage-v1"
+                "linux-proc-wait4-v2"
             } else {
-                "unix-rusage-v1"
+                "unix-wait4-v2"
             },
         }
     }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+fn rusage_peak_rss_bytes(usage: &libc::rusage) -> Option<u64> {
+    positive_max_rss_kib_to_bytes(usage.ru_maxrss)
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+fn positive_max_rss_kib_to_bytes(max_rss_kib: libc::c_long) -> Option<u64> {
+    u64::try_from(max_rss_kib)
+        .ok()
+        .filter(|value| *value > 0)
+        .map(|kib| kib.saturating_mul(1024))
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+fn rusage_peak_rss_bytes(_usage: &libc::rusage) -> Option<u64> {
+    None
 }
 
 #[cfg(unix)]
@@ -523,6 +593,14 @@ impl ProcessGroup {
     }
 
     fn observe(&mut self, _process_id: u32) {}
+
+    fn try_wait(&mut self, child: &mut Child) -> Result<Option<ExitStatus>> {
+        child.try_wait().context("poll Windows child")
+    }
+
+    fn wait(&mut self, child: &mut Child) -> Result<ExitStatus> {
+        child.wait().context("wait for Windows child")
+    }
 
     fn terminate(&self, child: &mut Child) -> Result<()> {
         let terminated =
@@ -604,6 +682,14 @@ impl ProcessGroup {
 
     fn observe(&mut self, _process_id: u32) {}
 
+    fn try_wait(&mut self, child: &mut Child) -> Result<Option<ExitStatus>> {
+        child.try_wait().context("poll child")
+    }
+
+    fn wait(&mut self, child: &mut Child) -> Result<ExitStatus> {
+        child.wait().context("wait for child")
+    }
+
     fn terminate(&self, child: &mut Child) -> Result<()> {
         child.kill().context("kill timed-out child")
     }
@@ -682,6 +768,19 @@ mod tests {
         }
     }
 
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn rusage_peak_rss_kibibytes_are_converted_to_bytes() {
+        assert_eq!(positive_max_rss_kib_to_bytes(123), Some(123 * 1024));
+        assert_eq!(positive_max_rss_kib_to_bytes(0), None);
+        assert_eq!(positive_max_rss_kib_to_bytes(-1), None);
+    }
+
     #[test]
     fn output_is_drained_and_bounded() {
         let (program, args) = fixture_command();
@@ -701,6 +800,26 @@ mod tests {
         assert!(outcome.stdout.first_byte_time.is_some());
         assert!(outcome.stdout.last_byte_time >= outcome.stdout.first_byte_time);
         assert!(outcome.stdout.last_byte_time <= Some(outcome.wall_time));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn short_lived_process_reports_peak_rss_after_exit() {
+        let (program, args) = fixture_command();
+        let outcome = execute(&ProcessSpec {
+            program: &program,
+            args: &args,
+            current_dir: None,
+            env: &[],
+            timeout: Duration::from_secs(30),
+            stdout_limit: 64,
+            stderr_limit: 64,
+        })
+        .unwrap();
+
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(outcome.cpu_time_ns.is_some());
+        assert!(outcome.peak_rss_bytes.is_some_and(|bytes| bytes > 0));
     }
 
     #[test]
