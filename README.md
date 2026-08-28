@@ -149,4 +149,4 @@ Agent Vigilo is an active systems project focused on reliable AI evaluation, LLM
 
 ## License
 
-[MIT](LICENSE)
+[Apache 2.0](LICENSE)
