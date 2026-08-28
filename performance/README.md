@@ -56,6 +56,8 @@ requires them. Their setup remains outside the measured process boundary.
 - `infra/performance/compose.yml` defines the private PostgreSQL and RabbitMQ
   topology created for one campaign; infrastructure definitions remain under
   `infra`.
+- `infra/performance/aws/template.yaml` provisions the pinned ephemeral EC2 host
+  implementing the canonical AWS environment contract.
 - `xtask` implements `cargo perf`; generated builds and results stay under
   `target/perf`.
 
@@ -445,8 +447,10 @@ the real canonical comparison, nightly component/recovery/capacity run, an
 optional configured projection, and weekly soak on an exclusive Linux runner
 labelled `vigilo-performance`.
 
-The self-hosted jobs are inert in a new repository. After provisioning a Linux
-Actions runner version `2.327.1` or newer with Docker Engine and Compose:
+The self-hosted jobs are inert in a new repository. Provision the canonical AWS
+host with `infra/performance/aws/template.yaml` as documented in
+`infra/performance/aws/README.md`, then install a Linux Actions runner version
+`2.327.1` or newer:
 
 1. Confirm it matches `performance/environments/aws-m6i-2xlarge-al2023-v1.toml`
    and carries the `self-hosted`, `linux`, `x64`, and `vigilo-performance`

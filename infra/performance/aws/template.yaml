@@ -1,0 +1,381 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Ephemeral AWS host for the Vigilo aws-m6i-2xlarge-al2023-v1 performance
+  environment. This stack installs benchmark prerequisites but does not start a
+  benchmark or declare the host canonical.
+
+Metadata:
+  Vigilo:
+    Environment:
+      Id: aws-m6i-2xlarge-al2023-v1
+      Region: us-west-2
+      AvailabilityZoneId: usw2-az1
+      AmiId: ami-0c5f78ca5e1169a1a
+      AmiName: al2023-ami-2023.9.20251117.1-kernel-6.12-x86_64
+      InstanceType: m6i.2xlarge
+      Market: on-demand
+      Architecture: x86_64
+      Vcpus: 8
+      MemoryMiB: 32768
+      RootVolumeGiB: 100
+      RootVolumeType: gp3
+      RootVolumeIops: 6000
+      RootVolumeThroughputMiBps: 250
+      DockerComposeVersion: v2.39.3
+      DockerComposeSha256: 065836e21bce25674d2876dc64321ac707808fcd120e1c3ba700b0ce5ce8ff16
+
+Rules:
+  CanonicalRegionOnly:
+    Assertions:
+      - Assert: !Equals [!Ref "AWS::Region", us-west-2]
+        AssertDescription: >
+          aws-m6i-2xlarge-al2023-v1 is frozen to the us-west-2 region.
+
+Resources:
+  PerformanceVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-vpc
+        - Key: io.vigilo.environment
+          Value: aws-m6i-2xlarge-al2023-v1
+
+  PerformanceSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZoneId: usw2-az1
+      CidrBlock: 10.42.1.0/24
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref PerformanceVpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-subnet
+        - Key: io.vigilo.environment
+          Value: aws-m6i-2xlarge-al2023-v1
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-igw
+        - Key: io.vigilo.environment
+          Value: aws-m6i-2xlarge-al2023-v1
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref PerformanceVpc
+
+  PerformanceRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PerformanceVpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-routes
+        - Key: io.vigilo.environment
+          Value: aws-m6i-2xlarge-al2023-v1
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref PerformanceRouteTable
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PerformanceRouteTable
+      SubnetId: !Ref PerformanceSubnet
+
+  PerformanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: >
+        Egress-only access for the SSM-managed Vigilo performance host.
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Package, source, container image, and SSM access
+      VpcId: !Ref PerformanceVpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-host
+        - Key: io.vigilo.environment
+          Value: aws-m6i-2xlarge-al2023-v1
+
+  PerformanceInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: io.vigilo.environment
+          Value: aws-m6i-2xlarge-al2023-v1
+
+  PerformanceInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref PerformanceInstanceRole
+
+  BootstrapWaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  PerformanceInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - DefaultRoute
+      - SubnetRouteTableAssociation
+    Properties:
+      AvailabilityZone: !GetAtt PerformanceSubnet.AvailabilityZone
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            Iops: 6000
+            Throughput: 250
+            VolumeSize: 100
+            VolumeType: gp3
+      DisableApiTermination: false
+      EbsOptimized: true
+      IamInstanceProfile: !Ref PerformanceInstanceProfile
+      ImageId: ami-0c5f78ca5e1169a1a
+      InstanceInitiatedShutdownBehavior: terminate
+      InstanceType: m6i.2xlarge
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 1
+        HttpTokens: required
+        InstanceMetadataTags: disabled
+      Monitoring: false
+      PropagateTagsToVolumeOnCreation: true
+      SecurityGroupIds:
+        - !Ref PerformanceSecurityGroup
+      SourceDestCheck: true
+      SubnetId: !Ref PerformanceSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-host
+        - Key: io.vigilo.environment
+          Value: aws-m6i-2xlarge-al2023-v1
+        - Key: io.vigilo.ephemeral
+          Value: "true"
+      Tenancy: default
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > >(tee /var/log/vigilo-performance-bootstrap.log | logger -t vigilo-performance -s 2>/dev/console) 2>&1
+
+          WAIT_HANDLE='${BootstrapWaitHandle}'
+          signal_bootstrap() {
+            status=$1
+            reason=$2
+            curl --fail --silent --show-error --request PUT \
+              --header 'Content-Type:' \
+              --data-binary "{\"Status\":\"$status\",\"Reason\":\"$reason\",\"UniqueId\":\"vigilo-performance-bootstrap\",\"Data\":\"$status\"}" \
+              "$WAIT_HANDLE"
+          }
+          bootstrap_failed() {
+            code=$?
+            signal_bootstrap FAILURE "bootstrap exited with status $code" || true
+            exit "$code"
+          }
+          trap bootstrap_failed EXIT
+
+          swapoff -a
+          sed -ri '/[[:space:]]swap[[:space:]]/s/^/#/' /etc/fstab
+
+          cat >/etc/sysctl.d/99-vigilo-performance.conf <<'SYSCTL'
+          vm.swappiness = 0
+          vm.dirty_ratio = 10
+          vm.dirty_background_ratio = 3
+          vm.dirty_writeback_centisecs = 100
+          vm.dirty_expire_centisecs = 200
+          vm.zone_reclaim_mode = 0
+          SYSCTL
+          sysctl --system
+
+          cat >/etc/systemd/system/vigilo-performance-cpu.service <<'UNIT'
+          [Unit]
+          Description=Apply the Vigilo performance CPU and THP policy
+          After=multi-user.target
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/local/sbin/vigilo-performance-cpu
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          cat >/usr/local/sbin/vigilo-performance-cpu <<'SCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          for control in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+            test ! -w "$control" || echo performance >"$control"
+          done
+          test ! -w /sys/devices/system/cpu/intel_pstate/no_turbo || echo 1 >/sys/devices/system/cpu/intel_pstate/no_turbo
+          test ! -w /sys/devices/system/cpu/cpufreq/boost || echo 0 >/sys/devices/system/cpu/cpufreq/boost
+          test ! -w /sys/kernel/mm/transparent_hugepage/enabled || echo never >/sys/kernel/mm/transparent_hugepage/enabled
+          test ! -w /sys/kernel/mm/transparent_hugepage/defrag || echo never >/sys/kernel/mm/transparent_hugepage/defrag
+          SCRIPT
+          chmod 0755 /usr/local/sbin/vigilo-performance-cpu
+          systemctl enable --now vigilo-performance-cpu.service
+
+          dnf install -y docker git gcc gcc-c++ jq make tar gzip xz
+          systemctl enable --now amazon-ssm-agent docker
+          usermod -aG docker ec2-user
+
+          install -d -m 0755 /usr/local/lib/docker/cli-plugins
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output /usr/local/lib/docker/cli-plugins/docker-compose \
+            https://github.com/docker/compose/releases/download/v2.39.3/docker-compose-linux-x86_64
+          echo '065836e21bce25674d2876dc64321ac707808fcd120e1c3ba700b0ce5ce8ff16  /usr/local/lib/docker/cli-plugins/docker-compose' | sha256sum --check --strict
+          chmod 0755 /usr/local/lib/docker/cli-plugins/docker-compose
+
+          install -d -o ec2-user -g ec2-user -m 0755 /opt/vigilo-performance
+          cat >/etc/profile.d/vigilo-performance.sh <<'PROFILE'
+          export VIGILO_PERF_ENVIRONMENT_ID=aws-m6i-2xlarge-al2023-v1
+          PROFILE
+
+          cat >/usr/local/bin/vigilo-performance-attest <<'SCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+
+          token=$(curl --fail --silent --show-error --request PUT \
+            --header 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+            http://169.254.169.254/latest/api/token)
+          metadata() {
+            curl --fail --silent --show-error \
+              --header "X-aws-ec2-metadata-token: $token" \
+              "http://169.254.169.254/latest/meta-data/$1"
+          }
+
+          instance_type=$(metadata instance-type)
+          ami_id=$(metadata ami-id)
+          availability_zone_id=$(metadata placement/availability-zone-id)
+          architecture=$(uname -m)
+          logical_cpus=$(nproc)
+          swap_bytes=$(free --bytes | awk '/^Swap:/ {print $2}')
+
+          test "$instance_type" = m6i.2xlarge
+          test "$ami_id" = ami-0c5f78ca5e1169a1a
+          test "$availability_zone_id" = usw2-az1
+          test "$architecture" = x86_64
+          test "$logical_cpus" = 8
+          test "$swap_bytes" = 0
+          docker info >/dev/null
+          test "$(docker compose version --short)" = 2.39.3
+
+          jq -n \
+            --arg schema_id 'vigilo-performance-host-attestation/v1' \
+            --arg environment_id 'aws-m6i-2xlarge-al2023-v1' \
+            --arg instance_id "$(metadata instance-id)" \
+            --arg instance_type "$instance_type" \
+            --arg ami_id "$ami_id" \
+            --arg availability_zone "$(metadata placement/availability-zone)" \
+            --arg availability_zone_id "$availability_zone_id" \
+            --arg architecture "$architecture" \
+            --arg kernel "$(uname -r)" \
+            --arg docker "$(docker version --format '{{.Server.Version}}')" \
+            --arg compose "$(docker compose version --short)" \
+            --argjson logical_cpus "$logical_cpus" \
+            --argjson memory_bytes "$(free --bytes | awk '/^Mem:/ {print $2}')" \
+            --argjson swap_bytes "$swap_bytes" \
+            '{
+              schema_id: $schema_id,
+              environment_id: $environment_id,
+              instance_id: $instance_id,
+              instance_type: $instance_type,
+              ami_id: $ami_id,
+              availability_zone: $availability_zone,
+              availability_zone_id: $availability_zone_id,
+              architecture: $architecture,
+              logical_cpus: $logical_cpus,
+              memory_bytes: $memory_bytes,
+              swap_bytes: $swap_bytes,
+              kernel: $kernel,
+              docker: $docker,
+              docker_compose: $compose
+            }'
+          SCRIPT
+          chmod 0755 /usr/local/bin/vigilo-performance-attest
+          /usr/local/bin/vigilo-performance-attest >/var/lib/vigilo-performance-host-attestation.json
+
+          cat >/etc/systemd/system/vigilo-performance-expire.service <<'UNIT'
+          [Unit]
+          Description=Terminate the expired Vigilo performance host
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/systemctl poweroff
+          UNIT
+
+          cat >/etc/systemd/system/vigilo-performance-expire.timer <<'UNIT'
+          [Unit]
+          Description=Bound the lifetime of the Vigilo performance host
+
+          [Timer]
+          OnBootSec=12h
+          Unit=vigilo-performance-expire.service
+
+          [Install]
+          WantedBy=timers.target
+          UNIT
+          systemctl enable --now vigilo-performance-expire.timer
+
+          signal_bootstrap SUCCESS 'bootstrap and host attestation completed'
+          trap - EXIT
+
+  BootstrapWaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: PerformanceInstance
+    Properties:
+      Count: 1
+      Handle: !Ref BootstrapWaitHandle
+      Timeout: "1800"
+
+Outputs:
+  EnvironmentId:
+    Description: Performance environment contract selected by this stack.
+    Value: aws-m6i-2xlarge-al2023-v1
+  InstanceId:
+    Description: EC2 instance ID used with AWS Systems Manager Session Manager.
+    Value: !Ref PerformanceInstance
+  PublicIp:
+    Description: Ephemeral public IP used only for outbound access; no ingress is allowed.
+    Value: !GetAtt PerformanceInstance.PublicIp
+  AvailabilityZone:
+    Description: Account-local Availability Zone name.
+    Value: !GetAtt PerformanceSubnet.AvailabilityZone
+  AvailabilityZoneId:
+    Description: Stable Availability Zone ID frozen by the environment contract.
+    Value: !GetAtt PerformanceSubnet.AvailabilityZoneId
+  AmiId:
+    Description: Pinned Amazon Linux 2023 AMI.
+    Value: ami-0c5f78ca5e1169a1a
+  AttestationCommand:
+    Description: Run after connecting through Session Manager.
+    Value: sudo /usr/local/bin/vigilo-performance-attest

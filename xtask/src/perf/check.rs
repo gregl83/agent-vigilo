@@ -19,6 +19,7 @@ use anyhow::{
 use clap::Args;
 use serde::Deserialize;
 use serde_json::Value;
+use serde_yaml::Value as YamlValue;
 
 use super::{
     EXIT_PASS,
@@ -56,6 +57,30 @@ const PROFILES: [&str; 12] = [
     "recovery-v1",
     "soak-v1",
 ];
+
+#[derive(Debug, Deserialize)]
+struct CanonicalEnvironmentContract {
+    schema_id: String,
+    id: String,
+    canonical: bool,
+    provider: String,
+    region: String,
+    availability_zone_id: String,
+    instance_type: String,
+    market: String,
+    os: String,
+    ami_id: String,
+    ami_name: String,
+    architecture: String,
+    vcpus: u64,
+    memory_mib: u64,
+    storage: String,
+    root_volume_gib: u64,
+    root_volume_type: String,
+    root_volume_iops: u64,
+    root_volume_throughput_mibps: u64,
+    validity: Vec<String>,
+}
 
 /// CLI arguments for validating the performance harness.
 #[derive(Debug, Args)]
@@ -121,6 +146,7 @@ pub fn execute(args: CheckArgs) -> Result<u8> {
         registry.workloads.len()
     );
     println!("  profiles:    {}", PROFILES.join(", "));
+    println!("  environment: canonical AWS template matches environment/v1");
     println!("  tools:       cargo, rustc, and git available");
     println!("  production:  no reverse dependency or package leakage");
     println!("  process:     timeout, truncation, exit, and cleanup self-test passed");
@@ -230,15 +256,159 @@ fn validate_suppression_policy(policy: &SuppressionPolicy) -> Result<()> {
 /// Validates the canonical host descriptor used to label comparable results.
 fn validate_environment_contract(root: &Path) -> Result<()> {
     let path = root.join("performance/environments/aws-m6i-2xlarge-al2023-v1.toml");
-    let environment: toml::Value = toml::from_str(
-        &fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?,
-    )?;
-    if environment.get("schema_id").and_then(toml::Value::as_str)
-        != Some(super::model::ENVIRONMENT_SCHEMA)
-        || environment.get("id").and_then(toml::Value::as_str) != Some("aws-m6i-2xlarge-al2023-v1")
-        || environment.get("canonical").and_then(toml::Value::as_bool) != Some(true)
+    let environment_source =
+        fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let template_path = root.join("infra/performance/aws/template.yaml");
+    let template_source = fs::read_to_string(&template_path)
+        .with_context(|| format!("read {}", template_path.display()))?;
+    validate_environment_contract_sources(&environment_source, &template_source)
+}
+
+/// Requires the host descriptor and its CloudFormation implementation to agree exactly.
+fn validate_environment_contract_sources(
+    environment_source: &str,
+    template_source: &str,
+) -> Result<()> {
+    let environment: CanonicalEnvironmentContract = toml::from_str(environment_source)?;
+    if environment.schema_id != super::model::ENVIRONMENT_SCHEMA
+        || environment.id != "aws-m6i-2xlarge-al2023-v1"
+        || !environment.canonical
+        || environment.provider != "aws"
+        || environment.region != "us-west-2"
+        || environment.market != "on-demand"
+        || environment.os != "Amazon Linux 2023"
+        || environment.architecture != "x86_64"
+        || environment.vcpus != 8
+        || environment.memory_mib != 32_768
+        || environment.storage.trim().is_empty()
+        || environment.validity
+            != [
+                "exclusive_host",
+                "fixed_cpu_policy",
+                "no_swap",
+                "thermal_and_load_check",
+            ]
     {
         bail!("canonical performance environment contract is invalid");
+    }
+
+    let template: YamlValue = serde_yaml::from_str(template_source)?;
+    let metadata = yaml_path(&template, &["Metadata", "Vigilo", "Environment"])?;
+    require_yaml_string(metadata, "Id", &environment.id)?;
+    require_yaml_string(metadata, "Region", &environment.region)?;
+    require_yaml_string(
+        metadata,
+        "AvailabilityZoneId",
+        &environment.availability_zone_id,
+    )?;
+    require_yaml_string(metadata, "AmiId", &environment.ami_id)?;
+    require_yaml_string(metadata, "AmiName", &environment.ami_name)?;
+    require_yaml_string(metadata, "InstanceType", &environment.instance_type)?;
+    require_yaml_string(metadata, "Market", &environment.market)?;
+    require_yaml_string(metadata, "Architecture", &environment.architecture)?;
+    require_yaml_u64(metadata, "Vcpus", environment.vcpus)?;
+    require_yaml_u64(metadata, "MemoryMiB", environment.memory_mib)?;
+    require_yaml_u64(metadata, "RootVolumeGiB", environment.root_volume_gib)?;
+    require_yaml_string(metadata, "RootVolumeType", &environment.root_volume_type)?;
+    require_yaml_u64(metadata, "RootVolumeIops", environment.root_volume_iops)?;
+    require_yaml_u64(
+        metadata,
+        "RootVolumeThroughputMiBps",
+        environment.root_volume_throughput_mibps,
+    )?;
+
+    let subnet = yaml_path(&template, &["Resources", "PerformanceSubnet", "Properties"])?;
+    require_yaml_string(
+        subnet,
+        "AvailabilityZoneId",
+        &environment.availability_zone_id,
+    )?;
+
+    let instance = yaml_path(
+        &template,
+        &["Resources", "PerformanceInstance", "Properties"],
+    )?;
+    require_yaml_string(instance, "ImageId", &environment.ami_id)?;
+    require_yaml_string(instance, "InstanceType", &environment.instance_type)?;
+    require_yaml_string(instance, "Tenancy", "default")?;
+    require_yaml_string(instance, "InstanceInitiatedShutdownBehavior", "terminate")?;
+    require_yaml_bool(instance, "EbsOptimized", true)?;
+    require_yaml_bool(instance, "Monitoring", false)?;
+    if instance.get("InstanceMarketOptions").is_some() {
+        bail!("canonical performance instance must use on-demand capacity");
+    }
+    require_yaml_string(
+        yaml_path(instance, &["MetadataOptions"])?,
+        "HttpTokens",
+        "required",
+    )?;
+
+    let mappings = yaml_path(instance, &["BlockDeviceMappings"])?
+        .as_sequence()
+        .context("performance instance BlockDeviceMappings must be a sequence")?;
+    if mappings.len() != 1 {
+        bail!("performance instance must have exactly one root block-device mapping");
+    }
+    require_yaml_string(&mappings[0], "DeviceName", "/dev/xvda")?;
+    let ebs = yaml_path(&mappings[0], &["Ebs"])?;
+    require_yaml_bool(ebs, "DeleteOnTermination", true)?;
+    require_yaml_bool(ebs, "Encrypted", true)?;
+    require_yaml_u64(ebs, "Iops", environment.root_volume_iops)?;
+    require_yaml_u64(ebs, "Throughput", environment.root_volume_throughput_mibps)?;
+    require_yaml_u64(ebs, "VolumeSize", environment.root_volume_gib)?;
+    require_yaml_string(ebs, "VolumeType", &environment.root_volume_type)?;
+
+    let security_group = yaml_path(
+        &template,
+        &["Resources", "PerformanceSecurityGroup", "Properties"],
+    )?;
+    if security_group.get("SecurityGroupIngress").is_some() {
+        bail!("canonical performance security group must not allow inbound traffic");
+    }
+    yaml_path(&template, &["Rules", "CanonicalRegionOnly"])?;
+    yaml_path(&template, &["Resources", "BootstrapWaitHandle"])?;
+    let wait = yaml_path(
+        &template,
+        &["Resources", "BootstrapWaitCondition", "Properties"],
+    )?;
+    require_yaml_u64(wait, "Count", 1)?;
+    require_yaml_string(wait, "Timeout", "1800")?;
+    if template_source.contains("VIGILO_PERF_CANONICAL_VALIDATED") {
+        bail!("AWS bootstrap must not self-certify the canonical environment");
+    }
+    Ok(())
+}
+
+fn yaml_path<'a>(value: &'a YamlValue, path: &[&str]) -> Result<&'a YamlValue> {
+    let mut current = value;
+    for key in path {
+        current = current
+            .get(*key)
+            .with_context(|| format!("CloudFormation contract is missing {}", path.join(".")))?;
+    }
+    Ok(current)
+}
+
+fn require_yaml_string(value: &YamlValue, key: &str, expected: &str) -> Result<()> {
+    let actual = yaml_path(value, &[key])?.as_str();
+    if actual != Some(expected) {
+        bail!("CloudFormation {key} must be {expected:?}, found {actual:?}");
+    }
+    Ok(())
+}
+
+fn require_yaml_u64(value: &YamlValue, key: &str, expected: u64) -> Result<()> {
+    let actual = yaml_path(value, &[key])?.as_u64();
+    if actual != Some(expected) {
+        bail!("CloudFormation {key} must be {expected}, found {actual:?}");
+    }
+    Ok(())
+}
+
+fn require_yaml_bool(value: &YamlValue, key: &str, expected: bool) -> Result<()> {
+    let actual = yaml_path(value, &[key])?.as_bool();
+    if actual != Some(expected) {
+        bail!("CloudFormation {key} must be {expected}, found {actual:?}");
     }
     Ok(())
 }
@@ -752,6 +922,27 @@ mod tests {
         validate_ci_contract(&root).unwrap();
         validate_suppressions(&root).unwrap();
         calibration::validate_repository_contract(&root).unwrap();
+    }
+
+    #[test]
+    fn canonical_environment_rejects_cloudformation_drift_and_self_certification() {
+        let root = workspace_root().unwrap();
+        let environment = fs::read_to_string(
+            root.join("performance/environments/aws-m6i-2xlarge-al2023-v1.toml"),
+        )
+        .unwrap();
+        let template =
+            fs::read_to_string(root.join("infra/performance/aws/template.yaml")).unwrap();
+        validate_environment_contract_sources(&environment, &template).unwrap();
+
+        let wrong_instance = template.replace(
+            "      InstanceType: m6i.2xlarge",
+            "      InstanceType: m6i.4xlarge",
+        );
+        assert!(validate_environment_contract_sources(&environment, &wrong_instance).is_err());
+
+        let self_certifying = format!("{template}\n# VIGILO_PERF_CANONICAL_VALIDATED=1\n");
+        assert!(validate_environment_contract_sources(&environment, &self_certifying).is_err());
     }
 
     #[test]

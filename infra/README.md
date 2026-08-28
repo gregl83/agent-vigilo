@@ -23,3 +23,11 @@ loopback ports, database namespace, broker scope, labelled network, and labelled
 volumes for each campaign. Operators do not start this topology directly;
 service-backed performance workloads provision and remove only their recorded
 resources.
+
+## AWS Performance Host
+
+`infra/performance/aws/template.yaml` provisions the ephemeral EC2 host for the
+canonical performance environment. Its fixed instance, AMI, Availability Zone,
+and EBS settings implement the contract in
+`performance/environments/aws-m6i-2xlarge-al2023-v1.toml`; deployment and
+teardown commands are documented in `infra/performance/aws/README.md`.

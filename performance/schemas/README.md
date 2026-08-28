@@ -155,8 +155,9 @@ service credentials or provisioning scripts.
 | `schema_id` | Environment document shape, currently `environment/v1`. |
 | `id` | Stable host contract identity. Results from different IDs are not canonical blocking comparisons. |
 | `canonical` | Whether results may support calibrated blocking verdicts. |
-| `provider`, `instance_type` | Infrastructure provider and host shape. |
-| `os`, `architecture`, `vcpus`, `memory_mib`, `storage` | Required operating system, hardware, and storage characteristics. |
+| `provider`, `region`, `availability_zone_id`, `instance_type`, `market` | Infrastructure provider, stable placement, on-demand market, and host shape. |
+| `os`, `ami_id`, `ami_name`, `architecture`, `vcpus`, `memory_mib` | Required operating system image and hardware characteristics. |
+| `storage`, `root_volume_*` | Human-readable and structured EBS size, type, IOPS, and throughput contract. |
 | `validity` | Readiness observations required before accepting a canonical campaign. |
 
 ## Deployment Configuration
