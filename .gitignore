@@ -29,9 +29,8 @@ target
 # Local GGUF model files used by the dev docker compose example.
 /models/
 
-# Agent planning files
+# Agents
 .agents
-.agent-plans
 
 # SQLx
 .sqlx

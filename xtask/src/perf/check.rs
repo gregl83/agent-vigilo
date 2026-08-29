@@ -621,7 +621,7 @@ fn validate_no_roadmap_markers(root: &Path) -> Result<()> {
         .filter(|path| !path.is_empty())
     {
         let relative = String::from_utf8_lossy(relative).replace('\\', "/");
-        if relative.starts_with(".agent-plans/") || !is_reviewed_text_path(Path::new(&relative)) {
+        if relative.starts_with(".agents/plans/") || !is_reviewed_text_path(Path::new(&relative)) {
             continue;
         }
         let path = root.join(&relative);

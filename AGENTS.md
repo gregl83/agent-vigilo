@@ -39,10 +39,9 @@ This file records Vigilo-specific constraints that are easy to miss. A nearer
 - Keep evaluator execution contracts in `vigilo/src/contracts/`, not persistence
   models. Update host mappings, evaluator examples, and docs with WIT changes.
 - Do not rename public CLI flags or terms unless the task explicitly requires it.
-- Performance work follows `.agent-plans/VIGILO_PERFORMANCE_TESTING_PLAN.md` and
-  `performance/README.md`. Production code must not depend on `xtask/perf`; keep
-  `cargo perf check` service-free, require an exact correctness oracle before
-  timing, and require bounded, exact fixture cleanup.
+- Performance work follows `performance/README.md`. Production code must not
+  depend on `xtask/perf`; keep `cargo perf check` service-free, require an exact
+  correctness oracle before timing, and require bounded, exact fixture cleanup.
 
 ## Testing And Verification
 
